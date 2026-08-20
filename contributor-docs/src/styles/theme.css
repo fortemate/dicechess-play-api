@@ -1,0 +1,54 @@
+/* play-api contributor docs — shares the Dice Chess brand accent with the Bot API site
+   (docs/src/styles/theme.css) so the two read as one project. Trimmed to what this site
+   actually renders: no splash hero, no dice strip. Accent is a warm dice-amber, tuned
+   separately for dark (default) and light so text on accent keeps AA contrast in both. */
+
+:root {
+	--sl-color-accent-low: #422c00;
+	--sl-color-accent: #c8871a;
+	--sl-color-accent-high: #f2cd8b;
+
+	--sl-color-text-accent: #f0bd5c;
+
+	/* brand amber, used for card icons */
+	--dc-amber: #f4b942;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #ffeec4;
+	--sl-color-accent: #9a6a00;
+	--sl-color-accent-high: #4c3400;
+
+	--sl-color-text-accent: #8a5e00;
+
+	/* the dark-theme amber is far too light to sit on the pale accent-low card-icon
+	   background; darken it so the icon keeps AA contrast in light mode */
+	--dc-amber: #8a5e00;
+}
+
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+
+.card {
+	transition:
+		transform 0.15s ease,
+		border-color 0.15s ease,
+		box-shadow 0.15s ease;
+}
+
+.card:hover {
+	transform: translateY(-3px);
+	border-color: var(--sl-color-accent);
+	box-shadow: 0 10px 30px -12px hsl(40 60% 30% / 0.35);
+}
+
+.card .icon {
+	color: var(--dc-amber);
+	background: var(--sl-color-accent-low);
+}
+
+/* ── Misc polish ────────────────────────────────────────────────────────── */
+
+/* tighten the method badges when we write `GET`/`POST` inline as <code> */
+.sl-markdown-content :not(pre) > code {
+	border: 1px solid var(--sl-color-gray-5);
+}

@@ -1,0 +1,306 @@
+asyncapi: 3.1.0
+info:
+  title: Dice Chess Bot Event Streams
+  version: '1.0'
+  description: >
+    The two long-lived ndjson (newline-delimited JSON) streams a bot may hold: the account event
+    stream for incoming challenges and game starts, and a per-game stream of state transitions.
+    Each message is one JSON object on its own line; blank lines are ~25s keep-alives and must be
+    ignored. Streams are live-only — recover missed facts via the REST polling endpoints (see
+    openapi.yaml). This description complements the REST contract in `openapi.yaml`.
+  license:
+    name: AGPL-3.0-or-later
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+servers:
+  production:
+    host: api.fortemate.com
+    protocol: https
+    description: 'Canonical production platform. Authenticate with an Authorization: Bearer <token> header.'
+    security:
+      - $ref: '#/components/securitySchemes/bearerAuth'
+  legacy:
+    host: play-api.jc.id.lv
+    protocol: https
+    description: 'Legacy production platform (deprecated during migration). Authenticate with an Authorization: Bearer <token> header.'
+    security:
+      - $ref: '#/components/securitySchemes/bearerAuth'
+channels:
+  accountEvents:
+    address: /bot/stream/event
+    title: Account event stream
+    description: Incoming challenges and game starts for the authenticated bot.
+    messages:
+      challengeReceived: { $ref: '#/components/messages/ChallengeReceived' }
+      challengeDeclined: { $ref: '#/components/messages/ChallengeDeclined' }
+      gameStart: { $ref: '#/components/messages/GameStart' }
+  gameEvents:
+    address: /bot/game/stream/{id}
+    title: Game event stream
+    description: State transitions for one game.
+    parameters:
+      id:
+        description: The game id.
+    messages:
+      snapshot: { $ref: '#/components/messages/Snapshot' }
+      diceRolled: { $ref: '#/components/messages/DiceRolled' }
+      turnPlayed: { $ref: '#/components/messages/TurnPlayed' }
+      drawOffered: { $ref: '#/components/messages/DrawOffered' }
+      drawDeclined: { $ref: '#/components/messages/DrawDeclined' }
+      gameEnded: { $ref: '#/components/messages/GameEnded' }
+      rejected: { $ref: '#/components/messages/Rejected' }
+operations:
+  receiveAccountEvents:
+    action: receive
+    channel: { $ref: '#/channels/accountEvents' }
+    summary: Stream account events.
+    messages:
+      - { $ref: '#/channels/accountEvents/messages/challengeReceived' }
+      - { $ref: '#/channels/accountEvents/messages/challengeDeclined' }
+      - { $ref: '#/channels/accountEvents/messages/gameStart' }
+  receiveGameEvents:
+    action: receive
+    channel: { $ref: '#/channels/gameEvents' }
+    summary: Stream one game's state transitions.
+    messages:
+      - { $ref: '#/channels/gameEvents/messages/snapshot' }
+      - { $ref: '#/channels/gameEvents/messages/diceRolled' }
+      - { $ref: '#/channels/gameEvents/messages/turnPlayed' }
+      - { $ref: '#/channels/gameEvents/messages/drawOffered' }
+      - { $ref: '#/channels/gameEvents/messages/drawDeclined' }
+      - { $ref: '#/channels/gameEvents/messages/gameEnded' }
+      - { $ref: '#/channels/gameEvents/messages/rejected' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: A Bearer token from POST /bot/anon or POST /bot/register.
+  messages:
+    ChallengeReceived:
+      name: ChallengeReceived
+      title: A challenge was addressed to you.
+      payload:
+        type: object
+        required: [ChallengeReceived]
+        properties:
+          ChallengeReceived:
+            type: object
+            properties:
+              id: { type: string }
+              challenger: { $ref: '#/components/schemas/Principal' }
+    ChallengeDeclined:
+      name: ChallengeDeclined
+      title: A challenge you created was declined or expired.
+      payload:
+        type: object
+        required: [ChallengeDeclined]
+        properties:
+          ChallengeDeclined:
+            type: object
+            properties:
+              id: { type: string }
+    GameStart:
+      name: GameStart
+      title: A game you are seated in has started.
+      payload:
+        type: object
+        required: [GameStart]
+        properties:
+          GameStart:
+            type: object
+            properties:
+              gameId: { type: string }
+    Snapshot:
+      name: Snapshot
+      title: The current game state, sent immediately on connect.
+      payload:
+        type: object
+        required: [Snapshot]
+        properties:
+          Snapshot:
+            type: object
+            properties:
+              v: { type: integer }
+              state: { $ref: '#/components/schemas/PublicGameState' }
+              history:
+                type: array
+                items: { $ref: '#/components/schemas/SnapshotTurn' }
+                description: >-
+                  Every completed turn so far, consistent with `v`, so a client that joins mid-game renders the
+                  full move list rather than only what happens after it connected. Empty before the first turn.
+    DiceRolled:
+      name: DiceRolled
+      title: The server rolled the dice for a turn.
+      payload:
+        type: object
+        required: [DiceRolled]
+        properties:
+          DiceRolled:
+            type: object
+            properties:
+              v: { type: integer }
+              seat: { $ref: '#/components/schemas/Seat' }
+              dice: { type: array, items: { type: integer, minimum: 1, maximum: 6 } }
+              dfen: { type: string }
+              clocks: { $ref: '#/components/schemas/Clocks' }
+              legalMoves:
+                oneOf: [{ $ref: '#/components/schemas/MoveTree' }, { type: 'null' }]
+                description: The legal-move tree for this roll; {} = forced pass; null = fetch GET /games/{id}/moves.
+    TurnPlayed:
+      name: TurnPlayed
+      title: A turn's moves were applied.
+      payload:
+        type: object
+        required: [TurnPlayed]
+        properties:
+          TurnPlayed:
+            type: object
+            properties:
+              v: { type: integer }
+              seat: { $ref: '#/components/schemas/Seat' }
+              moves: { type: array, items: { type: string } }
+              fenAfter: { type: string }
+    DrawOffered:
+      name: DrawOffered
+      title: A draw offer is pending for the active seat.
+      payload:
+        type: object
+        required: [DrawOffered]
+        properties:
+          DrawOffered:
+            type: object
+            required: [v, by]
+            properties:
+              v: { type: integer }
+              by: { $ref: '#/components/schemas/Seat', description: The seat who made the offer. }
+    DrawDeclined:
+      name: DrawDeclined
+      title: A pending draw offer was explicitly declined.
+      payload:
+        type: object
+        required: [DrawDeclined]
+        properties:
+          DrawDeclined:
+            type: object
+            required: [v, by]
+            properties:
+              v: { type: integer }
+              by: { $ref: '#/components/schemas/Seat', description: The seat who declined the offer. }
+    GameEnded:
+      name: GameEnded
+      title: The game is over — carries the provably-fair reveal.
+      payload:
+        type: object
+        required: [GameEnded]
+        properties:
+          GameEnded:
+            type: object
+            properties:
+              v: { type: integer }
+              over:
+                type: object
+                properties:
+                  result: { description: '{"Win":{"side":"White"}} or {"Draw":{}}.' }
+                  termination: { type: string, enum: [KingCaptured, Resign, Draw, Aborted, Timeout] }
+              seed: { type: [string, 'null'], description: Revealed server seed (null only while the game is still active). }
+              clientSeeds:
+                oneOf: [{ $ref: '#/components/schemas/ClientSeeds' }, { type: 'null' }]
+                description: The two revealed client seeds, null only while the game is still active.
+    Rejected:
+      name: Rejected
+      title: The engine rejected submitted moves.
+      payload:
+        type: object
+        required: [Rejected]
+        properties:
+          Rejected:
+            type: object
+            properties:
+              v: { type: integer }
+              seat: { $ref: '#/components/schemas/Seat' }
+              reason: { type: string }
+  schemas:
+    Seat:
+      type: string
+      enum: [White, Black]
+    SnapshotTurn:
+      type: object
+      description: One completed turn, replayed in a Snapshot's history so a joining client starts at move 1.
+      properties:
+        seat: { $ref: '#/components/schemas/Seat' }
+        dice: { type: array, items: { type: integer, minimum: 1, maximum: 6 } }
+        moves:
+          type: array
+          items: { type: string }
+          description: UCI micro-moves played; empty for a forced pass.
+        fenAfter:
+          type: string
+          description: The position after the turn (also the next turn's starting position).
+    Clocks:
+      type: [object, 'null']
+      properties:
+        white: { type: integer }
+        black: { type: integer }
+    ClientSeeds:
+      type: object
+      description: The two revealed client seeds (present only with the end-of-game reveal).
+      properties:
+        white: { type: string }
+        black: { type: string }
+    MoveTree:
+      type: object
+      description: >
+        A prefix tree of UCI micro-moves; each key is a micro-move whose value is the tree of
+        legal continuations. A leaf ({}) is a complete legal turn.
+      additionalProperties:
+        $ref: '#/components/schemas/MoveTree'
+    Principal:
+      type: object
+      description: Single-key identity wrapper, e.g. {"Bot":{"team":"anon","name":"other-bot"}}.
+      oneOf:
+        - { type: object, required: [Guest], properties: { Guest: { type: object, properties: { id: { type: string } } } } }
+        - { type: object, required: [User], properties: { User: { type: object, properties: { id: { type: string } } } } }
+        - { type: object, required: [Bot], properties: { Bot: { type: object, properties: { team: { type: string }, name: { type: string } } } } }
+    PublicGameState:
+      type: object
+      description: The same object GET /games/{id} returns (see PublicGameState in openapi.yaml).
+      required: [version, dfen, activeSeat, dicePending, status, timeControl, commit]
+      properties:
+        version: { type: integer }
+        dfen: { type: string }
+        activeSeat: { $ref: '#/components/schemas/Seat' }
+        dicePending: { type: boolean }
+        status: { type: object }
+        timeControl: { type: object }
+        clocks: { $ref: '#/components/schemas/Clocks' }
+        commit: { type: string }
+        seed: { type: [string, 'null'] }
+        clientSeeds:
+          oneOf: [{ $ref: '#/components/schemas/ClientSeeds' }, { type: 'null' }]
+        drawOffer:
+          type: [object, 'null']
+          description: Present when a draw offer is pending for the active player.
+          required: [pending]
+          properties:
+            pending: { type: boolean }
+        mayOfferDraw:
+          type: [boolean, 'null']
+          description: Whether the active player is allowed to offer a draw this turn under anti-spam alternation.
+        legalMoves:
+          oneOf: [{ $ref: '#/components/schemas/MoveTree' }, { type: 'null' }]
+        players:
+          type: object
+          properties:
+            white: { $ref: '#/components/schemas/PublicFace' }
+            black: { $ref: '#/components/schemas/PublicFace' }
+        rated:
+          type: [boolean, 'null']
+          description: Whether the game counts toward rating; absent/null means "the server does not say".
+    PublicFace:
+      type: object
+      properties:
+        kind: { type: string, enum: [Bot, Human] }
+        name: { type: [string, 'null'] }
+        rating:
+          type: [number, 'null']
+          description: Settled rating as of game start; only on a named face. Absent/null means "not said".

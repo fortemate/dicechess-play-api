@@ -1,0 +1,81 @@
+---
+title: Dice Chess Bot API
+description: Connect a bot to the Dice Chess play platform — REST, streaming, or one serverless webhook. Anonymous in minutes, provably-fair dice, an automatic rating ladder.
+template: splash
+hero:
+  tagline: Build a bot for Dice Chess. Get a token in one request, play your first game in five minutes, and never implement a single rule of the variant yourself — the server hands you the legal moves.
+  image:
+    file: ../../assets/logo.svg
+  actions:
+    - text: A Bot in Five Minutes
+      link: ./quickstart/
+      icon: right-arrow
+    - text: GitHub Repository
+      link: https://github.com/rabestro/dicechess-play-api
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## Three ways to connect
+
+<CardGrid>
+	<LinkCard
+		title="Poll — a cron function"
+		href="./connection-modes/#poll-only"
+		description="Wake on a timer, list your games over REST, submit a move, sleep. No long-lived connection. The move verdict comes back on the submit itself."
+	/>
+	<LinkCard
+		title="Stream — real-time ndjson"
+		href="./reference/streaming/"
+		description="Hold two ndjson streams — your account events and each game's transitions — and react the instant the dice are rolled. Best for short time controls."
+	/>
+	<LinkCard
+		title="Webhook — pure serverless"
+		href="./reference/webhooks/"
+		description="Register one HTTPS callback. The server POSTs when it is your turn and your HTTP response body is the move. No stream, no timer — a single stateless function."
+	/>
+</CardGrid>
+
+## Why it is easy to write a bot
+
+<CardGrid stagger>
+	<Card title="No rules engine required" icon="approve-check">
+		The server enumerates every legal turn for the current roll as a prefix tree and puts it
+		on the wire. Walk any root-to-leaf path and submit it — a complete random bot is ~100 lines
+		in any language, with no board representation of its own.
+	</Card>
+	<Card title="Anonymous in one request" icon="rocket">
+		`POST /bot/anon` mints a token with zero registration — enough to play against the house
+		sparring bot in minutes. Claim a durable identity later, when you want it to survive
+		restarts and climb the ladder.
+	</Card>
+	<Card title="Provably-fair dice" icon="seti:lock">
+		Every roll is a committed HMAC that anyone can recompute after the game. The server commits
+		to its seed before it sees yours, so neither side can grind the dice — and you can prove it.
+	</Card>
+	<Card title="An automatic rating ladder" icon="star">
+		Opt a registered bot in and the server pairs it against other bots on its own — Glicko-2
+		ratings, a public leaderboard. No matchmaking code on your side.
+	</Card>
+</CardGrid>
+
+## What is Dice Chess?
+
+**Dice Chess** is a chess variant where each turn begins with a roll of three dice. Each die value maps to a piece type, and you make one micro-move per die — in any order — using pieces of the rolled types:
+
+<ul class="dice-map">
+	<li><span class="pip">⚀</span><span class="glyph">♙</span><span class="name">1 · Pawn</span></li>
+	<li><span class="pip">⚁</span><span class="glyph">♘</span><span class="name">2 · Knight</span></li>
+	<li><span class="pip">⚂</span><span class="glyph">♗</span><span class="name">3 · Bishop</span></li>
+	<li><span class="pip">⚃</span><span class="glyph">♖</span><span class="name">4 · Rook</span></li>
+	<li><span class="pip">⚄</span><span class="glyph">♕</span><span class="name">5 · Queen</span></li>
+	<li><span class="pip">⚅</span><span class="glyph">♔</span><span class="name">6 · King</span></li>
+</ul>
+
+A turn ends after its micro-moves are spent, when there is no further legal move, or when it captures the opponent's king — which wins the game immediately. You never need to compute any of this: the [legal-move tree](./game-mechanics/#legal-moves) already has the rules applied.
+
+:::tip[Start here]
+New to the platform? Follow [A Bot in Five Minutes](./quickstart/) — anonymous token, one challenge against the house bot, and a play loop you can paste. Then skim [Game Mechanics](./game-mechanics/) for DFEN and the legal-move tree.
+:::

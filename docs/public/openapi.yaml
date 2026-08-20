@@ -1,0 +1,1318 @@
+openapi: 3.1.0
+info:
+  title: Dice Chess Bot API
+  version: '1.0'
+  description: >
+    REST contract for connecting a bot to the Dice Chess play platform. This is the
+    machine-readable companion to the guides at https://bots.fortemate.com/ (legacy: https://bots.jc.id.lv/) —
+    use it to generate a client (`openapi-generator`, `openapi-typescript`, etc.). The two
+    long-lived ndjson event streams are described separately in `asyncapi.yaml`.
+  license:
+    name: AGPL-3.0-or-later
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+servers:
+  - url: https://api.fortemate.com
+    description: Canonical production platform
+  - url: https://play-api.jc.id.lv
+    description: Legacy production platform (deprecated during migration)
+security:
+  - bearerAuth: []
+tags:
+  - name: Identity
+    description: Tokens and bot identity — anonymous mint, durable registration, rotation, ladder opt-in.
+  - name: Challenges
+    description: Direct bot-to-bot challenges.
+  - name: Seeks
+    description: Public lobby offers — how bots meet humans.
+  - name: Gameplay
+    description: Seeding the dice, submitting turns, resigning.
+  - name: Discovery
+    description: Public, unauthenticated reads — live games, legal moves, a single game snapshot.
+  - name: Leaderboard
+    description: Public rating-ladder reads. Present only when the server runs with persistence.
+  - name: Strength
+    description: >
+      Public, precise pairwise SPRT verdicts and a Bradley-Terry pool ranking — the error-rate-bounded
+      complement to the Glicko-2 leaderboard. Present only when the server runs with persistence, and
+      answers 503 until the rating batch has completed its first refresh.
+  - name: Webhooks
+    description: Register an HTTPS callback the server POSTs turns to. Registered bots only; enabled per server.
+paths:
+  /bot/anon:
+    post:
+      tags: [Identity]
+      summary: Mint an anonymous token
+      description: >
+        Mints an ephemeral, unranked token with zero registration. Anonymous tokens live in
+        server memory (~24h TTL) and never appear on the ladder. One of the two routes that need
+        no Authorization header (the other is POST /bot/register).
+      security: []
+      parameters:
+        - name: name
+          in: query
+          required: false
+          schema: { type: string }
+          description: Optional display name for the anonymous bot.
+      responses:
+        '201':
+          description: Token minted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /bot/register:
+    post:
+      tags: [Identity]
+      summary: Register a durable bot
+      description: >
+        Claims a durable self-service identity that survives server restarts and can join the
+        ladder, rotate its token, and register a webhook. The token is shown exactly once.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Identity claimed. Store the token now — it is shown only once.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '400':
+          description: Invalid slug, or a reserved team (`anon`, `house`).
+        '409':
+          description: The identity (team/name) is already taken.
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /bot/token:
+    post:
+      tags: [Identity]
+      summary: Rotate the token
+      description: >
+        Swaps the caller's Bearer token; the old one stops authenticating immediately, the new
+        one is shown once. Registered bots only.
+      responses:
+        '200':
+          description: Fresh token.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                required: [token]
+        '403':
+          description: Caller is anonymous (re-mint instead) or static (rotates via server env).
+  /bot/account:
+    get:
+      tags: [Identity]
+      summary: Current identity
+      responses:
+        '200':
+          description: The caller's identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /bot/ladder/join:
+    post:
+      tags: [Identity]
+      summary: Join the rating ladder
+      description: >
+        Opts a registered bot into the server-paired rating ladder. Passive: the server starts
+        server-chosen games on its own. Registered bots only.
+      responses:
+        '200':
+          description: Ladder membership state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LadderState' }
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+  /bot/ladder/leave:
+    post:
+      tags: [Identity]
+      summary: Leave the rating ladder
+      description: Freezes the bot's rating and stops new ladder pairings. Registered bots only.
+      responses:
+        '200':
+          description: Ladder membership state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LadderState' }
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+  /bot/open-to-humans:
+    post:
+      tags: [Identity]
+      summary: Open to human catalog games
+      description: >
+        Advertises a registered bot in the human-facing catalog and, in the same write, sets its
+        optional description. A zero-length or field-absent body clears the description. Registered
+        bots only.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetOpenToHumans' }
+      responses:
+        '200':
+          description: Catalog opt-in state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpenToHumansState' }
+        '400':
+          description: Description longer than 200 characters, or a malformed body.
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+  /bot/open-to-humans/leave:
+    post:
+      tags: [Identity]
+      summary: Close to human catalog games
+      description: Removes the bot from the human catalog, leaving its description intact. Registered bots only.
+      responses:
+        '200':
+          description: Catalog opt-in state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpenToHumansState' }
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+  /bot/capacity:
+    get:
+      tags: [Identity]
+      summary: Read the declared concurrent-game capacity
+      description: >
+        How many games the server may seat this bot in at once, how much of that the rating ladder
+        may take, and how many games are in flight right now. Registered bots only — anonymous and
+        server-configured house bots have no declaration and are unbounded.
+      responses:
+        '200':
+          description: Declared capacity and current usage.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Capacity' }
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+    post:
+      tags: [Identity]
+      summary: Declare the concurrent-game capacity
+      description: >
+        Sets how many games this bot is willing to hold at once; a registered bot starts at 1.
+        Enforced when a game is seated, never by delaying a turn inside a running game. At the
+        limit the ladder skips the bot until a game ends, and the human/challenge/seek paths
+        answer 409 without consuming the offer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetCapacity' }
+      responses:
+        '200':
+          description: Declared capacity and current usage.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Capacity' }
+        '400':
+          description: maxConcurrentGames outside 1..32, or a malformed body.
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+  /bot/challenge:
+    post:
+      tags: [Challenges]
+      summary: Create a challenge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateChallengeRequest' }
+      responses:
+        '201':
+          description: Challenge created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Challenge' }
+        '400':
+          description: Challenging yourself.
+        '429':
+          description: Too many pending challenges.
+  /bot/challenges:
+    get:
+      tags: [Challenges]
+      summary: List pending challenges
+      description: Every pending challenge involving the caller — `in` addressed to you, `out` yours.
+      responses:
+        '200':
+          description: Pending challenges.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChallengeList' }
+  /bot/challenge/{id}/accept:
+    post:
+      tags: [Challenges]
+      summary: Accept a challenge
+      parameters: [{ $ref: '#/components/parameters/ChallengeId' }]
+      responses:
+        '201':
+          description: Game created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameCreated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: A side is at its concurrent-game limit. The challenge stays pending — retry after a game ends. }
+  /bot/challenge/{id}/decline:
+    post:
+      tags: [Challenges]
+      summary: Decline a challenge
+      parameters: [{ $ref: '#/components/parameters/ChallengeId' }]
+      responses:
+        '200': { description: Declined. }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /bot/seeks:
+    post:
+      tags: [Seeks]
+      summary: Post a lobby seek
+      description: A standing public offer in the same lobby guests use. Anyone may accept it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeControl:
+                  allOf: [{ $ref: '#/components/schemas/TimeControl' }]
+                  description: >-
+                    Optional. Omitted, the seek gets Fischer 600+10 — a human may sit down at this offer, and a
+                    clockless public game has nothing to end it but the 120-second anti-abandonment cap. Ask for
+                    Unlimited explicitly if you want no game clock.
+                rated:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Optional, defaults to false. Rated is chosen by the seek's creator for any registered opponent —
+                    there is no curated roster. Posting the seek anonymously (a guest, or a bot registered under the
+                    shared anonymous team) silently degrades `rated` to false. Once posted, a rated seek can only be
+                    accepted by a signed-in account or a registered bot — an anonymous acceptor gets 403 and the
+                    seek stays open for someone else.
+      responses:
+        '201':
+          description: Seek posted. Hold it by polling; it expires after ~2 minutes without a poll.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  seekId: { type: string }
+                  secret: { type: string, description: Capability secret for poll/cancel. }
+                required: [seekId, secret]
+        '429':
+          description: Too many open seeks (cap 3).
+  /bot/seeks/{id}/accept:
+    post:
+      tags: [Seeks]
+      summary: Accept a lobby seek
+      description: Accept an open seek from the public `GET /lobby/seeks` list. Colour is random.
+      parameters: [{ $ref: '#/components/parameters/SeekId' }]
+      responses:
+        '201':
+          description: Game created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameCreated' }
+        '400': { description: Accepting your own seek. }
+        '403': { description: The seek is rated and this bot is anonymous (registered under the shared anonymous team) — a rated seek needs a registered opponent; the seek stays open. }
+        '404': { description: No such open seek. }
+        '409': { description: Someone claimed it first, or a side is at its concurrent-game limit (the seek stays open). }
+  /bot/game/{id}/seed:
+    post:
+      tags: [Gameplay]
+      summary: Submit a dice seed
+      description: >
+        Contribute this seat's post-commit entropy for the provably-fair dice. Submit once, as
+        soon as the game starts and before the opening roll. Fire-and-forget.
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seed: { type: string, minLength: 16, maxLength: 256 }
+              required: [seed]
+      responses:
+        '202': { description: Accepted (a duplicate, too-late, or malformed seed is ignored). }
+  /bot/game/{id}/move:
+    post:
+      tags: [Gameplay]
+      summary: Submit turn moves
+      description: >
+        Submit the turn's micro-moves in UCI, one per rolled die. The verdict is synchronous.
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MoveRequest' }
+      responses:
+        '200':
+          description: The turn was applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+        '202':
+          description: No verdict within a few seconds — treat as fire-and-forget and watch the stream.
+        '409':
+          description: Refused (`not your turn`, `illegal turn`, `game is over`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+  /bot/game/{id}/draw/accept:
+    post:
+      tags: [Gameplay]
+      summary: Accept a pending draw offer
+      description: >
+        Accept a pending draw offer when it is your turn and an offer is pending.
+        Ends the game in a draw by agreement. Alias: `/bot/game/{id}/draw/yes`.
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The draw offer was accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+        '202': { description: Accepted — processing lagged; observe the stream. }
+        '409':
+          description: Refused (`not your turn`, `no draw offer pending`, `game is over`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+  /bot/game/{id}/draw/decline:
+    post:
+      tags: [Gameplay]
+      summary: Explicitly decline a pending draw offer
+      description: >
+        Explicitly decline a pending draw offer and reveal your dice to enter the move phase.
+        Alias: `/bot/game/{id}/draw/no`.
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The draw offer was declined.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+        '202': { description: Accepted — processing lagged; observe the stream. }
+        '409':
+          description: Refused (`not your turn`, `no draw offer pending`, `game is over`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+  /bot/game/{id}/resign:
+    post:
+      tags: [Gameplay]
+      summary: Resign a game
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '202': { description: Accepted. }
+  /bot/games:
+    get:
+      tags: [Gameplay]
+      summary: List my live games
+      description: >
+        Every live game the caller is seated in — the polling counterpart of `GameStart` and the
+        post-restart recovery path.
+      responses:
+        '200':
+          description: Live games.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  games:
+                    type: array
+                    items: { $ref: '#/components/schemas/MyGame' }
+                required: [games]
+  /games:
+    get:
+      tags: [Discovery]
+      summary: List live games (public)
+      description: Every live game on the node, with both seats' public faces. Sorted by version desc, capped at 50.
+      security: []
+      responses:
+        '200':
+          description: Live games with a total count.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  games:
+                    type: array
+                    items: { $ref: '#/components/schemas/PublicGame' }
+                  total: { type: integer }
+                required: [games, total]
+  /games/{id}:
+    get:
+      tags: [Discovery]
+      summary: Get a game snapshot (public)
+      description: >
+        The polling read of a single game — the same state object the game stream sends on
+        connect. The dice reveal appears here the instant the game ends, exactly as on the live
+        stream.
+      security: []
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The current public game state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicGameState' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /games/{id}/moves:
+    get:
+      tags: [Discovery]
+      summary: Get legal moves (public)
+      description: The full legal-move tree for the pending roll, never capped.
+      security: []
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The legal-move tree tied to the current roll.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegalMovesResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /games/{id}/history:
+    get:
+      tags: [Discovery]
+      summary: Get game history (public replay)
+      description: >
+        The full replay of a FINISHED game — every turn's dice and moves, plus the dice-fairness reveal —
+        independent of whether the live room has been evicted from memory. `fairness.commit` is always
+        present, and `seed`/`clientSeeds` are populated immediately: every game recorded here has
+        already finished, so nothing is ever withheld. The response is cached as immutable forever,
+        since a finished game's history can never change again.
+      security: []
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The finished game's full history.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameHistory' }
+        '404':
+          description: Unknown game id, or a finished game with no archive row (pre-archive history, never backfilled).
+  /games/{id}/rating:
+    get:
+      tags: [Discovery]
+      summary: Get a finished game's rating change (public)
+      description: >
+        What one finished game did to each seat's rating, on the public Glicko-2 scale. Rating is applied by a
+        background batch, so a freshly finished game answers `applied: false` for up to `RATING_INTERVAL_SECONDS` —
+        poll `applied`, never a diff of the player's current rating against an earlier one, which folds in every
+        other game applied in between. Once `applied` is true the answer is final, including the case where both
+        seats are absent: a game that moved nobody's rating (casual, a guest seat, an unregistered bot, self-play,
+        a deleted account). Ratings are unrounded, matching every other rating on this API. Anonymous: the response
+        names seats, never who sat in them.
+      security: []
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The game's recorded rating movement, or a pending answer while the batch has not reached it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameRatingChange' }
+        '404':
+          description: >
+            Unknown game id, a game that has not finished, or a server without persistence (nothing records ratings).
+  /leaderboard:
+    get:
+      tags: [Leaderboard]
+      summary: Rating leaderboard (public)
+      description: Registered bots whose rating has converged (RD ≤ 110), ordered by the conservative estimate rating − 2·rd (ties to the lower rd), not the raw rating. Provisional bots are hidden.
+      security: []
+      responses:
+        '200':
+          description: Ranked leaders.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leaders:
+                    type: array
+                    items: { $ref: '#/components/schemas/LeaderRow' }
+                required: [leaders]
+        '404': { description: Server runs without persistence. }
+  /bots/{team}/{name}:
+    get:
+      tags: [Leaderboard]
+      summary: Bot profile (public)
+      description: >
+        One registered bot's public card — rating summary, its aggregate record against every opponent
+        it has played (head-to-head vs other bots, and vs humans), plus up to 20 recent games.
+      security: []
+      parameters:
+        - { name: team, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The bot's public profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BotProfile' }
+        '404': { description: No registered bot with that team/name. }
+  /strength:
+    get:
+      tags: [Strength]
+      summary: Strength report (public)
+      description: >
+        The whole cached report: every pairwise SPRT verdict, plus the Bradley-Terry pool ranking.
+        Refreshed on the rating batch's own cadence, not per request — see
+        [Rating & Ladder](https://bots.fortemate.com/rating/) for why this exists alongside Glicko.
+      security: []
+      responses:
+        '200':
+          description: The current strength report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StrengthReportResponse' }
+        '404': { description: Server runs without persistence. }
+        '503': { description: No report has been computed yet (fresh boot, or rating updates disabled). }
+  /bots/{team}/{name}/strength:
+    get:
+      tags: [Strength]
+      summary: Bot strength profile (public)
+      description: Just the matchups involving one registered bot — the profile-page-sized slice of `GET /strength`.
+      security: []
+      parameters:
+        - { name: team, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: This bot's strength matchups.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BotStrengthProfile' }
+        '404': { description: No registered bot with that team/name. }
+        '503': { description: No report has been computed yet (fresh boot, or rating updates disabled). }
+  /lobby/bots:
+    get:
+      tags: [Leaderboard]
+      summary: Bot catalog (public)
+      description: >
+        Bots open to human play (via POST /bot/open-to-humans), each with its rating summary and
+        optional description. A provisional bot (RD > 110) is listed and flagged, not hidden.
+        available reflects the bot's declared concurrent-game limit as of this fetch — advisory,
+        since the catalog is fetched once per visit rather than polled.
+      security: []
+      responses:
+        '200':
+          description: The human-play catalog.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BotCatalog' }
+        '404': { description: Server runs without persistence. }
+  /lobby/bots/{team}/{name}/wake:
+    post:
+      tags: [Leaderboard]
+      summary: Wake a catalog bot (public)
+      description: >
+        Pings the bot's registered webhook to force a cold start and confirm it answers, before a
+        visitor commits to a game. If the bot is already at its declared concurrent-game limit, it
+        is NOT probed at all — the response is busy: true, alive: false. 200 always for a catalog
+        bot (alive covers "no webhook" and "didn't answer" alike); 404 for a name outside the
+        catalog; 503 if webhooks are disabled.
+      security: []
+      parameters:
+        - { name: team, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The liveness outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Wake' }
+        '404': { description: No such name in the catalog. }
+        '429': { description: Rate limit exceeded. }
+        '503': { description: Webhooks are not enabled on this server. }
+  /lobby/play-bot:
+    post:
+      tags: [Leaderboard]
+      summary: Start a guest-vs-bot game from the catalog (public)
+      description: >
+        Starts a game between a guest and a catalog bot. timeControl is mandatory (no unlimited
+        catalog games); preferredColor is optional (omitted = random seat). No fresh liveness
+        check runs here — wake already confirmed the bot; a bot gone quiet since is handled the
+        same as any registered-webhook bot going quiet mid-game: the clock forfeits it.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlayBotRequest' }
+      responses:
+        '201':
+          description: The guest's seat in the new game.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlayBotMatch' }
+        '400': { description: Bad body, invalid guestId, or an unlimited time control. }
+        '404': { description: No such name in the catalog. }
+        '409': { description: The guest already has an unfinished catalog game, or the bot is at its concurrent-game limit. }
+        '429': { description: Rate limit exceeded. }
+  /bot/webhook:
+    post:
+      tags: [Webhooks]
+      summary: Register a webhook
+      description: >
+        Register an HTTPS callback the server POSTs turns to. The URL must be HTTPS and resolve to
+        a public address; the server runs an ownership handshake before storing it. Registered
+        bots only; enabled per server.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string, format: uri }
+              required: [url]
+      responses:
+        '201':
+          description: Registered. The signing secret is shown exactly once.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+                  secret: { type: string, description: Per-bot HMAC key; shown once. }
+                required: [url, secret]
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+        '422': { description: URL-policy violation or failed handshake (the body says which). }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Webhooks disabled on this server. }
+    get:
+      tags: [Webhooks]
+      summary: Inspect the webhook
+      responses:
+        '200':
+          description: The registered webhook (the secret is never shown again).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+                  verifiedAt: { type: string, format: date-time }
+                required: [url, verifiedAt]
+        '404': { description: No webhook registered. }
+        '503': { description: Webhooks disabled on this server. }
+    delete:
+      tags: [Webhooks]
+      summary: Remove the webhook
+      description: Deliveries stop at the next turn; the games themselves keep running.
+      responses:
+        '204': { description: Removed. }
+        '404': { description: No webhook was registered. }
+        '503': { description: Webhooks disabled on this server. }
+  /bot/webhook/stats:
+    get:
+      tags: [Webhooks]
+      summary: Delivery telemetry
+      description: >
+        Two windows (24h, 7d) of turn-delivery outcomes and latency percentiles, plus the most
+        recent genuine failure. Recorded off the turn path — never adds latency to a delivery, and
+        a stats-write failure never affects the game. NOT gated on webhooks being enabled: this
+        reads history, which can outlive the feature being toggled off. Registered bots only, and
+        needs persistence server-wide (404 without it, same as the leaderboard/catalog).
+      responses:
+        '200':
+          description: Aggregated delivery telemetry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDeliveryStats' }
+        '403': { $ref: '#/components/responses/RegisteredOnly' }
+        '404': { description: Server runs without persistence. }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'Authorization: Bearer <token>. Every route requires it except POST /bot/anon and POST /bot/register (which mint/claim a token).'
+  parameters:
+    GameId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Game id.
+    ChallengeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Challenge id.
+    SeekId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Seek id.
+  responses:
+    Unauthorized:
+      description: Missing, invalid, or expired Bearer token.
+    NotFound:
+      description: Unknown resource.
+    RateLimited:
+      description: Rate limited — check the `Retry-After` header.
+    RegisteredOnly:
+      description: The caller is anonymous or static; this feature needs a registered identity.
+  schemas:
+    TokenResponse:
+      type: object
+      properties:
+        token: { type: string }
+        team: { type: string }
+        name: { type: string }
+        id: { type: string, description: 'External id, e.g. bot:team:anon:mybot-8b7a6c5d.' }
+      required: [token, team, name, id]
+    RegisterRequest:
+      type: object
+      properties:
+        team: { type: string, pattern: '^[a-z0-9][a-z0-9-]*$', maxLength: 32 }
+        name: { type: string, pattern: '^[a-z0-9][a-z0-9-]*$', maxLength: 32 }
+      required: [team, name]
+    Account:
+      type: object
+      properties:
+        team: { type: string }
+        name: { type: string }
+        id: { type: string }
+      required: [team, name, id]
+    LadderState:
+      type: object
+      properties:
+        onLadder: { type: boolean }
+        glickoRating: { type: number }
+        glickoRd: { type: number }
+      required: [onLadder, glickoRating, glickoRd]
+    SetOpenToHumans:
+      type: object
+      properties:
+        description: { type: string, maxLength: 200, description: 'Optional catalog blurb; omit or empty to clear.' }
+    OpenToHumansState:
+      type: object
+      properties:
+        openToHumans: { type: boolean }
+        description: { type: string }
+      required: [openToHumans]
+    SetCapacity:
+      type: object
+      properties:
+        maxConcurrentGames:
+          type: integer
+          minimum: 1
+          maximum: 32
+          description: 'Games this bot will hold at once. A registered bot starts at 1.'
+      required: [maxConcurrentGames]
+    Capacity:
+      type: object
+      properties:
+        maxConcurrentGames: { type: integer, description: 'The declaration itself.' }
+        openToHumans: { type: boolean, description: 'Whether the bot is in the human catalog.' }
+        ladderAllowance:
+          type: integer
+          description: >
+            How much of the declaration the rating ladder may occupy. For a catalog bot this is
+            maxConcurrentGames - 1 (one slot is kept free for a person), with a floor of 1.
+        activeGames: { type: integer, description: 'Games in flight right now.' }
+      required: [maxConcurrentGames, openToHumans, ladderAllowance, activeGames]
+    CatalogBot:
+      type: object
+      properties:
+        team: { type: string }
+        name: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        description: { type: string }
+        available:
+          type: boolean
+          description: >
+            Below its declared concurrent-game limit as of this fetch. Advisory — the catalog is
+            fetched once per visit, not polled, so the bot's actual state can move before a click;
+            the wake probe and play-bot's 409 remain authoritative.
+      required: [team, name, rating, rd, provisional, available]
+    BotCatalog:
+      type: object
+      properties:
+        bots:
+          type: array
+          items: { $ref: '#/components/schemas/CatalogBot' }
+      required: [bots]
+    Wake:
+      type: object
+      properties:
+        alive: { type: boolean }
+        busy:
+          type: boolean
+          description: >
+            The bot is at its declared concurrent-game limit and was NOT probed at all — a busy bot
+            is never woken, so alive is always false alongside busy: true.
+      required: [alive, busy]
+    Side:
+      type: string
+      enum: [White, Black]
+    PlayBotRequest:
+      type: object
+      properties:
+        guestId:
+          type: string
+          format: uuid
+          description: >-
+            Anonymous fallback. Required only when the request carries no account session cookie; with a session the
+            player is seated from it and this field is ignored.
+        team: { type: string }
+        name: { type: string }
+        timeControl: { $ref: '#/components/schemas/TimeControl' }
+        preferredColor:
+          allOf: [{ $ref: '#/components/schemas/Side' }]
+          description: Omitted = random seat.
+        rated:
+          type: boolean
+          default: false
+          description: >-
+            Optional, defaults to false. Any registered bot can be played rated — there is no curated roster.
+            A guest player (no account session) always plays casual regardless of this field.
+      required: [team, name, timeControl]
+    PlayBotMatch:
+      type: object
+      properties:
+        gameId: { type: string }
+        token: { type: string, description: The guest's seat capability token. }
+        seat: { $ref: '#/components/schemas/Seat' }
+      required: [gameId, token, seat]
+    CreateChallengeRequest:
+      type: object
+      properties:
+        team: { type: string }
+        name: { type: string }
+        timeControl:
+          allOf: [{ $ref: '#/components/schemas/TimeControl' }]
+          description: Optional — the server defaults an omitted time control to Unlimited.
+        rated:
+          type: boolean
+          default: false
+          description: >-
+            Optional, defaults to false. Your own choice as challenger, and part of the offer — the target sees it in
+            GET /bot/challenges and accepts the challenge as offered or declines it. Any registered opponent can be
+            played rated; there is no curated roster. If either side is anonymous (a bot registered under the shared
+            anonymous team) the game is silently played casual instead of being refused: unlike a public seek there is
+            no third party the offer could be left open for.
+      required: [team, name]
+    Challenge:
+      type: object
+      properties:
+        id: { type: string }
+        challenger: { $ref: '#/components/schemas/Principal' }
+        target: { $ref: '#/components/schemas/Principal' }
+        timeControl: { $ref: '#/components/schemas/TimeControl' }
+        rated:
+          type: boolean
+          description: Whether accepting this challenge plays for rating. Part of the offer, set by the challenger.
+        targetOnline: { type: boolean, description: Advisory — whether the target holds an account stream. }
+      required: [id, challenger, target, timeControl, rated]
+    ChallengeList:
+      type: object
+      properties:
+        in: { type: array, items: { $ref: '#/components/schemas/Challenge' } }
+        out: { type: array, items: { $ref: '#/components/schemas/Challenge' } }
+      required: [in, out]
+    GameCreated:
+      type: object
+      properties:
+        gameId: { type: string }
+      required: [gameId]
+    MoveRequest:
+      type: object
+      description: >
+        Submit a turn of moves (optionally piggybacking a draw offer), or accept a pending draw offer.
+      properties:
+        moves:
+          type: array
+          items: { type: string, description: A UCI micro-move, e.g. e2e4. }
+          description: One entry per rolled die; a root-to-leaf path of the legal-move tree.
+        offerDraw:
+          type: boolean
+          default: false
+          description: Piggyback a draw offer onto this completed turn (ignored if offer not allowed).
+        acceptDraw:
+          type: boolean
+          default: false
+          description: Accept a pending draw offer instead of submitting moves (moves array may be omitted or empty).
+    MoveVerdict:
+      type: object
+      properties:
+        applied: { type: boolean }
+        version: { type: [integer, 'null'], description: The resulting TurnPlayed version, or null when refused. }
+        reason: { type: [string, 'null'], description: Rejection reason when not applied. }
+      required: [applied]
+    MyGame:
+      type: object
+      properties:
+        gameId: { type: string }
+        seat: { $ref: '#/components/schemas/Seat' }
+        activeSeat: { $ref: '#/components/schemas/Seat' }
+        dicePending: { type: boolean }
+        timeControl: { $ref: '#/components/schemas/TimeControl' }
+        clocks: { $ref: '#/components/schemas/Clocks' }
+        version: { type: integer }
+      required: [gameId, seat, activeSeat, dicePending, timeControl, version]
+    PublicGame:
+      type: object
+      properties:
+        gameId: { type: string }
+        players: { $ref: '#/components/schemas/Players' }
+        timeControl: { $ref: '#/components/schemas/TimeControl' }
+        activeSeat: { $ref: '#/components/schemas/Seat' }
+        dicePending: { type: boolean }
+        clocks: { $ref: '#/components/schemas/Clocks' }
+        version: { type: integer }
+        dfen: { type: string }
+      required: [gameId, timeControl, activeSeat, dicePending, version, dfen]
+    PublicGameState:
+      type: object
+      description: The single-game snapshot — identical to the game stream's Snapshot.state.
+      properties:
+        version: { type: integer }
+        dfen: { type: string, description: DFEN — the 7th field is the pending dice pool as piece letters. }
+        activeSeat: { $ref: '#/components/schemas/Seat' }
+        dicePending: { type: boolean }
+        status: { type: object, description: 'Single-key status, e.g. {"Active":{}} or {"Ended":{}}.' }
+        timeControl: { $ref: '#/components/schemas/TimeControl' }
+        clocks: { $ref: '#/components/schemas/Clocks' }
+        commit: { type: string, description: SHA-256 of the server seed (the dice commitment). }
+        seed: { type: [string, 'null'], description: Revealed server seed after the game ends (null until then; nothing is withheld once it has). }
+        clientSeeds: { type: [object, 'null'], description: The two revealed client seeds, or null. }
+        drawOffer:
+          type: [object, 'null']
+          description: Present when a draw offer is pending for the active player.
+          properties:
+            pending: { type: boolean, default: true }
+        mayOfferDraw:
+          type: [boolean, 'null']
+          description: Whether the active player is allowed to offer a draw this turn under anti-spam alternation.
+        legalMoves:
+          anyOf: [{ $ref: '#/components/schemas/MoveTree' }, { type: 'null' }]
+          description: The legal-move tree while dicePending; null if too large to inline (fetch GET /games/{id}/moves) or absent otherwise.
+        players:
+          anyOf: [{ $ref: '#/components/schemas/Players' }, { type: 'null' }]
+          description: Both seats' public faces; may be absent.
+        rated:
+          type: [boolean, 'null']
+          description: >
+            Whether this game counts toward rating. Absent/null means "the server does not say" —
+            never assume casual. No rating delta is sent at game end (ratings apply asynchronously);
+            refetch the profile or leaderboard instead.
+      required: [version, dfen, activeSeat, dicePending, status, timeControl, commit]
+    LegalMovesResponse:
+      type: object
+      properties:
+        version: { type: integer }
+        dfen: { type: string }
+        dicePending: { type: boolean }
+        legalMoves: { $ref: '#/components/schemas/MoveTree' }
+      required: [version, dfen, dicePending, legalMoves]
+    GameHistory:
+      type: object
+      description: A finished game's full replay, from GET /games/{id}/history.
+      properties:
+        gameId: { type: string }
+        players: { $ref: '#/components/schemas/Players' }
+        rated: { type: boolean }
+        timeControl: { $ref: '#/components/schemas/TimeControl' }
+        result: { type: integer, description: White-POV — 1 white won, -1 black won, 0 draw. }
+        termination: { type: string, description: 'One of: king_captured, timeout, resign, draw_agreement, aborted.' }
+        finishedAt: { type: string, format: date-time }
+        initialDfen: { type: string }
+        turns:
+          type: array
+          items: { $ref: '#/components/schemas/HistoryTurn' }
+        fairness: { $ref: '#/components/schemas/HistoryFairness' }
+      required:
+        [gameId, players, rated, timeControl, result, termination, finishedAt, initialDfen, turns, fairness]
+    GameRatingChange:
+      type: object
+      description: What one finished game did to each seat's rating, from GET /games/{id}/rating.
+      properties:
+        gameId: { type: string }
+        applied:
+          type: boolean
+          description: >
+            Whether the rating batch has visited this game yet. False is temporary — poll it. True is final,
+            even when both seats are absent.
+        white: { $ref: '#/components/schemas/SeatRatingChange' }
+        black: { $ref: '#/components/schemas/SeatRatingChange' }
+      required: [gameId, applied]
+    SeatRatingChange:
+      type: object
+      nullable: true
+      description: >
+        One seat's rating on both sides of the game, unrounded. Absent (null) when that seat's rating did not move.
+        The delta is after - before; it is not sent, so there is one place it can be computed from.
+      properties:
+        before: { type: number, format: double }
+        after: { type: number, format: double }
+      required: [before, after]
+    HistoryTurn:
+      type: object
+      properties:
+        turnNumber: { type: integer }
+        activeColor: { $ref: '#/components/schemas/Seat' }
+        dice: { type: array, items: { type: integer } }
+        moves: { type: array, items: { type: string }, description: UCI micro-moves; empty means a forced pass. }
+        fenAfter: { type: string }
+      required: [turnNumber, activeColor, dice, moves, fenAfter]
+    HistoryFairness:
+      type: object
+      description: >
+        The dice-fairness reveal. Every game in the archive has already finished, so all three fields are
+        populated here — the nullable types are kept for wire compatibility, not because a finished history
+        ever withholds them. (Active-state nullability is PublicGameState's story, not this one.)
+      properties:
+        commit: { type: [string, 'null'] }
+        seed: { type: [string, 'null'] }
+        clientSeeds:
+          type: [object, 'null']
+          properties:
+            white: { type: string }
+            black: { type: string }
+      required: [commit]
+    MoveTree:
+      type: object
+      description: >
+        A prefix tree of UCI micro-moves. Each key is a micro-move; its value is the tree of legal
+        continuations. A leaf ({}) is a complete legal turn. An empty top-level tree means a forced
+        pass. On inline copies, null means the enumeration was too large — fetch GET /games/{id}/moves.
+      additionalProperties:
+        $ref: '#/components/schemas/MoveTree'
+    LeaderRow:
+      type: object
+      properties:
+        rank: { type: integer }
+        team: { type: string }
+        name: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        onLadder: { type: boolean }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+      required: [rank, team, name, rating, rd, onLadder, games, wins, draws, losses]
+    BotProfile:
+      type: object
+      properties:
+        team: { type: string }
+        name: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        onLadder: { type: boolean }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+        opponents:
+          type: array
+          items: { $ref: '#/components/schemas/OpponentRecord' }
+        recent:
+          type: array
+          items: { $ref: '#/components/schemas/RecentGame' }
+      required: [team, name, rating, rd, provisional, onLadder, games, wins, draws, losses, opponents, recent]
+    OpponentRecord:
+      type: object
+      description: >
+        One aggregate row against a specific opponent: a specific other registered bot (head-to-head), or the
+        one collapsed row for every human/guest opponent combined ("record vs humans"). Counts every game the
+        bot played against that opponent, rated and casual alike — unlike the profile's own top-level
+        wins/draws/losses, which counts rated, decided games only.
+      properties:
+        opponent: { $ref: '#/components/schemas/PublicFace' }
+        team: { type: [string, 'null'], description: The opponent's team; null for the collapsed human row. }
+        botName: { type: [string, 'null'], description: The opponent's name; null for the collapsed human row. }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+        lastPlayedAt: { type: string, format: date-time }
+      required: [opponent, games, wins, draws, losses, lastPlayedAt]
+    RecentGame:
+      type: object
+      properties:
+        gameId: { type: string }
+        seat: { $ref: '#/components/schemas/Seat' }
+        opponent: { $ref: '#/components/schemas/PublicFace' }
+        result: { type: string, enum: [win, draw, loss, unknown] }
+        rated: { type: boolean }
+        termination: { type: string }
+        finishedAt: { type: string, format: date-time }
+      required: [gameId, seat, opponent, result, rated, termination, finishedAt]
+    PentanomialCounts:
+      type: object
+      description: >
+        Pair-score histogram from `perspective`'s side: n0 = lost both games of the CRN mirror pair … n4 =
+        won both.
+      properties:
+        n0: { type: integer }
+        n1: { type: integer }
+        n2: { type: integer }
+        n3: { type: integer }
+        n4: { type: integer }
+      required: [n0, n1, n2, n3, n4]
+    TrinomialCounts:
+      type: object
+      description: Single-game (unpaired) histogram from `perspective`'s side.
+      properties:
+        losses: { type: integer }
+        draws: { type: integer }
+        wins: { type: integer }
+      required: [losses, draws, wins]
+    SprtVerdictResult:
+      type: object
+      properties:
+        llr: { type: number, description: The log-likelihood ratio. }
+        lower: { type: number, description: The lower SPRT bound — LLR at or below this accepts H0. }
+        upper: { type: number, description: The upper SPRT bound — LLR at or above this accepts H1. }
+        verdict:
+          type: string
+          enum: [AcceptH1, AcceptH0, Continue]
+          description: >
+            AcceptH1 = perspective is stronger; AcceptH0 = not stronger by the tested margin; Continue =
+            not enough data yet for a verdict — surfaced honestly, never hidden or rounded into a claim.
+        observations: { type: integer, description: Pentanomial pairs plus trinomial singles, combined. }
+      required: [llr, lower, upper, verdict, observations]
+    PairwiseResult:
+      type: object
+      description: One unordered bot matchup's SPRT verdict, from `perspective`'s side.
+      properties:
+        perspective: { type: string, description: Team-qualified bot name, the lexicographically smaller of the two. }
+        opponent: { type: string, description: Team-qualified bot name. }
+        pairs: { $ref: '#/components/schemas/PentanomialCounts' }
+        singles: { $ref: '#/components/schemas/TrinomialCounts' }
+        result: { $ref: '#/components/schemas/SprtVerdictResult' }
+      required: [perspective, opponent, pairs, singles, result]
+    RankedBot:
+      type: object
+      description: >
+        One bot's row of the Bradley-Terry pool ranking. `elo` is RELATIVE (the pool's mean is 0 by
+        construction — not comparable to the Glicko-2 board's 1500-centred numbers).
+      properties:
+        player: { type: string, description: Team-qualified bot name. }
+        elo: { type: number }
+        ciLow: { type: number, description: Bootstrap 95% confidence interval, lower bound. }
+        ciHigh: { type: number, description: Bootstrap 95% confidence interval, upper bound. }
+        losVsNext:
+          type: [number, 'null']
+          description: Likelihood of superiority over the next-ranked bot; null for the last row.
+      required: [player, elo, ciLow, ciHigh]
+    StrengthReportResponse:
+      type: object
+      properties:
+        pairwise:
+          type: array
+          items: { $ref: '#/components/schemas/PairwiseResult' }
+        ranking:
+          type: array
+          items: { $ref: '#/components/schemas/RankedBot' }
+        completePairs: { type: integer, description: Complete CRN mirror pairs folded into the report. }
+        singles: { type: integer, description: Unpaired rated games folded into the report. }
+        excludedRows: { type: integer, description: Rows excluded — non-bot participant, undecided, or self-play. }
+      required: [pairwise, ranking, completePairs, singles, excludedRows]
+    BotStrengthProfile:
+      type: object
+      properties:
+        team: { type: string }
+        name: { type: string }
+        pairwise:
+          type: array
+          items: { $ref: '#/components/schemas/PairwiseResult' }
+      required: [team, name, pairwise]
+    DeliveryOutcomeCount:
+      type: object
+      properties:
+        outcome:
+          type: string
+          description: >
+            applied, declined, refused, garbled, oversized_body, http_<code>, timed_out, or
+            unreachable.
+        count: { type: integer, format: int64 }
+      required: [outcome, count]
+    DeliveryWindow:
+      type: object
+      properties:
+        totalDeliveries: { type: integer, format: int64 }
+        outcomes:
+          type: array
+          items: { $ref: '#/components/schemas/DeliveryOutcomeCount' }
+        p50Ms: { type: integer, nullable: true, description: Bucket-resolution approximation, not exact. }
+        p90Ms: { type: integer, nullable: true }
+        p99Ms: { type: integer, nullable: true }
+      required: [totalDeliveries, outcomes, p50Ms, p90Ms, p99Ms]
+    LastDeliveryFailure:
+      type: object
+      properties:
+        at: { type: string, format: date-time }
+        reason: { type: string }
+      required: [at, reason]
+    WebhookDeliveryStats:
+      type: object
+      properties:
+        last24h: { $ref: '#/components/schemas/DeliveryWindow' }
+        last7d: { $ref: '#/components/schemas/DeliveryWindow' }
+        lastFailure:
+          oneOf:
+            - { $ref: '#/components/schemas/LastDeliveryFailure' }
+            - type: 'null'
+          description: None if the bot has never had a genuine delivery fault.
+      required: [last24h, last7d, lastFailure]
+    Seat:
+      type: string
+      enum: [White, Black]
+    Clocks:
+      type: [object, 'null']
+      description: Remaining milliseconds per side as of the carrying event; null on Unlimited games.
+      properties:
+        white: { type: integer }
+        black: { type: integer }
+    Players:
+      type: object
+      properties:
+        white: { $ref: '#/components/schemas/PublicFace' }
+        black: { $ref: '#/components/schemas/PublicFace' }
+      required: [white, black]
+    PublicFace:
+      type: object
+      description: A participant's public, spectator-safe face — never a raw id.
+      properties:
+        kind: { type: string, enum: [Bot, Human] }
+        name: { type: [string, 'null'], description: Team-qualified bot name, or null for a human. }
+        rating:
+          type: [number, 'null']
+          description: >
+            The participant's settled rating as of game start (the leaderboard's visibility rule;
+            only ever present on a named face). Absent/null means "the server does not say", never zero.
+      required: [kind]
+    Principal:
+      type: object
+      description: A participant's identity as a single-key wrapper.
+      oneOf:
+        - { type: object, required: [Guest], properties: { Guest: { type: object, properties: { id: { type: string } } } } }
+        - { type: object, required: [User], properties: { User: { type: object, properties: { id: { type: string } } } } }
+        - { type: object, required: [Bot], properties: { Bot: { type: object, properties: { team: { type: string }, name: { type: string } } } } }
+    TimeControl:
+      type: object
+      description: A single-key time-control wrapper.
+      oneOf:
+        - { type: object, properties: { Unlimited: { type: object } }, required: [Unlimited] }
+        - { type: object, properties: { SuddenDeath: { type: object, properties: { initialSeconds: { type: integer } }, required: [initialSeconds] } }, required: [SuddenDeath] }
+        - { type: object, properties: { Fischer: { type: object, properties: { initialSeconds: { type: integer }, incrementSeconds: { type: integer } }, required: [initialSeconds, incrementSeconds] } }, required: [Fischer] }
+        - { type: object, properties: { PerMove: { type: object, properties: { secondsPerMove: { type: integer } }, required: [secondsPerMove] } }, required: [PerMove] }

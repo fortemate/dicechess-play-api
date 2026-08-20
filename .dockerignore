@@ -14,3 +14,6 @@ project/project/
 docker-compose.yaml
 .env
 scripts/
+docs/
+contributor-docs/
+

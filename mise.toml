@@ -1,0 +1,112 @@
+[tools]
+# Local-development tool set. CI installs the JVM toolchain via setup-java/setup-sbt and
+# runs sbt directly (see .github/workflows/ci.yaml), so keep this lean.
+java = "temurin-25"   # Primary runtime, aligned with CI (Java 25)
+
+# Git hooks & formatting
+lefthook = "latest"   # Git hooks manager (pre-commit / pre-push)
+betterleaks = "latest" # Secret scanning in the pre-commit hook
+actionlint = "1.7.12"           # GitHub Actions workflow linter (pre-commit hook)
+scalafmt = "3.11.4"   # native CLI; MUST match the version in .scalafmt.conf
+
+# Workflow CLIs
+gh = "latest"         # GitHub CLI: PRs, issues, releases
+
+# Docs site (Astro/Starlight in docs/) — build only, unrelated to the Scala toolchain
+node = "22"           # matches the setup-node version in .github/workflows/deploy-docs.yaml
+jq = "latest"         # JSON processor
+tbls = "1.95.0"       # schema introspection for the generated contributor-docs reference
+
+[tasks.setup]
+description = "📦 Install tooling and register Git hooks locally"
+depends = ["setup:tools", "hook:install"]
+
+[tasks."setup:tools"]
+description = "🛠️  Install the SBT build tool"
+run = "brew install sbt"
+
+[tasks.compile]
+description = "🔨 Incremental compilation of main and test sources"
+run = 'sbt "compile; Test/compile"'
+
+[tasks.run]
+description = "▶️  Start the play-api server"
+run = "sbt run"
+
+[tasks.test]
+description = "🧪 Execute the full MUnit test suite"
+run = 'sbt "testOnly *"'
+
+[tasks."ladder:report"]
+description = "🏆 Print the E.1 strength report (pairwise SPRT + Bradley-Terry pool) — needs PLAY_DB_URL, read-only"
+run = 'sbt "runMain dicechess.play.rating.LadderReportMain"'
+
+[tasks."archive:backfill"]
+description = "🗄️  One-off: write game_archive rows for ended games that predate #177 — needs PLAY_DB_URL, WRITES"
+run = 'sbt "runMain dicechess.play.store.ArchiveBackfillMain"'
+
+[tasks.coverage]
+description = "📊 Run tests with scoverage and generate a local report"
+run = 'sbt shutdown && rm -rf target/covcache && sbt -Dsbt.global.localcache="$PWD/target/covcache" "clean; coverage; testOnly *; coverageReport"'
+
+[tasks.check]
+description = "✅ Full validation cycle (mirrors CI)"
+# Stop sbt server, clean local covcache, and execute with isolated localcache to force clean scoverage instrumentation.
+run = 'sbt shutdown && rm -rf target/covcache && sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"'
+
+[tasks.format]
+description = "✨ Reformat the codebase"
+run = "sbt scalafmtAll"
+
+[tasks."format:check"]
+description = "🔍 Verify code formatting"
+run = "sbt scalafmtCheckAll"
+
+[tasks.clean]
+description = "🧹 Remove build artifacts"
+run = "sbt clean"
+
+[tasks."hook:install"]
+description = "🪝 Register Git hooks via lefthook"
+run = "lefthook install"
+
+[tasks."hook:run"]
+description = "🏃 Run all pre-commit hook jobs across the codebase"
+run = "lefthook run pre-commit --all-files"
+
+[tasks."docs:install"]
+description = "📦 Install the documentation site's npm dependencies"
+dir = "docs"
+run = "npm install"
+
+[tasks."docs:dev"]
+description = "📖 Start the local Astro/Starlight documentation dev server"
+dir = "docs"
+run = "npm run dev"
+
+[tasks."docs:build"]
+description = "🏗️  Compile the documentation site to static HTML (docs/dist)"
+dir = "docs"
+run = "npm run build"
+
+# Contributor docs (contributor-docs/) — architecture, schema, conventions; GitHub Pages.
+# Separate site from docs/ above, which is the public Bot API reference on bots.jc.id.lv.
+
+[tasks."contrib-docs:install"]
+description = "📦 Install the contributor documentation site's npm dependencies"
+dir = "contributor-docs"
+run = "npm install"
+
+[tasks."contrib-docs:dev"]
+description = "📓 Start the local contributor documentation dev server"
+dir = "contributor-docs"
+run = "npm run dev"
+
+[tasks."contrib-docs:build"]
+description = "🏗️  Compile the contributor docs to static HTML (contributor-docs/dist)"
+dir = "contributor-docs"
+run = "npm run build"
+
+[tasks."contrib-docs:schema"]
+description = "🗄️  Regenerate the schema reference from the Flyway migrations (needs Docker)"
+run = "./scripts/generate-schema-docs.sh"

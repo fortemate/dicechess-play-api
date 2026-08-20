@@ -1,0 +1,27 @@
+# https://editorconfig.org
+# This is the top-most EditorConfig file
+root = true
+
+# Universal default rules applied to all files
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# 2-space indentation is the standard for the Scala / SBT ecosystem
+[*.{scala,sbt,json,toml,yaml,yml}]
+indent_style = space
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+indent_size = 4
+
+# Markdown: preserve standard Markdown double-space hard line breaks
+[*.{md,mdx}]
+trim_trailing_whitespace = false
+
+[*.txt]
+indent_style = space
+indent_size = 4

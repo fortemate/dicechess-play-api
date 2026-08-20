@@ -1,0 +1,17 @@
+# sbt / Scala
+target/
+project/target/
+project/project/
+.bsp/
+# Metals / IDE
+.metals/
+.bloop/
+.scala-build/
+.idea/
+*.iml
+.vscode/
+# OS / env
+.DS_Store
+.env
+.env.*
+!.env.example

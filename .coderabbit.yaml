@@ -1,0 +1,83 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+# =============================================================================
+# CodeRabbit Configuration — Dice Chess play-api (Scala 3 / cats-effect)
+# =============================================================================
+# Authoritative real-time server for human-vs-human play and the Bot API.
+# Pure-FP cats-effect service; the dice-chess rules engine is reused on the JVM.
+# =============================================================================
+
+language: en-US
+
+reviews:
+  # "assertive" — rigorous feedback suitable for an authoritative game server
+  # where correctness, concurrency safety, and anti-cheat matter.
+  profile: assertive
+
+  high_level_summary: false
+  poem: false
+  collapse_walkthrough: true
+
+  auto_review:
+    # Reviews are triggered manually with an "@coderabbitai review" comment.
+    enabled: false
+    drafts: false
+    base_branches:
+      - main
+
+  path_filters:
+    - "!**/target/**"
+    - "!**/project/target/**"
+    - "!**/*.lock"
+
+  tools:
+    actionlint:
+      enabled: true # Validate GitHub Actions workflow YAML
+    gitleaks:
+      enabled: true # Detect leaked secrets (complements the pre-commit hook)
+    shellcheck:
+      enabled: true # Lint shell scripts in mise.toml / CI
+    markdownlint:
+      enabled: true # Validate documentation formatting
+
+  path_instructions:
+    - path: "**/*.scala"
+      instructions: |
+        Modern Scala 3 + cats-effect (Typelevel) conventions.
+        When reviewing:
+        - No nulls, no exceptions for control flow, no `return`; model effects in IO
+          and errors as values (EitherT / typed ADTs).
+        - Comments explain "Why", not "What"; don't document self-evident methods.
+        - Use standard Markdown for Scaladoc code fences (```scala```), never the
+          legacy Scala 2 `{{{ ... }}}` syntax.
+
+    - path: "**/*.scala"
+      instructions: |
+        Concurrency & authority (this is an authoritative game server):
+        - A GameRoom serializes all state mutation through a single consumer fiber
+          over a Queue; flag any path that mutates shared state off that fiber, or
+          any Ref update that should have gone through the command queue.
+        - The server NEVER trusts client-supplied FEN, dice, or move legality —
+          everything is validated through the engine. Flag any code that trusts
+          client input for game-affecting decisions.
+        - Players are transport-agnostic: room logic must depend on the
+          PlayerConnection / Principal / Seat abstraction, never on a concrete
+          WebSocket or HTTP type. Flag transport leaking into the room.
+        - Dice come from the server's DiceSource (CSPRNG + commit-reveal); flag any
+          client-side or non-deterministic-in-the-wrong-place dice generation.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        CI/CD for a Scala 3 service that resolves the engine from GitHub Packages.
+        When reviewing:
+        - Prefer pinned action versions.
+        - Ensure GITHUB_TOKEN / packages:read is present where the engine artifact
+          is resolved, and secrets are not exposed to forks.
+
+    - path: "build.sbt"
+      instructions: |
+        SBT build for a Scala 3 cats-effect service.
+        When reviewing:
+        - Keep library versions consistent and compatible with Scala 3.8.3.
+        - Verify the GitHub Packages resolver/credentials stay free of network calls
+          at load time.

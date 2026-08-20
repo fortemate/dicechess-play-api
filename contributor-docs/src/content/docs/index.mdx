@@ -1,0 +1,56 @@
+---
+title: play-api Contributor Docs
+description: How the Dice Chess play-api server is built — architecture, database schema, concurrency doctrine, and testing conventions.
+---
+
+import { Card, CardGrid, Aside } from '@astrojs/starlight/components';
+
+This site documents **how `dicechess-play-api` is built**, for people changing its code.
+
+<Aside type="tip" title="Writing a bot? You want the other site.">
+	The Bot API reference — REST endpoints, event streams, webhooks, DFEN, the provably-fair dice
+	procedure — moved to **[bots.jc.id.lv](https://bots.jc.id.lv/)**. Nothing on this site is needed
+	to connect a bot.
+</Aside>
+
+`play-api` is the authoritative real-time Dice Chess server: human-versus-human play over
+WebSocket plus a public, Lichess-shaped Bot API. It is Scala 3 on Java 25, built on
+cats-effect, fs2, and http4s (Ember), and it is **server-authoritative** — rooms own the dice,
+the clocks, and move legality; clients only ever send intents.
+
+<CardGrid>
+	<Card title="Architecture" icon="puzzle">
+		The module map, what each package owns, and how a game flows from HTTP request to durable
+		snapshot. [Read →](/dicechess-play-api/architecture/)
+	</Card>
+	<Card title="Concurrency Doctrine" icon="random">
+		The single-writer rule for `GameRoom`, non-blocking event fan-out, and why a stalled
+		subscriber never stalls a game. [Read →](/dicechess-play-api/concurrency/)
+	</Card>
+	<Card title="Database Schema" icon="document">
+		Six tables, what each one is for, and the deliberate absence of some foreign keys.
+		[Read →](/dicechess-play-api/database/)
+	</Card>
+	<Card title="Development Setup" icon="rocket">
+		Toolchain, the commands that mirror CI, and the quality gates a pull request must clear.
+		[Read →](/dicechess-play-api/development/)
+	</Card>
+</CardGrid>
+
+## Where documentation lives
+
+The project keeps three documentation layers, split by audience:
+
+| Layer | Audience | Where |
+| --- | --- | --- |
+| File-head comments | Whoever edits that file | The top of each source file — the authoritative contract for a module |
+| Bot API reference | Third-party bot developers | [bots.jc.id.lv](https://bots.jc.id.lv/) |
+| Contributor docs | People changing this server | This site |
+
+Design records (ADRs) and the roadmap live in a separate, private vault and are referenced here
+by number only.
+
+<Aside type="caution" title="This site is public">
+	GitHub Pages has no private mode. Nothing may be documented here that is not already derivable
+	from the public repository — no host names, no topology, no configuration values.
+</Aside>

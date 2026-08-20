@@ -1,0 +1,60 @@
+name: "CD: Deploy Contributor Docs"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "contributor-docs/**"
+      - ".github/workflows/deploy-contributor-docs.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Contributor Docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "contributor-docs/package-lock.json"
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: contributor-docs
+
+      - name: Build with Astro
+        run: npm run build
+        working-directory: contributor-docs
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "contributor-docs/dist"
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

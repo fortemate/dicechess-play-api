@@ -1,0 +1,14 @@
+// Assets-only Worker serving the built Starlight site (dist/) at https://bots.jc.id.lv.
+// No main script: Cloudflare serves the static assets directly. The custom domain is
+// attached once, manually, in the dashboard (Worker → Settings → Domains & Routes), so the
+// CI token needs only the Workers Scripts scope — no DNS permissions.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "dicechess-bots-docs",
+	"compatibility_date": "2026-07-31",
+	"assets": {
+		"directory": "./dist",
+		// Starlight emits 404.html; serve it for unmatched routes instead of a bare error.
+		"not_found_handling": "404-page"
+	}
+}

@@ -1,0 +1,8 @@
+# Astro / Starlight build artifacts
+node_modules/
+dist/
+.astro/
+.DS_Store
+
+# Wrangler local state
+.wrangler/

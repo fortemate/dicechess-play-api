@@ -7,7 +7,7 @@ ThisBuild / version              := "0.1.0-SNAPSHOT"
 ThisBuild / scalaVersion         := "3.8.4"
 
 ThisBuild / description := "Authoritative real-time server for Dice Chess (human-vs-human + Bot API + Glicko-2 rating ladder)."
-ThisBuild / licenses    := List(License("AGPL-3.0", uri("https://www.gnu.org/licenses/agpl-3.0.txt")))
+ThisBuild / licenses := List(License("AGPL-3.0", uri("https://www.gnu.org/licenses/agpl-3.0.txt")))
 
 ThisBuild / scmInfo := Some(
   ScmInfo(
@@ -43,28 +43,28 @@ ThisBuild / credentials ++= (for {
   user = sys.env.get("GITHUB_ACTOR").filter(_.nonEmpty).getOrElse("git")
 } yield Credentials("GitHub Package Registry", "maven.pkg.github.com", user, token)).toSeq
 
-val DiceChessEngineVersion = "0.4.0"
-val CatsEffectVersion      = "3.7-4972921"
-val Fs2Version             = "3.13.0"
-val Http4sVersion          = "0.23.30"
-val CirceVersion           = "0.14.10"
-val LogbackVersion         = "1.6.3"
-val Http4sJdkClientVersion = "0.10.0"
-val MunitVersion           = "1.3.5"
-val MunitCatsEffectVersion = "2.2.0"
-val DoobieVersion          = "1.0.0-RC9"
-val FlywayVersion          = "13.3.0"
-val JavaJwtVersion         = "4.6.0"
-val JwksRsaVersion         = "0.24.1"
-val PostgresDriverVersion  = "42.7.13"
-val TestcontainersVersion  = "0.43.0"
+val DiceChessEngineVersion    = "0.4.0"
+val CatsEffectVersion         = "3.7-4972921"
+val Fs2Version                = "3.13.0"
+val Http4sVersion             = "0.23.30"
+val CirceVersion              = "0.14.10"
+val LogbackVersion            = "1.6.3"
+val Http4sJdkClientVersion    = "0.10.0"
+val MunitVersion              = "1.3.5"
+val MunitCatsEffectVersion    = "2.2.0"
+val DoobieVersion             = "1.0.0-RC9"
+val FlywayVersion             = "13.3.0"
+val JavaJwtVersion            = "4.6.0"
+val JwksRsaVersion            = "0.24.1"
+val PostgresDriverVersion     = "42.7.13"
+val TestcontainersVersion     = "0.43.0"
 val TestcontainersJavaVersion = "1.21.3"
 val DockerJavaVersion         = "3.7.1"
 
 lazy val root = (project in file("."))
   .enablePlugins(JavaAppPackaging)
   .settings(
-    name := "dicechess-play-api",
+    name                := "dicechess-play-api",
     Compile / mainClass := Some("dicechess.play.Main"),
     libraryDependencies ++= Seq(
       // Game rules: official Fortemate Dice Chess engine
@@ -97,12 +97,12 @@ lazy val root = (project in file("."))
       "org.typelevel" %% "munit-cats-effect"      % MunitCatsEffectVersion % Test,
       "org.http4s"    %% "http4s-jdk-http-client" % Http4sJdkClientVersion % Test,
       // PostgreSQL Testcontainers
-      "com.dimafeng" %% "testcontainers-scala-munit"      % TestcontainersVersion % Test,
-      "com.dimafeng" %% "testcontainers-scala-postgresql" % TestcontainersVersion % Test,
-      "org.testcontainers"     % "testcontainers"                % TestcontainersJavaVersion % Test,
-      "org.testcontainers"     % "postgresql"                    % TestcontainersJavaVersion % Test,
-      "com.github.docker-java" % "docker-java-api"               % DockerJavaVersion         % Test,
-      "com.github.docker-java" % "docker-java-transport-zerodep" % DockerJavaVersion         % Test
+      "com.dimafeng"          %% "testcontainers-scala-munit"      % TestcontainersVersion     % Test,
+      "com.dimafeng"          %% "testcontainers-scala-postgresql" % TestcontainersVersion     % Test,
+      "org.testcontainers"     % "testcontainers"                  % TestcontainersJavaVersion % Test,
+      "org.testcontainers"     % "postgresql"                      % TestcontainersJavaVersion % Test,
+      "com.github.docker-java" % "docker-java-api"                 % DockerJavaVersion         % Test,
+      "com.github.docker-java" % "docker-java-transport-zerodep"   % DockerJavaVersion         % Test
     ),
     scalacOptions ++= Seq(
       "-Werror",
@@ -111,9 +111,9 @@ lazy val root = (project in file("."))
       "-feature",
       "-explain"
     ),
-    coverageExcludedFiles := ".*Main\\.scala",
-    coverageFailOnMinimum := false,
-    Test / fork           := true,
+    coverageExcludedFiles    := ".*Main\\.scala",
+    coverageFailOnMinimum    := false,
+    Test / fork              := true,
     Test / parallelExecution := false,
     Test / javaOptions += "-Dapi.version=1.43"
   )

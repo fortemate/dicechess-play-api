@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/fortemate/.github/blob/main/SECURITY.md
+    about: Please do not open a public issue for security problems.
+  - name: How to play
+    url: https://fortemate.com/rules
+    about: The rules of Dice Chess.

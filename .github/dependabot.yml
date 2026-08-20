@@ -1,0 +1,73 @@
+# Dependency hygiene for every surface in this repo: the Scala backend (sbt), the two
+# Astro + Starlight sites (npm — docs/ for the public Bot API, contributor-docs/ for
+# contributor documentation), and the GitHub Actions used across all workflows.
+# One file only — GitHub reads .github/dependabot.yml, so this is the single source of
+# truth; a second dependabot.yaml is silently shadowed by this file and must not exist.
+version: 2
+updates:
+  # Scala backend (sbt): the build's library and plugin dependencies.
+  - package-ecosystem: "sbt"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+    ignore:
+      # sbt 2.x -> 3.x is a breaking major requiring a deliberate, manual migration
+      # (plugin compatibility, build definition changes) — not an automated bump.
+      - dependency-name: "org.scala-sbt:sbt"
+        update-types: ["version-update:semver-major"]
+
+  # Docs site (Astro + Starlight)
+  - package-ecosystem: "npm"
+    directory: "/docs"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "documentation"
+    commit-message:
+      prefix: "chore(docs)"
+    groups:
+      # One PR for the routine minor/patch bumps; majors still come individually.
+      astro-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Contributor docs site (Astro + Starlight) — separate npm project from /docs
+  - package-ecosystem: "npm"
+    directory: "/contributor-docs"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "documentation"
+    commit-message:
+      prefix: "chore(docs)"
+    groups:
+      # One PR for the routine minor/patch bumps; majors still come individually.
+      astro-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used by every workflow (CI, deploy, docs)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore(ci)"

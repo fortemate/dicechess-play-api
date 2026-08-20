@@ -1,0 +1,87 @@
+name: 'Ops: Release'
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: 'patch'
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version
+        id: bump_version
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const latestTag = '${{ steps.get_tag.outputs.latest_tag }}';
+            const bumpType = '${{ github.event.inputs.bump }}';
+
+            const cleanVersion = latestTag.startsWith('v') ? latestTag.slice(1) : latestTag;
+            const match = cleanVersion.match(/^(\d+)\.(\d+)\.(\d+)/);
+
+            let major = 0;
+            let minor = 0;
+            let patch = 0;
+
+            if (match) {
+              major = parseInt(match[1], 10);
+              minor = parseInt(match[2], 10);
+              patch = parseInt(match[3], 10);
+            }
+
+            if (bumpType === 'major') {
+              major += 1;
+              minor = 0;
+              patch = 0;
+            } else if (bumpType === 'minor') {
+              minor += 1;
+              patch = 0;
+            } else {
+              patch += 1;
+            }
+
+            const newTag = `v${major}.${minor}.${patch}`;
+            core.setOutput('new_tag', newTag);
+            console.log(`New tag will be: ${newTag}`);
+
+      - name: Create new Git tag
+        run: |
+          git tag ${{ steps.bump_version.outputs.new_tag }}
+          git push origin ${{ steps.bump_version.outputs.new_tag }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG: ${{ steps.bump_version.outputs.new_tag }}
+        run: |
+          gh release create "$NEW_TAG" \
+            --generate-notes \
+            --title "$NEW_TAG"

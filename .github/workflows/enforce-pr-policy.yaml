@@ -33,11 +33,14 @@ jobs:
               core.setFailed(`Branch "${headRef}" must be <type>/<short-desc> — type one of task|feat|bug|refactor|chore|docs|ci|test|perf, optionally <type>/<id>-<short-desc> to link an issue.`);
               return;
             }
-            // Require an issue link only when the branch references an issue number; issueless branches are exempt.
-            const hasIssueId = /^[a-z]+\/(issue-)?\d+-/.test(headRef);
-            const issuePattern = /(Closes|Resolves|Fixes)\s+#\d+/i;
-            if (hasIssueId && !issuePattern.test(body)) {
-              core.setFailed('A branch that references an issue number must link it: add "Closes #<n>" (or Fixes/Resolves) to the PR body.');
-              return;
+            // Require an issue link matching the branch issue ID when present.
+            const match = headRef.match(/^[a-z]+\/(?:issue-)?(\d+)-/);
+            if (match) {
+              const issueId = match[1];
+              const issuePattern = new RegExp(`(Closes|Resolves|Fixes)\\s+#${issueId}\\b`, 'i');
+              if (!issuePattern.test(body)) {
+                core.setFailed(`Branch "${headRef}" references issue #${issueId}, but the pull request body does not contain "Closes #${issueId}" (or Fixes/Resolves).`);
+                return;
+              }
             }
             console.log('PR policy OK.');

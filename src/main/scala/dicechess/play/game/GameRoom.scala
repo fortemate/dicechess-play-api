@@ -600,11 +600,10 @@ final class GameRoom private (
                     v => GameEvent.TurnPlayed(v, seat, uci, nextDfen)
                   )
                     .flatMap: s1 =>
-                      // Answer with the TurnPlayed version before rolling on: the caller correlates it with the stream.
-                      answer(reply, TurnVerdict.Applied(s1.version)) *>
-                        (winner match
-                          case Some(w) => endGame(s1, GameOver(GameResult.Win(w), Termination.KingCaptured))
-                          case None    => advanceOrEnd(s1))
+                      (winner match
+                        case Some(w) => endGame(s1, GameOver(GameResult.Win(w), Termination.KingCaptured))
+                        case None    => advanceOrEnd(s1)
+                      ).flatTap(_ => answer(reply, TurnVerdict.Applied(s1.version)))
 
   /** Complete a synchronous reply channel, if the command carried one. */
   private def answer(reply: Option[Deferred[IO, TurnVerdict]], verdict: TurnVerdict): IO[Unit] =

@@ -1,0 +1,16 @@
+# Keep the build context small and the image clean — only project sources and
+# build definition are needed; the multi-stage build compiles from scratch.
+target/
+project/target/
+project/project/
+.git/
+.github/
+.bsp/
+.metals/
+.bloop/
+.idea/
+.vscode/
+*.md
+docker-compose.yaml
+.env
+scripts/

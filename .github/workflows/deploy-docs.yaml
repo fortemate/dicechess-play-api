@@ -1,0 +1,57 @@
+name: "CD: Deploy Documentation"
+
+# Publishes the Astro + Starlight bot-developer docs (docs/) to https://bots.jc.id.lv,
+# an assets-only Cloudflare Worker (docs/wrangler.jsonc, #203). Paths-filtered to docs/**
+# so backend pushes never trigger a docs deploy and vice versa; the backend CI (ci.yaml)
+# likewise ignores docs-only changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/deploy-docs.yaml'
+  workflow_dispatch:
+
+# One concurrent deployment; a newer push supersedes an in-flight one.
+concurrency:
+  group: "docs-deploy"
+  cancel-in-progress: true
+
+env:
+  BUILD_PATH: "./docs"
+
+jobs:
+  deploy:
+    name: Build & Deploy Documentation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only; deploy auth is the Cloudflare API token, not GITHUB_TOKEN
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "${{ env.BUILD_PATH }}/package-lock.json"
+
+      - name: Install Node Dependencies
+        run: npm ci
+        working-directory: ${{ env.BUILD_PATH }}
+
+      - name: Build with Astro
+        run: npm run build
+        working-directory: ${{ env.BUILD_PATH }}
+
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: ${{ env.BUILD_PATH }}
+          # Use the wrangler pinned in docs/package.json instead of the action's default.
+          packageManager: npm

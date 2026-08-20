@@ -1,0 +1,43 @@
+name: "CI: PR Policy"
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  check-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate branch name and linked issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const headRef = context.payload.pull_request.head.ref;
+            const body = context.payload.pull_request.body || "";
+
+            // Skip validation for Dependabot branches
+            if (headRef.startsWith('dependabot/')) {
+              console.log('Skipping validation for Dependabot branch.');
+              return;
+            }
+
+            // Allowed branch prefixes. Issue-driven work uses task|feat|bug and links its issue;
+            // issueless work (refactor|chore|docs|ci|test|perf) needs no issue. The <id>- segment is
+            // optional, so `feat/123-add-clocks` and `refactor/extract-clock-policy` are both valid.
+            const pattern = /^(task|feat(ure)?|bug|refactor|chore|docs|ci|test|perf)\/((issue-)?\d+-)?[a-z0-9-]+$/;
+            if (!pattern.test(headRef)) {
+              core.setFailed(`Branch "${headRef}" must be <type>/<short-desc> — type one of task|feat|bug|refactor|chore|docs|ci|test|perf, optionally <type>/<id>-<short-desc> to link an issue.`);
+              return;
+            }
+            // Require an issue link only when the branch references an issue number; issueless branches are exempt.
+            const hasIssueId = /^[a-z]+\/(issue-)?\d+-/.test(headRef);
+            const issuePattern = /(Closes|Resolves|Fixes)\s+#\d+/i;
+            if (hasIssueId && !issuePattern.test(body)) {
+              core.setFailed('A branch that references an issue number must link it: add "Closes #<n>" (or Fixes/Resolves) to the PR body.');
+              return;
+            }
+            console.log('PR policy OK.');

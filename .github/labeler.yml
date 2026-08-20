@@ -1,0 +1,58 @@
+# PR labels, which are what `.github/release.yml` groups the release notes by. Keep the two in
+# lockstep: a label with no category there falls into "Other Changes", and a branch type with no
+# label here does the same — that is how an entire release of feature work once filed itself under
+# Documentation (v0.16.0: every branch was `task/…`, which mapped to nothing, while every PR touched
+# AGENTS.md, which mapped to `documentation`).
+#
+# Branch type is the PRIMARY signal — it states what the change IS. Paths are only a safety net for
+# a PR whose branch was named off-convention.
+#
+# This file is read from the BASE branch, not from the pull request: `labeler.yaml` runs on
+# `pull_request_target`, which is what stops a fork from executing its own config. So an edit here
+# cannot label its own PR — it takes effect on PRs opened (or pushed to) after it merges, and any
+# already-open PR is re-labelled on its next push.
+
+# ── Branch type → label. Total over the types `enforce-pr-policy.yaml` accepts ───────────────────
+# (task|feat|feature|bug|refactor|chore|docs|ci|test|perf). `chore` is deliberately unmapped: it is
+# the grab-bag, and "Other Changes" is the honest place for it.
+enhancement:
+  # `task/` is issue-driven work of unstated kind (the policy's own wording) and in practice has
+  # always been a new capability. It is treated as one here; a fix belongs on `bug/`.
+  - head-branch: ['^task/', '^feat/', '^feature/']
+bug:
+  - head-branch: ['^bug/']
+refactoring:
+  - head-branch: ['^refactor/']
+performance:
+  - head-branch: ['^perf/']
+
+# ── Path fallbacks, for a branch that carried no type ────────────────────────────────────────────
+documentation:
+  - head-branch: ['^docs/']
+  - changed-files:
+      # Enumerated rather than `**/*.md` on purpose: AGENTS.md (and its CLAUDE/GEMINI shims) ride
+      # along with almost every change, so a blanket rule labels feature work as documentation.
+      - any-glob-to-any-file:
+          - 'docs/**'
+          - 'contributor-docs/**'
+          - 'README.md'
+          - 'CONTRIBUTING.md'
+          - 'SECURITY.md'
+          - 'CLA.md'
+ci-cd:
+  - head-branch: ['^ci/']
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - 'mise.toml'
+          - 'lefthook.yml'
+testing:
+  - head-branch: ['^test/']
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/src/test/**'
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'build.sbt'
+          - 'project/**'

@@ -1,0 +1,92 @@
+name: "CI: Scala"
+
+on:
+  push:
+    branches: [main]
+    # Source only — doc-only changes should not trigger the test suite.
+    paths:
+      - "src/**"
+      - "build.sbt"
+      - "project/**"
+      - ".scalafmt.conf"
+      - "Dockerfile"
+      - "mise.toml"
+      - "sonar-project.properties"
+      - ".github/workflows/ci.yaml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "build.sbt"
+      - "project/**"
+      - ".scalafmt.conf"
+      - "Dockerfile"
+      - "mise.toml"
+      - "sonar-project.properties"
+      - ".github/workflows/ci.yaml"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # Exposed to the step `if:` so the Sonar scan is skipped until the project is
+      # onboarded on SonarCloud and the SONAR_TOKEN secret is set — keeps CI green.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Full history so SonarCloud computes new-code / blame accurately
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v5.7.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: sbt
+
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1.5.7
+
+      # Mirrors `mise run check`; invoked directly so the CI job only needs the JVM
+      # toolchain instead of the full local tool set from mise.toml.
+      - name: Run validation (format, coverage, tests)
+        run: |
+          sbt --version
+          sbt shutdown
+          rm -rf target/covcache
+          sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"
+        env:
+          # Resolves lv.id.jc:dicechess-engine-scala from GitHub Packages
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify and locate scoverage report
+        run: |
+          REPORT=$(find target -maxdepth 10 -path '*/scoverage-report/scoverage.xml' -print -quit)
+          if [ -z "$REPORT" ]; then
+            echo "::error::scoverage-report/scoverage.xml was not found!"
+            exit 1
+          fi
+          if ! grep -q 'statement-count' "$REPORT" && ! grep -q 'statements' "$REPORT"; then
+            echo "::error::scoverage-report/scoverage.xml does not contain statement coverage data!"
+            exit 1
+          fi
+          echo "Discovered scoverage report at: $REPORT"
+          echo "SONAR_COVERAGE_REPORT_PATH=$REPORT" >> "$GITHUB_ENV"
+
+      # Imports the scoverage report into SonarCloud.
+      # Requires Automatic Analysis to be OFF for this project (CI-based analysis instead).
+      - name: SonarQube Scan
+        if: ${{ env.SONAR_TOKEN != '' && github.actor != 'dependabot[bot]' }}
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        with:
+          args: >
+            -Dsonar.scala.coverage.reportPaths=${{ env.SONAR_COVERAGE_REPORT_PATH }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

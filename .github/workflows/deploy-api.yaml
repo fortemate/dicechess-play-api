@@ -1,0 +1,117 @@
+name: "CD: Publish API Image"
+
+on:
+  push:
+    branches: [main]
+    # Source/build inputs only — doc-only changes should not rebuild the image.
+    paths:
+      - "src/**"
+      - "build.sbt"
+      - "project/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "scripts/smoke-test.sh"
+      - ".github/workflows/deploy-api.yaml"
+  # Rebuild after a release so the new vX.Y.Z tag is published as an image tag.
+  workflow_run:
+    workflows: ["Ops: Release"]
+    types: [completed]
+  workflow_dispatch:
+
+# Newest commit wins: cancelling a superseded build prevents an older image
+# from being pushed as :latest after a newer one.
+concurrency:
+  group: deploy-api-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build & Push
+    # On a release (workflow_run) only proceed if the release itself succeeded.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      packages: write # push to ghcr
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve app version
+        id: version
+        run: |
+          git fetch --force --tags
+          app_version=$(git tag --points-at HEAD | head -n 1)
+          if [ -z "$app_version" ]; then
+            app_version="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $app_version"
+
+      - name: Set up QEMU (arm64 emulation for the runtime stage)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_run' }}
+            type=raw,value=${{ steps.version.outputs.app_version }}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.authors=Jegors Čemisovs
+
+      # Build the amd64 image into the runner's Docker first and prove it boots and
+      # serves before publishing :latest — guards against "builds fine, won't start".
+      - name: Build amd64 image for the smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: dicechess-play-api:smoke
+          build-args: |
+            GITHUB_ACTOR=${{ github.actor }}
+            APP_VERSION=${{ steps.version.outputs.app_version }}
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (container boots and serves)
+        run: IMAGE=dicechess-play-api:smoke bash scripts/smoke-test.sh
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            GITHUB_ACTOR=${{ github.actor }}
+            APP_VERSION=${{ steps.version.outputs.app_version }}
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

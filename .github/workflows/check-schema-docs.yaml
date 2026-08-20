@@ -1,0 +1,59 @@
+name: "CI: Schema Docs Drift"
+
+# The generated schema reference (contributor-docs/.../reference/schema.md) is committed so
+# that local builds work and schema changes show up as a reviewable diff. That only holds if
+# the committed copy is never stale: this job regenerates it from the migrations and fails when
+# the result differs. Same guarantee the OpenAPI spec gets on the Bot API site — the docs cannot
+# drift from the code.
+on:
+  pull_request:
+    paths:
+      - 'src/main/resources/db/migration/**'
+      - 'contributor-docs/src/content/docs/reference/schema.md'
+      - 'contributor-docs/scripts/render-schema-doc.mjs'
+      - 'scripts/generate-schema-docs.sh'
+      - '.github/workflows/check-schema-docs.yaml'
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Regenerate and compare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Installed from the release tarball rather than via k1LoW/setup-tbls: that action's
+      # downloader fails on this release with "bufio.Scanner: token too long". A direct,
+      # checksum-verified download is also one less third-party action in the supply chain.
+      - name: Install tbls
+        env:
+          # Keep in lockstep with the tbls pinned in mise.toml, so a laptop and a runner
+          # introspect identically — a version skew would show up as phantom drift.
+          TBLS_VERSION: "1.95.0"
+        run: |
+          set -euo pipefail
+          base="https://github.com/k1LoW/tbls/releases/download/v${TBLS_VERSION}"
+          archive="tbls_v${TBLS_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "${archive}" "${base}/${archive}"
+          curl -fsSL -o checksums-linux.txt "${base}/checksums-linux.txt"
+          grep " ${archive}\$" checksums-linux.txt | sha256sum -c -
+          tar -xzf "${archive}" tbls
+          install -m 0755 tbls /usr/local/bin/tbls
+          tbls version
+
+      - name: Regenerate the schema reference
+        run: ./scripts/generate-schema-docs.sh
+
+      - name: Fail if the committed page is stale
+        run: |
+          if ! git diff --exit-code -- contributor-docs/src/content/docs/reference/schema.md; then
+            echo "::error file=contributor-docs/src/content/docs/reference/schema.md::\
+          The committed schema reference does not match the migrations. \
+          Run 'mise run contrib-docs:schema' and commit the result."
+            exit 1
+          fi

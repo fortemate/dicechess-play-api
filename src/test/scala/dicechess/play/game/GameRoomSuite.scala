@@ -603,12 +603,12 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
           firstMovableRoll(room).flatMap { roll =>
-            val path    = leafPath(roll.legalMoves.get)
-            val other   = if roll.seat == Seat.White then Seat.Black else Seat.White
+            val path  = leafPath(roll.legalMoves.get)
+            val other = if roll.seat == Seat.White then Seat.Black else Seat.White
             for
               snap0 <- room.snapshot
-              _       = assertEquals(snap0.mayOfferDraw, Some(true))
-              _       = assertEquals(snap0.drawOffer, None)
+              _ = assertEquals(snap0.mayOfferDraw, Some(true))
+              _ = assertEquals(snap0.drawOffer, None)
               offeredFiber <- room.subscribe
                 .collectFirst { case e: GameEvent.DrawOffered => e }
                 .compile

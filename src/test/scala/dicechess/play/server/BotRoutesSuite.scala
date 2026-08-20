@@ -999,6 +999,37 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
       )
       assertEquals(unowned.flatMap(_.ownerExternalId), None, "the bot API keeps working with no account at all")
 
+  test(
+    "clientIp trusts CF-Connecting-IP / X-Forwarded-For from private/loopback proxies, but ignores from public peers"
+  ):
+    import com.comcast.ip4s.*
+    import org.typelevel.ci.*
+
+    def withRemote(req: Request[IO], ip: IpAddress): Request[IO] =
+      req.withAttribute(
+        Request.Keys.ConnectionInfo,
+        Request.Connection(
+          local = SocketAddress(ip"127.0.0.1", port"8080"),
+          remote = SocketAddress(ip, port"54321"),
+          secure = false
+        )
+      )
+
+    val loopbackPeer = withRemote(Request[IO](Method.GET, uri"/bot/account"), ip"127.0.0.1")
+      .putHeaders(org.http4s.Header.Raw(ci"CF-Connecting-IP", "203.0.113.195"))
+    assertEquals(BotRoutes.clientIp(loopbackPeer), "203.0.113.195", "trusts CF-Connecting-IP behind loopback/tunnel")
+
+    val privateBridgePeer = withRemote(Request[IO](Method.GET, uri"/bot/account"), ip"172.18.0.4")
+      .putHeaders(org.http4s.Header.Raw(ci"X-Forwarded-For", "198.51.100.42, 172.18.0.4"))
+    assertEquals(BotRoutes.clientIp(privateBridgePeer), "198.51.100.42", "trusts X-Forwarded-For behind private bridge")
+
+    val publicPeer = withRemote(Request[IO](Method.GET, uri"/bot/account"), ip"198.51.100.99")
+      .putHeaders(
+        org.http4s.Header.Raw(ci"CF-Connecting-IP", "1.2.3.4"),
+        org.http4s.Header.Raw(ci"X-Forwarded-For", "5.6.7.8")
+      )
+    assertEquals(BotRoutes.clientIp(publicPeer), "198.51.100.99", "ignores spoofed headers from direct public peer")
+
 /** Just enough `UserStore` for the session check in the register route. */
 final private class OwnerStubUsers(ref: cats.effect.Ref[IO, Map[String, dicechess.play.store.UserAccount]])
     extends dicechess.play.store.UserStore:

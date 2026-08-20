@@ -19,16 +19,23 @@ final class AnonMintLimiter private (
 ):
   import AnonMintLimiter.*
 
-  /** Consume one mint for `key`: `Right(())` if allowed, `Left(retryAfter)` if the window's limit is spent. */
+  /** Current number of tracked keys (for telemetry/testing). */
+  def size: IO[Int] = windows.get.map(_.size)
+
+  /** Consume one mint for `key`: `Right(())` if allowed, `Left(retryAfter)` if the window's limit is spent. Expired
+    * windows are swept periodically so stale keys never accumulate without bound.
+    */
   def attempt(key: String): IO[Either[FiniteDuration, Unit]] =
     IO.monotonic.flatMap: now =>
       windows.modify: live =>
-        live.get(key) match
-          case Some(w) if now - w.start < window =>
-            if w.count < limit then (live.updated(key, w.copy(count = w.count + 1)), Right(()))
-            else (live, Left(w.start + window - now)) // limit spent — retry once the window rolls over
-          case _ =>
-            (live.updated(key, Window(now, 1)), Right(())) // first hit, or a rolled-over window
+        // Sweep expired keys if the table has grown, or always filter expired windows
+        val fresh = live.filter((_, w) => now - w.start < window)
+        fresh.get(key) match
+          case Some(w) =>
+            if w.count < limit then (fresh.updated(key, w.copy(count = w.count + 1)), Right(()))
+            else (fresh, Left(w.start + window - now)) // limit spent — retry once the window rolls over
+          case None =>
+            (fresh.updated(key, Window(now, 1)), Right(())) // first hit, or a rolled-over window
 
 object AnonMintLimiter:
 

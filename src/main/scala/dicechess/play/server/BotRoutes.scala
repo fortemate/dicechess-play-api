@@ -573,15 +573,23 @@ object BotRoutes:
       token
     }
 
-  /** Client IP for rate-limiting. Behind the Cloudflare tunnel the socket peer is the tunnel, so the real client is in
-    * `CF-Connecting-IP` (then `X-Forwarded-For`, then the direct peer for local/dev).
+  /** Client IP for rate-limiting. Behind the Cloudflare tunnel or a private reverse proxy, the socket peer is a
+    * loopback or private bridge address, so the real client is in `CF-Connecting-IP` (or `X-Forwarded-For`). If a
+    * request arrives directly from an untrusted public peer, forwarding headers are ignored to prevent spoofing.
     */
   private[server] def clientIp(req: Request[IO]): String =
-    req.headers
-      .get(ci"CF-Connecting-IP")
-      .map(_.head.value)
-      .orElse(req.headers.get(ci"X-Forwarded-For").map(_.head.value.split(',').head.trim))
+    val isTrusted = req.remoteAddr.forall(ip => ip.isLoopback || ip.isPrivate)
+    val forwarded =
+      if isTrusted then
+        req.headers
+          .get(ci"CF-Connecting-IP")
+          .map(_.head.value.trim)
+          .orElse(req.headers.get(ci"X-Forwarded-For").map(_.head.value.split(',').head.trim))
+      else None
+
+    forwarded
       .orElse(req.remoteAddr.map(_.toString))
+      .filter(_.nonEmpty)
       .getOrElse("unknown")
 
   private[server] def ndjson[A: Encoder](

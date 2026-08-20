@@ -46,3 +46,16 @@ class StoreQueryShapeSuite extends munit.FunSuite:
       migration.contains("GENERATED ALWAYS AS (rating_category(time_control)) STORED"),
       "V1 must keep generating `category` from `rating_category`, or the column and the function drift apart"
     )
+
+  test("the baseline migration preserves non-cascading outbox FK and bots capacity constraint"):
+    val migration = source("src/main/resources/db/migration/V1__initial_schema.sql")
+    assert(
+      migration.contains("game_id            uuid PRIMARY KEY REFERENCES games (id),"),
+      "outbox must NOT cascade on delete, preserving snapshots with pending/parked payloads"
+    )
+    assert(
+      migration.contains(
+        "CONSTRAINT bots_max_concurrent_games_range CHECK (max_concurrent_games >= 1 AND max_concurrent_games <= 32)"
+      ),
+      "bots capacity must be bounded between 1 and 32 via CHECK constraint"
+    )

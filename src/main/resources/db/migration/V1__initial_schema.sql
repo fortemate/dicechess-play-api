@@ -37,7 +37,7 @@ CREATE INDEX games_active_idx ON games (status) WHERE status = 'active';
 
 -- ── 3. Outbox (Finished Games Delivery Queue) ──────────────────────────────────
 CREATE TABLE outbox (
-    game_id            uuid PRIMARY KEY REFERENCES games (id) ON DELETE CASCADE,
+    game_id            uuid PRIMARY KEY REFERENCES games (id),
     payload            jsonb       NOT NULL,
     attempts           int         NOT NULL DEFAULT 0,
     next_attempt_at    timestamptz NOT NULL DEFAULT now(),
@@ -66,7 +66,8 @@ CREATE TABLE bots (
     description          text,
     max_concurrent_games int              NOT NULL DEFAULT 1,
     rated_for_humans     boolean          NOT NULL DEFAULT false,
-    PRIMARY KEY (team, name)
+    PRIMARY KEY (team, name),
+    CONSTRAINT bots_max_concurrent_games_range CHECK (max_concurrent_games >= 1 AND max_concurrent_games <= 32)
 );
 
 CREATE INDEX bots_owner_idx ON bots (owner_external_id) WHERE owner_external_id IS NOT NULL;

@@ -261,101 +261,98 @@ object Main extends IOApp.Simple:
             }
             .map(Some(_))
       // The sweepers (seeks, pending challenges), the ladder scheduler, the rating batch, the webhook loop, and the
-      // ingest deliverer are scoped to the server: they run while it runs and are cancelled with it, so a failure
-      // surfaces instead of being silently dropped by a detached fiber.
+      // ingest deliverer are supervised concurrently with the server: if any mandatory loop fails, the error propagates
+      // and shuts down the server rather than letting /health pretend everything is running.
       _ <- webhookResource.use { webhookService =>
-        val loops = (
-          deliverer.background,
-          lobby.sweeper().background,
-          challenges.sweeper().background,
-          ladderLoop.background,
-          ratingLoop.background,
-          retentionLoop.background,
-          webhookService.fold(IO.never: IO[Unit])(_.loop.void).background,
-          // The stats drain loop (#225) is scoped identically to the delivery loop above — same service, same
-          // lifecycle, cancelled together on shutdown.
-          webhookService.fold(IO.never: IO[Unit])(_.statsLoop.void).background
-        ).tupled
-        loops.surround {
-          // The leaderboard/profile API reads bots + game_results — DB-only seams, so without persistence the
-          // routes are simply not mounted (404), same spirit as the rating batch above.
-          val leaderboard =
-            pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg =>
-              LeaderboardRoutes(botStore, pg, pg, pg, users = Some(pg))
-            )
-          // Same DB-only gating: the human catalog reads the bots table's rating + description columns (ADR-0014).
-          val catalog = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg =>
-            CatalogRoutes(pg, botStore, webhookService, registry, wakeLimit, playBotLimit, authSession)
-          )
-          // A visitor's own finished games (#151) — same DB-only-seam idiom: no game_results projection without a
-          // database, so the route is simply not mounted.
-          val playerGames = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => PlayerRoutes(pg, pg))
-          // Same DB-only gating again (#181): `strengthCache` exists either way, but with no persistence there is no
-          // rating batch to ever populate it, so mounting the route would just mean an eternal 503 instead of a 404.
-          val strength = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(_ => StrengthRoutes(botStore, strengthCache))
-          // The durable replay endpoint (#178) reads game_archive — DB-only seam again, same idiom as every route
-          // above.
-          val history = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => HistoryRoutes(pg, pg))
-          // What a finished game did to each seat's rating (#296) — reads the game_results columns the rating batch
-          // writes, so it is DB-only for the same reason the batch itself is, and absent (404) without persistence.
-          val gameRating = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => RatingRoutes(pg))
-          // Browser report intake (#212) writes client_reports — DB-only seam once more: without persistence there
-          // is no queue to accept into, so the SPA's POST gets a 404 and its outbox simply retries later.
-          val ingest = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => IngestRoutes(pg, ingestLimit))
-          // Google sign-in (#233, ADR-0017): needs persistence (users live in Postgres) AND the full auth config —
-          // Google client + session secret. Anything less and the routes are simply not mounted (404), the same
-          // absence-disables idiom as everything above; GoogleAuth.configFromEnv warns on a PARTIAL Google config.
-          val auth = (pgStore, googleConfig, authSession)
-            .mapN { (pg, gc, s) =>
-              AuthRoutes(s, GoogleAuth.live(gc), pg, pg, pg, frontendUrl, admins)
-            }
-            .getOrElse(org.http4s.HttpRoutes.empty[IO])
-          // The signed-in player's own surface (#236): guest claims plus the merged history those claims produce.
-          // Gated exactly like /auth/* — it needs the same session, and there is nothing to read without persistence.
-          // The owner's bot surface (#253/#254): the same operations the bot drives with its Bearer token, reached
-          // instead with the owner's session. Needs persistence (ownership is a column) and a session secret.
-          val ownerBots = (authSession, pgStore)
-            .mapN((s, _) => OwnerBotRoutes(s, botAuth, registry))
-            .getOrElse(org.http4s.HttpRoutes.empty[IO])
-          // The administrator's bot surface (#273/#313): inventory plus any registered bot's mutations, no bot token;
-          // writes are audited (V19), reads deliberately are not. Mounted only when someone is actually listed AND
-          // both halves the allowlist depends on exist.
-          val adminBots = (authSession, pgStore)
-            .mapN((s, pg) => AdminBotRoutes(s, botAuth, admins, pg))
-            .filter(_ => admins.nonEmpty)
-            .getOrElse(org.http4s.HttpRoutes.empty[IO])
-          val me = (authSession, pgStore)
-            .mapN((s, pg) => MeRoutes(s, pg, pg))
-            .getOrElse(org.http4s.HttpRoutes.empty[IO])
-          EmberServerBuilder
-            .default[IO]
-            .withHost(host)
-            .withPort(port)
-            .withHttpWebSocketApp(wsb =>
-              cors(
-                (HealthRoutes(version) <+> PlayRoutes(registry, wsb, authSession) <+> LobbyRoutes(
+        // The leaderboard/profile API reads bots + game_results — DB-only seams, so without persistence the
+        // routes are simply not mounted (404), same spirit as the rating batch above.
+        val leaderboard =
+          pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => LeaderboardRoutes(botStore, pg, pg, pg, users = Some(pg)))
+        // Same DB-only gating: the human catalog reads the bots table's rating + description columns (ADR-0014).
+        val catalog = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg =>
+          CatalogRoutes(pg, botStore, webhookService, registry, wakeLimit, playBotLimit, authSession)
+        )
+        // A visitor's own finished games (#151) — same DB-only-seam idiom: no game_results projection without a
+        // database, so the route is simply not mounted.
+        val playerGames = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => PlayerRoutes(pg, pg))
+        // Same DB-only gating again (#181): `strengthCache` exists either way, but with no persistence there is no
+        // rating batch to ever populate it, so mounting the route would just mean an eternal 503 instead of a 404.
+        val strength = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(_ => StrengthRoutes(botStore, strengthCache))
+        // The durable replay endpoint (#178) reads game_archive — DB-only seam again, same idiom as every route
+        // above.
+        val history = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => HistoryRoutes(pg, pg))
+        // What a finished game did to each seat's rating (#296) — reads the game_results columns the rating batch
+        // writes, so it is DB-only for the same reason the batch itself is, and absent (404) without persistence.
+        val gameRating = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => RatingRoutes(pg))
+        // Browser report intake (#212) writes client_reports — DB-only seam once more: without persistence there
+        // is no queue to accept into, so the SPA's POST gets a 404 and its outbox simply retries later.
+        val ingest = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => IngestRoutes(pg, ingestLimit))
+        // Google sign-in (#233, ADR-0017): needs persistence (users live in Postgres) AND the full auth config —
+        // Google client + session secret. Anything less and the routes are simply not mounted (404), the same
+        // absence-disables idiom as everything above; GoogleAuth.configFromEnv warns on a PARTIAL Google config.
+        val auth = (pgStore, googleConfig, authSession)
+          .mapN { (pg, gc, s) =>
+            AuthRoutes(s, GoogleAuth.live(gc), pg, pg, pg, frontendUrl, admins)
+          }
+          .getOrElse(org.http4s.HttpRoutes.empty[IO])
+        // The signed-in player's own surface (#236): guest claims plus the merged history those claims produce.
+        // Gated exactly like /auth/* — it needs the same session, and there is nothing to read without persistence.
+        // The owner's bot surface (#253/#254): the same operations the bot drives with its Bearer token, reached
+        // instead with the owner's session. Needs persistence (ownership is a column) and a session secret.
+        val ownerBots = (authSession, pgStore)
+          .mapN((s, _) => OwnerBotRoutes(s, botAuth, registry))
+          .getOrElse(org.http4s.HttpRoutes.empty[IO])
+        // The administrator's bot surface (#273/#313): inventory plus any registered bot's mutations, no bot token;
+        // writes are audited (V19), reads deliberately are not. Mounted only when someone is actually listed AND
+        // both halves the allowlist depends on exist.
+        val adminBots = (authSession, pgStore)
+          .mapN((s, pg) => AdminBotRoutes(s, botAuth, admins, pg))
+          .filter(_ => admins.nonEmpty)
+          .getOrElse(org.http4s.HttpRoutes.empty[IO])
+        val me = (authSession, pgStore)
+          .mapN((s, pg) => MeRoutes(s, pg, pg))
+          .getOrElse(org.http4s.HttpRoutes.empty[IO])
+
+        EmberServerBuilder
+          .default[IO]
+          .withHost(host)
+          .withPort(port)
+          .withHttpWebSocketApp(wsb =>
+            cors(
+              (HealthRoutes(version) <+> PlayRoutes(registry, wsb, authSession) <+> LobbyRoutes(
+                lobby,
+                authSession
+              ) <+>
+                leaderboard <+>
+                catalog <+> playerGames <+> strength <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
+                ownerBots <+> adminBots <+>
+                WebhookRoutes(botAuth, webhookService, webhookLimit, pgStore) <+>
+                BotRoutes(
+                  botAuth,
+                  challenges,
+                  botEvents,
+                  registry,
                   lobby,
-                  authSession
-                ) <+>
-                  leaderboard <+>
-                  catalog <+> playerGames <+> strength <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
-                  ownerBots <+> adminBots <+>
-                  WebhookRoutes(botAuth, webhookService, webhookLimit, pgStore) <+>
-                  BotRoutes(
-                    botAuth,
-                    challenges,
-                    botEvents,
-                    registry,
-                    lobby,
-                    mintLimit,
-                    registerLimit,
-                    session = authSession
-                  )).orNotFound
-              )
+                  mintLimit,
+                  registerLimit,
+                  session = authSession
+                )).orNotFound
             )
-            .build
-            .useForever
-        }
+          )
+          .build
+          .use { _ =>
+            (
+              deliverer,
+              lobby.sweeper(),
+              challenges.sweeper(),
+              ladderLoop,
+              ratingLoop,
+              retentionLoop,
+              webhookService.fold(IO.unit)(_.loop.void),
+              webhookService.fold(IO.unit)(_.statsLoop.void),
+              IO.never
+            ).parTupled.void
+          }
       }
     yield ()
 

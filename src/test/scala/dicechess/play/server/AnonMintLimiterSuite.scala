@@ -1,6 +1,7 @@
 package dicechess.play.server
 
 import cats.effect.IO
+import cats.syntax.all.*
 
 import scala.concurrent.duration.*
 
@@ -47,3 +48,16 @@ class AnonMintLimiterSuite extends munit.CatsEffectSuite:
           assert(a.isRight)
           assert(b.isLeft)
           assert(c.isRight, "after the window rolls over, attempts are allowed again")
+
+  test("evicts stale keys after their window expires"):
+    AnonMintLimiter
+      .create(limit = 10, window = 50.millis)
+      .flatMap: lim =>
+        for
+          _     <- (1 to 100).toList.traverse(i => lim.attempt(s"one-shot-key-$i"))
+          size1 <- lim.size
+          _ = assertEquals(size1, 100)
+          _     <- IO.sleep(70.millis)
+          _     <- lim.attempt("active-key")
+          size2 <- lim.size
+        yield assertEquals(size2, 1, "all 100 expired keys must be swept, leaving only the fresh key")

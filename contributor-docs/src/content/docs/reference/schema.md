@@ -256,8 +256,9 @@ Indexes:
 
 Indexes:
 
+- `nickname_history_old_name_idx` — `CREATE INDEX nickname_history_old_name_idx ON public.nickname_history USING btree (lower(old_nickname))`
 - `nickname_history_pkey` — `CREATE UNIQUE INDEX nickname_history_pkey ON public.nickname_history USING btree (id)`
-- `nickname_history_user_idx` — `CREATE INDEX nickname_history_user_idx ON public.nickname_history USING btree (user_id)`
+- `nickname_history_user_idx` — `CREATE INDEX nickname_history_user_idx ON public.nickname_history USING btree (user_id, changed_at)`
 
 ### `outbox`
 

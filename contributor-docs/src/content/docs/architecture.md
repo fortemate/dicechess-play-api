@@ -57,7 +57,7 @@ is the most common way to break the platform.
   `dicechess-play` SvelteKit front end. Both sides must be verified together.
 - **Publishes** the analytics ingest payload built in `ingest/PlaysiteIngest.scala` — posted to
   the analytics service's `/api/games` with `source=playsite`, idempotent, first writer wins.
-- **Publishes** the public Bot API, documented at [bots.jc.id.lv](https://bots.jc.id.lv/). Its
+- **Publishes** the public Bot API, documented at [bots.fortemate.com](https://bots.fortemate.com/). Its
   machine-readable contracts (`openapi.yaml`, `asyncapi.yaml`) live in that site's `public/`
   directory and are rendered into the reference at build time, so the spec cannot drift
   silently from the docs.
@@ -76,4 +76,4 @@ Routes are grouped by audience rather than by resource:
   webhooks, ladder.
 
 The complete, authoritative reference for the bot-facing routes is the
-[Bot API site](https://bots.jc.id.lv/), not this page.
+[Bot API site](https://bots.fortemate.com/), not this page.

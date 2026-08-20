@@ -74,7 +74,7 @@ pulled an image without recreating the container all still read as PASS.
 `scripts/post-deploy-check.sh` covers that half against a running deployment:
 
 ```bash
-BASE_URL=https://play-api.jc.id.lv EXPECT_VERSION=v0.16.9 scripts/post-deploy-check.sh
+BASE_URL=https://api.fortemate.com EXPECT_VERSION=v0.16.9 scripts/post-deploy-check.sh
 ```
 
 It pins what is really serving (`GET /version` — the promotion may not have taken), proves the

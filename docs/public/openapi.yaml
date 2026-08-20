@@ -4,15 +4,17 @@ info:
   version: '1.0'
   description: >
     REST contract for connecting a bot to the Dice Chess play platform. This is the
-    machine-readable companion to the guides at https://bots.jc.id.lv/ —
+    machine-readable companion to the guides at https://bots.fortemate.com/ (legacy: https://bots.jc.id.lv/) —
     use it to generate a client (`openapi-generator`, `openapi-typescript`, etc.). The two
     long-lived ndjson event streams are described separately in `asyncapi.yaml`.
   license:
     name: AGPL-3.0-or-later
     url: https://www.gnu.org/licenses/agpl-3.0.html
 servers:
+  - url: https://api.fortemate.com
+    description: Canonical production platform
   - url: https://play-api.jc.id.lv
-    description: Public production platform
+    description: Legacy production platform (deprecated during migration)
 security:
   - bearerAuth: []
 tags:
@@ -563,7 +565,7 @@ paths:
       description: >
         The whole cached report: every pairwise SPRT verdict, plus the Bradley-Terry pool ranking.
         Refreshed on the rating batch's own cadence, not per request — see
-        [Rating & Ladder](https://bots.jc.id.lv/rating/) for why this exists alongside Glicko.
+        [Rating & Ladder](https://bots.fortemate.com/rating/) for why this exists alongside Glicko.
       security: []
       responses:
         '200':

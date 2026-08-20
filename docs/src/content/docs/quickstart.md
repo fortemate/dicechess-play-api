@@ -8,15 +8,17 @@ This walkthrough takes you from nothing to a bot playing a full game against the
 The base URL for the public platform is:
 
 ```text
-https://play-api.jc.id.lv
+https://api.fortemate.com
 ```
+
+*(Legacy host `https://play-api.jc.id.lv` is supported during transition).*
 
 ## 1. Mint a token
 
 No registration, no signup — one request gives you an anonymous, ready-to-play token:
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/anon?name=my-first-bot"
+curl -X POST "https://api.fortemate.com/bot/anon?name=my-first-bot"
 ```
 
 ```json
@@ -39,7 +41,7 @@ export TOKEN="bearer-token-string"
 The platform ships a built-in sparring partner at `house/greedy`. Challenge it to an unlimited-time game:
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/challenge" \
+curl -X POST "https://api.fortemate.com/bot/challenge" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"team": "house", "name": "greedy", "timeControl": {"Unlimited": {}}}'
@@ -48,7 +50,7 @@ curl -X POST "https://play-api.jc.id.lv/bot/challenge" \
 The house bot accepts immediately. Find the resulting game:
 
 ```bash
-curl "https://play-api.jc.id.lv/bot/games" -H "Authorization: Bearer $TOKEN"
+curl "https://api.fortemate.com/bot/games" -H "Authorization: Bearer $TOKEN"
 ```
 
 ```json
@@ -68,7 +70,7 @@ curl "https://play-api.jc.id.lv/bot/games" -H "Authorization: Bearer $TOKEN"
 As soon as the game starts, submit a random seed — your contribution to the [provably-fair dice](../provably-fair/). It is optional but good citizenship (and it is *your* entropy in the roll):
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/game/$GAME_ID/seed" \
+curl -X POST "https://api.fortemate.com/bot/game/$GAME_ID/seed" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"seed": "'"$(head -c 16 /dev/urandom | xxd -p)"'"}'
@@ -79,7 +81,7 @@ curl -X POST "https://play-api.jc.id.lv/bot/game/$GAME_ID/seed" \
 When `dicePending` is `true` and `activeSeat` is your seat, fetch the legal-move tree for the current roll:
 
 ```bash
-curl "https://play-api.jc.id.lv/games/$GAME_ID/moves"
+curl "https://api.fortemate.com/games/$GAME_ID/moves"
 ```
 
 ```json
@@ -94,7 +96,7 @@ curl "https://play-api.jc.id.lv/games/$GAME_ID/moves"
 `legalMoves` is a **prefix tree of UCI micro-moves**. Walk any path from the root to a leaf (`{}`) — that path is one complete, legal turn. Submit it:
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/game/$GAME_ID/move" \
+curl -X POST "https://api.fortemate.com/bot/game/$GAME_ID/move" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"moves": ["e2e4", "b1c3", "g1f3"]}'

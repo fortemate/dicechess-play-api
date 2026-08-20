@@ -33,12 +33,12 @@
 # which is the whole reason it exists.
 #
 # Usage:
-#   BASE_URL=https://play-api.jc.id.lv scripts/post-deploy-check.sh
+#   BASE_URL=https://api.fortemate.com scripts/post-deploy-check.sh
 #   BASE_URL=... EXPECT_VERSION=v0.16.9 scripts/post-deploy-check.sh   # also pin what must be live
 #   BASE_URL=... PLAY_GAME=0 scripts/post-deploy-check.sh              # read-only subset
 set -euo pipefail
 
-BASE_URL="${BASE_URL:?set BASE_URL, e.g. BASE_URL=https://play-api.jc.id.lv scripts/post-deploy-check.sh}"
+BASE_URL="${BASE_URL:?set BASE_URL, e.g. BASE_URL=https://api.fortemate.com scripts/post-deploy-check.sh}"
 BASE_URL="${BASE_URL%/}"
 EXPECT_VERSION="${EXPECT_VERSION:-}"
 PLAY_GAME="${PLAY_GAME:-1}"

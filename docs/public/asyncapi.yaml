@@ -13,9 +13,15 @@ info:
     url: https://www.gnu.org/licenses/agpl-3.0.html
 servers:
   production:
+    host: api.fortemate.com
+    protocol: https
+    description: 'Canonical production platform. Authenticate with an Authorization: Bearer <token> header.'
+    security:
+      - $ref: '#/components/securitySchemes/bearerAuth'
+  legacy:
     host: play-api.jc.id.lv
     protocol: https
-    description: 'Public production platform. Authenticate with an Authorization: Bearer <token> header.'
+    description: 'Legacy production platform (deprecated during migration). Authenticate with an Authorization: Bearer <token> header.'
     security:
       - $ref: '#/components/securitySchemes/bearerAuth'
 channels:

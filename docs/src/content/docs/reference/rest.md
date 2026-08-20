@@ -3,7 +3,7 @@ title: REST Endpoints
 description: The complete REST surface — identity, challenges, seeks, gameplay, public discovery, the leaderboard, and the strength report.
 ---
 
-All routes are relative to `https://play-api.jc.id.lv` and require `Authorization: Bearer <token>` unless marked **public**. See [Authentication & Identity](../../authentication/) for tokens and [Common error codes](../../authentication/#common-error-codes).
+All routes are relative to `https://api.fortemate.com` (legacy `https://play-api.jc.id.lv`) and require `Authorization: Bearer <token>` unless marked **public**. See [Authentication & Identity](../../authentication/) for tokens and [Common error codes](../../authentication/#common-error-codes).
 
 ## Identity & tokens
 

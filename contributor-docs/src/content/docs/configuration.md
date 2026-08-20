@@ -74,9 +74,9 @@ boot — someone clearly tried to enable sign-in — instead of the usual silent
 | --- | --- |
 | `GOOGLE_CLIENT_ID` | The OAuth client (Google Cloud console). Required. |
 | `GOOGLE_CLIENT_SECRET` | Its secret. Required. |
-| `GOOGLE_REDIRECT_URI` | Must match the console entry, e.g. `https://play-api.jc.id.lv/auth/callback`. Required. |
+| `GOOGLE_REDIRECT_URI` | Must match the console entry, e.g. `https://api.fortemate.com/auth/callback`. Required. |
 | `PLAY_SESSION_SECRET` | HMAC key for session JWTs (e.g. `openssl rand -base64 48`). Required; no fallback on purpose. |
-| `PLAY_FRONTEND_URL` | Where login/callback send the browser back. Default `https://play.jc.id.lv`; local dev sets `http://localhost:5173`. |
+| `PLAY_FRONTEND_URL` | Where login/callback send the browser back. Default `https://fortemate.com`; local dev sets `http://localhost:5173`. |
 
 With sign-in enabled, `PLAY_CORS_ORIGINS` must be a real allow-list: the empty allow-all mode
 stays credential-less by design, so the SPA's credentialed fetches would fail against it.

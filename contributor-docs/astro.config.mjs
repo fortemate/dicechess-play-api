@@ -11,7 +11,7 @@ import mermaid from 'astro-mermaid';
 // Everything here is public: GitHub Pages has no private mode. Nothing may be documented that
 // is not already derivable from this public repository — no host topology, no env values.
 export default defineConfig({
-	site: 'https://jc.id.lv',
+	site: 'https://fortemate.com',
 	base: '/dicechess-play-api',
 	// The bot-docs slugs this site inherited. Astro emits a meta-refresh page for each in a
 	// static build, so search results and stale bookmarks land on the moved page rather than on
@@ -33,14 +33,14 @@ export default defineConfig({
 			'reference/webhooks',
 			'reference/data-shapes',
 			'api',
-		].map((slug) => [`/${slug}`, `https://bots.jc.id.lv/${slug}/`]),
+		].map((slug) => [`/${slug}`, `https://bots.fortemate.com/${slug}/`]),
 	),
 	integrations: [
 		mermaid(),
 		starlight({
 			title: 'play-api Contributor Docs',
 			description:
-				'How the Dice Chess play-api server is built: architecture, database schema, concurrency doctrine, and testing conventions. For contributors — bot developers want bots.jc.id.lv instead.',
+				'How the Dice Chess play-api server is built: architecture, database schema, concurrency doctrine, and testing conventions. For contributors — bot developers want bots.fortemate.com instead.',
 			favicon: '/favicon.svg',
 			customCss: ['./src/styles/theme.css'],
 			social: [

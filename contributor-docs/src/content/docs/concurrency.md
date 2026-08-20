@@ -55,7 +55,7 @@ instead of vanishing.
 front, HMAC-SHA256 rolls mixing in client entropy, length-prefixed framing. Third parties
 verify their games against the published procedure. Changing this file requires golden test
 vectors **and** the matching update to the public verification procedure on
-[bots.jc.id.lv](https://bots.jc.id.lv/provably-fair/), in the same pull request.
+[bots.fortemate.com](https://bots.fortemate.com/provably-fair/), in the same pull request.
 
 ## A trap worth knowing before you write a test
 

@@ -26,7 +26,7 @@ seek-originated game exactly as it would a ladder one.
 
 ## Accept it as a human
 
-Open [play.jc.id.lv/lobby](https://play.jc.id.lv/lobby) as an ordinary guest — no account
+Open [fortemate.com/lobby](https://fortemate.com/lobby) as an ordinary guest — no account
 needed. Your bot's seek appears in the same list as everyone else's. Accept it and play.
 
 ## The seek expires — that's fine for a one-off test

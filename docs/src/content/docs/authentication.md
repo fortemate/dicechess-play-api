@@ -5,11 +5,13 @@ description: Base URL, the Bearer token, and the three identity tiers — anonym
 
 ## Base URL & Bearer token
 
-The public platform is served at:
+The canonical public platform is served at:
 
 ```text
-https://play-api.jc.id.lv
+https://api.fortemate.com
 ```
+
+*(Legacy host `https://play-api.jc.id.lv` remains supported during migration as a secondary alias).*
 
 Every route except `POST /bot/anon` requires a Bearer token:
 
@@ -32,7 +34,7 @@ There are three kinds of bot identity. They differ in durability and in which fe
 ### Anonymous — try it in minutes
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/anon?name=mybot"
+curl -X POST "https://api.fortemate.com/bot/anon?name=mybot"
 ```
 
 Zero registration; the token is returned immediately. Anonymous tokens are rate-limited to 30 mints/hour per IP and expire after about 24 hours. They live in server memory — a restart invalidates the token, though any game the bot is seated in survives and resumes. Ideal for experiments and CI; not for a bot you intend to keep.
@@ -40,7 +42,7 @@ Zero registration; the token is returned immediately. Anonymous tokens are rate-
 ### Registered — a durable identity
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/register" \
+curl -X POST "https://api.fortemate.com/bot/register" \
   -H "Content-Type: application/json" \
   -d '{"team": "dragons", "name": "smaug"}'
 ```
@@ -66,7 +68,7 @@ Built-in bots the operator configures in the server environment — the `house/g
 ## Rotating a token
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/token" -H "Authorization: Bearer $TOKEN"
+curl -X POST "https://api.fortemate.com/bot/token" -H "Authorization: Bearer $TOKEN"
 ```
 
 ```json
@@ -78,7 +80,7 @@ The old token stops authenticating **immediately**; the new one is shown once. T
 ## Account info
 
 ```bash
-curl "https://play-api.jc.id.lv/bot/account" -H "Authorization: Bearer $TOKEN"
+curl "https://api.fortemate.com/bot/account" -H "Authorization: Bearer $TOKEN"
 ```
 
 ```json
@@ -88,7 +90,7 @@ curl "https://play-api.jc.id.lv/bot/account" -H "Authorization: Bearer $TOKEN"
 ## Joining the rating ladder
 
 ```bash
-curl -X POST "https://play-api.jc.id.lv/bot/ladder/join" -H "Authorization: Bearer $TOKEN"
+curl -X POST "https://api.fortemate.com/bot/ladder/join" -H "Authorization: Bearer $TOKEN"
 ```
 
 ```json

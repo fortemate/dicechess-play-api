@@ -1,4 +1,4 @@
-// Assets-only Worker serving the built Starlight site (dist/) at https://bots.jc.id.lv.
+// Assets-only Worker serving the built Starlight site (dist/) at https://bots.fortemate.com.
 // No main script: Cloudflare serves the static assets directly. The custom domain is
 // attached once, manually, in the dashboard (Worker → Settings → Domains & Routes), so the
 // CI token needs only the Workers Scripts scope — no DNS permissions.

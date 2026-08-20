@@ -605,16 +605,18 @@ class GameRoomSuite extends munit.CatsEffectSuite:
           firstMovableRoll(room).flatMap { roll =>
             val path    = leafPath(roll.legalMoves.get)
             val other   = if roll.seat == Seat.White then Seat.Black else Seat.White
-            val offered = room.subscribe
-              .collectFirst { case e: GameEvent.DrawOffered => e }
-              .compile
-              .lastOrError
             for
               snap0 <- room.snapshot
               _       = assertEquals(snap0.mayOfferDraw, Some(true))
               _       = assertEquals(snap0.drawOffer, None)
-              submits = room.submitTurn(roll.seat, path, offerDraw = true)
-              event <- (offered, submits).parMapN((e, _) => e)
+              offeredFiber <- room.subscribe
+                .collectFirst { case e: GameEvent.DrawOffered => e }
+                .compile
+                .lastOrError
+                .start
+              _     <- IO.sleep(20.millis)
+              _     <- room.submitTurn(roll.seat, path, offerDraw = true)
+              event <- offeredFiber.joinWithNever.timeout(5.seconds)
               snap1 <- room.snapshot
             yield
               assertEquals(event.by, roll.seat)

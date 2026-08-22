@@ -32,6 +32,15 @@ RUN --mount=type=secret,id=github_token \
 # multicall coreutils binary and breaks the sbt-native-packager launcher.
 FROM eclipse-temurin:25-jre-noble
 
+LABEL org.opencontainers.image.title="Dice Chess Play API" \
+      org.opencontainers.image.description="Authoritative real-time server for Dice Chess (human-vs-human + Bot API + Glicko-2 rating ladder)" \
+      org.opencontainers.image.url="https://fortemate.com" \
+      org.opencontainers.image.source="https://github.com/fortemate/dicechess-play-api" \
+      org.opencontainers.image.vendor="Fortemate" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.authors="Jegors Čemisovs" \
+      org.opencontainers.image.base.name="eclipse-temurin:25-jre-noble"
+
 # curl: used by the compose healthcheck (GET /health) and handy for debugging.
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 

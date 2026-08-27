@@ -59,6 +59,12 @@ mise run coverage   # Run tests with scoverage and generate report
 - Doobie `ConnectionIO` for database interactions; transactional boundaries clearly demarcated.
 - Error handling: structured domain errors or HTTP status responses; no swallowed exceptions.
 
+## Git and pull requests
+
+- When the branch name is under your control, use `<type>/<short-desc>` or `<type>/<id>-<short-desc>` where type is `task`, `feat`, `fix`, `bug`, `refactor`, `chore`, `docs`, `ci`, `test`, or `perf`.
+- Some external integrations, including Jules, control the published branch name. Their generated names are accepted by PR Policy when the pull request body contains `Closes #<id>`, `Fixes #<id>`, or `Resolves #<id>`.
+- Do not modify `.github/workflows/**` or `.github/labeler.yml` as part of an unrelated task merely to make that task's checks pass. Repository automation changes belong in a dedicated pull request.
+
 ## Issue management
 <!-- dc-shared:issue-management v1 — keep identical across Fortemate repositories -->
 
@@ -66,7 +72,7 @@ mise run coverage   # Run tests with scoverage and generate report
   - `Bug` for unexpected or incorrect behavior.
   - `Feature` for a request, idea, or new user-visible capability.
   - `Task` for a specific piece of engineering, research, maintenance, or documentation work.
-- Never commit directly to a repository's default branch. Name branches `<type>/<short-description>` or `<type>/<id>-<short-description>` using the canonical types `task|feat|bug|refactor|chore|docs|ci|test|perf`. Include an Issue id only when the pull request is intended to fully complete that Issue; otherwise omit it or use the id of an independently actionable sub-issue. Example: `bug/42-fix-dfen-parser`.
+- Never commit directly to a repository's default branch. Name branches `<type>/<short-description>` or `<type>/<id>-<short-description>` using the canonical types `task|feat|fix|bug|refactor|chore|docs|ci|test|perf`. Include an Issue id only when the pull request is intended to fully complete that Issue; otherwise omit it or use the id of an independently actionable sub-issue. Example: `bug/42-fix-dfen-parser`.
 - Do not apply `bug` or `enhancement` labels to Issues merely to repeat their Type. Keep those labels for pull-request release classification. On Issues, labels describe only a technical domain or cross-cutting concern, and only existing repository labels may be used.
 - Before creating or updating an Issue, search relevant Fortemate repositories across open and closed Issues for semantic duplicates. Read the live Types, field options, labels, assignees, relationships, and open milestones before mutation; never rely on cached IDs or invent metadata.
 - GitHub-facing work items are English-only. Use the appropriate Issue Form when available, or `gh issue create --body-file <file>` for CLI creation; never pass a multiline body inline. Every Issue must contain `Context`, `Objective`, and a testable `Definition of Done`.

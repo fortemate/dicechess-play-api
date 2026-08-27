@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Validate branch name and linked issue
+      - name: Validate branch convention or linked issue
         uses: actions/github-script@v9
         with:
           script: |
@@ -28,19 +28,31 @@ jobs:
             // Allowed branch prefixes. Issue-driven work uses task|feat|bug and links its issue;
             // issueless work (refactor|chore|docs|ci|test|perf) needs no issue. The <id>- segment is
             // optional, so `feat/123-add-clocks` and `refactor/extract-clock-policy` are both valid.
-            const pattern = /^(task|feat(ure)?|bug|refactor|chore|docs|ci|test|perf)\/((issue-)?\d+-)?[a-z0-9-]+$/;
-            if (!pattern.test(headRef)) {
-              core.setFailed(`Branch "${headRef}" must be <type>/<short-desc> — type one of task|feat|bug|refactor|chore|docs|ci|test|perf, optionally <type>/<id>-<short-desc> to link an issue.`);
+            const pattern = /^(task|feat(ure)?|fix|bug|refactor|chore|docs|ci|test|perf)\/((issue-)?\d+-)?[a-z0-9-]+$/;
+            const followsConvention = pattern.test(headRef);
+            const closingIssuePattern = /\b(?:Closes|Resolves|Fixes)\s+#(\d+)\b/gi;
+            const closingIssueIds = new Set(
+              Array.from(body.matchAll(closingIssuePattern), match => match[1])
+            );
+
+            // Require an issue link matching the branch issue ID when present in a conventional branch.
+            if (followsConvention) {
+              const match = headRef.match(/^[a-z]+\/(?:issue-)?(\d+)-/);
+              if (match) {
+                const issueId = match[1];
+                if (!closingIssueIds.has(issueId)) {
+                  core.setFailed(`Branch "${headRef}" references issue #${issueId}, but the pull request body does not contain "Closes #${issueId}" (or Fixes/Resolves).`);
+                  return;
+                }
+              }
+            }
+
+            if (!followsConvention && closingIssueIds.size === 0) {
+              core.setFailed(`Branch "${headRef}" does not follow the preferred <type>/<short-desc> convention. Tool-managed branch names are accepted when the pull request body closes an issue with "Closes #<id>" (or Fixes/Resolves).`);
               return;
             }
-            // Require an issue link matching the branch issue ID when present.
-            const match = headRef.match(/^[a-z]+\/(?:issue-)?(\d+)-/);
-            if (match) {
-              const issueId = match[1];
-              const issuePattern = new RegExp(`(Closes|Resolves|Fixes)\\s+#${issueId}\\b`, 'i');
-              if (!issuePattern.test(body)) {
-                core.setFailed(`Branch "${headRef}" references issue #${issueId}, but the pull request body does not contain "Closes #${issueId}" (or Fixes/Resolves).`);
-                return;
-              }
+
+            if (!followsConvention) {
+              console.log(`Accepting tool-managed branch "${headRef}" because the pull request closes issue(s): ${Array.from(closingIssueIds).map(id => `#${id}`).join(', ')}.`);
             }
             console.log('PR policy OK.');

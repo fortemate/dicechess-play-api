@@ -20,7 +20,7 @@ enhancement:
   # always been a new capability. It is treated as one here; a fix belongs on `bug/`.
   - head-branch: ['^task/', '^feat/', '^feature/']
 bug:
-  - head-branch: ['^bug/']
+  - head-branch: ['^bug/', '^fix/']
 refactoring:
   - head-branch: ['^refactor/']
 performance:

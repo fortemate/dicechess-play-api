@@ -36,12 +36,14 @@ jobs:
             );
 
             // Require an issue link matching the branch issue ID when present in a conventional branch.
-            const match = headRef.match(/^[a-z]+\/(?:issue-)?(\d+)-/);
-            if (match) {
-              const issueId = match[1];
-              if (!closingIssueIds.has(issueId)) {
-                core.setFailed(`Branch "${headRef}" references issue #${issueId}, but the pull request body does not contain "Closes #${issueId}" (or Fixes/Resolves).`);
-                return;
+            if (followsConvention) {
+              const match = headRef.match(/^[a-z]+\/(?:issue-)?(\d+)-/);
+              if (match) {
+                const issueId = match[1];
+                if (!closingIssueIds.has(issueId)) {
+                  core.setFailed(`Branch "${headRef}" references issue #${issueId}, but the pull request body does not contain "Closes #${issueId}" (or Fixes/Resolves).`);
+                  return;
+                }
               }
             }
 

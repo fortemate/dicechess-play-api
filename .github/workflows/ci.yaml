@@ -51,7 +51,7 @@ jobs:
           cache: sbt
 
       - name: Setup sbt
-        uses: sbt/setup-sbt@v1.5.7
+        uses: sbt/setup-sbt@v1.5.8
 
       # Mirrors `mise run check`; invoked directly so the CI job only needs the JVM
       # toolchain instead of the full local tool set from mise.toml.

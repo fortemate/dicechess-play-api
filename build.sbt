@@ -106,6 +106,7 @@ lazy val root = (project in file("."))
     ),
     scalacOptions ++= Seq(
       "-Werror",
+      "-Wconf:msg=Skipping coverage instrumentation:s",
       "-Wunused:all",
       "-deprecation",
       "-feature",

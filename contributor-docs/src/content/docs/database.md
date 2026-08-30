@@ -53,8 +53,7 @@ unique constraint so one token maps to exactly one identity. The same row carrie
 (`open_to_humans`, `description`). Primary key is `(team, name)`. Ratings live in `bot_ratings`
 per category.
 
-`rated_for_humans` (V15) is a dead column kept in place by the no-drop rule — no migration has
-ever dropped a column, and none will start now. It is no longer selected by any query. The
+`rated_for_humans` is a legacy column no longer selected by any query. The
 curation model it embodied was superseded by #279: rated play is now a player choice at game or
 seek creation, and the anti-farming guarantee moved into the rating batch itself
 (`RatingBatch.applyGame`: a guest seat is never rated; an account vs a bot it **owns** never
@@ -184,14 +183,8 @@ away with the account, freeing the guest id for a future claim.
 ### `bot_ratings` / `user_ratings` — one Glicko-2 state per speed (#280)
 
 Bullet / Blitz / Rapid, keyed by estimated game duration. **These are the live scales**: every
-public response reads them since phase 2, and the single-scale `glicko_*` columns on `bots` and
-`users` are read by nothing.
-
-Those columns are still *written* by the batch, though, and that is deliberate rather than an
-oversight to tidy up. While they exist they have to stay current: rolling the release back would
-otherwise resume from a scale with a hole in it exactly the size of the time it was deployed.
-They are dropped — together with the batch's dual write — in a follow-up migration once the
-cutover has been observed in production.
+public response reads them, and per-category rating is the only rating system. The legacy single-scale
+`glicko_*` columns on `bots` and `users` and the batch's dual-write were dropped in migration `V2` (#9).
 
 The tables are **sparse**: a row exists only for a `(participant, category)` pair that has
 actually been rated, and an absent row *is* the fresh state 1500 / 350 / 0.06 — the same seeds

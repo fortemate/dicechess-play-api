@@ -389,9 +389,9 @@ final class PgGameStore private (xa: Transactor[IO])
       .map(_ == 1)
 
   def ratingOf(team: String, name: String): IO[Option[BotRating]] =
-    sql"""SELECT glicko_rating, glicko_rd, glicko_vol, on_ladder, owner_external_id
+    sql"""SELECT on_ladder, owner_external_id
           FROM play.bots WHERE team = $team AND name = $name"""
-      .query[(Double, Double, Double, Boolean, Option[String])]
+      .query[(Boolean, Option[String])]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
@@ -402,8 +402,8 @@ final class PgGameStore private (xa: Transactor[IO])
     */
   def setOnLadder(team: String, name: String, onLadder: Boolean): IO[Option[BotRating]] =
     sql"""UPDATE play.bots SET on_ladder = $onLadder WHERE team = $team AND name = $name
-          RETURNING glicko_rating, glicko_rd, glicko_vol, on_ladder, owner_external_id"""
-      .query[(Double, Double, Double, Boolean, Option[String])]
+          RETURNING on_ladder, owner_external_id"""
+      .query[(Boolean, Option[String])]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
@@ -513,8 +513,8 @@ final class PgGameStore private (xa: Transactor[IO])
   def adminSetOnLadder(adminUserId: String, team: String, name: String, onLadder: Boolean): IO[Option[BotRating]] =
     adminTx(adminUserId, team, name, action = if onLadder then "ladder.join" else "ladder.leave", detail = None) {
       sql"""UPDATE play.bots SET on_ladder = $onLadder WHERE team = $team AND name = $name
-            RETURNING glicko_rating, glicko_rd, glicko_vol, on_ladder, owner_external_id"""
-        .query[(Double, Double, Double, Boolean, Option[String])]
+            RETURNING on_ladder, owner_external_id"""
+        .query[(Boolean, Option[String])]
         .option
     }.map(_.map(PgGameStore.toBotRating))
 
@@ -918,8 +918,7 @@ final class PgGameStore private (xa: Transactor[IO])
       .map(_.map(PgGameStore.toRow))
 
   def applyRatingUpdate(gameId: GameId, white: RatingUpdate, black: RatingUpdate): IO[Unit] =
-    (updateGlicko(white.identity, white.after) *> updateGlicko(black.identity, black.after) *>
-      updateCategoryGlicko(white) *> updateCategoryGlicko(black) *>
+    (updateCategoryGlicko(white) *> updateCategoryGlicko(black) *>
       stampApplied(gameId, Some(white), Some(black)))
       .transact(xa)
       .timeout(SaveTimeout)
@@ -948,20 +947,6 @@ final class PgGameStore private (xa: Transactor[IO])
         )
       })
 
-  /** One participant's rating write, dispatched to the table that identity lives in (#248). Both branches stay inside
-    * the caller's single transaction — see `RatingStore.applyRatingUpdate` on why atomicity is per game, not per table.
-    */
-  private def updateGlicko(identity: RatedIdentity, glicko: Glicko): ConnectionIO[Unit] =
-    identity match
-      case RatedIdentity.Bot(team, name) =>
-        sql"""UPDATE play.bots
-              SET glicko_rating = ${glicko.rating}, glicko_rd = ${glicko.deviation}, glicko_vol = ${glicko.volatility}
-              WHERE team = $team AND name = $name""".update.run.void
-      case RatedIdentity.User(id) =>
-        sql"""UPDATE play.users
-              SET glicko_rating = ${glicko.rating}, glicko_rd = ${glicko.deviation}, glicko_vol = ${glicko.volatility}
-              WHERE id = $id::uuid""".update.run.void
-
   def categoryRatingOf(identity: RatedIdentity, category: RatingCategory): IO[Glicko] =
     val row = identity match
       case RatedIdentity.Bot(team, name) =>
@@ -976,7 +961,7 @@ final class PgGameStore private (xa: Transactor[IO])
       .transact(xa)
       .timeout(SaveTimeout)
       // A missing row IS the fresh state, not a missing participant — see `RatingStore.categoryRatingOf`. The batch
-      // has already established that the participant exists (`BotStore`/`UserStore.ratingOf` found it) before it can
+      // has already established that the participant exists (`BotStore`/`UserStore.userById` found it) before it can
       // ever get here, so there is nothing else absence could mean.
       .map(_.fold(Glicko.Initial)((rating, rd, vol) => Glicko(rating, rd, vol)))
 
@@ -998,60 +983,46 @@ final class PgGameStore private (xa: Transactor[IO])
         RatingCategory.fromWireName(category).map(_ -> Glicko(rating, rd, vol))
       }.toMap)
 
-  /** One participant's PER-CATEGORY rating write (#280), an upsert because the tables are sparse: the first rated game
-    * a participant plays in a category creates its row, every later one updates it. `None` — an uncategorised control —
-    * writes nothing at all, which is what keeps `Unlimited`/`PerMove` games off every scale while still letting them
-    * move the shared one exactly as they do today.
-    *
-    * Inside the caller's transaction, like `updateGlicko`: a game that moved the shared scale but not the category one
-    * would be indistinguishable, afterwards, from a game the batch had not reached yet.
+  /** One participant's rating write (#280), an upsert because the tables are sparse: the first rated game a participant
+    * plays in a category creates its row, every later one updates it.
     *
     * '''`INSERT … SELECT` from the parent table, not `VALUES`''', so that a participant which vanished between the
-    * batch's read and this write is a NO-OP — exactly what `updateGlicko`'s `UPDATE … WHERE` already degrades to. With
-    * bare `VALUES` the foreign key would raise instead, and the consequences are out of all proportion to the race: the
-    * transaction aborts, the game is never stamped, and since `drainQueue` has no per-row recovery it sits at the head
-    * of the queue failing every tick from then on — for an account that is gone and is never coming back (`DELETE
-    * /auth/me`, #237, leaves the `user:` id in `game_results` forever). The bot branch has no such delete path today;
-    * it is written the same way because the asymmetry, not the guard, is what a future one would trip on.
+    * batch's read and this write is a NO-OP. With bare `VALUES` the foreign key would raise instead, and the
+    * consequences are out of all proportion to the race: the transaction aborts, the game is never stamped, and since
+    * `drainQueue` has no per-row recovery it sits at the head of the queue failing every tick from then on — for an
+    * account that is gone and is never coming back (`DELETE /auth/me`, #237, leaves the `user:` id in `game_results`
+    * forever). The bot branch has no such delete path today; it is written the same way because the asymmetry, not the
+    * guard, is what a future one would trip on.
     */
   private def updateCategoryGlicko(update: RatingUpdate): ConnectionIO[Unit] =
-    update.category.fold(().pure[ConnectionIO]) { move =>
-      val glicko = move.after
-      update.identity match
-        case RatedIdentity.Bot(team, name) =>
-          sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
-                SELECT b.team, b.name, ${move.category.wireName},
-                       ${glicko.rating}, ${glicko.deviation}, ${glicko.volatility}
-                FROM play.bots b WHERE b.team = $team AND b.name = $name
-                ON CONFLICT (team, name, category)
-                DO UPDATE SET rating = EXCLUDED.rating, rd = EXCLUDED.rd, vol = EXCLUDED.vol""".update.run.void
-        case RatedIdentity.User(id) =>
-          sql"""INSERT INTO play.user_ratings (user_id, category, rating, rd, vol)
-                SELECT u.id, ${move.category.wireName},
-                       ${glicko.rating}, ${glicko.deviation}, ${glicko.volatility}
-                FROM play.users u WHERE u.id = $id::uuid
-                ON CONFLICT (user_id, category)
-                DO UPDATE SET rating = EXCLUDED.rating, rd = EXCLUDED.rd, vol = EXCLUDED.vol""".update.run.void
-    }
+    val glicko = update.after
+    update.identity match
+      case RatedIdentity.Bot(team, name) =>
+        sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+              SELECT b.team, b.name, ${update.category.wireName},
+                     ${glicko.rating}, ${glicko.deviation}, ${glicko.volatility}
+              FROM play.bots b WHERE b.team = $team AND b.name = $name
+              ON CONFLICT (team, name, category)
+              DO UPDATE SET rating = EXCLUDED.rating, rd = EXCLUDED.rd, vol = EXCLUDED.vol""".update.run.void
+      case RatedIdentity.User(id) =>
+        sql"""INSERT INTO play.user_ratings (user_id, category, rating, rd, vol)
+              SELECT u.id, ${update.category.wireName},
+                     ${glicko.rating}, ${glicko.deviation}, ${glicko.volatility}
+              FROM play.users u WHERE u.id = $id::uuid
+              ON CONFLICT (user_id, category)
+              DO UPDATE SET rating = EXCLUDED.rating, rd = EXCLUDED.rd, vol = EXCLUDED.vol""".update.run.void
 
   /** The claim stamp, carrying the movement it was stamped for (#296). One statement rather than a second UPDATE on the
     * same row: the numbers and the stamp describe the same event, and a skip passes `None` twice precisely so a skipped
     * game reads back as applied-with-no-movement instead of never-applied.
-    *
-    * The recorded movement is the CATEGORY one since #280 — what `GET /games/{id}/rating` reports has to be the change
-    * on the scale the game actually counted on, which is also the scale the player's profile will show it against. A
-    * game with no category move cannot occur any more (an uncategorised control is casual at creation, and the batch
-    * skips whatever was already queued), so the fall-back to the shared pair exists only so this method stays total;
-    * rows written between V21 and this change carry the shared scale's numbers, which for Blitz — the only category
-    * with meaningful traffic — are the same numbers.
     */
   private def stampApplied(
       gameId: GameId,
       white: Option[RatingUpdate],
       black: Option[RatingUpdate]
   ): ConnectionIO[Unit] =
-    def before(update: Option[RatingUpdate]) = update.map(u => u.category.fold(u.before.rating)(_.before.rating))
-    def after(update: Option[RatingUpdate])  = update.map(u => u.category.fold(u.after.rating)(_.after.rating))
+    def before(update: Option[RatingUpdate]) = update.map(_.before.rating)
+    def after(update: Option[RatingUpdate])  = update.map(_.after.rating)
     sql"""UPDATE play.game_results
           SET rating_applied_at = now(),
               white_rating_before = ${before(white)},
@@ -1399,14 +1370,6 @@ final class PgGameStore private (xa: Transactor[IO])
     // Independent tables, independent reads — combine in parallel so a mixed human-vs-bot game costs one round-trip.
     (users, bots).parMapN(_ ++ _)
 
-  def ratingOf(userId: String): IO[Option[UserRating]] =
-    sql"""SELECT glicko_rating, glicko_rd, glicko_vol FROM play.users WHERE id = $userId::uuid"""
-      .query[(Double, Double, Double)]
-      .option
-      .transact(xa)
-      .timeout(SaveTimeout)
-      .map(_.map(UserRating.apply.tupled))
-
   /** See [[UserStore.updateNickname]]. `now` is sampled once, outside the transaction, so the cooldown check, the
     * write, and the hold/history rows it produces all agree on one instant — the same reason `Retention.tick` samples
     * its own cutoff before touching the database.
@@ -1589,12 +1552,12 @@ object PgGameStore:
               case GameStatus.Ended(_) =>
                 Left(s"ended but missing a player seat (${snapshot.players.keySet}) — investigate")
 
-  /** The `bots` rating projection, in one place: the column list appears in three statements (one read, two updates)
+  /** The `bots` ladder projection, in one place: the column list appears in three statements (one read, two updates)
     * and the tuple shape must not drift between them.
     */
-  private def toBotRating(row: (Double, Double, Double, Boolean, Option[String])): BotRating =
-    val (rating, rd, vol, onLadder, owner) = row
-    BotRating(rating, rd, vol, onLadder, owner)
+  private def toBotRating(row: (Boolean, Option[String])): BotRating =
+    val (onLadder, owner) = row
+    BotRating(onLadder, owner)
 
   private[store] type ResultTuple =
     (String, String, String, Option[Short], String, Boolean, String, String, Option[String], Boolean, Instant)

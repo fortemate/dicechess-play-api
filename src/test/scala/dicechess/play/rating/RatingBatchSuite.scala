@@ -99,15 +99,15 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           id           <- GameId.random
           _            <- db.save(id, endedFixture(alice, bob, rated = true)) // alice (White) wins
           _            <- batch(db).flatMap(_.tick)
-          aliceR       <- db.ratingOf("rb1", "alice").map(_.getOrElse(fail("alice missing")))
-          bobR         <- db.ratingOf("rb1", "bob").map(_.getOrElse(fail("bob missing")))
+          aliceR       <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
+          bobR         <- db.categoryRatingOf(RatedIdentity.of(bob), RatingCategory.Blitz)
           queued       <- stillQueued(db, id)
           _       <- batch(db).flatMap(_.tick) // second tick: nothing left to apply for this game
-          aliceR2 <- db.ratingOf("rb1", "alice").map(_.getOrElse(fail("alice missing")))
+          aliceR2 <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
         yield
-          assert(aliceR.glickoRating > 1500.0, s"the winner must gain: ${aliceR.glickoRating}")
-          assert(bobR.glickoRating < 1500.0, s"the loser must lose: ${bobR.glickoRating}")
-          assert(aliceR.glickoRd < 350.0 && bobR.glickoRd < 350.0, "playing must shrink both RDs")
+          assert(aliceR.rating > 1500.0, s"the winner must gain: ${aliceR.rating}")
+          assert(bobR.rating < 1500.0, s"the loser must lose: ${bobR.rating}")
+          assert(aliceR.deviation < 350.0 && bobR.deviation < 350.0, "playing must shrink both RDs")
           assert(!queued, "an applied game must leave the queue")
           assertEquals(aliceR2, aliceR, "a second tick must not re-apply the same game")
       }
@@ -122,10 +122,10 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           _            <- db.save(id, endedFixture(alice, bob, rated = false))
           queued       <- stillQueued(db, id)
           _            <- batch(db).flatMap(_.tick)
-          aliceR       <- db.ratingOf("rb2", "alice")
+          aliceR       <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
         yield
           assert(!queued, "a casual game must not be queued for rating")
-          assertEquals(aliceR, Some(BotRating.initial), "a casual game must leave the rating untouched")
+          assertEquals(aliceR, Glicko.Initial, "a casual game must leave the rating untouched")
       }
     }
 
@@ -137,22 +137,22 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           id1          <- GameId.random
           _            <- db.save(id1, endedFixture(alice, bob, rated = true))
           _            <- batch(db).flatMap(_.tick) // "before the restart"
-          afterFirst   <- db.ratingOf("rb3", "alice").map(_.getOrElse(fail("alice missing")))
+          afterFirst   <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
           // The "restart": a brand-new batch over the same store — no in-memory cursor to lose (#119's design).
           restarted <- batch(db)
           _         <- restarted.tick
-          replayed  <- db.ratingOf("rb3", "alice").map(_.getOrElse(fail("alice missing")))
+          replayed  <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
           _ = assertEquals(replayed, afterFirst, "a restarted batch must not re-apply an already-stamped game")
           id2    <- GameId.random
           _      <- db.save(id2, endedFixture(bob, alice, rated = true)) // bob (White) wins the second game
           _      <- restarted.tick
           queued <- stillQueued(db, id2)
-          bobR   <- db.ratingOf("rb3", "bob").map(_.getOrElse(fail("bob missing")))
+          bobR   <- db.categoryRatingOf(RatedIdentity.of(bob), RatingCategory.Blitz)
         yield
           assert(!queued, "the restarted batch must apply the new game")
           assert(
-            bobR.glickoRating > 1500.0,
-            s"bob won one of two: his second result must lift him: ${bobR.glickoRating}"
+            bobR.rating > 1500.0,
+            s"bob won one of two: his second result must lift him: ${bobR.rating}"
           )
       }
     }
@@ -166,11 +166,11 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           _          <- db.save(id, endedFixture(Principal.User("rb4-human"), alice, rated = true))
           _          <- batch(db).flatMap(_.tick)
           queued     <- stillQueued(db, id)
-          aliceR     <- db.ratingOf("rb4", "alice")
+          aliceR     <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
           change     <- db.ratingChangeFor(id)
         yield
           assert(!queued, "an unappliable game must still be stamped, or it clogs the queue head forever")
-          assertEquals(aliceR, Some(BotRating.initial), "no rating may change on a skipped game")
+          assertEquals(aliceR, Glicko.Initial, "no rating may change on a skipped game")
           // A skipped game is a FINAL "nobody's rating moved", not a not-yet: a client polling `applied` has to stop
           // here rather than wait for numbers that will never be written (#296).
           assertEquals(change, Some(GameRatingChange(applied = true, white = None, black = None)))
@@ -186,18 +186,18 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           _            <- db.save(id, endedFixture(alice, bob, rated = true)) // alice (White) wins
           _            <- batch(db).flatMap(_.tick)
           change       <- db.ratingChangeFor(id).map(_.getOrElse(fail("a saved game must have a result row")))
-          aliceR       <- db.ratingOf("rb-delta", "alice").map(_.getOrElse(fail("alice missing")))
-          bobR         <- db.ratingOf("rb-delta", "bob").map(_.getOrElse(fail("bob missing")))
+          aliceR       <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
+          bobR         <- db.categoryRatingOf(RatedIdentity.of(bob), RatingCategory.Blitz)
         yield
           assert(change.applied)
           val white = change.white.getOrElse(fail("the winner's movement must be recorded"))
           val black = change.black.getOrElse(fail("the loser's movement must be recorded"))
           // `before` is only knowable while the batch holds it — the instant the transaction commits, the bot's row
           // carries `after` and the pre-game number is gone. That is the whole reason it is written here.
-          assertEquals(white.before, Glicko.Initial.rating, "before is the PRE-game rating of the winning seat")
-          assertEquals(black.before, Glicko.Initial.rating)
-          assertEquals(white.after, aliceR.glickoRating, "after is exactly what landed on the participant's own row")
-          assertEquals(black.after, bobR.glickoRating)
+          assertEquals(white.before, 1500.0, "before is Glickman's default for an unrated bot")
+          assertEquals(black.before, 1500.0)
+          assertEquals(white.after, aliceR.rating, "after is exactly what landed on the participant's own row")
+          assertEquals(black.after, bobR.rating)
           // The property the reported bug violated: a client reading THIS row can never show a winner losing rating.
           assert(white.after > white.before, s"a win can only raise a rating: $white")
           assert(black.after < black.before, s"a loss can only lower one: $black")
@@ -343,13 +343,13 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
               strengthCache = strengthCache
             )
             .flatMap(_.tick)
-          winnerRating <- db.ratingOf(winner.id)
-          loserRating  <- db.ratingOf(loser.id)
+          winnerRating <- db.categoryRatingOf(RatedIdentity.User(winner.id), RatingCategory.Blitz)
+          loserRating  <- db.categoryRatingOf(RatedIdentity.User(loser.id), RatingCategory.Blitz)
           queued       <- stillQueued(db, id)
         yield
-          assert(winnerRating.exists(_.glickoRating > 1500), s"the winner must gain: $winnerRating")
-          assert(loserRating.exists(_.glickoRating < 1500), s"the loser must lose: $loserRating")
-          assert(winnerRating.exists(_.glickoRd < 350), "a played game must shrink the deviation")
+          assert(winnerRating.rating > 1500, s"the winner must gain: $winnerRating")
+          assert(loserRating.rating < 1500, s"the loser must lose: $loserRating")
+          assert(winnerRating.deviation < 350, "a played game must shrink the deviation")
           assert(!queued, "the game must be stamped applied in the same transaction as the two writes")
       }
     }
@@ -366,17 +366,12 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           bobBlitz     <- db.categoryRatingOf(RatedIdentity.of(bob), RatingCategory.Blitz)
           aliceRapid   <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Rapid)
           aliceBullet  <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Bullet)
-          aliceShared  <- db.ratingOf("rb-cat1", "alice").map(_.getOrElse(fail("alice missing")))
         yield
           assert(aliceBlitz.rating > 1500.0, s"the winner must gain on the Blitz scale: $aliceBlitz")
           assert(bobBlitz.rating < 1500.0, s"the loser must lose on the Blitz scale: $bobBlitz")
           assert(aliceBlitz.deviation < 350.0, "playing must shrink the category deviation too")
           assertEquals(aliceRapid, Glicko.Initial, "a Blitz game must leave the Rapid scale untouched")
           assertEquals(aliceBullet, Glicko.Initial, "and the Bullet one")
-          // The transitional invariant phase 2 relies on: with both scales starting from the same fresh state, a
-          // participant that only ever plays one category reads identically on both. Divergence is exactly the
-          // traffic that is NOT in the seeded category.
-          assertEquals(aliceBlitz.rating, aliceShared.glickoRating, "one category of traffic keeps the two in step")
       }
     }
 
@@ -421,13 +416,11 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           // directly is the only way to reproduce it, and the batch must drain it rather than choke on it.
           _      <- db.save(id, endedFixture(alice, bob, rated = true, timeControl = TimeControl.Unlimited))
           _      <- batch(db).flatMap(_.tick)
-          shared <- db.ratingOf("rb-cat3", "alice").map(_.getOrElse(fail("alice missing")))
           blitz  <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Blitz)
           rapid  <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Rapid)
           bullet <- db.categoryRatingOf(RatedIdentity.of(alice), RatingCategory.Bullet)
           queued <- stillQueued(db, id)
         yield
-          assertEquals(shared, BotRating.initial, "no scale may move for a game that belongs to none")
           assertEquals(blitz, Glicko.Initial, "an unbounded game belongs on no category scale")
           assertEquals(rapid, Glicko.Initial)
           assertEquals(bullet, Glicko.Initial)
@@ -479,20 +472,20 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
               strengthCache = strengthCache
             )
             .flatMap(_.tick)
-          playerRating <- db.ratingOf(player.id)
-          first        <- db.ratingOf("rb-mixed", "first")
-          second       <- db.ratingOf("rb-mixed", "second")
+          playerRating <- db.categoryRatingOf(RatedIdentity.User(player.id), RatingCategory.Blitz)
+          first        <- db.categoryRatingOf(RatedIdentity.Bot("rb-mixed", "first"), RatingCategory.Blitz)
+          second       <- db.categoryRatingOf(RatedIdentity.Bot("rb-mixed", "second"), RatingCategory.Blitz)
           firstQueued  <- stillQueued(db, firstGame)
           secondQueued <- stillQueued(db, secondGame)
         yield
           // Two wins for the human: the shift is larger than a single-win test would show, which is itself evidence
           // both games moved the rating rather than one silently sitting out.
           assert(
-            playerRating.exists(_.glickoRating > 1520),
+            playerRating.rating > 1520,
             s"two rated wins must move the rating twice: $playerRating"
           )
-          assert(first.exists(_.glickoRating < 1500), s"the first opponent lost a rated game: $first")
-          assert(second.exists(_.glickoRating < 1500), s"the second opponent lost a rated game too: $second")
+          assert(first.rating < 1500, s"the first opponent lost a rated game: $first")
+          assert(second.rating < 1500, s"the second opponent lost a rated game too: $second")
           assert(!firstQueued && !secondQueued, "both rows are stamped applied")
       }
     }
@@ -524,13 +517,13 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
               strengthCache = strengthCache
             )
             .flatMap(_.tick)
-          botRating   <- db.ratingOf("rb-guest", "opponent")
+          botRating   <- db.categoryRatingOf(RatedIdentity.Bot("rb-guest", "opponent"), RatingCategory.Blitz)
           guestQueued <- stillQueued(db, guestGame)
           ghostQueued <- stillQueued(db, ghostGame)
         yield
           assertEquals(
-            botRating.map(_.glickoRating),
-            Some(1500.0),
+            botRating,
+            Glicko.Initial,
             "neither a guest nor a vanished account may move a bot's rating"
           )
           assert(!guestQueued, "the guest game is stamped applied, not left at the head of the queue")
@@ -562,19 +555,19 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
               strengthCache = strengthCache
             )
             .flatMap(_.tick)
-          mine     <- db.ratingOf("rb-own", "mine")
-          theirs   <- db.ratingOf("rb-own", "theirs")
-          player   <- db.ratingOf(owner.id)
+          mine     <- db.categoryRatingOf(RatedIdentity.Bot("rb-own", "mine"), RatingCategory.Blitz)
+          theirs   <- db.categoryRatingOf(RatedIdentity.Bot("rb-own", "theirs"), RatingCategory.Blitz)
+          player   <- db.categoryRatingOf(RatedIdentity.User(owner.id), RatingCategory.Blitz)
           ownStill <- stillQueued(db, ownGame)
         yield
           assertEquals(
-            mine.map(_.glickoRating),
-            Some(1500.0),
+            mine,
+            Glicko.Initial,
             "beating your own bot must move nothing — that is farming with extra steps"
           )
-          assert(theirs.exists(_.glickoRating < 1500), s"someone else's bot still counts: $theirs")
+          assert(theirs.rating < 1500, s"someone else's bot still counts: $theirs")
           // The player gained from the stranger's bot only, so a single win's worth — not two.
-          assert(player.exists(_.glickoRating > 1500), s"the legitimate game still rated: $player")
+          assert(player.rating > 1500, s"the legitimate game still rated: $player")
           assert(!ownStill, "the skipped game is stamped applied, not left clogging the queue")
       }
     }
@@ -718,7 +711,6 @@ class RatingBatchResilienceSuite extends CatsEffectSuite:
       IO.raiseError(AssertionError("unused"))
     def userById(id: String): IO[Option[UserAccount]]                        = IO.pure(None)
     def byNickname(nickname: String): IO[Option[UserAccount]]                = IO.pure(None)
-    def ratingOf(userId: String): IO[Option[UserRating]]                     = IO.pure(None)
     def updateNickname(userId: String, nickname: String): IO[NicknameUpdate] = IO.raiseError(AssertionError("unused"))
     def linkGuest(userId: String, guestId: String): IO[GuestLink]            = IO.raiseError(AssertionError("unused"))
     def guestsOf(userId: String): IO[List[String]]                           = IO.pure(Nil)
@@ -988,7 +980,7 @@ class RatingEligibilitySuite extends munit.FunSuite:
   private val userB = "0197f0a0-0000-7000-8000-0000000000b2"
 
   private def account(id: String): RatingBatch.Participant =
-    RatingBatch.Participant.OfUser(id, UserRating.initial)
+    RatingBatch.Participant.OfUser(id)
 
   private def bot(name: String, owner: Option[String] = None): RatingBatch.Participant =
     RatingBatch.Participant.OfBot(Principal.Bot("acme", name), BotRating.initial.copy(ownerExternalId = owner))

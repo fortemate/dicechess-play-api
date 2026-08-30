@@ -2,7 +2,7 @@ package dicechess.play.server
 
 import cats.effect.{IO, Ref}
 import cats.syntax.all.*
-import dicechess.play.store.{BotStore, GuestLink, NicknameUpdate, UserAccount, UserRating, UserStore}
+import dicechess.play.store.{BotStore, GuestLink, NicknameUpdate, UserAccount, UserStore}
 import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.implicits.*
 import org.http4s.{AuthScheme, Credentials, HttpApp, Method, Request, RequestCookie, Status}
@@ -33,7 +33,6 @@ class OwnerBotRoutesSuite extends munit.CatsEffectSuite:
       }
     def userById(id: String): IO[Option[UserAccount]]                        = ref.get.map(_.values.find(_.id == id))
     def byNickname(nickname: String): IO[Option[UserAccount]]                = IO.pure(None)
-    def ratingOf(userId: String): IO[Option[UserRating]]                     = IO.pure(None)
     def updateNickname(userId: String, nickname: String): IO[NicknameUpdate] = IO.raiseError(AssertionError("unused"))
     def linkGuest(userId: String, guestId: String): IO[GuestLink]            = IO.raiseError(AssertionError("unused"))
     def guestsOf(userId: String): IO[List[String]]                           = IO.pure(Nil)

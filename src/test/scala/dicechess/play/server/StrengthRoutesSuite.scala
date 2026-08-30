@@ -84,7 +84,7 @@ class StrengthRoutesSuite extends munit.CatsEffectSuite:
       .map(resp => assertEquals(resp.status, Status.NotFound))
 
   test("GET /bots/{team}/{name}/strength is 503 for a registered bot before the cache has ever been warmed"):
-    app(bots = Map(("acme", "alice") -> BotRating(1650.0, 95.0, 0.058, onLadder = true, None)))
+    app(bots = Map(("acme", "alice") -> BotRating(onLadder = true, None)))
       .run(Request[IO](Method.GET, uri"/bots/acme/alice/strength"))
       .map(resp => assertEquals(resp.status, Status.ServiceUnavailable))
 
@@ -98,7 +98,7 @@ class StrengthRoutesSuite extends munit.CatsEffectSuite:
     )
     val report  = sampleReport.copy(pairwise = List(aliceVsBob, carolVsDave))
     val service = app(
-      bots = Map(("acme", "alice") -> BotRating(1650.0, 95.0, 0.058, onLadder = true, None)),
+      bots = Map(("acme", "alice") -> BotRating(onLadder = true, None)),
       report = Some(report)
     )
     service.run(Request[IO](Method.GET, uri"/bots/acme/alice/strength")).flatMap { resp =>

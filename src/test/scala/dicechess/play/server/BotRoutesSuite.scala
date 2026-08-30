@@ -173,8 +173,8 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
         anonNo   <- service.run(request(Method.POST, uri"/bot/ladder/join", Some(anon.token))).map(_.status)
         staticNo <- service.run(request(Method.POST, uri"/bot/ladder/join", Some("tok-alice"))).map(_.status)
       yield
-        assertEquals(joined, LadderStatus(onLadder = true, glickoRating = 1500.0, glickoRd = 350.0))
-        assertEquals(left, LadderStatus(onLadder = false, glickoRating = 1500.0, glickoRd = 350.0))
+        assertEquals(joined, LadderStatus(onLadder = true))
+        assertEquals(left, LadderStatus(onLadder = false))
         assertEquals(anonNo, Status.Forbidden)
         assertEquals(staticNo, Status.Forbidden)
 
@@ -1043,7 +1043,6 @@ final private class OwnerStubUsers(ref: cats.effect.Ref[IO, Map[String, diceches
     }
   def userById(id: String): IO[Option[UserAccount]]                        = ref.get.map(_.values.find(_.id == id))
   def byNickname(nickname: String): IO[Option[UserAccount]]                = IO.pure(None)
-  def ratingOf(userId: String): IO[Option[UserRating]]                     = IO.pure(None)
   def updateNickname(userId: String, nickname: String): IO[NicknameUpdate] = IO.raiseError(AssertionError("unused"))
   def linkGuest(userId: String, guestId: String): IO[GuestLink]            = IO.raiseError(AssertionError("unused"))
   def guestsOf(userId: String): IO[List[String]]                           = IO.pure(Nil)

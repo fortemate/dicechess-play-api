@@ -12,7 +12,6 @@ import dicechess.play.store.{
   OpponentFilter,
   PovResultFilter,
   UserAccount,
-  UserRating,
   UserStore
 }
 import org.http4s.circe.CirceEntityCodec.given
@@ -58,8 +57,6 @@ class MeRoutesSuite extends munit.CatsEffectSuite:
     def userById(id: String): IO[Option[UserAccount]]         = ref.get.map(_.values.find(_.id == id))
     def byNickname(nickname: String): IO[Option[UserAccount]] =
       ref.get.map(_.values.find(_.nickname.equalsIgnoreCase(nickname)))
-    def ratingOf(userId: String): IO[Option[UserRating]] =
-      ref.get.map(_.values.find(_.id == userId).map(_ => UserRating.initial))
     def updateNickname(userId: String, nickname: String): IO[NicknameUpdate] = IO.raiseError(AssertionError("unused"))
     def linkGuest(userId: String, guestId: String): IO[GuestLink]            =
       ref.get.flatMap { users =>

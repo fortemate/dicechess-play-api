@@ -18,19 +18,6 @@ final case class UserAccount(
     isActive: Boolean
 )
 
-/** An account's Glicko-2 state (#247, ADR-0017) — the human half of the ONE shared scale bots already live on, which is
-  * why the triple is identical to [[BotRating]]'s and seeded from the same defaults. No `onLadder` counterpart: a
-  * person is not scheduled into games by the server.
-  */
-final case class UserRating(glickoRating: Double, glickoRd: Double, glickoVol: Double):
-  /** The pure-math view, exactly as `Glicko2.update` consumes and produces it. */
-  def glicko: dicechess.play.rating.Glicko =
-    dicechess.play.rating.Glicko(rating = glickoRating, deviation = glickoRd, volatility = glickoVol)
-
-object UserRating:
-  /** A fresh account's starting state — Glickman's defaults for an unrated player, same as `BotRating.initial`. */
-  val initial: UserRating = UserRating(glickoRating = 1500, glickoRd = 350, glickoVol = 0.06)
-
 /** The ways a nickname change can land (#275). `Taken` and `Held` are kept status-for-status indistinguishable at the
   * route (both a plain 409) on purpose: telling a caller "that name is on hold" rather than "that name is taken" would
   * itself be a membership oracle, leaking that a specific name was recently vacated. `CooldownActive` carries how long
@@ -84,11 +71,6 @@ trait UserStore:
     * what one player can actually type after seeing another across a board.
     */
   def byNickname(nickname: String): IO[Option[UserAccount]]
-
-  /** An account's rating state (#247). Separate from [[userById]] because the two have different readers: every
-    * authenticated request needs the account, only rating-aware surfaces need the triple. `None` for an unknown id.
-    */
-  def ratingOf(userId: String): IO[Option[UserRating]]
 
   /** Display names for ACCOUNT external ids (`user:<uuid>`), so a registered opponent shows a nickname instead of
     * "Anonymous" on seats, seek offers, replays and history (#194 step 4). Batched because every caller resolves a

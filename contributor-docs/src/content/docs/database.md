@@ -48,14 +48,12 @@ idempotency UUID, so a duplicate POST answers `200` without overwriting the firs
 ### `bots` — durable identity plus ladder state
 
 A bot's identity survives restarts here. Only a **hash** of the bearer token is stored, with a
-unique constraint so one token maps to exactly one identity. The same row carries the Glicko-2
-triple (`glicko_rating`, `glicko_rd`, `glicko_vol`, seeded at 1500 / 350 / 0.06), the
-`on_ladder` flag, and the human-facing catalog opt-in (`open_to_humans`, `description`).
-Primary key is `(team, name)`. The Glicko triple here is the single scale across every speed;
-`bot_ratings` (V21) is the per-category one being grown beside it.
+unique constraint so one token maps to exactly one identity. The same row carries the
+`on_ladder` flag, the owner account (`owner_external_id`), and the human-facing catalog opt-in
+(`open_to_humans`, `description`). Primary key is `(team, name)`. Ratings live in `bot_ratings`
+per category.
 
-`rated_for_humans` (V15) is a dead column kept in place by the no-drop rule — no migration has
-ever dropped a column, and none will start now. It is no longer selected by any query. The
+`rated_for_humans` is a legacy column no longer selected by any query. The
 curation model it embodied was superseded by #279: rated play is now a player choice at game or
 seek creation, and the anti-farming guarantee moved into the rating batch itself
 (`RatingBatch.applyGame`: a guest seat is never rated; an account vs a bot it **owns** never
@@ -162,14 +160,7 @@ can never be forked or reassigned by anything a login provider controls. The nic
 only public-facing field; uniqueness is case-insensitive via a functional index on
 `lower(nickname)` (no `citext` extension to install). `is_active` is a kill switch re-checked
 on every authenticated request, because the session token is deliberately never trusted for
-authorization state.
-
-Rating state (V15) lives on this row too — `glicko_rating`, `glicko_rd`, `glicko_vol`, seeded 1500 / 350 /
-0.06. The types and seeds are **identical to `bots`** on purpose: accounts and bots share ONE Glicko-2 scale,
-which is what makes "who is strongest" answerable across both and what solves cold start, since
-human-vs-human traffic is thin while bots are always available to be measured against. There is no
-`on_ladder` counterpart — a person is not scheduled into games by the server. As on `bots`, this is
-the all-speeds scale; `user_ratings` (V21) is its per-category successor.
+authorization state. Ratings live in `user_ratings` per category.
 
 ### `user_identities` — login methods, keyed by `(provider, subject)`
 
@@ -192,14 +183,8 @@ away with the account, freeing the guest id for a future claim.
 ### `bot_ratings` / `user_ratings` — one Glicko-2 state per speed (#280)
 
 Bullet / Blitz / Rapid, keyed by estimated game duration. **These are the live scales**: every
-public response reads them since phase 2, and the single-scale `glicko_*` columns on `bots` and
-`users` are read by nothing.
-
-Those columns are still *written* by the batch, though, and that is deliberate rather than an
-oversight to tidy up. While they exist they have to stay current: rolling the release back would
-otherwise resume from a scale with a hole in it exactly the size of the time it was deployed.
-They are dropped — together with the batch's dual write — in a follow-up migration once the
-cutover has been observed in production.
+public response reads them, and per-category rating is the only rating system. The legacy single-scale
+`glicko_*` columns on `bots` and `users` and the batch's dual-write were dropped in migration `V2` (#9).
 
 The tables are **sparse**: a row exists only for a `(participant, category)` pair that has
 actually been rated, and an absent row *is* the fresh state 1500 / 350 / 0.06 — the same seeds

@@ -90,13 +90,12 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   /** Accounts, for the human half of the board and the public profile (#249). Only the two reads those surfaces make
     * are implemented; anything else would be a test reaching where it should not.
     */
-  private def stubUsers(accounts: List[UserAccount], ratings: Map[String, UserRating]): UserStore = new UserStore:
+  private def stubUsers(accounts: List[UserAccount]): UserStore = new UserStore:
     def upsertOnLogin(p: String, s: String, e: Option[String], n: IO[String]): IO[UserAccount] =
       IO.raiseError(AssertionError("unused"))
     def userById(id: String): IO[Option[UserAccount]]         = IO.pure(accounts.find(_.id == id))
     def byNickname(nickname: String): IO[Option[UserAccount]] =
       IO.pure(accounts.find(_.nickname.equalsIgnoreCase(nickname)))
-    def ratingOf(userId: String): IO[Option[UserRating]]                     = IO.pure(ratings.get(userId))
     def updateNickname(userId: String, nickname: String): IO[NicknameUpdate] = IO.raiseError(AssertionError("unused"))
     def linkGuest(userId: String, guestId: String): IO[GuestLink]            = IO.raiseError(AssertionError("unused"))
     def guestsOf(userId: String): IO[List[String]]                           = IO.raiseError(AssertionError("unused"))
@@ -110,7 +109,6 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       opponents: Map[String, List[OpponentAggregateRow]] = Map.empty,
       players: List[PlayerLeaderboardEntry] = Nil,
       accounts: List[UserAccount] = Nil,
-      playerRatings: Map[String, UserRating] = Map.empty,
       // `entries`/`players` above are the DEFAULT category's board; these two add the other scales, so a test can
       // assert that `?category=` actually selects one (#280).
       entriesByCategory: Map[RatingCategory, List[LeaderboardEntry]] = Map.empty,
@@ -128,7 +126,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       ),
       stubResults(recent, opponents),
       stubRatings(ratings),
-      users = Some(stubUsers(accounts, playerRatings))
+      users = Some(stubUsers(accounts))
     ).orNotFound
 
   private val at = Instant.parse("2026-07-16T12:00:00Z")
@@ -190,7 +188,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       OpponentAggregateRow(None, games = 4, wins = 3, draws = 0, losses = 1, lastPlayedAt = at)
     )
     val service = app(
-      bots = Map(("acme", "alice") -> BotRating(1650.0, 95.0, 0.058, onLadder = true, None)),
+      bots = Map(("acme", "alice") -> BotRating(onLadder = true, None)),
       // Two scales, one of them provisional: the profile must report each on its own terms rather than collapsing
       // them (#280). Blitz is the default, so it is also what the scalar fields above describe.
       ratings = Map(
@@ -243,7 +241,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
 
   test("a provisional bot is absent from the board but visible — flagged — on its own profile"):
     val service = app(
-      bots = Map(("acme", "newbie") -> BotRating(1500.0, 350.0, 0.06, onLadder = true, None)),
+      bots = Map(("acme", "newbie") -> BotRating(onLadder = true, None)),
       entries = List(LeaderboardEntry("acme", "newbie", 1500.0, 350.0, onLadder = true, ResultTally.Empty)),
       ratings = Map(RatedIdentity.Bot("acme", "newbie") -> Map(RatingCategory.Blitz -> Glicko.Initial))
     )
@@ -292,7 +290,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
 
   test("a profile reports a category it has never played by ABSENCE, not by a 1500 nobody measured (#280)"):
     val service = app(
-      bots = Map(("acme", "onespeed") -> BotRating(1700.0, 60.0, 0.05, onLadder = true, None)),
+      bots = Map(("acme", "onespeed") -> BotRating(onLadder = true, None)),
       ratings = Map(RatedIdentity.Bot("acme", "onespeed") -> Map(RatingCategory.Blitz -> Glicko(1700.0, 60.0, 0.05))),
       categoryTallies =
         Map(Principal.Bot("acme", "onespeed").externalId -> Map(RatingCategory.Blitz -> ResultTally(8, 0, 2)))
@@ -304,7 +302,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     }
 
   test("a bot with no rated game anywhere is still a 200 with an empty ratings list, not a 404 (#280)"):
-    val service = app(bots = Map(("acme", "unplayed") -> BotRating(1500.0, 350.0, 0.06, onLadder = false, None)))
+    val service = app(bots = Map(("acme", "unplayed") -> BotRating(onLadder = false, None)))
     service.run(Request[IO](Method.GET, uri"/bots/acme/unplayed")).flatMap { resp =>
       assertEquals(resp.status, Status.Ok, "registration is what makes a bot exist, not having played")
       resp.as[BotProfile].map { profile =>
@@ -352,7 +350,6 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       recent = Map(me -> List(row("g-p1", me, alice.externalId, result = Some(1)))),
       opponents = Map(me -> List(OpponentAggregateRow(Some(alice.externalId), 3, 2, 0, 1, at))),
       accounts = List(account),
-      playerRatings = Map(account.id -> UserRating(1600.0, 90.0, 0.06)),
       ratings = Map(RatedIdentity.User(account.id) -> Map(RatingCategory.Blitz -> Glicko(1600.0, 90.0, 0.06))),
       categoryTallies = Map(me -> Map(RatingCategory.Blitz -> ResultTally(9, 1, 5)))
     )

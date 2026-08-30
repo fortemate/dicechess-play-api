@@ -57,7 +57,7 @@ final case class BotRegistered(token: String, team: String, name: String, id: St
 final case class RotatedToken(token: String) derives Codec.AsObject
 
 /** The caller's rating-ladder state after `POST /bot/ladder/join` or `/leave`. */
-final case class LadderStatus(onLadder: Boolean, glickoRating: Double, glickoRd: Double) derives Codec.AsObject
+final case class LadderStatus(onLadder: Boolean) derives Codec.AsObject
 
 /** `POST /bot/open-to-humans` body — optional: a catalog description to set while opening the bot (ADR-0014). */
 final case class SetOpenToHumans(description: Option[String] = None) derives Codec.AsObject:
@@ -478,7 +478,7 @@ object BotRoutes:
     auth
       .setOnLadder(bot, onLadder)
       .flatMap:
-        case Some(rating) => Ok(LadderStatus(rating.onLadder, rating.glickoRating, rating.glickoRd))
+        case Some(rating) => Ok(LadderStatus(rating.onLadder))
         case None         => Forbidden("only a registered bot can join the rating ladder")
 
   /** `POST /bot/open-to-humans` — opt in and (re)set the catalog description in one atomic write. A blank body means

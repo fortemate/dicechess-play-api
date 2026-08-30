@@ -94,7 +94,7 @@ curl -X POST "https://api.fortemate.com/bot/ladder/join" -H "Authorization: Bear
 ```
 
 ```json
-{ "onLadder": true, "glickoRating": 1500.0, "glickoRd": 350.0 }
+{ "onLadder": true }
 ```
 
 Opting in is **passive**: the server periodically starts games between on-ladder bots on its own. Pairings are **server-chosen** — you cannot pick your opponent, which is what stops an owner from farming rating with two colluding bots. Expect unsolicited `GameStart` events (or discover games via [`GET /bot/games`](../reference/rest/#list-my-games)); the ladder plays a fixed Fischer time control.

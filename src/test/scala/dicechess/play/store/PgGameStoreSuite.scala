@@ -1958,23 +1958,21 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
 
   // ── Rating state for accounts ──────────────────────────────────────────────
 
-  test("a fresh account starts on the same Glicko seeds as a fresh bot"):
+  test("a fresh account and bot start on Glicko.Initial for any category (#280)"):
     withContainers { pg =>
       store(pg).use { db =>
         for
           user       <- db.upsertOnLogin("google", "sub-rating-seed", None, IO.pure("SeedNick"))
-          userRating <- db.ratingOf(user.id)
+          userRating <- db.categoryRatingOf(RatedIdentity.User(user.id), RatingCategory.Blitz)
           _          <- db.register("rating-team", "seed-bot", "hash-rating-seed")
-          botRating  <- db.ratingOf("rating-team", "seed-bot")
-          missing    <- db.ratingOf(UUID.randomUUID().toString)
+          botRating  <- db.categoryRatingOf(RatedIdentity.Bot("rating-team", "seed-bot"), RatingCategory.Blitz)
         yield
-          assertEquals(userRating, Some(UserRating.initial), "1500/350/0.06 — the same seeds V4 gave bots")
+          assertEquals(userRating, Glicko.Initial, "1500/350/0.06 initial Glicko state")
           assertEquals(
-            userRating.map(_.glicko),
-            botRating.map(_.glicko),
-            "one shared scale: an account and a bot must start from the identical pure-math state"
+            userRating,
+            botRating,
+            "both populations start from the identical pure-math state"
           )
-          assertEquals(missing, None)
       }
     }
 
@@ -2235,12 +2233,11 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
     }
 
   /** One participant's rating forced to a chosen value through the production write path — the only way to set one
-    * outside the batch. Both scales get it (#280): the shared columns because they are still written, and
-    * `RatingCategory.Default` because that is what every reader in this suite now looks at.
+    * outside the batch.
     */
   private def seeded(identity: RatedIdentity, rating: Double, rd: Double): RatingUpdate =
     val after = Glicko(rating, rd, 0.05)
-    RatingUpdate(identity, Glicko.Initial, after, Some(CategoryMove(RatingCategory.Default, Glicko.Initial, after)))
+    RatingUpdate(identity, RatingCategory.Default, Glicko.Initial, after)
 
   private def sha256Hex(hexSeed: String): String =
     val bytes = hexSeed.grouped(2).map(p => Integer.parseInt(p, 16).toByte).toArray
@@ -2250,21 +2247,20 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
     withContainers { pg =>
       store(pg).use { db =>
         // The race `DELETE /auth/me` opens: the batch resolves a participant in one transaction and writes in the
-        // next. `updateGlicko`'s UPDATE has always degraded to zero rows here; the per-category INSERT must too, or
-        // the foreign key aborts the transaction, the game is never stamped, and — `drainQueue` having no per-row
-        // recovery — it fails at the head of the queue on every tick from then on, for an account never coming back.
+        // next. The per-category INSERT must degrade to zero rows here, or the foreign key aborts the transaction, the
+        // game is never stamped, and — `drainQueue` having no per-row recovery — it fails at the head of the queue on
+        // every tick from then on, for an account never coming back.
         val ghostId            = "0197f0a0-0000-7000-8000-0000000002b7"
         val bot: Principal.Bot = Principal.Bot("gone-team", "gone-bot")
-        val move               = (before: Double, after: Double) =>
-          Some(CategoryMove(RatingCategory.Blitz, Glicko(before, 200, 0.06), Glicko(after, 190, 0.06)))
+        val move               = (after: Double) => Glicko(after, 190, 0.06)
         for
           _  <- db.register(bot.team, bot.name, "hash-gone-bot")
           id <- GameId.random
           _  <- db.save(id, endedResultFixture(Principal.User(ghostId), bot, rated = true))
           _  <- db.applyRatingUpdate(
             id,
-            RatingUpdate(RatedIdentity.User(ghostId), Glicko.Initial, Glicko.Initial, move(1500, 1520)),
-            RatingUpdate(RatedIdentity.of(bot), Glicko.Initial, Glicko.Initial, move(1500, 1480))
+            RatingUpdate(RatedIdentity.User(ghostId), RatingCategory.Blitz, Glicko(1500, 200, 0.06), move(1520)),
+            RatingUpdate(RatedIdentity.of(bot), RatingCategory.Blitz, Glicko(1500, 200, 0.06), move(1480))
           )
           ghost    <- db.categoryRatingOf(RatedIdentity.User(ghostId), RatingCategory.Blitz)
           survivor <- db.categoryRatingOf(RatedIdentity.of(bot), RatingCategory.Blitz)
@@ -2321,15 +2317,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           stamp2 <- GameId.random
           rapidW = RatingUpdate(
             RatedIdentity.of(fast),
+            RatingCategory.Rapid,
             Glicko.Initial,
-            Glicko.Initial,
-            Some(CategoryMove(RatingCategory.Rapid, Glicko.Initial, Glicko(1660.0, 70.0, 0.05)))
+            Glicko(1660.0, 70.0, 0.05)
           )
           rapidB = RatingUpdate(
             RatedIdentity.of(slow),
+            RatingCategory.Rapid,
             Glicko.Initial,
-            Glicko.Initial,
-            Some(CategoryMove(RatingCategory.Rapid, Glicko.Initial, Glicko(1440.0, 75.0, 0.05)))
+            Glicko(1440.0, 75.0, 0.05)
           )
           _ <- db.applyRatingUpdate(stamp2, rapidW, rapidB)
           // Two Blitz wins for `fast`, one Rapid win for `slow` — three rated games, two different scales.

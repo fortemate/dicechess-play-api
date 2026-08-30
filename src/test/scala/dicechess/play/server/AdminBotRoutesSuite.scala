@@ -12,7 +12,6 @@ import dicechess.play.store.{
   GuestLink,
   NicknameUpdate,
   UserAccount,
-  UserRating,
   UserStore
 }
 import org.http4s.circe.CirceEntityCodec.given
@@ -43,7 +42,6 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       }
     def userById(id: String): IO[Option[UserAccount]]                        = ref.get.map(_.values.find(_.id == id))
     def byNickname(nickname: String): IO[Option[UserAccount]]                = IO.pure(None)
-    def ratingOf(userId: String): IO[Option[UserRating]]                     = IO.pure(None)
     def updateNickname(userId: String, nickname: String): IO[NicknameUpdate] = IO.raiseError(AssertionError("unused"))
     def linkGuest(userId: String, guestId: String): IO[GuestLink]            = IO.raiseError(AssertionError("unused"))
     def guestsOf(userId: String): IO[List[String]]                           = IO.pure(Nil)

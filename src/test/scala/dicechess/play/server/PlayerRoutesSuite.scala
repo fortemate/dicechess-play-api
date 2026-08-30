@@ -73,7 +73,6 @@ class PlayerRoutesSuite extends munit.CatsEffectSuite:
       IO.raiseError(AssertionError("unused"))
     def userById(id: String): IO[Option[UserAccount]]                        = IO.pure(None)
     def byNickname(nickname: String): IO[Option[UserAccount]]                = IO.pure(None)
-    def ratingOf(userId: String): IO[Option[UserRating]]                     = IO.pure(None)
     def updateNickname(userId: String, nickname: String): IO[NicknameUpdate] = IO.raiseError(AssertionError("unused"))
     def linkGuest(userId: String, guestId: String): IO[GuestLink]            = IO.raiseError(AssertionError("unused"))
     def guestsOf(userId: String): IO[List[String]]                           = IO.pure(Nil)

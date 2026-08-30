@@ -8,13 +8,11 @@ import dicechess.play.ingest.PlaysiteIngest
 import dicechess.play.store.{
   BotRating,
   BotStore,
-  CategoryMove,
   GameResultRow,
   GameResultsStore,
   RatedIdentity,
   RatingStore,
   RatingUpdate,
-  UserRating,
   UserStore
 }
 
@@ -159,16 +157,14 @@ final class RatingBatch private (
             case (None, None) =>
               skip(row, s"uncategorised time control '${row.timeControl}' belongs to no rating scale")
             case (None, Some(category)) =>
-              val whiteNew = Glicko2.update(w.glicko, List(Glicko2.Result(b.glicko, whiteScore)))
-              val blackNew = Glicko2.update(b.glicko, List(Glicko2.Result(w.glicko, blackScore)))
-              categoryMoves(category, w, b, whiteScore, blackScore).flatMap: (whiteCategory, blackCategory) =>
+              ratingUpdates(category, w, b, whiteScore, blackScore).flatMap: (whiteUpdate, blackUpdate) =>
                 // Both states travel to the store, not just the new one (#296): the movement is recorded on the
                 // game's own row, and `before` is only knowable here — the moment after this write, the tables carry
                 // `after`.
                 ratingStore.applyRatingUpdate(
                   row.gameId,
-                  RatingUpdate(w.identity, w.glicko, whiteNew, Some(whiteCategory)),
-                  RatingUpdate(b.identity, b.glicko, blackNew, Some(blackCategory))
+                  whiteUpdate,
+                  blackUpdate
                 ) *>
                   parkIfOnLadder(w, row) *> parkIfOnLadder(b, row)
         case (Some(_), Some(_), None) => skip(row, "no definite result")
@@ -178,37 +174,31 @@ final class RatingBatch private (
           skip(row, "a participant has no rating state (a guest, an unregistered bot, or a deleted account)")
     }
 
-  /** The per-category half of one game's rating write (#280): the same Glicko-2 step, run again on the scale the game's
-    * own time control belongs to, against both seats' PRE-game state on THAT scale.
-    *
-    * A second full update rather than a reuse of the shared-scale numbers, because the two scales are different states:
-    * seeded games-based (V21), a ladder bot's Blitz state starts equal to its shared one and stays equal for as long as
-    * only Blitz games are rated, while everything else diverges from the first game it plays elsewhere. Reading both
-    * `before` states is what makes the pair a real Glicko-2 update rather than a copy of one.
-    *
-    * The shared scale is still written beside it, unread by anything since #280's cutover, and deliberately so until
-    * the follow-up migration drops those columns: while they exist they must stay current, or rolling this release back
-    * would resume from a scale with a hole in it exactly the size of the time it was deployed.
+  /** The Glicko-2 rating update for one game (#280) on the scale the game's own time control belongs to, against both
+    * seats' PRE-game state on THAT scale.
     */
-  private def categoryMoves(
+  private def ratingUpdates(
       category: RatingCategory,
       white: RatingBatch.Participant,
       black: RatingBatch.Participant,
       whiteScore: Double,
       blackScore: Double
-  ): IO[(CategoryMove, CategoryMove)] =
+  ): IO[(RatingUpdate, RatingUpdate)] =
     (
       ratingStore.categoryRatingOf(white.identity, category),
       ratingStore.categoryRatingOf(black.identity, category)
       // `parMapN`, the `PgGameStore.settledRatingsByExternalId` precedent: two independent point reads, possibly in
       // different tables, so a mixed human-vs-bot game costs one round trip rather than two. Reading outside the
-      // write transaction is safe for the same reason the shared scale's read is — the batch is a single writer.
+      // write transaction is safe — the batch is a single writer.
     ).parMapN: (whiteBefore, blackBefore) =>
-      def move(before: Glicko, opponent: Glicko, score: Double) =
-        CategoryMove(category, before, Glicko2.update(before, List(Glicko2.Result(opponent, score))))
-      (move(whiteBefore, blackBefore, whiteScore), move(blackBefore, whiteBefore, blackScore))
+      def update(identity: RatedIdentity, before: Glicko, opponent: Glicko, score: Double) =
+        RatingUpdate(identity, category, before, Glicko2.update(before, List(Glicko2.Result(opponent, score))))
+      (
+        update(white.identity, whiteBefore, blackBefore, whiteScore),
+        update(black.identity, blackBefore, whiteBefore, blackScore)
+      )
 
-  /** Resolve one stored external id into the rating state behind it, or `None` when it has none — a guest, an
+  /** Resolve one stored external id into the participant behind it, or `None` when it has none — a guest, an
     * anonymous/unregistered bot, or an account that has since been deleted (#237 makes that reachable: the id stays in
     * `game_results` forever, resolving to nothing).
     */
@@ -218,8 +208,9 @@ final class RatingBatch private (
         botStore.ratingOf(bot.team, bot.name).map(_.map(RatingBatch.Participant.OfBot(bot, _)))
       case None =>
         Principal.fromUserExternalId(externalId) match
-          case Some(userId) => userStore.ratingOf(userId).map(_.map(RatingBatch.Participant.OfUser(userId, _)))
-          case None         => IO.pure(None)
+          case Some(userId) =>
+            userStore.userById(userId).map(_.filter(_.isActive).map(_ => RatingBatch.Participant.OfUser(userId)))
+          case None => IO.pure(None)
 
   /** The ladder auto-park check (#150) applies to bots only: a human losing on time is a human losing on time, not a
     * dead endpoint to take off the pairing pool.
@@ -227,7 +218,7 @@ final class RatingBatch private (
   private def parkIfOnLadder(participant: RatingBatch.Participant, row: GameResultRow): IO[Unit] =
     participant match
       case RatingBatch.Participant.OfBot(bot, rating) => parkIfStreakReached(bot, row, rating.onLadder)
-      case RatingBatch.Participant.OfUser(_, _)       => IO.unit
+      case RatingBatch.Participant.OfUser(_)          => IO.unit
 
   /** The auto-park check for one participant of a just-applied game (#150).
     *
@@ -276,20 +267,15 @@ final class RatingBatch private (
 
 object RatingBatch:
 
-  /** One seat's rating state, whichever population it belongs to (#248) — the batch's uniform view over the two, since
-    * they share one scale and differ only in which row a write lands on.
+  /** One seat's identity and ladder/owner state (#248).
     */
   private[rating] enum Participant:
     case OfBot(bot: Principal.Bot, rating: BotRating)
-    case OfUser(userId: String, rating: UserRating)
+    case OfUser(userId: String)
 
     def identity: RatedIdentity = this match
-      case OfBot(bot, _)     => RatedIdentity.of(bot)
-      case OfUser(userId, _) => RatedIdentity.User(userId)
-
-    def glicko: Glicko = this match
-      case OfBot(_, rating)  => rating.glicko
-      case OfUser(_, rating) => rating.glicko
+      case OfBot(bot, _)  => RatedIdentity.of(bot)
+      case OfUser(userId) => RatedIdentity.User(userId)
 
   /** Why this pairing may NOT move a rating, or `None` when it may. Pure, so the whole policy matrix is testable
     * without a database — and symmetric, so a rule cannot apply to White but not Black.

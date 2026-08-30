@@ -185,7 +185,7 @@ object AdminBotRoutes:
 
   private def respondLadder(state: IO[Option[BotRating]]): IO[Response[IO]] =
     state.flatMap:
-      case Some(r) => Ok(LadderStatus(r.onLadder, r.glickoRating, r.glickoRd))
+      case Some(r) => Ok(LadderStatus(r.onLadder))
       case None    => noSuchBot
 
   private def respondCatalog(state: IO[Option[BotCatalogState]]): IO[Response[IO]] =

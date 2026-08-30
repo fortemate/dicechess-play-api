@@ -176,29 +176,16 @@ trait RetentionStore:
     */
   def pruneOnce(olderThan: java.time.Instant, limit: Int): IO[RetentionSweep]
 
-/** A registered bot's rating-ladder state (#100): Glicko-2 parameters plus whether it has opted into the ladder, and a
-  * forward-looking owner slot for when human accounts arrive (always `None` today — nothing populates it yet; adding
-  * the column now avoids a later migration).
+/** A registered bot's ladder opt-in state (#100) and owner account (#253).
   */
 final case class BotRating(
-    glickoRating: Double,
-    glickoRd: Double,
-    glickoVol: Double,
     onLadder: Boolean,
     ownerExternalId: Option[String]
-):
-  /** The pure-math view of this state, as `Glicko2.update` consumes and produces it. */
-  def glicko: dicechess.play.rating.Glicko =
-    dicechess.play.rating.Glicko(rating = glickoRating, deviation = glickoRd, volatility = glickoVol)
+)
 
 object BotRating:
-  /** A freshly registered bot's starting state: Glickman's suggested defaults for a new, unrated player, opted out of
-    * the ladder until explicitly turned on.
-    */
+  /** A freshly registered bot's starting state: opted out of the ladder until explicitly turned on. */
   val initial: BotRating = BotRating(
-    glickoRating = 1500,
-    glickoRd = 350,
-    glickoVol = 0.06,
     onLadder = false,
     ownerExternalId = None
   )
@@ -442,8 +429,8 @@ object BotStore:
                   OwnedBot(
                     team = team,
                     name = name,
-                    rating = r.glickoRating,
-                    rd = r.glickoRd,
+                    rating = 1500.0,
+                    rd = 350.0,
                     onLadder = r.onLadder,
                     openToHumans = cat.get((team, name)).exists(_._1)
                   )
@@ -667,31 +654,15 @@ enum RatedIdentity:
 object RatedIdentity:
   def of(bot: Principal.Bot): RatedIdentity = RatedIdentity.Bot(bot.team, bot.name)
 
-/** One seat's movement on ONE category's scale (#280), the per-category half of a [[RatingUpdate]]. Carries its own
-  * `before`/`after` rather than reusing the shared-scale pair beside it because the two are genuinely different
-  * numbers: they start equal for a seeded Blitz participant and diverge the moment it plays anything else.
-  */
-final case class CategoryMove(
-    category: RatingCategory,
-    before: dicechess.play.rating.Glicko,
-    after: dicechess.play.rating.Glicko
-)
-
-/** One seat's rating write for one game (#296): where it lands, and the state on both sides of it. The batch computes
-  * `after` from `before` and the opponent's PRE-game state, so carrying the pair together is what lets the write record
-  * the movement rather than just the result of it.
-  *
-  * `before`/`after` are the SHARED single scale — the one every public response still reads. `category` is the
-  * per-category scale (#280 phase 1), written to `bot_ratings`/`user_ratings` in the same transaction and read by
-  * nothing yet; `None` when the game's control is uncategorised (`Unlimited`/`PerMove`), which still moves the shared
-  * scale exactly as it does today. Per-seat rather than per-game even though both seats always agree on the category,
-  * so each write is self-contained and no cross-record invariant has to hold for the store to be correct.
+/** One seat's rating write for one game (#296): where it lands, and the state on both sides of it on the game's
+  * category scale (#280). The batch computes `after` from `before` and the opponent's PRE-game state, so carrying the
+  * pair together is what lets the write record the movement rather than just the result of it.
   */
 final case class RatingUpdate(
     identity: RatedIdentity,
+    category: RatingCategory,
     before: dicechess.play.rating.Glicko,
-    after: dicechess.play.rating.Glicko,
-    category: Option[CategoryMove] = None
+    after: dicechess.play.rating.Glicko
 )
 
 /** What a finished game did to one seat's rating, on the public scale (#296). Recorded by the batch, never derived
@@ -731,7 +702,7 @@ trait RatingStore:
     *
     * Absence is a value, not a `None`: the per-category tables are sparse (see V21), and every caller would otherwise
     * write the same `getOrElse` — the one place a `null`-shaped answer could turn into a rating computed against
-    * nothing. Contrast [[BotStore.ratingOf]]/[[UserStore.ratingOf]], whose `None` means "no such participant", a
+    * nothing. Contrast [[BotStore.ratingOf]]/[[UserStore.userById]], whose `None` means "no such participant", a
     * genuinely different answer the batch already acts on.
     */
   def categoryRatingOf(identity: RatedIdentity, category: RatingCategory): IO[dicechess.play.rating.Glicko]

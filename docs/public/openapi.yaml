@@ -791,9 +791,7 @@ components:
       type: object
       properties:
         onLadder: { type: boolean }
-        glickoRating: { type: number }
-        glickoRd: { type: number }
-      required: [onLadder, glickoRating, glickoRd]
+      required: [onLadder]
     SetOpenToHumans:
       type: object
       properties:

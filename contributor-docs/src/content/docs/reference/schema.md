@@ -143,9 +143,6 @@ Indexes:
 | `token_hash` | `text` | no | — | unique |
 | `created_at` | `timestamp with time zone` | no | `now()` | — |
 | `rotated_at` | `timestamp with time zone` | yes | — | — |
-| `glicko_rating` | `double precision` | no | `1500` | — |
-| `glicko_rd` | `double precision` | no | `350` | — |
-| `glicko_vol` | `double precision` | no | `0.06` | — |
 | `on_ladder` | `boolean` | no | `false` | — |
 | `owner_external_id` | `text` | yes | — | — |
 | `open_to_humans` | `boolean` | no | `false` | — |
@@ -346,9 +343,6 @@ Indexes:
 | `created_at` | `timestamp with time zone` | no | `now()` | — |
 | `last_login_at` | `timestamp with time zone` | yes | — | — |
 | `is_active` | `boolean` | no | `true` | — |
-| `glicko_rating` | `double precision` | no | `1500` | — |
-| `glicko_rd` | `double precision` | no | `350` | — |
-| `glicko_vol` | `double precision` | no | `0.06` | — |
 | `nickname_changed_at` | `timestamp with time zone` | yes | — | — |
 
 Indexes:

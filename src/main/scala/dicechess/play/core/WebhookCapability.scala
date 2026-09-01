@@ -42,16 +42,16 @@ object WebhookCapability:
 
   /** Parse and canonicalize a registration selection.
     *
-    * Every input member must be both known and selectable. Duplicates are accepted, then collapsed into registry
-    * order. The entire selection fails on the first invalid member, so a mixed request can never be partially stored.
+    * Every input member must be both known and selectable. Duplicates are accepted, then collapsed into registry order.
+    * The entire selection fails on the first invalid member, so a mixed request can never be partially stored.
     */
   def parseSelection(names: List[String]): Either[String, List[WebhookCapability]] =
     names
       .foldLeft[Either[String, Set[WebhookCapability]]](Right(Set.empty)):
-        case (left @ Left(_), _) => left
+        case (left @ Left(_), _)     => left
         case (Right(selected), name) =>
           fromWireName(name) match
-            case None => Left(s"unknown webhook capability: $name")
+            case None                                       => Left(s"unknown webhook capability: $name")
             case Some(capability) if !capability.selectable =>
               Left(s"webhook capability is not available: ${capability.wireName}")
             case Some(capability) => Right(selected + capability)

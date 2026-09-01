@@ -51,7 +51,7 @@ class WebhookCapabilitySuite extends munit.FunSuite:
     val knownNames      = WebhookCapability.registry.map(_.wireName).mkString(", ")
     val selectableNames = WebhookCapability.selectableCapabilities.map(_.wireName).mkString(", ")
     val statuses        = WebhookCapabilityStatus.values.map(_.wireName).mkString(", ")
-    val example = WebhookCapability.registry
+    val example         = WebhookCapability.registry
       .map(capability =>
         s"          - { name: ${capability.wireName}, status: ${capability.status.wireName}, selectable: ${capability.selectable} }"
       )

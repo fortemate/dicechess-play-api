@@ -2,12 +2,16 @@ package dicechess.play.server
 
 import cats.effect.{IO, Ref}
 import cats.syntax.all.*
+import dicechess.play.core.Principal
 import dicechess.play.rating.Glicko2
 import dicechess.play.store.{
-  AdminBotStore,
   AdminBotListing,
+  AdminBotStore,
+  AdminBotWebhook,
+  AdminWebhookFailure,
   BotCatalogState,
   BotRating,
+  BotSeatPolicy,
   BotStore,
   GuestLink,
   NicknameUpdate,
@@ -18,9 +22,10 @@ import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.implicits.*
 import org.http4s.{HttpApp, Method, Request, RequestCookie, Status, Uri}
 
+import java.time.Instant
 import java.util.UUID
 
-/** The admin bot surface (#273/#313): any registered bot, no bot token, writes through [[AdminBotStore]] and an
+/** The admin bot surface (#273/#313/#34): any registered bot, no bot token, writes through [[AdminBotStore]] and an
   * inventory read that deliberately does not write. The store double records mutations, because "the audited path was
   * taken, by this admin" is the property the routes must uphold; whether the audit row itself lands transactionally is
   * `PgGameStoreSuite`'s job.
@@ -83,19 +88,48 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
     def adminRotate(adminUserId: String, team: String, name: String, newTokenHash: String): IO[Boolean] =
       calls.update(_ :+ (adminUserId, team, name, s"rotate hash=$newTokenHash")) *>
         IO.pure((team, name) == known)
+    def adminSetMaxConcurrentGames(
+        adminUserId: String,
+        team: String,
+        name: String,
+        maxConcurrentGames: Int
+    ): IO[Option[BotSeatPolicy]] =
+      calls.update(_ :+ (adminUserId, team, name, s"capacity=$maxConcurrentGames")) *>
+        answer(team, name, BotSeatPolicy(Principal.Bot(team, name), maxConcurrentGames, openToHumans = true))
 
   /** One admin account, one plain account, one known bot (`acme/alice`). */
-  private def fixture: IO[(HttpApp[IO], String, String, UserAccount, StubAdminStore)] =
+  private def fixture: IO[(HttpApp[IO], String, String, UserAccount, StubAdminStore, GameRegistry)] =
     for
       accounts <- Ref.of[IO, Map[String, UserAccount]](Map.empty)
       calls    <- Ref.of[IO, List[(String, String, String, String)]](Nil)
       botStore <- BotStore.inMemory
       auth     <- BotAuth.fromSpec("", botStore)
+      registry <- GameRegistry.create()
       users = StubUsers(accounts)
+      verifiedAt = Instant.parse("2026-08-01T12:00:00Z")
+      failedAt   = Instant.parse("2026-08-02T10:00:00Z")
       store = StubAdminStore(
         ("acme", "alice"),
         List(
-          AdminBotListing("acme", "alice", 1650.0, 80.0, onLadder = true, openToHumans = true, Some("ready"), true),
+          AdminBotListing(
+            "acme",
+            "alice",
+            1650.0,
+            80.0,
+            onLadder = true,
+            openToHumans = true,
+            Some("ready"),
+            maxConcurrentGames = 4,
+            owned = true,
+            webhook = Some(
+              AdminBotWebhook(
+                url = "https://alice.example.com/bot",
+                verifiedAt = verifiedAt,
+                capabilities = List("draws", "custom_legacy_cap"),
+                lastFailure = Some(AdminWebhookFailure(failedAt, "the endpoint answered HTTP 500"))
+              )
+            )
+          ),
           AdminBotListing(
             "orphaned",
             "hidden",
@@ -104,7 +138,9 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
             onLadder = false,
             openToHumans = false,
             None,
-            owned = false
+            maxConcurrentGames = 1,
+            owned = false,
+            webhook = None
           )
         ),
         calls
@@ -114,8 +150,8 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       plain       <- users.upsertOnLogin("google", "sub-plain", None, IO.pure("PlainNick"))
       adminCookie <- session.sign(admin)
       plainCookie <- session.sign(plain)
-      app = AdminBotRoutes(session, auth, Set(admin.id), store).orNotFound
-    yield (app, adminCookie, plainCookie, admin, store)
+      app = AdminBotRoutes(session, auth, Set(admin.id), store, registry).orNotFound
+    yield (app, adminCookie, plainCookie, admin, store, registry)
 
   /** Raw-string bodies on purpose, sent as `application/json` bytes: with `CirceEntityCodec.given` in scope a plain
     * `withEntity(string)` would pick the CIRCE encoder and ship a quoted JSON *string*, not the object it spells.
@@ -130,12 +166,18 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
 
   test("the gate protects inventory and mutations: no session is 401, a signed-in non-admin is 403"):
     for
-      (app, _, plainCookie, _, store) <- fixture
-      anonymousInventory              <- app.run(request(Method.GET, "/admin/bots", None))
-      nonAdminInventory               <- app.run(request(Method.GET, "/admin/bots", Some(plainCookie)))
-      anonymousMutation               <- app.run(request(Method.POST, "/admin/bots/acme/alice/ladder/leave", None))
+      (app, _, plainCookie, _, store, _) <- fixture
+      anonymousInventory                 <- app.run(request(Method.GET, "/admin/bots", None))
+      nonAdminInventory                  <- app.run(request(Method.GET, "/admin/bots", Some(plainCookie)))
+      anonymousMutation                  <- app.run(request(Method.POST, "/admin/bots/acme/alice/ladder/leave", None))
       nonAdminMutation <- app.run(request(Method.POST, "/admin/bots/acme/alice/ladder/leave", Some(plainCookie)))
-      recorded         <- store.calls.get
+      anonymousCapacity <- app.run(
+        request(Method.POST, "/admin/bots/acme/alice/capacity", None, Some("""{"maxConcurrentGames":2}"""))
+      )
+      nonAdminCapacity <- app.run(
+        request(Method.POST, "/admin/bots/acme/alice/capacity", Some(plainCookie), Some("""{"maxConcurrentGames":2}"""))
+      )
+      recorded <- store.calls.get
     yield
       assertEquals(anonymousInventory.status, Status.Unauthorized)
       assertEquals(
@@ -145,20 +187,26 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       )
       assertEquals(anonymousMutation.status, Status.Unauthorized)
       assertEquals(nonAdminMutation.status, Status.Forbidden)
+      assertEquals(anonymousCapacity.status, Status.Unauthorized)
+      assertEquals(nonAdminCapacity.status, Status.Forbidden)
       assertEquals(recorded, Nil, "a refused caller must never create an audit candidate")
 
-  test("the admin inventory returns the full registry, including a provisional closed bot, without an audit write"):
+  test("the admin inventory returns the full registry with enriched capacity and webhook summary"):
     for
-      (app, adminCookie, _, _, store) <- fixture
-      response                        <- app.run(request(Method.GET, "/admin/bots", Some(adminCookie)))
-      body                            <- response.as[AdminBots]
-      recorded                        <- store.calls.get
+      (app, adminCookie, _, _, store, _) <- fixture
+      response                           <- app.run(request(Method.GET, "/admin/bots", Some(adminCookie)))
+      body                               <- response.as[AdminBots]
+      recorded                           <- store.calls.get
     yield
       assertEquals(response.status, Status.Ok)
       assertEquals(body.bots.map(_.name), List("alice", "hidden"))
       val hidden = body.bots.find(_.name == "hidden").getOrElse(fail("the invisible registered bot is missing"))
       assertEquals(hidden.onLadder, false)
       assertEquals(hidden.openToHumans, false)
+      assertEquals(hidden.maxConcurrentGames, 1)
+      assertEquals(hidden.ladderAllowance, 1)
+      assertEquals(hidden.activeGames, 0)
+      assertEquals(hidden.webhook, None)
       assert(
         hidden.rd > Glicko2.ProvisionalDeviationThreshold,
         "the fresh 350 RD bot is still provisional and absent from the leaderboard"
@@ -166,14 +214,27 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       // The flag the client must not have to derive: the threshold is the server's, as it is on every other
       // rating-bearing wire type. Asserted on BOTH bots, so the field cannot be a constant that happens to look right.
       assertEquals(hidden.provisional, true, "rd 350 is provisional — one of the two reasons it is publicly invisible")
+
       val alice = body.bots.find(_.name == "alice").getOrElse(fail("the converged bot is missing"))
       assertEquals(alice.provisional, false, "rd 80 has converged")
-      assertEquals(hidden.owned, false)
+      assertEquals(alice.maxConcurrentGames, 4)
+      assertEquals(alice.ladderAllowance, 3, "openToHumans = true reserves 1 slot: max(1, 4 - 1) = 3")
+      assertEquals(alice.activeGames, 0)
+      assertEquals(alice.owned, true)
+
+      val webhook = alice.webhook.getOrElse(fail("alice must have webhook summary"))
+      assertEquals(webhook.url, "https://alice.example.com/bot")
+      assertEquals(webhook.verifiedAt, Instant.parse("2026-08-01T12:00:00Z"))
+      assertEquals(webhook.capabilities, List("draws", "custom_legacy_cap"))
+      assertEquals(
+        webhook.lastFailure,
+        Some(LastDeliveryFailure(Instant.parse("2026-08-02T10:00:00Z"), "the endpoint answered HTTP 500"))
+      )
       assertEquals(recorded, Nil, "inventory reads are not admin actions")
 
   test("ladder join/leave answer the shared LadderStatus shape and record the acting admin"):
     for
-      (app, adminCookie, _, admin, store) <- fixture
+      (app, adminCookie, _, admin, store, _) <- fixture
       joined   <- app.run(request(Method.POST, "/admin/bots/acme/alice/ladder/join", Some(adminCookie)))
       status   <- joined.as[LadderStatus]
       ghost    <- app.run(request(Method.POST, "/admin/bots/acme/ghost/ladder/leave", Some(adminCookie)))
@@ -189,8 +250,8 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
 
   test("catalog writes share one description contract: blank body clears, over-long is a 400, describe never opens"):
     for
-      (app, adminCookie, _, admin, store) <- fixture
-      opened                              <- app.run(
+      (app, adminCookie, _, admin, store, _) <- fixture
+      opened                                 <- app.run(
         request(
           Method.POST,
           "/admin/bots/acme/alice/open-to-humans",
@@ -237,10 +298,46 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       )
       assert(recorded.forall(_._1 == admin.id))
 
+  test("admin capacity mutation validates bounds, returns authoritative snapshot, and records audit"):
+    for
+      (app, adminCookie, _, admin, store, _) <- fixture
+      zeroCap                                <- app.run(
+        request(Method.POST, "/admin/bots/acme/alice/capacity", Some(adminCookie), Some("""{"maxConcurrentGames":0}"""))
+      )
+      highCap <- app.run(
+        request(Method.POST, "/admin/bots/acme/alice/capacity", Some(adminCookie), Some("""{"maxConcurrentGames":33}"""))
+      )
+      badBody <- app.run(
+        request(Method.POST, "/admin/bots/acme/alice/capacity", Some(adminCookie), Some("""{"notCapacity":5}"""))
+      )
+      success <- app.run(
+        request(Method.POST, "/admin/bots/acme/alice/capacity", Some(adminCookie), Some("""{"maxConcurrentGames":8}"""))
+      )
+      capBody <- success.as[Capacity]
+      ghost   <- app.run(
+        request(Method.POST, "/admin/bots/acme/ghost/capacity", Some(adminCookie), Some("""{"maxConcurrentGames":4}"""))
+      )
+      recorded <- store.calls.get
+    yield
+      assertEquals(zeroCap.status, Status.BadRequest)
+      assertEquals(highCap.status, Status.BadRequest)
+      assertEquals(badBody.status, Status.BadRequest)
+      assertEquals(success.status, Status.Ok)
+      assertEquals(
+        capBody,
+        Capacity(maxConcurrentGames = 8, openToHumans = true, ladderAllowance = 7, activeGames = 0)
+      )
+      assertEquals(ghost.status, Status.NotFound)
+      assertEquals(
+        recorded,
+        List((admin.id, "acme", "alice", "capacity=8"), (admin.id, "acme", "ghost", "capacity=4")),
+        "invalid bodies must never reach the store"
+      )
+
   test("rotation demands the echoed name, hands the plaintext back once, and the store sees only a hash"):
     for
-      (app, adminCookie, _, _, store) <- fixture
-      unconfirmed                     <- app.run(
+      (app, adminCookie, _, _, store, _) <- fixture
+      unconfirmed                        <- app.run(
         request(Method.POST, "/admin/bots/acme/alice/token", Some(adminCookie), Some("""{"confirm":"wrong"}"""))
       )
       rotated <- app.run(
@@ -285,3 +382,4 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
     val warning = AdminBotRoutes.malformedWarning(List(2, 3), total = 3)
     assert(!warning.contains(secret), "a rejected value must never be echoed")
     assert(warning.contains("position(s) 2, 3 of 3"), "position is what an operator needs to find the bad entry")
+

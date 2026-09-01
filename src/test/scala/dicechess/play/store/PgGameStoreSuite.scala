@@ -1996,6 +1996,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(hidden.openToHumans, false)
           assert(hidden.rd > Glicko2.ProvisionalDeviationThreshold, "a fresh bot is not on the public leaderboard")
           assertEquals(hidden.description, None)
+          assertEquals(hidden.maxConcurrentGames, 1)
+          assertEquals(hidden.webhook, None)
           assertEquals(hidden.owned, true, "the read reveals self-service availability, not the owner's external id")
           assertEquals(audits, 0L, "an inventory read is not an admin action")
       }
@@ -2143,6 +2145,80 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(rating.flatMap(_.ownerExternalId), Some(owner), "rotation must not move ownership")
           assert(!ghost, "no such bot — nothing rotated")
           assertEquals(rows, List((admin, "token.rotate", None)), "never the token, never its hash")
+      }
+    }
+
+  test("the admin inventory surfaces maxConcurrentGames and webhook diagnostics without exposing HMAC secrets"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        val verifiedAt = Instant.parse("2026-08-01T12:00:00Z")
+        val failedAt   = Instant.parse("2026-08-02T15:30:00Z")
+        val hook = BotWebhook(
+          team = "admin-wh",
+          name = "diagnostics-bot",
+          url = "https://example.com/bot-webhook",
+          secret = "secret-hmac-key-should-never-leak",
+          verifiedAt = verifiedAt,
+          capabilities = List("draws", "custom_legacy_cap")
+        )
+        for
+          _         <- db.register("admin-wh", "diagnostics-bot", "hash-admin-wh-diag")
+          _         <- db.setMaxConcurrentGames("admin-wh", "diagnostics-bot", 4)
+          _         <- db.put(hook)
+          _         <- db.recordDelivery("admin-wh", "diagnostics-bot", DeliveryOutcome.HttpStatus(500), 120.millis, failedAt)
+          inventory <- db.adminBots
+        yield
+          val bot = inventory
+            .find(b => b.team == "admin-wh" && b.name == "diagnostics-bot")
+            .getOrElse(fail("the registered bot must be in admin inventory"))
+          assertEquals(bot.maxConcurrentGames, 4)
+          val wh = bot.webhook.getOrElse(fail("webhook must be present"))
+          assertEquals(wh.url, "https://example.com/bot-webhook")
+          assertEquals(wh.verifiedAt, verifiedAt)
+          assertEquals(wh.capabilities, List("draws", "custom_legacy_cap"))
+          assertEquals(wh.lastFailure, Some(AdminWebhookFailure(failedAt, "the endpoint answered HTTP 500")))
+      }
+    }
+
+  test("an admin capacity change updates maxConcurrentGames, keeps open/ladder flags and owner, and records before/after in audit"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val admin = UUID.randomUUID().toString
+        val owner = "user:" + UUID.randomUUID().toString
+        for
+          _       <- db.register("admin-cap", "cap-bot", "hash-admin-cap", owner = Some(owner))
+          _       <- db.adminSetOnLadder(admin, "admin-cap", "cap-bot", onLadder = true)
+          _       <- db.adminOpenToHumans(admin, "admin-cap", "cap-bot", Some("open blurb"))
+          raised  <- db.adminSetMaxConcurrentGames(admin, "admin-cap", "cap-bot", 6)
+          lowered <- db.adminSetMaxConcurrentGames(admin, "admin-cap", "cap-bot", 3)
+          ghost   <- db.adminSetMaxConcurrentGames(admin, "admin-cap", "ghost", 4)
+          policy  <- db.seatPolicyOf("admin-cap", "cap-bot")
+          rows    <- sql"""SELECT admin_user_id::text, action, detail FROM play.admin_actions
+                           WHERE team = 'admin-cap' AND name = 'cap-bot' AND action = 'capacity.set' ORDER BY id"""
+            .query[(String, String, Option[String])]
+            .to[List]
+            .transact(xa)
+          ghostRows <- sql"""SELECT count(*) FROM play.admin_actions
+                             WHERE team = 'admin-cap' AND name = 'ghost'"""
+            .query[Long]
+            .unique
+            .transact(xa)
+        yield
+          assertEquals(raised.map(_.maxConcurrentGames), Some(6))
+          assertEquals(raised.map(_.openToHumans), Some(true))
+          assertEquals(lowered.map(_.maxConcurrentGames), Some(3))
+          assertEquals(lowered.map(_.openToHumans), Some(true))
+          assertEquals(ghost, None)
+          assertEquals(ghostRows, 0L, "non-existent bot writes no audit row")
+          assertEquals(policy.map(_.maxConcurrentGames), Some(3))
+          assertEquals(policy.map(_.openToHumans), Some(true))
+          assertEquals(
+            rows,
+            List(
+              (admin, "capacity.set", Some("1 -> 6")),
+              (admin, "capacity.set", Some("6 -> 3"))
+            )
+          )
       }
     }
 

@@ -306,7 +306,7 @@ object Main extends IOApp.Simple:
         // writes are audited (V19), reads deliberately are not. Mounted only when someone is actually listed AND
         // both halves the allowlist depends on exist.
         val adminBots = (authSession, pgStore)
-          .mapN((s, pg) => AdminBotRoutes(s, botAuth, admins, pg))
+          .mapN((s, pg) => AdminBotRoutes(s, botAuth, admins, pg, registry))
           .filter(_ => admins.nonEmpty)
           .getOrElse(org.http4s.HttpRoutes.empty[IO])
         val me = (authSession, pgStore)

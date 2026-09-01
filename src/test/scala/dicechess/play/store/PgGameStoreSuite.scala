@@ -2409,6 +2409,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
                  ('caps', 'reserved', 'hash-v3-reserved'),
                  ('caps', 'wrong-case', 'hash-v3-wrong-case'),
                  ('caps', 'whitespace', 'hash-v3-whitespace'),
+                 ('caps', 'multidim-draws', 'hash-v3-multidim-draws'),
+                 ('caps', 'multidim-no-draws', 'hash-v3-multidim-no-draws'),
                  ('caps', 'null-only', 'hash-v3-null-only')""").update.run *>
             (fr"INSERT INTO" ++ Fragment.const(s"$schema.bot_webhooks") ++
               fr"""(team, name, url, secret, verified_at, capabilities) VALUES
@@ -2421,6 +2423,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
                    ('caps', 'reserved', 'https://example.com/hook', 'secret', now(), ARRAY['doubling']::text[]),
                    ('caps', 'wrong-case', 'https://example.com/hook', 'secret', now(), ARRAY['Draws']::text[]),
                    ('caps', 'whitespace', 'https://example.com/hook', 'secret', now(), ARRAY[' draws ']::text[]),
+                   ('caps', 'multidim-draws', 'https://example.com/hook', 'secret', now(), ARRAY[['legacy', 'draws'], ['doubling', 'unknown']]::text[]),
+                   ('caps', 'multidim-no-draws', 'https://example.com/hook', 'secret', now(), ARRAY[['legacy', 'Draws'], ['doubling', 'unknown']]::text[]),
                    ('caps', 'null-only', 'https://example.com/hook', 'secret', now(), ARRAY[NULL]::text[])""").update.run)
             .transact(xa)
         val stored =
@@ -2436,16 +2440,18 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         yield assertEquals(
           rows,
           List(
-            "draws"      -> "{draws}",
-            "draws-null" -> "{draws}",
-            "duplicate"  -> "{draws}",
-            "empty"      -> "{}",
-            "mixed"      -> "{draws}",
-            "null-only"  -> "{}",
-            "reserved"   -> "{}",
-            "unknown"    -> "{}",
-            "whitespace" -> "{}",
-            "wrong-case" -> "{}"
+            "draws"             -> "{draws}",
+            "draws-null"        -> "{draws}",
+            "duplicate"         -> "{draws}",
+            "empty"             -> "{}",
+            "mixed"             -> "{draws}",
+            "multidim-draws"    -> "{draws}",
+            "multidim-no-draws" -> "{}",
+            "null-only"         -> "{}",
+            "reserved"          -> "{}",
+            "unknown"           -> "{}",
+            "whitespace"        -> "{}",
+            "wrong-case"        -> "{}"
           )
         )
       }

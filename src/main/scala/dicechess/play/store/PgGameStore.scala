@@ -492,22 +492,24 @@ final class PgGameStore private (xa: Transactor[IO])
           LEFT JOIN play.bot_webhooks w
             ON w.team = b.team AND w.name = b.name
           ORDER BY COALESCE(r.rating, ${Glicko.Initial.rating}) DESC, b.team, b.name"""
-      .query[(
-          String,
-          String,
-          Double,
-          Double,
-          Boolean,
-          Boolean,
-          Option[String],
-          Int,
-          Boolean,
-          Option[String],
-          Option[Instant],
-          Option[List[String]],
-          Option[Instant],
-          Option[String]
-      )]
+      .query[
+        (
+            String,
+            String,
+            Double,
+            Double,
+            Boolean,
+            Boolean,
+            Option[String],
+            Int,
+            Boolean,
+            Option[String],
+            Option[Instant],
+            Option[List[String]],
+            Option[Instant],
+            Option[String]
+        )
+      ]
       .to[List]
       .transact(xa)
       .timeout(SaveTimeout)

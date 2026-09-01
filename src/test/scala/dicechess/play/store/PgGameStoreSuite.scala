@@ -2153,7 +2153,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       store(pg).use { db =>
         val verifiedAt = Instant.parse("2026-08-01T12:00:00Z")
         val failedAt   = Instant.parse("2026-08-02T15:30:00Z")
-        val hook = BotWebhook(
+        val hook       = BotWebhook(
           team = "admin-wh",
           name = "diagnostics-bot",
           url = "https://example.com/bot-webhook",
@@ -2162,10 +2162,10 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           capabilities = List("draws", "custom_legacy_cap")
         )
         for
-          _         <- db.register("admin-wh", "diagnostics-bot", "hash-admin-wh-diag")
-          _         <- db.setMaxConcurrentGames("admin-wh", "diagnostics-bot", 4)
-          _         <- db.put(hook)
-          _         <- db.recordDelivery("admin-wh", "diagnostics-bot", DeliveryOutcome.HttpStatus(500), 120.millis, failedAt)
+          _ <- db.register("admin-wh", "diagnostics-bot", "hash-admin-wh-diag")
+          _ <- db.setMaxConcurrentGames("admin-wh", "diagnostics-bot", 4)
+          _ <- db.put(hook)
+          _ <- db.recordDelivery("admin-wh", "diagnostics-bot", DeliveryOutcome.HttpStatus(500), 120.millis, failedAt)
           inventory <- db.adminBots
         yield
           val bot = inventory
@@ -2180,7 +2180,9 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  test("an admin capacity change updates maxConcurrentGames, keeps open/ladder flags and owner, and records before/after in audit"):
+  test(
+    "an admin capacity change updates maxConcurrentGames, keeps open/ladder flags and owner, and records before/after in audit"
+  ):
     withContainers { pg =>
       (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
         val admin = UUID.randomUUID().toString

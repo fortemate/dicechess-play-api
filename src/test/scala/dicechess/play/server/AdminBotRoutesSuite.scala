@@ -105,10 +105,10 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       botStore <- BotStore.inMemory
       auth     <- BotAuth.fromSpec("", botStore)
       registry <- GameRegistry.create()
-      users = StubUsers(accounts)
+      users      = StubUsers(accounts)
       verifiedAt = Instant.parse("2026-08-01T12:00:00Z")
       failedAt   = Instant.parse("2026-08-02T10:00:00Z")
-      store = StubAdminStore(
+      store      = StubAdminStore(
         ("acme", "alice"),
         List(
           AdminBotListing(
@@ -170,7 +170,7 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       anonymousInventory                 <- app.run(request(Method.GET, "/admin/bots", None))
       nonAdminInventory                  <- app.run(request(Method.GET, "/admin/bots", Some(plainCookie)))
       anonymousMutation                  <- app.run(request(Method.POST, "/admin/bots/acme/alice/ladder/leave", None))
-      nonAdminMutation <- app.run(request(Method.POST, "/admin/bots/acme/alice/ladder/leave", Some(plainCookie)))
+      nonAdminMutation  <- app.run(request(Method.POST, "/admin/bots/acme/alice/ladder/leave", Some(plainCookie)))
       anonymousCapacity <- app.run(
         request(Method.POST, "/admin/bots/acme/alice/capacity", None, Some("""{"maxConcurrentGames":2}"""))
       )
@@ -305,7 +305,12 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
         request(Method.POST, "/admin/bots/acme/alice/capacity", Some(adminCookie), Some("""{"maxConcurrentGames":0}"""))
       )
       highCap <- app.run(
-        request(Method.POST, "/admin/bots/acme/alice/capacity", Some(adminCookie), Some("""{"maxConcurrentGames":33}"""))
+        request(
+          Method.POST,
+          "/admin/bots/acme/alice/capacity",
+          Some(adminCookie),
+          Some("""{"maxConcurrentGames":33}""")
+        )
       )
       badBody <- app.run(
         request(Method.POST, "/admin/bots/acme/alice/capacity", Some(adminCookie), Some("""{"notCapacity":5}"""))
@@ -382,4 +387,3 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
     val warning = AdminBotRoutes.malformedWarning(List(2, 3), total = 3)
     assert(!warning.contains(secret), "a rejected value must never be echoed")
     assert(warning.contains("position(s) 2, 3 of 3"), "position is what an operator needs to find the bad entry")
-

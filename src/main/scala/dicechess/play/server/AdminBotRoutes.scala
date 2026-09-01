@@ -99,28 +99,30 @@ object AdminBotRoutes:
               .traverse: bot =>
                 val principal: Principal.Bot = Principal.Bot(bot.team, bot.name)
                 val policy                   = BotSeatPolicy(principal, bot.maxConcurrentGames, bot.openToHumans)
-                registry.activeGamesFor(principal).map: active =>
-                  AdminBot(
-                    team = bot.team,
-                    name = bot.name,
-                    rating = bot.rating,
-                    rd = bot.rd,
-                    provisional = bot.rd > Glicko2.ProvisionalDeviationThreshold,
-                    onLadder = bot.onLadder,
-                    openToHumans = bot.openToHumans,
-                    description = bot.description,
-                    maxConcurrentGames = bot.maxConcurrentGames,
-                    ladderAllowance = policy.ladderAllowance,
-                    activeGames = active,
-                    owned = bot.owned,
-                    webhook = bot.webhook.map: w =>
-                      AdminWebhook(
-                        url = w.url,
-                        verifiedAt = w.verifiedAt,
-                        capabilities = w.capabilities,
-                        lastFailure = w.lastFailure.map(f => LastDeliveryFailure(f.at, f.reason))
-                      )
-                  )
+                registry
+                  .activeGamesFor(principal)
+                  .map: active =>
+                    AdminBot(
+                      team = bot.team,
+                      name = bot.name,
+                      rating = bot.rating,
+                      rd = bot.rd,
+                      provisional = bot.rd > Glicko2.ProvisionalDeviationThreshold,
+                      onLadder = bot.onLadder,
+                      openToHumans = bot.openToHumans,
+                      description = bot.description,
+                      maxConcurrentGames = bot.maxConcurrentGames,
+                      ladderAllowance = policy.ladderAllowance,
+                      activeGames = active,
+                      owned = bot.owned,
+                      webhook = bot.webhook.map: w =>
+                        AdminWebhook(
+                          url = w.url,
+                          verifiedAt = w.verifiedAt,
+                          capabilities = w.capabilities,
+                          lastFailure = w.lastFailure.map(f => LastDeliveryFailure(f.at, f.reason))
+                        )
+                    )
               .flatMap(enriched => Ok(AdminBots(enriched)))
 
       case req @ POST -> Root / "admin" / "bots" / team / name / "capacity" =>

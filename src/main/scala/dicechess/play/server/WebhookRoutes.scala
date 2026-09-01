@@ -1,8 +1,9 @@
 package dicechess.play.server
 
 import cats.effect.IO
-import dicechess.play.core.Principal
+import dicechess.play.core.{Principal, WebhookCapability, WebhookCapabilityStatus}
 import dicechess.play.store.{DeliveryStatsWindow, WebhookStatsStore, WebhookStats as StoredWebhookStats}
+import dicechess.play.wire.Codecs.given
 import io.circe.Codec
 import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.dsl.io.*
@@ -15,12 +16,27 @@ import java.time.Instant
 final case class RegisterWebhook(url: String, capabilities: Option[List[String]] = None) derives Codec.AsObject
 
 /** The successful registration: the per-bot signing secret, shown exactly once (like a registered bot's token). */
-final case class WebhookCreated(url: String, secret: String, capabilities: Option[List[String]] = None)
+final case class WebhookCreated(url: String, secret: String, capabilities: Option[List[WebhookCapability]] = None)
     derives Codec.AsObject
 
 /** `GET /bot/webhook`: the current registration's public face — the secret is never shown again. */
-final case class WebhookInfo(url: String, verifiedAt: java.time.Instant, capabilities: Option[List[String]] = None)
-    derives Codec.AsObject
+final case class WebhookInfo(
+    url: String,
+    verifiedAt: java.time.Instant,
+    capabilities: Option[List[WebhookCapability]] = None
+) derives Codec.AsObject
+
+/** One entry in the public webhook-capability registry. `selectable = false` means the name is reserved for a future
+  * protocol extension and is rejected by registration today.
+  */
+final case class WebhookCapabilityDescriptor(
+    name: WebhookCapability,
+    status: WebhookCapabilityStatus,
+    selectable: Boolean
+) derives Codec.AsObject
+
+/** `GET /bot/webhook/capabilities`: stable registry order, independent of authentication and dispatcher health. */
+final case class WebhookCapabilityCatalog(capabilities: List[WebhookCapabilityDescriptor]) derives Codec.AsObject
 
 /** One outcome's share of a `GET /bot/webhook/stats` window (#225). */
 final case class DeliveryOutcomeCount(outcome: String, count: Long) derives Codec.AsObject
@@ -55,8 +71,9 @@ final case class WebhookDeliveryStats(
   * remove. A REGISTERED-bot perk like token rotation and the ladder — anonymous and static bots are refused: the
   * callback URL and signing secret belong to a durable identity, not an ephemeral token.
   *
-  * The whole surface answers 503 when webhooks are disabled on the server (`WEBHOOK_TIMEOUT_SECONDS` unset) — the
-  * endpoints exist so the failure is explicit, but nothing can be registered that would never fire.
+  * Registration, inspection and removal answer 503 when webhooks are disabled on the server (`WEBHOOK_TIMEOUT_SECONDS`
+  * unset) — the endpoints exist so the failure is explicit, but nothing can be registered that would never fire.
+  * Capability discovery is contract metadata and remains public and available.
   */
 object WebhookRoutes:
 
@@ -73,6 +90,15 @@ object WebhookRoutes:
       stats: Option[WebhookStatsStore] = None
   ): HttpRoutes[IO] =
     HttpRoutes.of[IO]:
+      case GET -> Root / "bot" / "webhook" / "capabilities" =>
+        Ok(
+          WebhookCapabilityCatalog(
+            WebhookCapability.registry.map(capability =>
+              WebhookCapabilityDescriptor(capability, capability.status, capability.selectable)
+            )
+          )
+        )
+
       case req @ POST -> Root / "bot" / "webhook" =>
         withService(webhooks): service =>
           BotRoutes.withBot(auth, req): bot =>
@@ -93,14 +119,16 @@ object WebhookRoutes:
                       .flatMap:
                         case Left(failure) => BadRequest(failure.message)
                         case Right(body)   =>
-                          val caps = body.capabilities.getOrElse(Nil)
-                          service
-                            .register(bot, body.url, caps)
-                            .flatMap:
-                              case Right(hook) =>
-                                val outCaps = Option.when(hook.capabilities.nonEmpty)(hook.capabilities)
-                                Created(WebhookCreated(hook.url, hook.secret, outCaps))
-                              case Left(reason) => UnprocessableEntity(reason)
+                          WebhookCapability.parseSelection(body.capabilities.getOrElse(Nil)) match
+                            case Left(reason)        => UnprocessableEntity(reason)
+                            case Right(capabilities) =>
+                              service
+                                .register(bot, body.url, capabilities)
+                                .flatMap:
+                                  case Right(hook) =>
+                                    val outCaps = Option.when(hook.capabilities.nonEmpty)(hook.capabilities)
+                                    Created(WebhookCreated(hook.url, hook.secret, outCaps))
+                                  case Left(reason) => UnprocessableEntity(reason)
 
       case req @ GET -> Root / "bot" / "webhook" =>
         withService(webhooks): service =>

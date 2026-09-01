@@ -666,29 +666,26 @@ paths:
       description: >
         Register an HTTPS callback the server POSTs turns to. The URL must be HTTPS and resolve to
         a public address; the server runs an ownership handshake before storing it. Registered
-        bots only; enabled per server.
+        bots only; enabled per server. Capability names are exact and case-sensitive: duplicate
+        selectable values are accepted and collapsed into canonical registry order, while unknown
+        values and recognized-but-reserved values return 422 with distinct plain-text reasons.
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              properties:
-                url: { type: string, format: uri }
-              required: [url]
+            schema: { $ref: '#/components/schemas/RegisterWebhookRequest' }
       responses:
         '201':
           description: Registered. The signing secret is shown exactly once.
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  url: { type: string, format: uri }
-                  secret: { type: string, description: Per-bot HMAC key; shown once. }
-                required: [url, secret]
+              schema: { $ref: '#/components/schemas/WebhookCreated' }
         '403': { $ref: '#/components/responses/RegisteredOnly' }
-        '422': { description: URL-policy violation or failed handshake (the body says which). }
+        '422':
+          description: >
+            URL-policy violation, failed handshake, unknown/non-canonical capability
+            (unknown webhook capability), or recognized but currently unavailable capability
+            (webhook capability is not available). The plain-text body identifies the reason.
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Webhooks disabled on this server. }
     get:
@@ -699,12 +696,7 @@ paths:
           description: The registered webhook (the secret is never shown again).
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  url: { type: string, format: uri }
-                  verifiedAt: { type: string, format: date-time }
-                required: [url, verifiedAt]
+              schema: { $ref: '#/components/schemas/WebhookInfo' }
         '404': { description: No webhook registered. }
         '503': { description: Webhooks disabled on this server. }
     delete:
@@ -715,6 +707,21 @@ paths:
         '204': { description: Removed. }
         '404': { description: No webhook was registered. }
         '503': { description: Webhooks disabled on this server. }
+  /bot/webhook/capabilities:
+    get:
+      tags: [Webhooks]
+      summary: Discover webhook capabilities
+      description: >
+        Public contract metadata in stable registry order. available means the capability may be
+        selected in a registration now; reserved fixes a canonical name without enabling storage
+        or behavior. This endpoint remains available when webhook delivery is disabled server-wide.
+      security: []
+      responses:
+        '200':
+          description: The complete known capability registry and current selection status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookCapabilityCatalog' }
   /bot/webhook/stats:
     get:
       tags: [Webhooks]
@@ -1300,6 +1307,79 @@ components:
           type: array
           items: { $ref: '#/components/schemas/PairwiseResult' }
       required: [team, name, pairwise]
+    WebhookCapability:
+      type: string
+      enum: [draws, doubling]
+      description: >
+        A canonical capability name known to this API. Known does not mean selectable: doubling is
+        reserved until its authoritative protocol and implementation are complete.
+    SelectableWebhookCapability:
+      type: string
+      enum: [draws]
+      description: A capability currently accepted in webhook registration and update requests.
+    WebhookCapabilityStatus:
+      type: string
+      enum: [available, reserved]
+      description: >
+        available values may be selected now; reserved values have a canonical name but no enabled
+        storage or runtime behavior.
+    WebhookCapabilityDescriptor:
+      type: object
+      properties:
+        name: { $ref: '#/components/schemas/WebhookCapability' }
+        status: { $ref: '#/components/schemas/WebhookCapabilityStatus' }
+        selectable:
+          type: boolean
+          description: Whether this capability is currently accepted in registration and update requests.
+      required: [name, status, selectable]
+    WebhookCapabilityCatalog:
+      type: object
+      properties:
+        capabilities:
+          type: array
+          description: Stable registry order; currently draws followed by doubling.
+          items: { $ref: '#/components/schemas/WebhookCapabilityDescriptor' }
+          uniqueItems: true
+      required: [capabilities]
+      example:
+        capabilities:
+          - { name: draws, status: available, selectable: true }
+          - { name: doubling, status: reserved, selectable: false }
+    RegisterWebhookRequest:
+      type: object
+      properties:
+        url: { type: string, format: uri }
+        capabilities:
+          type: [array, 'null']
+          description: >
+            Optional, exact case-sensitive names; null or omission selects none. Duplicate input is
+            accepted and collapsed into canonical registry order; no trimming or case folding is
+            performed.
+          items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
+          default: []
+      required: [url]
+    WebhookCreated:
+      type: object
+      properties:
+        url: { type: string, format: uri }
+        secret: { type: string, description: Per-bot HMAC key; shown once. }
+        capabilities:
+          type: [array, 'null']
+          description: Canonical selected capabilities; null or omitted when none are selected.
+          items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
+          uniqueItems: true
+      required: [url, secret]
+    WebhookInfo:
+      type: object
+      properties:
+        url: { type: string, format: uri }
+        verifiedAt: { type: string, format: date-time }
+        capabilities:
+          type: [array, 'null']
+          description: Canonical selected capabilities; null or omitted when none are selected.
+          items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
+          uniqueItems: true
+      required: [url, verifiedAt]
     DeliveryOutcomeCount:
       type: object
       properties:
@@ -1416,7 +1496,8 @@ components:
         verifiedAt: { type: string, format: date-time }
         capabilities:
           type: array
-          items: { type: string }
+          items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
+          uniqueItems: true
         lastFailure:
           oneOf:
             - $ref: '#/components/schemas/LastDeliveryFailure'

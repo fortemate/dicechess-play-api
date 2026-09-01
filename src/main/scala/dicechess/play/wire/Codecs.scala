@@ -34,10 +34,21 @@ object Codecs:
       Encoder.encodeString.contramap(_.toString)
     )
 
-  given Codec[Side]        = nameCodec("Side", Side.values)
-  given Codec[Seat]        = nameCodec("Seat", Seat.values)
-  given Codec[Termination] = nameCodec("Termination", Termination.values)
-  given Codec[PlayerKind]  = nameCodec("PlayerKind", PlayerKind.values)
+  private def wireNameCodec[A](label: String, values: List[A], wireName: A => String): Codec[A] =
+    val byName = values.iterator.map(value => wireName(value) -> value).toMap
+    Codec.from(
+      Decoder.decodeString.emap(name => byName.get(name).toRight(s"invalid $label: $name")),
+      Encoder.encodeString.contramap(wireName)
+    )
+
+  given Codec[Side]              = nameCodec("Side", Side.values)
+  given Codec[Seat]              = nameCodec("Seat", Seat.values)
+  given Codec[Termination]       = nameCodec("Termination", Termination.values)
+  given Codec[PlayerKind]        = nameCodec("PlayerKind", PlayerKind.values)
+  given Codec[WebhookCapability] =
+    wireNameCodec("WebhookCapability", WebhookCapability.registry, _.wireName)
+  given Codec[WebhookCapabilityStatus] =
+    wireNameCodec("WebhookCapabilityStatus", WebhookCapabilityStatus.values.toList, _.wireName)
 
   // MoveTree is recursive, so it can't be derived: a node encodes as the plain object of its children (sorted for a
   // stable wire), and any JSON object decodes back into nodes.

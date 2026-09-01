@@ -3,7 +3,7 @@ package dicechess.play.server
 import cats.effect.{IO, Ref, Resource}
 import cats.effect.std.{Console, Queue, Supervisor}
 import cats.syntax.all.*
-import dicechess.play.core.{GameEvent, GameId, GameStatus, Principal, PublicGameState, Seat}
+import dicechess.play.core.{GameEvent, GameId, GameStatus, Principal, PublicGameState, Seat, WebhookCapability}
 import dicechess.play.game.GameRoom
 import dicechess.play.store.{BotWebhook, DeliveryOutcome, WebhookStatsStore, WebhookStore}
 import dicechess.play.wire.Codecs.given
@@ -73,28 +73,35 @@ final class Webhooks private (
     * is the webhook stored; the secret is returned to the caller exactly once. Errors are values for the routes to
     * answer 422 with.
     */
-  def register(bot: Principal.Bot, url: String, capabilities: List[String] = Nil): IO[Either[String, BotWebhook]] =
-    checkUrl(url).flatMap:
-      case Left(reason) => IO.pure(Left(reason))
-      case Right(_)     =>
-        for
-          secret <- WebhookSecurity.randomHex(SecretBytes)
-          nonce  <- WebhookSecurity.randomHex(NonceBytes)
-          body = WebhookVerification("verification", nonce).asJson.noSpaces
-          answer <- post(url, secret, body, config.timeout)
-          stored <- answer match
-            case Left(reason)  => IO.pure(Left(s"verification failed: $reason"))
-            case Right(echoed) =>
-              decode[WebhookNonceEcho](echoed) match
-                case Right(WebhookNonceEcho(`nonce`)) =>
-                  IO.realTime.flatMap { now =>
-                    val hook =
-                      BotWebhook(bot.team, bot.name, url, secret, Instant.ofEpochMilli(now.toMillis), capabilities)
-                    store.put(hook).as(Right(hook))
-                  }
-                case Right(_) => IO.pure(Left("verification failed: endpoint echoed a different nonce"))
-                case Left(_)  => IO.pure(Left("verification failed: endpoint did not answer {\"nonce\": ...}"))
-        yield stored
+  def register(
+      bot: Principal.Bot,
+      url: String,
+      capabilities: List[WebhookCapability] = Nil
+  ): IO[Either[String, BotWebhook]] =
+    WebhookCapability.canonicalizeSelection(capabilities) match
+      case Left(reason)    => IO.pure(Left(reason))
+      case Right(selected) =>
+        checkUrl(url).flatMap:
+          case Left(reason) => IO.pure(Left(reason))
+          case Right(_)     =>
+            for
+              secret <- WebhookSecurity.randomHex(SecretBytes)
+              nonce  <- WebhookSecurity.randomHex(NonceBytes)
+              body = WebhookVerification("verification", nonce).asJson.noSpaces
+              answer <- post(url, secret, body, config.timeout)
+              stored <- answer match
+                case Left(reason)  => IO.pure(Left(s"verification failed: $reason"))
+                case Right(echoed) =>
+                  decode[WebhookNonceEcho](echoed) match
+                    case Right(WebhookNonceEcho(`nonce`)) =>
+                      IO.realTime.flatMap { now =>
+                        val hook =
+                          BotWebhook(bot.team, bot.name, url, secret, Instant.ofEpochMilli(now.toMillis), selected)
+                        store.put(hook).as(Right(hook))
+                      }
+                    case Right(_) => IO.pure(Left("verification failed: endpoint echoed a different nonce"))
+                    case Left(_)  => IO.pure(Left("verification failed: endpoint did not answer {\"nonce\": ...}"))
+            yield stored
 
   def info(bot: Principal.Bot): IO[Option[BotWebhook]] = store.get(bot.team, bot.name)
 
@@ -228,7 +235,7 @@ final class Webhooks private (
         val isOurTurn = state.status == GameStatus.Active && state.dicePending && state.activeSeat == seat
 
         if isOurPreRoll then
-          if !hook.capabilities.contains("draws") then
+          if !hook.capabilities.contains(WebhookCapability.Draws) then
             // Preserve legacy bot behavior: bots that did not opt in cannot answer a
             // draw decision, so decline before revealing dice and continue with yourTurn.
             room.respondDraw(seat, accept = false).void

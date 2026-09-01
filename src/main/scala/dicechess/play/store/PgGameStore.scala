@@ -482,16 +482,76 @@ final class PgGameStore private (xa: Transactor[IO])
   def adminBots: IO[List[AdminBotListing]] =
     sql"""SELECT b.team, b.name,
                  COALESCE(r.rating, ${Glicko.Initial.rating}), COALESCE(r.rd, ${Glicko.Initial.deviation}),
-                 b.on_ladder, b.open_to_humans, b.description, b.owner_external_id IS NOT NULL
+                 b.on_ladder, b.open_to_humans, b.description,
+                 b.max_concurrent_games,
+                 b.owner_external_id IS NOT NULL,
+                 w.url, w.verified_at, w.capabilities, w.last_failure_at, w.last_failure_reason
           FROM play.bots b
           LEFT JOIN play.bot_ratings r
             ON r.team = b.team AND r.name = b.name AND r.category = ${RatingCategory.Default.wireName}
+          LEFT JOIN play.bot_webhooks w
+            ON w.team = b.team AND w.name = b.name
           ORDER BY COALESCE(r.rating, ${Glicko.Initial.rating}) DESC, b.team, b.name"""
-      .query[(String, String, Double, Double, Boolean, Boolean, Option[String], Boolean)]
+      .query[
+        (
+            String,
+            String,
+            Double,
+            Double,
+            Boolean,
+            Boolean,
+            Option[String],
+            Int,
+            Boolean,
+            Option[String],
+            Option[Instant],
+            Option[List[String]],
+            Option[Instant],
+            Option[String]
+        )
+      ]
       .to[List]
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.map(AdminBotListing.apply.tupled))
+      .map(_.map {
+        case (
+              team,
+              name,
+              rating,
+              rd,
+              onLadder,
+              openToHumans,
+              description,
+              maxConcurrentGames,
+              owned,
+              wUrl,
+              wVerifiedAt,
+              wCapabilities,
+              wLastFailureAt,
+              wLastFailureReason
+            ) =>
+          val webhook = for
+            url        <- wUrl
+            verifiedAt <- wVerifiedAt
+          yield AdminBotWebhook(
+            url = url,
+            verifiedAt = verifiedAt,
+            capabilities = wCapabilities.getOrElse(Nil),
+            lastFailure = (wLastFailureAt, wLastFailureReason).mapN(AdminWebhookFailure.apply)
+          )
+          AdminBotListing(
+            team = team,
+            name = name,
+            rating = rating,
+            rd = rd,
+            onLadder = onLadder,
+            openToHumans = openToHumans,
+            description = description,
+            maxConcurrentGames = maxConcurrentGames,
+            owned = owned,
+            webhook = webhook
+          )
+      })
 
   /** One admin mutation and its `admin_actions` row in a single transaction (V19, the `renameTx` shape): a crash can
     * never leave the action applied but unrecorded. The row is written only when the mutation found its bot — the table
@@ -559,6 +619,33 @@ final class PgGameStore private (xa: Transactor[IO])
             WHERE team = $team AND name = $name""".update.run
         .map(rows => Option.when(rows == 1)(()))
     }.map(_.isDefined)
+
+  def adminSetMaxConcurrentGames(
+      adminUserId: String,
+      team: String,
+      name: String,
+      maxConcurrentGames: Int
+  ): IO[Option[BotSeatPolicy]] =
+    (for
+      oldLimit <- sql"""SELECT max_concurrent_games FROM play.bots WHERE team = $team AND name = $name FOR UPDATE"""
+        .query[Int]
+        .option
+      result <- oldLimit.traverse { before =>
+        val detail = s"$before -> $maxConcurrentGames"
+        sql"""UPDATE play.bots SET max_concurrent_games = $maxConcurrentGames
+              WHERE team = $team AND name = $name
+              RETURNING open_to_humans"""
+          .query[Boolean]
+          .unique
+          .flatMap { open =>
+            sql"""INSERT INTO play.admin_actions (admin_user_id, team, name, action, detail)
+                  VALUES ($adminUserId::uuid, $team, $name, 'capacity.set', $detail)""".update.run
+              .as(BotSeatPolicy(Principal.Bot(team, name), maxConcurrentGames, open))
+          }
+      }
+    yield result)
+      .transact(xa)
+      .timeout(SaveTimeout)
 
   /** Catalog cards for `GET /lobby/bots` (ADR-0014): the open-to-humans bots with their rating summary and blurb, best
     * rating first. Needs no `game_results` join, unlike the leaderboard. `max_concurrent_games` (#189) rides along in

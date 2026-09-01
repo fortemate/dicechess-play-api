@@ -60,7 +60,7 @@ in their queues undelivered. Boot warns on stderr, and nothing else complains.
 | `RETENTION_DAYS` | Optional, default `30`. |
 | `RETENTION_BATCH_SIZE` | Optional, default `1000`. |
 | `PLAY_BOT_TOKENS` | Statically configured bots, as `team\|name\|token` CSV. |
-| `PLAY_ADMINS` | Comma-separated **account uuids** granted the admin bot surface (#273): `/admin/bots/{team}/{name}/…` drives any registered bot without its token — ladder, catalog, description, token rotation — every write audited in `admin_actions` (V19). Uuids, not nicknames: nicknames rename and release (V18). Needs `PLAY_SESSION_SECRET` **and** persistence; boot warns loudly when set without them. Malformed entries are skipped and reported by **position only** — never by value, since one of them may be a secret pasted into the wrong variable. |
+| `PLAY_ADMINS` | Comma-separated **account uuids** granted the admin bot surface (#273): `/admin/bots/{team}/{name}/…` drives any registered bot without its token — ladder, catalog, description, capacity, token rotation — every write audited in `admin_actions` (V19). Uuids, not nicknames: nicknames rename and release (V18). Needs `PLAY_SESSION_SECRET` **and** persistence; boot warns loudly when set without them. Malformed entries are skipped and reported by **position only** — never by value, since one of them may be a secret pasted into the wrong variable. |
 | `PLAY_CORS_ORIGINS` | Allowed origins; empty allows any (credential-less). A non-empty list also enables credentialed CORS — required once sign-in is on. |
 | `APP_VERSION` | Surfaced at `GET /version`. Set by the CD workflow from the git tag. |
 

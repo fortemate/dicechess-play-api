@@ -53,6 +53,27 @@ trait AdminBotStore:
     */
   def adminRotate(adminUserId: String, team: String, name: String, newTokenHash: String): IO[Boolean]
 
+  /** [[BotStore.setMaxConcurrentGames]] with an audit row (`capacity.set`, `before -> after` as its detail). `None` if
+    * no such registered bot.
+    */
+  def adminSetMaxConcurrentGames(
+      adminUserId: String,
+      team: String,
+      name: String,
+      maxConcurrentGames: Int
+  ): IO[Option[BotSeatPolicy]]
+
+/** The most recent delivery failure for a bot's webhook registration. */
+final case class AdminWebhookFailure(at: java.time.Instant, reason: String)
+
+/** Summary of a registered bot's webhook configuration and health, without the signing secret. */
+final case class AdminBotWebhook(
+    url: String,
+    verifiedAt: java.time.Instant,
+    capabilities: List[String] = Nil,
+    lastFailure: Option[AdminWebhookFailure] = None
+)
+
 /** One row in the administrator's full bot inventory (#313). `owned` intentionally stops at a boolean: an administrator
   * needs to distinguish self-service from unclaimed bots, but revealing the owning account would turn a recovery
   * surface into an attribution lookup and would not change any action it may take.
@@ -65,5 +86,7 @@ final case class AdminBotListing(
     onLadder: Boolean,
     openToHumans: Boolean,
     description: Option[String],
-    owned: Boolean
+    maxConcurrentGames: Int,
+    owned: Boolean,
+    webhook: Option[AdminBotWebhook]
 )

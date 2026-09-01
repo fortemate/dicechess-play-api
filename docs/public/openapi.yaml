@@ -37,6 +37,8 @@ tags:
       answers 503 until the rating batch has completed its first refresh.
   - name: Webhooks
     description: Register an HTTPS callback the server POSTs turns to. Registered bots only; enabled per server.
+  - name: Admin
+    description: Break-glass operator controls and complete inventory. Gated by user session in PLAY_ADMINS.
 paths:
   /bot/anon:
     post:
@@ -731,12 +733,76 @@ paths:
               schema: { $ref: '#/components/schemas/WebhookDeliveryStats' }
         '403': { $ref: '#/components/responses/RegisteredOnly' }
         '404': { description: Server runs without persistence. }
+  /admin/bots:
+    get:
+      tags: [Admin]
+      summary: Complete bot inventory
+      description: >
+        Returns the administrator's complete inventory, including provisional and closed bots,
+        enriched with seating capacity, load utilization, and verified webhook diagnostics (excluding HMAC secrets).
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Full inventory.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminBots'
+        '401':
+          description: Unauthorized. Live user session required.
+        '403':
+          description: Forbidden. Signed-in account is not on the PLAY_ADMINS allowlist.
+  /admin/bots/{team}/{name}/capacity:
+    post:
+      tags: [Admin]
+      summary: Set bot concurrent seating capacity
+      description: >
+        Sets the maximum number of concurrent games the bot is willing to play (1..32) without
+        needing the bot's own token or owner session. Audited in play.admin_actions.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: team
+          in: path
+          required: true
+          schema: { type: string }
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetCapacity'
+      responses:
+        '200':
+          description: Updated capacity snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capacity'
+        '400':
+          description: Invalid capacity (must be between 1 and 32).
+        '401':
+          description: Unauthorized. Live user session required.
+        '403':
+          description: Forbidden. Signed-in account is not on the PLAY_ADMINS allowlist.
+        '404':
+          description: No such registered bot.
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       description: 'Authorization: Bearer <token>. Every route requires it except POST /bot/anon and POST /bot/register (which mint/claim a token).'
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: play_session
+      description: 'Session cookie minted by the play server during user login.'
   parameters:
     GameId:
       name: id
@@ -1314,3 +1380,45 @@ components:
         - { type: object, properties: { SuddenDeath: { type: object, properties: { initialSeconds: { type: integer } }, required: [initialSeconds] } }, required: [SuddenDeath] }
         - { type: object, properties: { Fischer: { type: object, properties: { initialSeconds: { type: integer }, incrementSeconds: { type: integer } }, required: [initialSeconds, incrementSeconds] } }, required: [Fischer] }
         - { type: object, properties: { PerMove: { type: object, properties: { secondsPerMove: { type: integer } }, required: [secondsPerMove] } }, required: [PerMove] }
+    AdminBots:
+      type: object
+      properties:
+        bots:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminBot'
+      required: [bots]
+    AdminBot:
+      type: object
+      properties:
+        team: { type: string }
+        name: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        onLadder: { type: boolean }
+        openToHumans: { type: boolean }
+        description: { type: [string, 'null'] }
+        maxConcurrentGames: { type: integer }
+        ladderAllowance: { type: integer }
+        activeGames: { type: integer }
+        owned: { type: boolean }
+        webhook:
+          oneOf:
+            - $ref: '#/components/schemas/AdminWebhook'
+            - type: 'null'
+      required: [team, name, rating, rd, provisional, onLadder, openToHumans, description, maxConcurrentGames, ladderAllowance, activeGames, owned, webhook]
+    AdminWebhook:
+      type: object
+      description: Summary of a bot's webhook registration for administrator inspection without HMAC secrets.
+      properties:
+        url: { type: string }
+        verifiedAt: { type: string, format: date-time }
+        capabilities:
+          type: array
+          items: { type: string }
+        lastFailure:
+          oneOf:
+            - $ref: '#/components/schemas/LastDeliveryFailure'
+            - type: 'null'
+      required: [url, verifiedAt, capabilities, lastFailure]

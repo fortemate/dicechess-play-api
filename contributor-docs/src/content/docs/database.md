@@ -226,9 +226,10 @@ No foreign key to `users` or `bots`, deliberately: the table exists to answer qu
 the actors are gone (an admin account deleted via `DELETE /auth/me` still has to be nameable
 as "who did this"), and a cascade would erase exactly the history an audit exists to keep.
 `action` is a short verb id (`ladder.join`, `ladder.leave`, `catalog.open`, `catalog.close`,
-`catalog.describe`, `token.rotate`); `detail` carries the action's human-relevant parameter —
-the description text of the catalog writes — and never secret material: `token.rotate` keeps
-it NULL. Operator-only, read with `psql`; never exposed on any wire type.
+`catalog.describe`, `token.rotate`, `capacity.set`); `detail` carries the action's human-relevant
+parameter — the description text of catalog writes or `before -> after` capacity limits — and never
+secret material: `token.rotate` keeps it NULL. Operator-only, read with `psql`; never exposed on any
+wire type.
 
 ## Two deliberate design choices
 

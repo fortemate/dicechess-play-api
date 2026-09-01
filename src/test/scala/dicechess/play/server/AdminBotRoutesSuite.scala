@@ -2,7 +2,7 @@ package dicechess.play.server
 
 import cats.effect.{IO, Ref}
 import cats.syntax.all.*
-import dicechess.play.core.Principal
+import dicechess.play.core.{Principal, WebhookCapability}
 import dicechess.play.rating.Glicko2
 import dicechess.play.store.{
   AdminBotListing,
@@ -125,7 +125,7 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
               AdminBotWebhook(
                 url = "https://alice.example.com/bot",
                 verifiedAt = verifiedAt,
-                capabilities = List("draws", "custom_legacy_cap"),
+                capabilities = List(WebhookCapability.Draws),
                 lastFailure = Some(AdminWebhookFailure(failedAt, "the endpoint answered HTTP 500"))
               )
             )
@@ -225,7 +225,7 @@ class AdminBotRoutesSuite extends munit.CatsEffectSuite:
       val webhook = alice.webhook.getOrElse(fail("alice must have webhook summary"))
       assertEquals(webhook.url, "https://alice.example.com/bot")
       assertEquals(webhook.verifiedAt, Instant.parse("2026-08-01T12:00:00Z"))
-      assertEquals(webhook.capabilities, List("draws", "custom_legacy_cap"))
+      assertEquals(webhook.capabilities, List(WebhookCapability.Draws))
       assertEquals(
         webhook.lastFailure,
         Some(LastDeliveryFailure(Instant.parse("2026-08-02T10:00:00Z"), "the endpoint answered HTTP 500"))

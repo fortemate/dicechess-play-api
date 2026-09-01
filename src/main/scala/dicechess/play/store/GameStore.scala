@@ -452,7 +452,7 @@ final case class BotWebhook(
     url: String,
     secret: String,
     verifiedAt: java.time.Instant,
-    capabilities: List[String] = Nil
+    capabilities: List[WebhookCapability] = Nil
 )
 
 /** Persistence seam for webhook registrations (F.2, #104). One webhook per bot identity; `put` replaces (re-register

@@ -1,6 +1,7 @@
 package dicechess.play.store
 
 import cats.effect.IO
+import dicechess.play.core.WebhookCapability
 
 /** The administrator's door to any registered bot (#273) — the same mutations [[BotStore]] grants the bot's own token
   * and the owner surface grants a claimed owner, minus every credential check, plus an audit row. Deliberately a
@@ -70,7 +71,7 @@ final case class AdminWebhookFailure(at: java.time.Instant, reason: String)
 final case class AdminBotWebhook(
     url: String,
     verifiedAt: java.time.Instant,
-    capabilities: List[String] = Nil,
+    capabilities: List[WebhookCapability] = Nil,
     lastFailure: Option[AdminWebhookFailure] = None
 )
 

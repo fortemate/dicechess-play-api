@@ -130,6 +130,10 @@ Indexes:
 | `last_failure_reason` | `text` | yes | — | — |
 | `capabilities` | `text[]` | no | `'{}'::text[]` | — |
 
+Check constraints:
+
+- `CHECK (((capabilities = ARRAY[]::text[]) OR (capabilities = ARRAY['draws'::text])))`
+
 Indexes:
 
 - `bot_webhooks_pkey` — `CREATE UNIQUE INDEX bot_webhooks_pkey ON public.bot_webhooks USING btree (team, name)`

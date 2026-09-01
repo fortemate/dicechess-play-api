@@ -5,7 +5,27 @@ description: Register one HTTPS callback and let the server POST your turns — 
 
 The push alternative to streams and polling (**registered bots only**): register an HTTPS callback once, and the server POSTs to it whenever it is your turn — **the HTTP response body is your move**. A bot becomes a single stateless HTTPS handler, woken only when there is a decision to make. Works with every time control — a 1–3 s cold start is noise against a Fischer 300+3 budget.
 
-Webhooks are enabled per server by the operator; when off, every endpoint below answers `503 Service Unavailable` — except [delivery stats](#how-to-see-what-is-happening), which read history and answer regardless of whether the feature is currently on. The per-turn wait is bounded by both a server cap — **120 s on the public deployment** — and the mover's remaining clock; see [How long you have to answer](#how-long-you-have-to-answer).
+Webhooks are enabled per server by the operator; when off, registration, inspection, and removal answer `503 Service Unavailable`, and no deliveries run. Two read-only exceptions remain available: the public [capability catalog](#discover-capabilities), because it describes the API contract rather than one bot's configuration, and [delivery stats](#how-to-see-what-is-happening), because they describe history. The per-turn wait is bounded by both a server cap — **120 s on the public deployment** — and the mover's remaining clock; see [How long you have to answer](#how-long-you-have-to-answer).
+
+## Discover capabilities
+
+`GET /bot/webhook/capabilities` is public: it needs no Bearer token and continues to answer when webhook delivery is disabled. It returns every canonical capability in stable registry order together with its current selection status:
+
+```json
+{
+  "capabilities": [
+    { "name": "draws", "status": "available", "selectable": true },
+    { "name": "doubling", "status": "reserved", "selectable": false }
+  ]
+}
+```
+
+| Name | Status | Selectable | Meaning |
+| --- | --- | --- | --- |
+| `draws` | `available` | `true` | May be selected now; enables the [`drawDecision`](#draw-decision-delivery-drawdecision) delivery described below. |
+| `doubling` | `reserved` | `false` | The canonical name is fixed, but it cannot be selected, stored, or acted on yet. The authoritative events and state machine belong to [play-api issue #37](https://github.com/fortemate/dicechess-play-api/issues/37). |
+
+`available` means accepted by registration; `reserved` does **not** imply a partially implemented behavior. A registry update is an explicit API change — a reserved capability never becomes active merely because its name is present in this response.
 
 ## Register a webhook
 
@@ -17,8 +37,11 @@ Webhooks are enabled per server by the operator; when off, every endpoint below 
 
 The URL must be **HTTPS** and resolve to a **public** address — loopback, RFC1918, link-local, CGNAT and IPv6-ULA targets are rejected, so the server can never be pointed at anyone's internal network. Before anything is stored, the server runs an **ownership handshake**: it POSTs `{"type":"verification","nonce":"<random>"}` to the URL, and the endpoint must answer `200` with `{"nonce":"<the same value>"}`. Only then does the webhook become active — no game data is ever sent to an unverified URL.
 
-- **Capabilities** (optional list of strings):
-  - `"draws"`: Opt-in to receive `drawDecision` webhook deliveries when an opponent offers a draw. If omitted or empty (the default), draw offers are automatically declined by the server on behalf of the bot, immediately revealing dice and sending a normal `yourTurn` payload.
+- **Capabilities** (optional list of canonical names):
+  - `"draws"`: Opt in to receive `drawDecision` webhook deliveries when an opponent offers a draw. If omitted, `null`, or empty (the default), draw offers are automatically declined by the server on behalf of the bot, immediately revealing dice and sending a normal `yourTurn` payload.
+  - Matching is exact and case-sensitive. The server does not trim or lowercase input, so `"Draws"`, `" draws "`, `"double"`, and any other unknown value return `422` with an `unknown webhook capability` reason.
+  - `"doubling"` is a known but reserved name and returns `422` with a `webhook capability is not available` reason until the complete protocol is implemented and deliberately enabled.
+  - Duplicate selectable input is accepted and collapsed into stable registry order: `["draws", "draws"]` is stored and returned as `["draws"]`.
 - **Response** `201`
 
   ```json
@@ -26,11 +49,11 @@ The URL must be **HTTPS** and resolve to a **public** address — loopback, RFC1
   ```
 
   `secret` is the per-bot HMAC key the server signs every delivery with — **shown exactly once.** Keep it in your function's secret storage. Re-registering replaces both URL and secret.
-- **Errors:** `403` anonymous/static caller; `422` URL-policy violation or failed handshake (the body says which); `429` per-IP registration budget; `503` webhooks disabled.
+- **Errors:** `403` anonymous/static caller; `422` with distinct plain-text reasons for an unknown/non-canonical capability or a recognized reserved capability; `422` for a URL-policy violation or failed handshake (the body says which); `429` per-IP registration budget; `503` webhooks disabled.
 
 ## Inspect / remove
 
-`GET /bot/webhook` → `200 { "url": …, "capabilities": ["draws"], "verifiedAt": "2026-07-17T12:00:00Z" }` (the secret is never shown again), or `404` if none.
+`GET /bot/webhook` → `200 { "url": …, "capabilities": ["draws"], "verifiedAt": "2026-07-17T12:00:00Z" }` (the secret is never shown again), or `404` if none. A non-empty `capabilities` array is always canonical; no selection remains backward-compatible as `"capabilities": null` (clients may also tolerate the optional field being absent).
 
 `DELETE /bot/webhook` → `204`; deliveries stop at the **next turn**. Mid-game included — the games themselves keep running and keep charging your clock.
 

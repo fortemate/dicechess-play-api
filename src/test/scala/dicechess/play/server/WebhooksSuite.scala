@@ -463,7 +463,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
           "https://bot.example/hook",
           "secret" * 8,
           Instant.EPOCH,
-          capabilities = List("draws")
+          capabilities = List(WebhookCapability.Draws)
         )
       )
       human = Principal.Guest("human-123")

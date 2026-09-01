@@ -1,6 +1,6 @@
 package dicechess.play.server
 
-import cats.effect.{IO, Resource}
+import cats.effect.{IO, Ref, Resource}
 import dicechess.play.store.{
   BotStore,
   DeliveryOutcome,
@@ -73,6 +73,12 @@ class WebhookRoutesSuite extends CatsEffectSuite:
     val base = Request[IO](Method.GET, Uri.unsafeFromString("/bot/webhook/stats"))
     token.fold(base)(t => base.putHeaders(Authorization(Credentials.Token(AuthScheme.Bearer, t))))
 
+  private val capabilitiesRequest: Request[IO] =
+    Request[IO](Method.GET, Uri.unsafeFromString("/bot/webhook/capabilities"))
+
+  private def registration(url: String, capabilities: List[String]): Json =
+    Json.obj("url" -> url.asJson, "capabilities" -> capabilities.asJson)
+
   private val goodBody = Json.obj("url" -> "https://fn.example/hook".asJson)
 
   /** A `WebhookStatsStore` that answers `answer` to every `statsFor` call and never actually records anything — the
@@ -103,6 +109,34 @@ class WebhookRoutesSuite extends CatsEffectSuite:
       assertEquals(got.status, Status.ServiceUnavailable)
       assertEquals(deleted.status, Status.ServiceUnavailable)
 
+  test("capability discovery is public, stable, and available when webhook delivery is disabled (#35)"):
+    for
+      bots    <- BotStore.inMemory
+      auth    <- BotAuth.fromSpec("", bots)
+      limiter <- AnonMintLimiter.create()
+      routes = WebhookRoutes(auth, None, limiter)
+      response <- routes.orNotFound.run(capabilitiesRequest)
+      body     <- response.as[Json]
+    yield
+      assertEquals(response.status, Status.Ok)
+      assertEquals(
+        body,
+        Json.obj(
+          "capabilities" -> List(
+            Json.obj(
+              "name"       -> "draws".asJson,
+              "status"     -> "available".asJson,
+              "selectable" -> true.asJson
+            ),
+            Json.obj(
+              "name"       -> "doubling".asJson,
+              "status"     -> "reserved".asJson,
+              "selectable" -> false.asJson
+            )
+          ).asJson
+        )
+      )
+
   test("no token is 401; anonymous and static bots are 403 — webhooks are a registered-bot perk"):
     fixture().use { (routes, _, anonToken, staticToken) =>
       for
@@ -129,13 +163,63 @@ class WebhookRoutesSuite extends CatsEffectSuite:
         assertEquals(created.status, Status.Created)
         assertEquals(body.hcursor.get[String]("url"), Right("https://fn.example/hook"))
         assert(body.hcursor.get[String]("secret").exists(_.matches("[0-9a-f]{64}")), s"one-time secret in $body")
+        assertEquals(body.hcursor.downField("capabilities").focus, Some(Json.Null))
         assertEquals(got.status, Status.Ok)
         assertEquals(info.hcursor.get[String]("url"), Right("https://fn.example/hook"))
         assert(info.hcursor.get[String]("secret").isLeft, "the secret must never be shown again")
+        assertEquals(info.hcursor.downField("capabilities").focus, Some(Json.Null))
         assertEquals(deleted.status, Status.NoContent)
         assertEquals(gone.status, Status.NotFound)
         assertEquals(again.status, Status.NotFound)
     }
+
+  test("registration canonicalizes draws and atomically rejects unknown or reserved values before handshake (#35)"):
+    for
+      outboundCalls <- Ref.of[IO, Int](0)
+      endpoint = HttpApp[IO] { req =>
+        outboundCalls.update(_ + 1) *> echoEndpoint.run(req)
+      }
+      _ <- fixture(endpoint = endpoint).use { (routes, token, _, _) =>
+        val valid = registration("https://fn.example/original", List("draws", "draws"))
+        for
+          created     <- routes.orNotFound.run(request(Method.POST, Some(token), Some(valid)))
+          createdBody <- created.as[Json]
+          unknown     <- routes.orNotFound.run(
+            request(
+              Method.POST,
+              Some(token),
+              Some(registration("https://fn.example/replacement", List("draws", "unknown")))
+            )
+          )
+          unknownReason <- unknown.bodyText.compile.string
+          reserved      <- routes.orNotFound.run(
+            request(Method.POST, Some(token), Some(registration("https://fn.example/replacement", List("doubling"))))
+          )
+          reservedReason <- reserved.bodyText.compile.string
+          wrongCase      <- routes.orNotFound.run(
+            request(Method.POST, Some(token), Some(registration("https://fn.example/replacement", List("Draws"))))
+          )
+          whitespace <- routes.orNotFound.run(
+            request(Method.POST, Some(token), Some(registration("https://fn.example/replacement", List(" draws "))))
+          )
+          calls <- outboundCalls.get
+          got   <- routes.orNotFound.run(request(Method.GET, Some(token)))
+          info  <- got.as[Json]
+        yield
+          assertEquals(created.status, Status.Created)
+          assertEquals(createdBody.hcursor.get[List[String]]("capabilities"), Right(List("draws")))
+          assertEquals(unknown.status, Status.UnprocessableEntity)
+          assert(unknownReason.contains("unknown webhook capability: unknown"), unknownReason)
+          assertEquals(reserved.status, Status.UnprocessableEntity)
+          assert(reservedReason.contains("webhook capability is not available: doubling"), reservedReason)
+          assertEquals(wrongCase.status, Status.UnprocessableEntity)
+          assertEquals(whitespace.status, Status.UnprocessableEntity)
+          assertEquals(calls, 1, "invalid selections must not perform an ownership handshake")
+          assertEquals(got.status, Status.Ok)
+          assertEquals(info.hcursor.get[String]("url"), Right("https://fn.example/original"))
+          assertEquals(info.hcursor.get[List[String]]("capabilities"), Right(List("draws")))
+      }
+    yield ()
 
   test("a failed handshake is 422 with the reason, and a malformed body is 400"):
     val wrongNonce = HttpApp[IO](_ => Ok(Json.obj("nonce" -> "different".asJson)))

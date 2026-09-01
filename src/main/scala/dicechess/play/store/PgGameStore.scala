@@ -11,7 +11,16 @@ import doobie.postgres.circe.jsonb.implicits.*
 import doobie.hikari.HikariTransactor
 import doobie.util.ExecutionContexts
 import doobie.util.fragments
-import dicechess.play.core.{GameId, GameOver, GameStatus, Principal, RatingCategory, Seat, Termination}
+import dicechess.play.core.{
+  GameId,
+  GameOver,
+  GameStatus,
+  Principal,
+  RatingCategory,
+  Seat,
+  Termination,
+  WebhookCapability
+}
 import dicechess.play.ingest.PlaysiteIngest
 import dicechess.play.rating.{Glicko, Glicko2}
 import io.circe.Json
@@ -55,6 +64,25 @@ final class PgGameStore private (xa: Transactor[IO])
     SaveTimeout,
     UniqueViolation
   }
+
+  /** Decode the constrained `bot_webhooks.capabilities` column at the persistence boundary. Flyway V3 guarantees that
+    * only the canonical selectable arrays reach this point; failing loudly here keeps a hand-edited or partially
+    * migrated row from silently acquiring semantics the typed model does not define.
+    */
+  private def webhookCapabilities(names: List[String]): List[WebhookCapability] =
+    WebhookCapability
+      .parseSelection(names)
+      .flatMap(capabilities =>
+        Either.cond(
+          capabilities.map(_.wireName) == names,
+          capabilities,
+          s"non-canonical stored array: ${names.mkString("[", ",", "]")}"
+        )
+      )
+      .fold(
+        reason => throw new IllegalStateException(s"invalid stored webhook capabilities: $reason"),
+        identity
+      )
 
   /** Upsert the snapshot — and, in the SAME transaction, enqueue the finished game's analytics payload and write its
     * `game_results` and `game_archive` (#177) rows: the snapshot write and all three handoffs are atomic, so a crash
@@ -536,7 +564,7 @@ final class PgGameStore private (xa: Transactor[IO])
           yield AdminBotWebhook(
             url = url,
             verifiedAt = verifiedAt,
-            capabilities = wCapabilities.getOrElse(Nil),
+            capabilities = webhookCapabilities(wCapabilities.getOrElse(Nil)),
             lastFailure = (wLastFailureAt, wLastFailureReason).mapN(AdminWebhookFailure.apply)
           )
           AdminBotListing(
@@ -678,8 +706,9 @@ final class PgGameStore private (xa: Transactor[IO])
 
   /** Upsert: a re-register replaces URL and secret together (the old secret stops signing immediately). */
   def put(webhook: BotWebhook): IO[Unit] =
+    val capabilities = webhook.capabilities.map(_.wireName)
     sql"""INSERT INTO play.bot_webhooks (team, name, url, secret, verified_at, capabilities)
-          VALUES (${webhook.team}, ${webhook.name}, ${webhook.url}, ${webhook.secret}, ${webhook.verifiedAt}, ${webhook.capabilities})
+          VALUES (${webhook.team}, ${webhook.name}, ${webhook.url}, ${webhook.secret}, ${webhook.verifiedAt}, $capabilities)
           ON CONFLICT (team, name)
           DO UPDATE SET url = EXCLUDED.url, secret = EXCLUDED.secret, verified_at = EXCLUDED.verified_at, capabilities = EXCLUDED.capabilities""".update.run
       .transact(xa)
@@ -689,7 +718,10 @@ final class PgGameStore private (xa: Transactor[IO])
   def get(team: String, name: String): IO[Option[BotWebhook]] =
     sql"""SELECT team, name, url, secret, verified_at, capabilities FROM play.bot_webhooks
           WHERE team = $team AND name = $name"""
-      .query[BotWebhook]
+      .query[(String, String, String, String, Instant, List[String])]
+      .map { case (storedTeam, storedName, url, secret, verifiedAt, capabilities) =>
+        BotWebhook(storedTeam, storedName, url, secret, verifiedAt, webhookCapabilities(capabilities))
+      }
       .option
       .transact(xa)
       .timeout(SaveTimeout)

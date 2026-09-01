@@ -258,15 +258,24 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  test("webhook registration round-trips, re-register replaces url+secret, delete reports truth (#104)"):
+  test("webhook registration round-trips typed capabilities and re-register replaces the row (#104, #35)"):
     withContainers { pg =>
       store(pg).use { db =>
         val at = java.time.Instant.parse("2026-07-17T12:00:00Z")
         for
           // A webhook row requires its bot identity (FK to bots) — dedicated namespace, same reasoning as above.
-          _        <- db.register("webhook-suite", "pusher", "hash-webhook-pusher")
-          none     <- db.get("webhook-suite", "pusher")
-          _        <- db.put(BotWebhook("webhook-suite", "pusher", "https://fn.example/turn", "secret-1", at))
+          _    <- db.register("webhook-suite", "pusher", "hash-webhook-pusher")
+          none <- db.get("webhook-suite", "pusher")
+          _    <- db.put(
+            BotWebhook(
+              "webhook-suite",
+              "pusher",
+              "https://fn.example/turn",
+              "secret-1",
+              at,
+              List(WebhookCapability.Draws)
+            )
+          )
           first    <- db.get("webhook-suite", "pusher")
           _        <- db.put(BotWebhook("webhook-suite", "pusher", "https://fn2.example/turn", "secret-2", at))
           replaced <- db.get("webhook-suite", "pusher")
@@ -275,7 +284,19 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           again    <- db.delete("webhook-suite", "pusher")
         yield
           assertEquals(none, None)
-          assertEquals(first, Some(BotWebhook("webhook-suite", "pusher", "https://fn.example/turn", "secret-1", at)))
+          assertEquals(
+            first,
+            Some(
+              BotWebhook(
+                "webhook-suite",
+                "pusher",
+                "https://fn.example/turn",
+                "secret-1",
+                at,
+                List(WebhookCapability.Draws)
+              )
+            )
+          )
           assertEquals(
             replaced,
             Some(BotWebhook("webhook-suite", "pusher", "https://fn2.example/turn", "secret-2", at)),
@@ -2159,7 +2180,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           url = "https://example.com/bot-webhook",
           secret = "secret-hmac-key-should-never-leak",
           verifiedAt = verifiedAt,
-          capabilities = List("draws", "custom_legacy_cap")
+          capabilities = List(WebhookCapability.Draws)
         )
         for
           _ <- db.register("admin-wh", "diagnostics-bot", "hash-admin-wh-diag")
@@ -2175,7 +2196,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           val wh = bot.webhook.getOrElse(fail("webhook must be present"))
           assertEquals(wh.url, "https://example.com/bot-webhook")
           assertEquals(wh.verifiedAt, verifiedAt)
-          assertEquals(wh.capabilities, List("draws", "custom_legacy_cap"))
+          assertEquals(wh.capabilities, List(WebhookCapability.Draws))
           assertEquals(wh.lastFailure, Some(AdminWebhookFailure(failedAt, "the endpoint answered HTTP 500")))
       }
     }
@@ -2370,6 +2391,108 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         .createSchemas(true)
       upTo.fold(configured)(version => configured.target(MigrationVersion.fromVersion(version))).load().migrate()
       ()
+    }
+
+  test("V3 canonicalizes legacy webhook capabilities before closing the database contract (#35)"):
+    withContainers { pg =>
+      rawXa(pg).use { xa =>
+        val schema = "mig_v3_webhook_caps"
+        val plant  =
+          ((fr"INSERT INTO" ++ Fragment.const(s"$schema.bots") ++
+            fr"""(team, name, token_hash) VALUES
+                 ('caps', 'draws', 'hash-v3-draws'),
+                 ('caps', 'duplicate', 'hash-v3-duplicate'),
+                 ('caps', 'mixed', 'hash-v3-mixed'),
+                 ('caps', 'draws-null', 'hash-v3-draws-null'),
+                 ('caps', 'empty', 'hash-v3-empty'),
+                 ('caps', 'unknown', 'hash-v3-unknown'),
+                 ('caps', 'reserved', 'hash-v3-reserved'),
+                 ('caps', 'wrong-case', 'hash-v3-wrong-case'),
+                 ('caps', 'whitespace', 'hash-v3-whitespace'),
+                 ('caps', 'null-only', 'hash-v3-null-only')""").update.run *>
+            (fr"INSERT INTO" ++ Fragment.const(s"$schema.bot_webhooks") ++
+              fr"""(team, name, url, secret, verified_at, capabilities) VALUES
+                   ('caps', 'draws', 'https://example.com/hook', 'secret', now(), ARRAY['draws']::text[]),
+                   ('caps', 'duplicate', 'https://example.com/hook', 'secret', now(), ARRAY['draws', 'draws']::text[]),
+                   ('caps', 'mixed', 'https://example.com/hook', 'secret', now(), ARRAY['unknown', 'draws']::text[]),
+                   ('caps', 'draws-null', 'https://example.com/hook', 'secret', now(), ARRAY['draws', NULL]::text[]),
+                   ('caps', 'empty', 'https://example.com/hook', 'secret', now(), ARRAY[]::text[]),
+                   ('caps', 'unknown', 'https://example.com/hook', 'secret', now(), ARRAY['unknown']::text[]),
+                   ('caps', 'reserved', 'https://example.com/hook', 'secret', now(), ARRAY['doubling']::text[]),
+                   ('caps', 'wrong-case', 'https://example.com/hook', 'secret', now(), ARRAY['Draws']::text[]),
+                   ('caps', 'whitespace', 'https://example.com/hook', 'secret', now(), ARRAY[' draws ']::text[]),
+                   ('caps', 'null-only', 'https://example.com/hook', 'secret', now(), ARRAY[NULL]::text[])""").update.run)
+            .transact(xa)
+        val stored =
+          (fr"SELECT name, capabilities::text FROM" ++ Fragment.const(s"$schema.bot_webhooks") ++ fr"ORDER BY name")
+            .query[(String, String)]
+            .to[List]
+            .transact(xa)
+        for
+          _    <- migrateInto(pg, schema, Some("2"))
+          _    <- plant
+          _    <- migrateInto(pg, schema)
+          rows <- stored
+        yield assertEquals(
+          rows,
+          List(
+            "draws"      -> "{draws}",
+            "draws-null" -> "{draws}",
+            "duplicate"  -> "{draws}",
+            "empty"      -> "{}",
+            "mixed"      -> "{draws}",
+            "null-only"  -> "{}",
+            "reserved"   -> "{}",
+            "unknown"    -> "{}",
+            "whitespace" -> "{}",
+            "wrong-case" -> "{}"
+          )
+        )
+      }
+    }
+
+  test("V3 accepts only canonical stored webhook capability arrays (#35)"):
+    withContainers { pg =>
+      rawXa(pg).use { xa =>
+        val schema  = "mig_v3_webhook_check"
+        val seedBot =
+          (fr"INSERT INTO" ++ Fragment.const(s"$schema.bots") ++
+            fr"(team, name, token_hash) VALUES ('caps', 'target', 'hash-v3-target')").update.run.transact(xa)
+        def insert(capabilitiesSql: String): IO[Either[Throwable, Int]] =
+          ((fr"INSERT INTO" ++ Fragment.const(s"$schema.bot_webhooks") ++
+            fr"""(team, name, url, secret, verified_at, capabilities)
+                 VALUES ('caps', 'target', 'https://example.com/hook', 'secret', now(),""") ++
+            Fragment.const0(capabilitiesSql) ++ fr")").update.run.transact(xa).attempt
+        val deleteHook =
+          (fr"DELETE FROM" ++ Fragment.const(s"$schema.bot_webhooks") ++
+            fr"WHERE team = 'caps' AND name = 'target'").update.run.transact(xa).void
+        def assertCheckViolation(result: Either[Throwable, Int], label: String): Unit =
+          result match
+            case Left(error: java.sql.SQLException) =>
+              assertEquals(error.getSQLState, "23514", s"$label must fail the canonical CHECK")
+            case Left(error) => fail(s"$label failed with ${error.getClass.getName}, not a SQL CHECK violation")
+            case Right(rows) => fail(s"$label unexpectedly inserted $rows row(s)")
+        for
+          _            <- migrateInto(pg, schema)
+          _            <- seedBot
+          empty        <- insert("ARRAY[]::text[]")
+          _            <- deleteHook
+          draws        <- insert("ARRAY['draws']::text[]")
+          _            <- deleteHook
+          unknown      <- insert("ARRAY['unknown']::text[]")
+          reserved     <- insert("ARRAY['doubling']::text[]")
+          duplicate    <- insert("ARRAY['draws', 'draws']::text[]")
+          nullOnly     <- insert("ARRAY[NULL]::text[]")
+          drawsAndNull <- insert("ARRAY['draws', NULL]::text[]")
+        yield
+          assertEquals(empty, Right(1))
+          assertEquals(draws, Right(1))
+          assertCheckViolation(unknown, "unknown value")
+          assertCheckViolation(reserved, "reserved doubling")
+          assertCheckViolation(duplicate, "duplicate draws")
+          assertCheckViolation(nullOnly, "NULL element")
+          assertCheckViolation(drawsAndNull, "draws plus NULL")
+      }
     }
 
   test("the board and its record are scoped to one category — a Rapid game never counts on the Blitz board (#280)"):

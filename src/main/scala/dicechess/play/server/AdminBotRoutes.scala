@@ -3,9 +3,10 @@ package dicechess.play.server
 import cats.effect.IO
 import cats.effect.std.Console
 import cats.syntax.all.*
-import dicechess.play.core.Principal
+import dicechess.play.core.{Principal, WebhookCapability}
 import dicechess.play.rating.Glicko2
 import dicechess.play.store.{AdminBotStore, BotCatalogState, BotRating, BotSeatPolicy, UserAccount}
+import dicechess.play.wire.Codecs.given
 import io.circe.Codec
 import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.dsl.io.*
@@ -17,7 +18,7 @@ import java.util.UUID
 final case class AdminWebhook(
     url: String,
     verifiedAt: java.time.Instant,
-    capabilities: List[String],
+    capabilities: List[WebhookCapability],
     lastFailure: Option[LastDeliveryFailure]
 ) derives Codec.AsObject
 

@@ -1,7 +1,7 @@
 package dicechess.play.store
 
 import cats.effect.IO
-import dicechess.play.core.WebhookCapability
+import dicechess.play.core.{Principal, WebhookCapability}
 
 import java.time.Instant
 import java.util.UUID
@@ -77,6 +77,17 @@ final case class CreatedWebhookSetup(
     secret: String,
     expiresAt: Instant,
     revision: UUID
+)
+
+/** Caller-selected activation identity and lease window. The store rebases the window onto its database clock before
+  * persisting it, so this value carries intent rather than an authoritative timestamp.
+  */
+final case class WebhookActivationAttempt(
+    setupId: UUID,
+    expectedRevision: UUID,
+    leaseId: UUID,
+    requestedAt: Instant,
+    leaseExpiresAt: Instant
 )
 
 /** Internal verification material returned only after a cross-instance activation lease is acquired. */
@@ -173,14 +184,9 @@ trait WebhookManagementStore:
   ): IO[WebhookManagementResult[CreatedWebhookSetup]]
 
   def acquireWebhookActivation(
-      team: String,
-      name: String,
+      bot: Principal.Bot,
       actor: WebhookActor,
-      setupId: UUID,
-      expectedRevision: UUID,
-      leaseId: UUID,
-      now: Instant,
-      leaseExpiresAt: Instant,
+      attempt: WebhookActivationAttempt,
       context: WebhookRequestContext
   ): IO[WebhookManagementResult[WebhookActivationLease]]
 

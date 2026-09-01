@@ -119,7 +119,7 @@ final class GameRoom private (
     stateRef.get.flatMap: s =>
       // The writer fiber stops once the game ends, so an ended room would never drain the inbox — answer eagerly.
       // (A game ending in the gap between this check and the offer is caught by the caller's verdict timeout.)
-      if s.ended then IO.pure(IO.pure(TurnVerdict.Refused("game is over")))
+      if s.ended then IO.pure(IO.pure(TurnVerdict.Refused(GameOverReason)))
       else
         (Deferred[IO, TurnVerdict], IO.monotonic).flatMapN: (reply, receivedAt) =>
           inbox
@@ -133,7 +133,7 @@ final class GameRoom private (
   /** The draw-decision equivalent of [[enqueueTurn]]; see that method for the database-fence rationale. */
   def enqueueDrawResponse(seat: Seat, accept: Boolean): IO[IO[TurnVerdict]] =
     stateRef.get.flatMap: s =>
-      if s.ended then IO.pure(IO.pure(TurnVerdict.Refused("game is over")))
+      if s.ended then IO.pure(IO.pure(TurnVerdict.Refused(GameOverReason)))
       else
         (Deferred[IO, TurnVerdict], IO.monotonic).flatMapN: (reply, receivedAt) =>
           inbox.offer(Msg.Command(seat, GameCommand.RespondDraw(accept), receivedAt, Some(reply))).as(reply.get)
@@ -526,7 +526,7 @@ final class GameRoom private (
       reply: Option[Deferred[IO, TurnVerdict]]
   ): IO[Session] =
     s.status match
-      case GameStatus.Ended(_) => answer(reply, TurnVerdict.Refused("game is over")).as(s)
+      case GameStatus.Ended(_) => answer(reply, TurnVerdict.Refused(GameOverReason)).as(s)
       case GameStatus.Active   =>
         command match
           case GameCommand.Resign =>
@@ -648,6 +648,7 @@ object GameRoom:
 
   private val MaxPlies           = 5000L
   private val FiftyMoveHalfMoves = 100
+  private val GameOverReason     = "game is over"
 
   /** Per-subscriber fan-out buffer. A subscriber this many events behind is dropped, never blocking the writer. */
   private val DefaultFanOutBuffer = 256

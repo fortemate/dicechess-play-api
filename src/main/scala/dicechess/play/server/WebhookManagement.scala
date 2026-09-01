@@ -10,6 +10,7 @@ import dicechess.play.store.{
   ManagedWebhookSlot as StoredSlot,
   WebhookActivationFailure,
   WebhookActivationFailureReason,
+  WebhookActivationAttempt,
   WebhookActor,
   WebhookActorKind,
   WebhookBudgetDecision,
@@ -191,14 +192,15 @@ final class WebhookManagement(
                   for
                     leaseId  <- IO(UUID.randomUUID())
                     acquired <- store.acquireWebhookActivation(
-                      bot.team,
-                      bot.name,
+                      bot,
                       storedActor(actor),
-                      id,
-                      rev,
-                      leaseId,
-                      at,
-                      at.plusMillis((config.verificationTimeout + LeaseGrace).toMillis),
+                      WebhookActivationAttempt(
+                        id,
+                        rev,
+                        leaseId,
+                        at,
+                        at.plusMillis((config.verificationTimeout + LeaseGrace).toMillis)
+                      ),
                       context(requestId)
                     )
                     answer <- acquired match

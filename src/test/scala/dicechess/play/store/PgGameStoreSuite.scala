@@ -362,14 +362,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           staged <- db.webhookSlot("webhook-v4", "staged", actor, now.plusSeconds(1), context)
           stagedSlot = managementValue(staged, "staged slot disappeared")
           acquired <- db.acquireWebhookActivation(
-            "webhook-v4",
-            "staged",
+            Principal.Bot("webhook-v4", "staged"),
             actor,
-            setupId,
-            createdSetup.revision,
-            leaseId,
-            now.plusSeconds(2),
-            now.plusSeconds(20),
+            WebhookActivationAttempt(
+              setupId,
+              createdSetup.revision,
+              leaseId,
+              now.plusSeconds(2),
+              now.plusSeconds(20)
+            ),
             context
           )
           lease = acquired match
@@ -392,14 +393,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             case WebhookManagementResult.Applied(value) => value
             case other                                  => fail(s"same capability update failed: $other")
           replay <- db.acquireWebhookActivation(
-            "webhook-v4",
-            "staged",
+            Principal.Bot("webhook-v4", "staged"),
             actor,
-            setupId,
-            createdSetup.revision,
-            UUID.randomUUID(),
-            now.plusSeconds(4),
-            now.plusSeconds(20),
+            WebhookActivationAttempt(
+              setupId,
+              createdSetup.revision,
+              UUID.randomUUID(),
+              now.plusSeconds(4),
+              now.plusSeconds(20)
+            ),
             context
           )
           tombstone <- sql"""SELECT status,
@@ -489,14 +491,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             case WebhookManagementResult.Applied(value) => value.revision
             case other                                  => fail(s"owner setup creation failed: $other")
           ownerAcquired <- db.acquireWebhookActivation(
-            "webhook-authority",
-            "owner-race",
+            Principal.Bot("webhook-authority", "owner-race"),
             owner,
-            ownerSetup,
-            ownerRevision,
-            UUID.fromString("0197f0a0-0000-7000-8000-000000000371"),
-            now.plusSeconds(1),
-            now.plusSeconds(10),
+            WebhookActivationAttempt(
+              ownerSetup,
+              ownerRevision,
+              UUID.fromString("0197f0a0-0000-7000-8000-000000000371"),
+              now.plusSeconds(1),
+              now.plusSeconds(10)
+            ),
             context
           )
           ownerLease = ownerAcquired match
@@ -524,14 +527,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             case WebhookManagementResult.Applied(value) => value.revision
             case other                                  => fail(s"admin setup creation failed: $other")
           adminAcquired <- db.acquireWebhookActivation(
-            "webhook-authority",
-            "admin-race",
+            Principal.Bot("webhook-authority", "admin-race"),
             admin,
-            adminSetup,
-            adminRevision,
-            UUID.fromString("0197f0a0-0000-7000-8000-000000000372"),
-            now.plusSeconds(1),
-            now.plusSeconds(10),
+            WebhookActivationAttempt(
+              adminSetup,
+              adminRevision,
+              UUID.fromString("0197f0a0-0000-7000-8000-000000000372"),
+              now.plusSeconds(1),
+              now.plusSeconds(10)
+            ),
             context
           )
           adminLease = adminAcquired match
@@ -689,14 +693,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           leases <- (1 to WebhookManagementStore.MaximumSetupAttempts).toList.traverse { attempt =>
             for
               acquired <- db.acquireWebhookActivation(
-                "webhook-attempts",
-                "capped",
+                Principal.Bot("webhook-attempts", "capped"),
                 owner,
-                setupId,
-                revision,
-                UUID.randomUUID(),
-                now.minusSeconds(365.days.toSeconds),
-                now.minusSeconds(365.days.toSeconds).plusSeconds(15),
+                WebhookActivationAttempt(
+                  setupId,
+                  revision,
+                  UUID.randomUUID(),
+                  now.minusSeconds(365.days.toSeconds),
+                  now.minusSeconds(365.days.toSeconds).plusSeconds(15)
+                ),
                 context
               )
               lease = acquired match
@@ -720,14 +725,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             context
           )
           sixth <- db.acquireWebhookActivation(
-            "webhook-attempts",
-            "capped",
+            Principal.Bot("webhook-attempts", "capped"),
             owner,
-            setupId,
-            revision,
-            UUID.randomUUID(),
-            now.plusSeconds(2),
-            now.plusSeconds(17),
+            WebhookActivationAttempt(
+              setupId,
+              revision,
+              UUID.randomUUID(),
+              now.plusSeconds(2),
+              now.plusSeconds(17)
+            ),
             context
           )
           terminal <- sql"""SELECT status, activation_attempts, candidate_secret, lease_id
@@ -841,14 +847,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             context
           )
           replay <- db.acquireWebhookActivation(
-            "webhook-owner",
-            "transfer",
+            Principal.Bot("webhook-owner", "transfer"),
             WebhookActor(WebhookActorKind.Owner, bob),
-            setupId,
-            setupRevision,
-            UUID.randomUUID(),
-            now.plusSeconds(2),
-            now.plusSeconds(20),
+            WebhookActivationAttempt(
+              setupId,
+              setupRevision,
+              UUID.randomUUID(),
+              now.plusSeconds(2),
+              now.plusSeconds(20)
+            ),
             context
           )
           stored <- sql"""SELECT s.status, s.candidate_secret, b.ownership_generation, b.webhook_revision
@@ -1519,14 +1526,9 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             )
             revision = managementValue(created, s"$name setup creation failed").revision
             acquired <- db.acquireWebhookActivation(
-              "webhook-legacy-race",
-              name,
+              Principal.Bot("webhook-legacy-race", name),
               actor,
-              setupId,
-              revision,
-              UUID.randomUUID(),
-              at,
-              at.plusSeconds(30),
+              WebhookActivationAttempt(setupId, revision, UUID.randomUUID(), at, at.plusSeconds(30)),
               context
             )
           yield managementValue(acquired, s"$name activation lease missing")
@@ -1558,25 +1560,27 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             context
           )
           replaceReplay <- db.acquireWebhookActivation(
-            "webhook-legacy-race",
-            "replace",
+            Principal.Bot("webhook-legacy-race", "replace"),
             replaceActor,
-            replaceSetup,
-            replaceLease.revision,
-            UUID.randomUUID(),
-            at.plusSeconds(2),
-            at.plusSeconds(32),
+            WebhookActivationAttempt(
+              replaceSetup,
+              replaceLease.revision,
+              UUID.randomUUID(),
+              at.plusSeconds(2),
+              at.plusSeconds(32)
+            ),
             context
           )
           deleteReplay <- db.acquireWebhookActivation(
-            "webhook-legacy-race",
-            "delete",
+            Principal.Bot("webhook-legacy-race", "delete"),
             deleteActor,
-            deleteSetup,
-            deleteLease.revision,
-            UUID.randomUUID(),
-            at.plusSeconds(2),
-            at.plusSeconds(32),
+            WebhookActivationAttempt(
+              deleteSetup,
+              deleteLease.revision,
+              UUID.randomUUID(),
+              at.plusSeconds(2),
+              at.plusSeconds(32)
+            ),
             context
           )
         yield

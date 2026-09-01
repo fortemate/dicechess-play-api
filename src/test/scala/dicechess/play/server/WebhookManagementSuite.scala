@@ -15,6 +15,7 @@ import dicechess.play.store.{
   OutcomeCount,
   WebhookActivationFailure,
   WebhookActivationFailureReason,
+  WebhookActivationAttempt,
   WebhookActivationLease,
   WebhookAdminAuthorityRefresh,
   WebhookActor,
@@ -195,14 +196,9 @@ class WebhookManagementSuite extends CatsEffectSuite:
       observed.update(state => state.copy(creates = state.creates :+ setup)).as(answers.create(setup))
 
     def acquireWebhookActivation(
-        team: String,
-        name: String,
+        bot: Principal.Bot,
         actor: WebhookActor,
-        setupId: UUID,
-        expectedRevision: UUID,
-        leaseId: UUID,
-        now: Instant,
-        leaseExpiresAt: Instant,
+        attempt: WebhookActivationAttempt,
         context: WebhookRequestContext
     ): IO[WebhookManagementResult[WebhookActivationLease]] =
       observed.update(state => state.copy(acquireCount = state.acquireCount + 1)).as(answers.acquire)

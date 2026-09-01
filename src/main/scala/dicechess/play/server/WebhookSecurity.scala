@@ -134,38 +134,43 @@ object WebhookSecurity:
     * naturally.
     */
   private[server] def isPublic(address: InetAddress): Boolean =
-    val bytes          = address.getAddress
-    def b(i: Int): Int = bytes(i) & 0xff
-    val v4Special      = bytes.length == 4 && {
-      val zeroNet      = b(0) == 0                                  // 0.0.0.0/8 — local on Linux
-      val cgnat        = b(0) == 100 && (b(1) & 0xc0) == 64         // 100.64.0.0/10
-      val ietfProtocol = b(0) == 192 && b(1) == 0 && b(2) == 0      // 192.0.0.0/24
-      val testNets     = (b(0) == 192 && b(1) == 0 && b(2) == 2) || // 192.0.2.0/24 TEST-NET-1
-        (b(0) == 198 && b(1) == 51 && b(2) == 100) || // 198.51.100.0/24 TEST-NET-2
-        (b(0) == 203 && b(1) == 0 && b(2) == 113) // 203.0.113.0/24 TEST-NET-3
-      val benchmarking = b(0) == 198 && (b(1) & 0xfe) == 18         // 198.18.0.0/15
-      val as112        = (b(0) == 192 && b(1) == 31 && b(2) == 196) ||
-        (b(0) == 192 && b(1) == 175 && b(2) == 48)
-      val amt          = b(0) == 192 && b(1) == 52 && b(2) == 193
-      val relayAnycast = b(0) == 192 && b(1) == 88 && b(2) == 99
-      val classE       = (b(0) & 0xf0) == 0xf0 // 240.0.0.0/4, broadcast included
-      zeroNet || cgnat || ietfProtocol || testNets || benchmarking || as112 || amt || relayAnycast || classE
-    }
-    val v6Special = bytes.length == 16 && {
-      // IPv6 public destinations must be global unicast (2000::/3), then must not belong to any IANA special-purpose
-      // block inside that space. This also rejects translation, discard-only, ULA, link-local and future-reserved
-      // top-level space without relying on platform-specific Inet6Address classifiers.
-      val notGlobalUnicast = (b(0) & 0xe0) != 0x20
-      val ietfAssignments  = b(0) == 0x20 && b(1) == 0x01 && (b(2) & 0xfe) == 0           // 2001::/23
-      val documentation    = b(0) == 0x20 && b(1) == 0x01 && b(2) == 0x0d && b(3) == 0xb8 // 2001:db8::/32
-      val sixToFour        = b(0) == 0x20 && b(1) == 0x02                                 // 2002::/16
-      val as112            = b(0) == 0x26 && b(1) == 0x20 && b(2) == 0x00 && b(3) == 0x4f && b(4) == 0x80 &&
-        b(5) == 0x00 // 2620:4f:8000::/48
-      val documentationV2  = b(0) == 0x3f && b(1) == 0xff && (b(2) & 0xf0) == 0           // 3fff::/20
-      notGlobalUnicast || ietfAssignments || documentation || sixToFour || as112 || documentationV2
-    }
+    val bytes      = address.getAddress
+    val specialUse = bytes.length match
+      case 4  => isSpecialUseIpv4(bytes)
+      case 16 => isSpecialUseIpv6(bytes)
+      case _  => false
     !(address.isLoopbackAddress || address.isAnyLocalAddress || address.isLinkLocalAddress ||
-      address.isSiteLocalAddress || address.isMulticastAddress || v4Special || v6Special)
+      address.isSiteLocalAddress || address.isMulticastAddress || specialUse)
+
+  private def isSpecialUseIpv4(bytes: Array[Byte]): Boolean =
+    def b(i: Int): Int = bytes(i) & 0xff
+    val zeroNet        = b(0) == 0                                  // 0.0.0.0/8 — local on Linux
+    val cgnat          = b(0) == 100 && (b(1) & 0xc0) == 64         // 100.64.0.0/10
+    val ietfProtocol   = b(0) == 192 && b(1) == 0 && b(2) == 0      // 192.0.0.0/24
+    val testNets       = (b(0) == 192 && b(1) == 0 && b(2) == 2) || // 192.0.2.0/24 TEST-NET-1
+      (b(0) == 198 && b(1) == 51 && b(2) == 100) || // 198.51.100.0/24 TEST-NET-2
+      (b(0) == 203 && b(1) == 0 && b(2) == 113) // 203.0.113.0/24 TEST-NET-3
+    val benchmarking   = b(0) == 198 && (b(1) & 0xfe) == 18         // 198.18.0.0/15
+    val as112          = (b(0) == 192 && b(1) == 31 && b(2) == 196) ||
+      (b(0) == 192 && b(1) == 175 && b(2) == 48)
+    val amt          = b(0) == 192 && b(1) == 52 && b(2) == 193
+    val relayAnycast = b(0) == 192 && b(1) == 88 && b(2) == 99
+    val classE       = (b(0) & 0xf0) == 0xf0 // 240.0.0.0/4, broadcast included
+    zeroNet || cgnat || ietfProtocol || testNets || benchmarking || as112 || amt || relayAnycast || classE
+
+  private def isSpecialUseIpv6(bytes: Array[Byte]): Boolean =
+    def b(i: Int): Int = bytes(i) & 0xff
+    // IPv6 public destinations must be global unicast (2000::/3), then must not belong to any IANA special-purpose
+    // block inside that space. This also rejects translation, discard-only, ULA, link-local and future-reserved
+    // top-level space without relying on platform-specific Inet6Address classifiers.
+    val notGlobalUnicast = (b(0) & 0xe0) != 0x20
+    val ietfAssignments  = b(0) == 0x20 && b(1) == 0x01 && (b(2) & 0xfe) == 0           // 2001::/23
+    val documentation    = b(0) == 0x20 && b(1) == 0x01 && b(2) == 0x0d && b(3) == 0xb8 // 2001:db8::/32
+    val sixToFour        = b(0) == 0x20 && b(1) == 0x02                                 // 2002::/16
+    val as112            = b(0) == 0x26 && b(1) == 0x20 && b(2) == 0x00 && b(3) == 0x4f && b(4) == 0x80 &&
+      b(5) == 0x00 // 2620:4f:8000::/48
+    val documentationV2  = b(0) == 0x3f && b(1) == 0xff && (b(2) & 0xf0) == 0           // 3fff::/20
+    notGlobalUnicast || ietfAssignments || documentation || sixToFour || as112 || documentationV2
 
 /** One HTTPS destination whose DNS result has passed the complete public-address policy. `uri` and `originalHost`
   * remain unchanged so an exact-IP connection can still authenticate the intended virtual host.

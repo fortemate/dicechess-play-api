@@ -397,12 +397,9 @@ final class PgGameStore private (xa: Transactor[IO])
                       auditWebhookTx(
                         actor,
                         bot,
-                        "webhook.setup.invalidate",
+                        WebhookSetupInvalidateAction,
                         context,
-                        bot.revision,
-                        nextRevision,
-                        registrationId,
-                        registrationId,
+                        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
                         Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "ownership_change".asJson)
                       )
                   }
@@ -416,10 +413,7 @@ final class PgGameStore private (xa: Transactor[IO])
                     bot,
                     "webhook.authority.owner_claim",
                     context,
-                    bot.revision,
-                    nextRevision,
-                    registrationId,
-                    registrationId,
+                    WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
                     Json.obj(
                       "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
                       "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson
@@ -452,12 +446,9 @@ final class PgGameStore private (xa: Transactor[IO])
                 auditWebhookTx(
                   actor,
                   bot,
-                  "webhook.setup.invalidate",
+                  WebhookSetupInvalidateAction,
                   context,
-                  bot.revision,
-                  nextRevision,
-                  registrationId,
-                  registrationId,
+                  WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
                   Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "ownership_change".asJson)
                 )
             }
@@ -471,10 +462,7 @@ final class PgGameStore private (xa: Transactor[IO])
               bot,
               "webhook.authority.owner_release",
               context,
-              bot.revision,
-              nextRevision,
-              registrationId,
-              registrationId,
+              WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
               Json.obj(
                 "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
                 "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson
@@ -839,6 +827,15 @@ final class PgGameStore private (xa: Transactor[IO])
       leaseExpiresAt: Option[Instant]
   )
 
+  final private case class WebhookAuditTransition(
+      beforeRevision: UUID,
+      afterRevision: UUID,
+      beforeRegistrationId: Option[UUID],
+      afterRegistrationId: Option[UUID]
+  )
+
+  private val WebhookSetupInvalidateAction = "webhook.setup.invalidate"
+
   private def webhookFence(team: String, name: String): ConnectionIO[Unit] =
     val key = s"${team.length}:$team$name"
     sql"""SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($key, 0))""".query[Int].unique.void
@@ -1081,10 +1078,7 @@ final class PgGameStore private (xa: Transactor[IO])
       bot: WebhookBotControl,
       action: String,
       context: WebhookRequestContext,
-      beforeRevision: UUID,
-      afterRevision: UUID,
-      beforeRegistrationId: Option[UUID],
-      afterRegistrationId: Option[UUID],
+      transition: WebhookAuditTransition,
       metadata: Json
   ): ConnectionIO[Unit] =
     val adminUserId = Option.when(actor.kind == WebhookActorKind.Admin)(actor.id.stripPrefix("user:"))
@@ -1094,8 +1088,8 @@ final class PgGameStore private (xa: Transactor[IO])
              bot_incarnation_id, metadata)
           VALUES ($adminUserId::uuid, ${bot.team}, ${bot.name}, $action, NULL, ${actor.kind.wireName}, ${actor.id},
                   COALESCE(${context.requestId}, 'dbtx_' || txid_current()::text),
-                  $beforeRevision, $afterRevision, $beforeRegistrationId,
-                  $afterRegistrationId, ${bot.incarnationId}, $metadata)""".update.run.void
+                  ${transition.beforeRevision}, ${transition.afterRevision}, ${transition.beforeRegistrationId},
+                  ${transition.afterRegistrationId}, ${bot.incarnationId}, $metadata)""".update.run.void
 
   private def expirePendingWebhookSetup(
       bot: WebhookBotControl,
@@ -1115,10 +1109,7 @@ final class PgGameStore private (xa: Transactor[IO])
             bot,
             "webhook.setup.expire",
             context,
-            bot.revision,
-            nextRevision,
-            registrationId,
-            registrationId,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
             Json.obj("setupId" -> setup.setupId.toString.asJson)
           )
         yield bot.copy(revision = nextRevision)
@@ -1145,12 +1136,9 @@ final class PgGameStore private (xa: Transactor[IO])
               _ <- auditWebhookTx(
                 WebhookActor(WebhookActorKind.System, "webhook-authority-cleanup"),
                 bot,
-                "webhook.setup.invalidate",
+                WebhookSetupInvalidateAction,
                 context,
-                bot.revision,
-                nextRevision,
-                registrationId,
-                registrationId,
+                WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
                 Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "admin_authority".asJson)
               )
             yield bot.copy(revision = nextRevision)
@@ -1201,12 +1189,9 @@ final class PgGameStore private (xa: Transactor[IO])
           auditWebhookTx(
             actor,
             bot,
-            "webhook.setup.invalidate",
+            WebhookSetupInvalidateAction,
             context,
-            bot.revision,
-            nextRevision,
-            beforeRegistrationId,
-            beforeRegistrationId,
+            WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, beforeRegistrationId),
             Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "legacy_write".asJson)
           )
       }
@@ -1234,10 +1219,7 @@ final class PgGameStore private (xa: Transactor[IO])
         bot,
         action,
         context,
-        bot.revision,
-        nextRevision,
-        beforeRegistrationId,
-        Some(registrationId),
+        WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, Some(registrationId)),
         Json.obj(
           "before" -> beforeSlot.registration.map(registrationAuditMetadata).asJson,
           "after"  -> afterMetadata.asJson,
@@ -1288,12 +1270,9 @@ final class PgGameStore private (xa: Transactor[IO])
               auditWebhookTx(
                 actor,
                 bot,
-                "webhook.setup.invalidate",
+                WebhookSetupInvalidateAction,
                 context,
-                bot.revision,
-                nextRevision,
-                beforeRegistrationId,
-                None,
+                WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, None),
                 Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "legacy_delete".asJson)
               )
           }
@@ -1304,10 +1283,7 @@ final class PgGameStore private (xa: Transactor[IO])
             bot,
             "webhook.delete",
             context,
-            bot.revision,
-            nextRevision,
-            beforeRegistrationId,
-            None,
+            WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, None),
             Json.obj(
               "before" -> beforeSlot.registration.map(registrationAuditMetadata).asJson,
               "after"  -> Json.Null,
@@ -1431,10 +1407,7 @@ final class PgGameStore private (xa: Transactor[IO])
           bot,
           "webhook.setup.create",
           context,
-          bot.revision,
-          nextRevision,
-          registrationId,
-          registrationId,
+          WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
           Json.obj(
             "setupId"        -> setup.setupId.toString.asJson,
             "kind"           -> setup.kind.wireName.asJson,
@@ -1447,29 +1420,20 @@ final class PgGameStore private (xa: Transactor[IO])
       )
 
   def acquireWebhookActivation(
-      team: String,
-      name: String,
+      botIdentity: Principal.Bot,
       actor: WebhookActor,
-      setupId: UUID,
-      expectedRevision: UUID,
-      leaseId: UUID,
-      now: Instant,
-      leaseExpiresAt: Instant,
+      attempt: WebhookActivationAttempt,
       context: WebhookRequestContext
   ): IO[WebhookManagementResult[WebhookActivationLease]] =
-    val leaseDuration = java.time.Duration.between(now, leaseExpiresAt)
-    preparedWebhookBot(team, name, actor, context)
+    val leaseDuration = java.time.Duration.between(attempt.requestedAt, attempt.leaseExpiresAt)
+    preparedWebhookBot(botIdentity.team, botIdentity.name, actor, context)
       .flatMap:
         case (_, None)          => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
         case (dbNow, Some(bot)) =>
           acquireWebhookActivationTx(
             bot,
             actor,
-            setupId,
-            expectedRevision,
-            leaseId,
-            dbNow,
-            dbNow.plus(leaseDuration),
+            attempt.copy(requestedAt = dbNow, leaseExpiresAt = dbNow.plus(leaseDuration)),
             context
           )
       .transact(xa)
@@ -1478,13 +1442,14 @@ final class PgGameStore private (xa: Transactor[IO])
   private def acquireWebhookActivationTx(
       bot: WebhookBotControl,
       actor: WebhookActor,
-      setupId: UUID,
-      expectedRevision: UUID,
-      leaseId: UUID,
-      now: Instant,
-      leaseExpiresAt: Instant,
+      attempt: WebhookActivationAttempt,
       context: WebhookRequestContext
   ): ConnectionIO[WebhookManagementResult[WebhookActivationLease]] =
+    val setupId          = attempt.setupId
+    val expectedRevision = attempt.expectedRevision
+    val leaseId          = attempt.leaseId
+    val now              = attempt.requestedAt
+    val leaseExpiresAt   = attempt.leaseExpiresAt
     (terminalWebhookSetup(bot, setupId), pendingWebhookSetup(bot), actorAuthorityLive(bot, actor)).tupled.flatMap:
       case (_, _, false)        => WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
       case (Some(status), _, _) => WebhookManagementResult.SetupTerminal(status).pure[ConnectionIO]
@@ -1513,10 +1478,7 @@ final class PgGameStore private (xa: Transactor[IO])
             bot,
             "webhook.setup.attempts_exhausted",
             context,
-            bot.revision,
-            nextRevision,
-            registrationId,
-            registrationId,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
             Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "lease_expired".asJson)
           )
         yield WebhookManagementResult.SetupTerminal(WebhookSetupTerminalStatus.AttemptsExhausted)
@@ -1536,10 +1498,7 @@ final class PgGameStore private (xa: Transactor[IO])
                 bot,
                 "webhook.activation.start",
                 context,
-                bot.revision,
-                bot.revision,
-                registrationId,
-                registrationId,
+                WebhookAuditTransition(bot.revision, bot.revision, registrationId, registrationId),
                 Json.obj("setupId" -> setup.setupId.toString.asJson, "attempt" -> attemptNumber.asJson)
               )
             yield WebhookManagementResult.Applied(
@@ -1652,10 +1611,12 @@ final class PgGameStore private (xa: Transactor[IO])
         bot,
         action,
         context,
-        bot.revision,
-        nextRevision,
-        beforeSlot.registration.map(_.registrationId),
-        Some(registrationId),
+        WebhookAuditTransition(
+          bot.revision,
+          nextRevision,
+          beforeSlot.registration.map(_.registrationId),
+          Some(registrationId)
+        ),
         Json.obj(
           "setupId" -> setup.setupId.toString.asJson,
           "before"  -> beforeSlot.registration.map(registrationAuditMetadata).asJson,
@@ -1739,12 +1700,9 @@ final class PgGameStore private (xa: Transactor[IO])
       _ <- auditWebhookTx(
         actor,
         bot,
-        "webhook.setup.invalidate",
+        WebhookSetupInvalidateAction,
         context,
-        bot.revision,
-        nextRevision,
-        registrationId,
-        registrationId,
+        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
         Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "authority_changed".asJson)
       )
     yield WebhookManagementResult.AuthorityChanged
@@ -1770,10 +1728,7 @@ final class PgGameStore private (xa: Transactor[IO])
         bot,
         "webhook.activation.failed",
         context,
-        bot.revision,
-        bot.revision,
-        registrationId,
-        registrationId,
+        WebhookAuditTransition(bot.revision, bot.revision, registrationId, registrationId),
         Json.obj(
           "setupId" -> setup.setupId.toString.asJson,
           "attempt" -> attempts.asJson,
@@ -1788,10 +1743,7 @@ final class PgGameStore private (xa: Transactor[IO])
         bot,
         "webhook.setup.attempts_exhausted",
         context,
-        bot.revision,
-        nextRevision,
-        registrationId,
-        registrationId,
+        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
         Json.obj("setupId" -> setup.setupId.toString.asJson)
       ).whenA(exhausted)
       slot <- webhookSlotTx(bot.copy(revision = nextRevision), actor)
@@ -1841,10 +1793,7 @@ final class PgGameStore private (xa: Transactor[IO])
             bot,
             "webhook.setup.cancel",
             context,
-            bot.revision,
-            nextRevision,
-            registrationId,
-            registrationId,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
             Json.obj("setupId" -> setup.setupId.toString.asJson)
           )
           slot <- webhookSlotTx(bot.copy(revision = nextRevision), actor)
@@ -1893,10 +1842,12 @@ final class PgGameStore private (xa: Transactor[IO])
                         bot,
                         "webhook.capabilities.update",
                         context,
-                        bot.revision,
-                        nextRevision,
-                        Some(active.registrationId),
-                        Some(active.registrationId),
+                        WebhookAuditTransition(
+                          bot.revision,
+                          nextRevision,
+                          Some(active.registrationId),
+                          Some(active.registrationId)
+                        ),
                         Json.obj(
                           "before" -> active.capabilities.map(_.wireName).asJson,
                           "after"  -> names.asJson
@@ -1953,10 +1904,7 @@ final class PgGameStore private (xa: Transactor[IO])
               bot,
               "webhook.setup.cancel",
               context,
-              bot.revision,
-              nextRevision,
-              slot.registration.map(_.registrationId),
-              None,
+              WebhookAuditTransition(bot.revision, nextRevision, slot.registration.map(_.registrationId), None),
               Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "webhook_delete".asJson)
             )
         }
@@ -1967,10 +1915,7 @@ final class PgGameStore private (xa: Transactor[IO])
           bot,
           "webhook.delete",
           context,
-          bot.revision,
-          nextRevision,
-          slot.registration.map(_.registrationId),
-          None,
+          WebhookAuditTransition(bot.revision, nextRevision, slot.registration.map(_.registrationId), None),
           Json.obj(
             "before" -> slot.registration.map(registrationAuditMetadata).asJson,
             "after"  -> Json.Null
@@ -2031,12 +1976,9 @@ final class PgGameStore private (xa: Transactor[IO])
                     _ <- auditWebhookTx(
                       systemActor,
                       current,
-                      "webhook.setup.invalidate",
+                      WebhookSetupInvalidateAction,
                       context,
-                      current.revision,
-                      nextRevision,
-                      registrationId,
-                      registrationId,
+                      WebhookAuditTransition(current.revision, nextRevision, registrationId, registrationId),
                       Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "admin_authority".asJson)
                     )
                   yield 1
@@ -3037,12 +2979,9 @@ final class PgGameStore private (xa: Transactor[IO])
                     auditWebhookTx(
                       actor,
                       bot,
-                      "webhook.setup.invalidate",
+                      WebhookSetupInvalidateAction,
                       context,
-                      bot.revision,
-                      nextRevision,
-                      registrationId,
-                      registrationId,
+                      WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
                       Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "account_deletion".asJson)
                     )
                 }
@@ -3060,10 +2999,7 @@ final class PgGameStore private (xa: Transactor[IO])
                   bot,
                   "webhook.authority.owner_release",
                   context,
-                  bot.revision,
-                  nextRevision,
-                  registrationId,
-                  registrationId,
+                  WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
                   Json.obj(
                     "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
                     "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson,

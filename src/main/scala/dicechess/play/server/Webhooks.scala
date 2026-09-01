@@ -344,9 +344,9 @@ final class Webhooks private (
           DeliveryOutcome.HttpStatus(code)
         )
       case PostOutcome.TimedOut =>
-        declineThen("could not reach the endpoint", DeliveryOutcome.TimedOut)
+        declineThen(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
       case PostOutcome.Unreachable =>
-        declineThen("could not reach the endpoint", DeliveryOutcome.Unreachable)
+        declineThen(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
       case PostOutcome.PolicyRejected(reason) =>
         declineThen(reason, DeliveryOutcome.Unreachable)
 
@@ -396,8 +396,8 @@ final class Webhooks private (
         ifCurrent(failed("endpoint answered with an oversized body", DeliveryOutcome.OversizedBody))
       case PostOutcome.HttpStatus(code) =>
         ifCurrent(failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code)))
-      case PostOutcome.TimedOut    => ifCurrent(failed("could not reach the endpoint", DeliveryOutcome.TimedOut))
-      case PostOutcome.Unreachable => ifCurrent(failed("could not reach the endpoint", DeliveryOutcome.Unreachable))
+      case PostOutcome.TimedOut    => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut))
+      case PostOutcome.Unreachable => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable))
       case PostOutcome.PolicyRejected(reason) => ifCurrent(failed(reason, DeliveryOutcome.Unreachable))
 
   /** Fire-and-forget into the drain queue (#225) — `tryOffer` never blocks a turn on a slow or backed-up stats writer.
@@ -514,6 +514,9 @@ object Webhooks:
   private val SecretBytes = 32
   private val NonceBytes  = 16
 
+  /** Stable caller-visible text shared by timeout and transport failures to avoid exposing a connectivity oracle. */
+  private val CouldNotReachEndpointMessage = "could not reach the endpoint"
+
   /** Response-read cap: a `{"moves":[...]}` answer is bytes, not megabytes — the cap bounds what a hostile endpoint can
     * make the server buffer. A truncated body simply fails JSON decoding and is treated as garbage.
     */
@@ -540,8 +543,8 @@ object Webhooks:
         case Ok(body)               => Right(body)
         case OversizedBody          => Left("endpoint answered with an oversized body")
         case HttpStatus(code)       => Left(s"endpoint answered HTTP $code")
-        case TimedOut               => Left("could not reach the endpoint")
-        case Unreachable            => Left("could not reach the endpoint")
+        case TimedOut               => Left(CouldNotReachEndpointMessage)
+        case Unreachable            => Left(CouldNotReachEndpointMessage)
         case PolicyRejected(reason) => Left(reason)
 
   /** One delivery, queued for the stats drain loop (#225) — plain data, no `IO` inside, so `tryOffer`ing it is O(1) and

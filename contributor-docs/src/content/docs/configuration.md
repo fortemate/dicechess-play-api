@@ -55,13 +55,18 @@ in their queues undelivered. Boot warns on stderr, and nothing else complains.
 
 | Variable | Effect |
 | --- | --- |
-| `WEBHOOK_TIMEOUT_SECONDS` | Enables bot webhook push — both the routes and the dispatcher. Unset disables the feature. |
+| `WEBHOOK_TIMEOUT_SECONDS` | Enables the legacy Bearer-token webhook routes and turn dispatcher. Unset means no turn delivery, independently of whether the staged session-management control plane is enabled. |
+| `WEBHOOK_SESSION_MANAGEMENT_ENABLED` | Optional, default off. Only case-insensitive `true` mounts the owner/admin staged webhook routes. Also requires persistence, a live account session, and an explicit non-empty `PLAY_CORS_ORIGINS`; a partial configuration logs a boot warning and mounts nothing. This is a backend rollout gate, not evidence that any deployment or UI has enabled the feature. |
+| `WEBHOOK_VERIFICATION_TIMEOUT_SECONDS` | Candidate verification-v2 timeout for the staged session API. Default `10`; valid range `1..30`. An invalid value fails startup even while the staged API flag is off, so stale configuration cannot lie dormant until a future rollout. |
+| `WEBHOOK_SETUP_CREATES_PER_WINDOW` | Optional staged-verification budget per actor+bot in the fixed 15-minute window. Default and maximum `5`; valid range `1..5`, so production can only tighten the accepted policy. |
+| `WEBHOOK_ACTIVATIONS_PER_ACTOR_BOT_WINDOW` | Optional staged-activation budget per actor+bot in the fixed 15-minute window. Default and maximum `10`; valid range `1..10`. |
+| `WEBHOOK_ACTIVATIONS_PER_SOURCE_IP_WINDOW` | Optional staged-activation budget per source IP in the fixed 15-minute window. Default and maximum `30`; valid range `1..30`. |
 | `RETENTION_INTERVAL_SECONDS` | Enables the retention prune. Unset keeps ended snapshots and delivered outbox/`client_reports` rows forever. |
 | `RETENTION_DAYS` | Optional, default `30`. |
 | `RETENTION_BATCH_SIZE` | Optional, default `1000`. |
 | `PLAY_BOT_TOKENS` | Statically configured bots, as `team\|name\|token` CSV. |
-| `PLAY_ADMINS` | Comma-separated **account uuids** granted the admin bot surface (#273): `/admin/bots/{team}/{name}/…` drives any registered bot without its token — ladder, catalog, description, capacity, token rotation — every write audited in `admin_actions` (V19). Uuids, not nicknames: nicknames rename and release (V18). Needs `PLAY_SESSION_SECRET` **and** persistence; boot warns loudly when set without them. Malformed entries are skipped and reported by **position only** — never by value, since one of them may be a secret pasted into the wrong variable. |
-| `PLAY_CORS_ORIGINS` | Allowed origins; empty allows any (credential-less). A non-empty list also enables credentialed CORS — required once sign-in is on. |
+| `PLAY_ADMINS` | Comma-separated **account uuids** granted the admin bot surface (#273): `/admin/bots/{team}/{name}/…` drives any registered bot without its token — ladder, catalog, description, capacity, token rotation — every write audited in `admin_actions` (V19). Uuids, not nicknames: nicknames rename and release (V18). Needs `PLAY_SESSION_SECRET` **and** persistence; boot warns loudly when set without them. Malformed entries are skipped and reported by **position only** — never by value, since one of them may be a secret pasted into the wrong variable. When staged webhook management is enabled, the parsed, sorted allow-list is also hashed into the instance's admin-authority generation; the raw ids are not copied to the generation table. |
+| `PLAY_CORS_ORIGINS` | Exact comma-separated browser origins. Empty allows any origin only in credential-less CORS mode. A non-empty list enables credentialed CORS and is mandatory for staged webhook session mutations, whose server-side guard also requires an exact `Origin` match and `X-DiceChess-CSRF: 1`. |
 | `APP_VERSION` | Surfaced at `GET /version`. Set by the CD workflow from the git tag. |
 
 ## Player accounts (Google sign-in)
@@ -80,6 +85,58 @@ boot — someone clearly tried to enable sign-in — instead of the usual silent
 
 With sign-in enabled, `PLAY_CORS_ORIGINS` must be a real allow-list: the empty allow-all mode
 stays credential-less by design, so the SPA's credentialed fetches would fail against it.
+
+The staged webhook-management surface is stricter still: it stays unmounted unless
+`WEBHOOK_SESSION_MANAGEMENT_ENABLED=true`, persistence, `PLAY_SESSION_SECRET`, and a non-empty
+origin allow-list are all present. `PLAY_ADMINS` is required only for an administrator to use the
+`/admin/bots/{team}/{name}/webhook…` root; owners use the parallel `/me` root. Enabling the control
+plane does not start deliveries — set `WEBHOOK_TIMEOUT_SECONDS` separately when the dispatcher is
+intended to run. Promotion, database migration, and the flag change remain operator actions; this
+repository configuration does not perform them.
+
+The three staged-verification budget overrides are deliberately one-way: each accepts only a
+positive value at or below its documented default. A zero, a larger value, or non-integer text
+fails startup even while the feature flag is off. The shared window remains fixed at 15 minutes, so
+an environment override cannot silently weaken the effective request rate by shortening it.
+
+Every enabled instance writes its hashed admin-authority generation to PostgreSQL at startup and
+then heartbeats it every **5 seconds**. A generation is live for **20 seconds** after its last
+database-timestamped heartbeat. Admin webhook operations are authorized only while exactly one
+generation is live. A rolling `PLAY_ADMINS` change therefore fails closed with
+`403 admin_required` while old and new generations overlap; it cannot let each replica activate a
+setup under a different allow-list. Once the old heartbeat ages out, the sole surviving generation
+invalidates and scrubs pending admin setups from older generations. The `/me` owner root is not
+subject to this admin-generation fence. The heartbeat is a supervised server loop: a database or
+loop failure stops the process instead of leaving it serving stale administrator authority.
+
+## Staged webhook rollout runbook
+
+This is the required order from
+[ADR-004 §14](https://internal.fortemate.com/decisions/adr-004-staged-webhook-management).
+The session feature flag is the safety boundary; a green build alone is not permission to skip a
+step.
+
+1. Apply the additive migration while `WEBHOOK_SESSION_MANAGEMENT_ENABLED` is unset or `false`.
+   Do not mutate production registrations or rotate secrets as part of the migration.
+2. Deploy the revision/registration-generation-aware API with the session flag still off.
+3. Drain **and read back** every old webhook writer and delivery worker. Confirm from the platform,
+   not only from the deploy command, that no old API instance can perform a legacy webhook write
+   and no old delivery worker can run beside the generation-scoped apply/health path.
+4. Confirm that every remaining API instance reports the expected generation-aware build, and keep
+   the session flag off until the DNS-pinning integration proof passes: policy resolution must
+   reject private/rebound destinations, the connection must use the validated public IP, and Host
+   plus TLS SNI must retain the candidate hostname without a second DNS resolution.
+5. Wait for a versioned, compatible `dicechess-bot-runtime` release that implements
+   verification-v2 proof and dual-key pending configuration. Verify its vectors and deployment
+   guidance; an endpoint must keep accepting deliveries signed by the active key while using the
+   pending key only for activation-v2 proof.
+6. Only after all previous readbacks and proofs pass, set
+   `WEBHOOK_SESSION_MANAGEMENT_ENABLED=true`. Confirm the initial database heartbeat and a sole live
+   admin-authority generation before enabling any UI that performs session mutations.
+
+Rollback is **flag off**: unset or disable `WEBHOOK_SESSION_MANAGEMENT_ENABLED` and read back that
+the session routes are gone. Keep the additive migration and generation-aware writers/workers in
+place; do not reintroduce an old writer or delivery worker as the rollback mechanism.
 
 :::caution[Retention looks broken on an unbackfilled deployment]
 The prune refuses to remove an ended, non-aborted snapshot that has no `game_archive` row —

@@ -30,13 +30,26 @@ import dicechess.play.server.{
   PlayRoutes,
   RatingRoutes,
   SeatGuard,
+  SessionWebhookRoutes,
   StrengthRoutes,
+  ManagedWebhookVerifier,
+  WebhookManagement,
   WebhookRoutes,
+  WebhookTransport,
   Webhooks
 }
 import dicechess.play.ingest.IngestDeliverer
 import dicechess.play.rating.{Glicko2, RatingBatch, StrengthCache, StrengthReport}
-import dicechess.play.store.{BotStore, GameStore, PgGameStore, Retention, WebhookStatsStore, WebhookStore}
+import dicechess.play.store.{
+  BotStore,
+  GameStore,
+  PgGameStore,
+  Retention,
+  WebhookManagementStore,
+  WebhookRequestContext,
+  WebhookStatsStore,
+  WebhookStore
+}
 import org.http4s.client.Client
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.ember.server.EmberServerBuilder
@@ -73,30 +86,35 @@ object Main extends IOApp.Simple:
   // leaderboard/profile routes both need its DB-only seams (RatingStore, LeaderboardStore) and are simply absent
   // without a database. The outbound HTTP client is shared by every outbound feature (ingest delivery, webhook
   // push) and is built from the webhook window above — an unused pool holds no connections.
-  private def appResources: Resource[IO, (GameStore, BotStore, Option[PgGameStore], Client[IO], IO[Unit])] =
-    outboundClientBuilder(Webhooks.configFromEnv).build.flatMap { http =>
-      PgGameStore.configFromEnv match
-        case None => Resource.eval(BotStore.inMemory).map(bots => (GameStore.noop, bots, None, http, IO.never))
-        case Some(dbConfig) =>
-          PgGameStore.resource(dbConfig).map { store =>
-            val deliverer = IngestDeliverer.configFromEnv match
-              case None =>
-                cats.effect.std
-                  .Console[IO]
-                  .errorln(
-                    "[play][ingest] INGEST_URL/INGEST_TOKEN unset: finished games and browser reports accumulate " +
-                      "in the outbox/client_reports queues"
-                  )
-                  *> IO.never
-              case Some(ingestConfig) =>
-                // Two queues, one deliverer each (#212): the first-party outbox and the browser-submitted
-                // client_reports drain in parallel with identical retry/parking semantics.
-                (
-                  IngestDeliverer(store, http, ingestConfig).loop.void,
-                  IngestDeliverer(store.clientReports, http, ingestConfig).loop.void
-                ).parTupled.void
-            (store, store, Some(store), http, deliverer)
-          }
+  private def appResources
+      : Resource[IO, (GameStore, BotStore, Option[PgGameStore], Client[IO], WebhookTransport, IO[Unit])] =
+    (outboundClientBuilder(Webhooks.configFromEnv).build, WebhookTransport.resource).tupled.flatMap {
+      (http, webhookTransport) =>
+        PgGameStore.configFromEnv match
+          case None =>
+            Resource
+              .eval(BotStore.inMemory)
+              .map(bots => (GameStore.noop, bots, None, http, webhookTransport, IO.never))
+          case Some(dbConfig) =>
+            PgGameStore.resource(dbConfig).map { store =>
+              val deliverer = IngestDeliverer.configFromEnv match
+                case None =>
+                  cats.effect.std
+                    .Console[IO]
+                    .errorln(
+                      "[play][ingest] INGEST_URL/INGEST_TOKEN unset: finished games and browser reports accumulate " +
+                        "in the outbox/client_reports queues"
+                    )
+                    *> IO.never
+                case Some(ingestConfig) =>
+                  // Two queues, one deliverer each (#212): the first-party outbox and the browser-submitted
+                  // client_reports drain in parallel with identical retry/parking semantics.
+                  (
+                    IngestDeliverer(store, http, ingestConfig).loop.void,
+                    IngestDeliverer(store.clientReports, http, ingestConfig).loop.void
+                  ).parTupled.void
+              (store, store, Some(store), http, webhookTransport, deliverer)
+            }
     }
 
   def run: IO[Unit] = appResources.use(serve)
@@ -122,8 +140,10 @@ object Main extends IOApp.Simple:
         )
     )
 
-  private def serve(resources: (GameStore, BotStore, Option[PgGameStore], Client[IO], IO[Unit])): IO[Unit] =
-    val (store, botStore, pgStore, httpClient, deliverer) = resources
+  private def serve(
+      resources: (GameStore, BotStore, Option[PgGameStore], Client[IO], WebhookTransport, IO[Unit])
+  ): IO[Unit] =
+    val (store, botStore, pgStore, httpClient, webhookTransport, deliverer) = resources
     for
       registry  <- registryFor(store, pgStore)
       resumed   <- registry.resume
@@ -146,7 +166,8 @@ object Main extends IOApp.Simple:
         resolveNicknames =
           pgStore.fold[List[String] => IO[Map[String, String]]](_ => IO.pure(Map.empty))(_.nicknamesByExternalId)
       )
-      cors <- Cors.fromEnv
+      allowedOrigins <- Cors.allowedOriginsFromEnv
+      cors = Cors.policy(allowedOrigins)
       // Google sign-in config (#233, ADR-0017). Read here, applied where the routes mount below: the feature needs
       // BOTH halves (Google client + session secret) and persistence — anything less leaves the auth surface unmounted.
       googleConfig  <- GoogleAuth.configFromEnv
@@ -158,11 +179,41 @@ object Main extends IOApp.Simple:
       // The admin allowlist (#273): parsed here (malformed entries are named on stderr and skipped), applied where
       // the admin and `/auth/me` routes mount below — the surface needs the session verifier AND persistence, see
       // warnInertAdmins.
-      admins <- AdminBotRoutes.adminsFromEnv
-      _      <- warnLegacyLadderVars
-      _      <- warnDeprecatedRatedForHumans
-      _      <- warnDeprecatedOpenToHumans
-      _      <- warnInertAdmins(sessionOn = authSession.isDefined, persistenceOn = pgStore.isDefined)
+      admins               <- AdminBotRoutes.adminsFromEnv
+      managedWebhookConfig <- WebhookManagement.Config.fromEnv(admins)
+      managedWebhookRuntime =
+        if !allowedOrigins.isExplicitlyConfigured then None
+        else
+          (managedWebhookConfig, authSession, pgStore).mapN { (config, session, pg) =>
+            (config, session, pg)
+          }
+      _ <- warnLegacyLadderVars
+      _ <- warnDeprecatedRatedForHumans
+      _ <- warnDeprecatedOpenToHumans
+      _ <- warnInertAdmins(sessionOn = authSession.isDefined, persistenceOn = pgStore.isDefined)
+      _ <- warnInertWebhookManagement(
+        enabled = managedWebhookConfig.isDefined,
+        sessionOn = authSession.isDefined,
+        persistenceOn = pgStore.isDefined,
+        originsConfigured = allowedOrigins.isExplicitlyConfigured
+      )
+      _ <- managedWebhookRuntime.traverse_ { case (config, _, pg) =>
+        pg.refreshAdminWebhookAuthority(
+          config.adminAuthorityGeneration,
+          WebhookRequestContext(None)
+        ).void
+      }
+      adminAuthorityLoop = managedWebhookRuntime
+        .map { case (config, _, pg) =>
+          (IO.sleep(WebhookManagementStore.AdminHeartbeatInterval) *>
+            pg
+              .refreshAdminWebhookAuthority(
+                config.adminAuthorityGeneration,
+                WebhookRequestContext(None)
+              )
+              .void).foreverM
+        }
+        .getOrElse(IO.never)
       // The ladder scheduler is opt-in by env (LADDER_INTERVAL_SECONDS) — same "absence disables" idiom as
       // persistence/ingest above. Unset, the ladder never starts games on its own even if bots are on_ladder.
       ladderLoop <- LadderScheduler.configFromEnv match
@@ -257,7 +308,14 @@ object Main extends IOApp.Simple:
               // (`WebhookStatsStore.noop`) — see its own doc for why that's the right default rather than a
               // second in-memory code path.
               val stats = pgStore.fold(WebhookStatsStore.noop)(pg => pg: WebhookStatsStore)
-              Webhooks.create(registry, webhookStore, httpClient, webhookConfig, stats = stats)
+              Webhooks.create(
+                registry,
+                webhookStore,
+                httpClient,
+                webhookConfig,
+                stats = stats,
+                transport = Some(webhookTransport)
+              )
             }
             .map(Some(_))
       // The sweepers (seeks, pending challenges), the ladder scheduler, the rating batch, the webhook loop, and the
@@ -312,6 +370,19 @@ object Main extends IOApp.Simple:
         val me = (authSession, pgStore)
           .mapN((s, pg) => MeRoutes(s, pg, pg))
           .getOrElse(org.http4s.HttpRoutes.empty[IO])
+        // Shipped dark by default: enabling the staged API requires persistence, a live account session and an exact
+        // browser-origin allowlist. Bot-token webhook registration/delivery remains independent of this rollout gate.
+        val managedWebhooks = managedWebhookRuntime
+          .map { case (config, session, pg) =>
+            val service = new WebhookManagement(
+              pg,
+              pg,
+              Some(ManagedWebhookVerifier(webhookTransport)),
+              config
+            )
+            SessionWebhookRoutes(session, botAuth, admins, allowedOrigins, service)
+          }
+          .getOrElse(org.http4s.HttpRoutes.empty[IO])
 
         EmberServerBuilder
           .default[IO]
@@ -325,7 +396,7 @@ object Main extends IOApp.Simple:
               ) <+>
                 leaderboard <+>
                 catalog <+> playerGames <+> strength <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
-                ownerBots <+> adminBots <+>
+                ownerBots <+> adminBots <+> managedWebhooks <+>
                 WebhookRoutes(botAuth, webhookService, webhookLimit, pgStore) <+>
                 BotRoutes(
                   botAuth,
@@ -350,6 +421,7 @@ object Main extends IOApp.Simple:
               retentionLoop,
               webhookService.fold(IO.unit)(_.loop.void),
               webhookService.fold(IO.unit)(_.statsLoop.void),
+              adminAuthorityLoop,
               IO.never
             ).parTupled.void
           }
@@ -427,3 +499,21 @@ object Main extends IOApp.Simple:
           "PLAY_SESSION_SECRET and PLAY_DB_URL/PLAY_DB_USER/PLAY_DB_PASSWORD. Set both or remove the variable."
       )
       .whenA(sys.env.contains(AdminBotRoutes.EnvVar) && !(sessionOn && persistenceOn))
+
+  /** ADR-004's feature flag must never produce a half-mounted cookie mutation surface. In particular, the historical
+    * empty CORS setting means public credential-less reads; it is not an origin policy suitable for session writes.
+    */
+  private def warnInertWebhookManagement(
+      enabled: Boolean,
+      sessionOn: Boolean,
+      persistenceOn: Boolean,
+      originsConfigured: Boolean
+  ): IO[Unit] =
+    cats.effect.std
+      .Console[IO]
+      .errorln(
+        "[play][webhook-management] WEBHOOK_SESSION_MANAGEMENT_ENABLED is true but the routes are NOT mounted — " +
+          "PLAY_SESSION_SECRET, PLAY_DB_URL/PLAY_DB_USER/PLAY_DB_PASSWORD, and an explicit PLAY_CORS_ORIGINS " +
+          "allowlist are all required."
+      )
+      .whenA(enabled && !(sessionOn && persistenceOn && originsConfigured))

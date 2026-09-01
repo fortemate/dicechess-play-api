@@ -2,6 +2,7 @@ package dicechess.play.server
 
 import cats.effect.IO
 import cats.syntax.all.*
+import org.http4s.headers.Origin
 import org.http4s.implicits.*
 import org.http4s.{Header, Headers, Method, Request, Status, Uri}
 import org.typelevel.ci.*
@@ -23,6 +24,30 @@ class CorsSuite extends munit.CatsEffectSuite:
     headers
       .get(name)
       .fold(Set.empty[String])(_.head.value.split(',').iterator.map(_.trim.toLowerCase).filter(_.nonEmpty).toSet)
+
+  private def parsedOrigin(value: String): Origin =
+    Origin.parse(value).fold(error => fail(error.sanitized), identity)
+
+  test("the parsed allow-list is reusable as an exact server-side origin guard"):
+    val allowed = Cors.allowedOrigins(" https://play.jc.id.lv, http://localhost:5173, https://play.jc.id.lv ")
+    assert(allowed.isExplicitlyConfigured)
+    assert(allowed.allows(parsedOrigin("https://play.jc.id.lv")))
+    assert(allowed.allows(parsedOrigin("http://localhost:5173")))
+    assert(!allowed.allows(parsedOrigin("https://evil.example")))
+
+    val absent = Cors.allowedOrigins(" ,  ")
+    assert(!absent.isExplicitlyConfigured)
+    assert(!absent.allows(parsedOrigin("https://play.jc.id.lv")))
+
+  test("opaque Origin null is never a trusted credentialed origin"):
+    val opaqueOnly = Cors.allowedOrigins("null")
+    val mixed      = Cors.allowedOrigins("null, https://play.jc.id.lv")
+
+    assert(!opaqueOnly.isExplicitlyConfigured, "an opaque origin must not enable credentialed CORS or session routes")
+    assert(!opaqueOnly.allows(Origin.Null))
+    assert(mixed.isExplicitlyConfigured)
+    assert(mixed.allows(parsedOrigin("https://play.jc.id.lv")))
+    assert(!mixed.allows(Origin.Null))
 
   test("a normal GET from any origin gets Access-Control-Allow-Origin: * by default"):
     app("")
@@ -130,8 +155,10 @@ class CorsSuite extends munit.CatsEffectSuite:
     */
   test("the credentialed preflight allows every request header the session-gated surfaces send"):
     val needed = List(
-      "content-type", // every JSON body
-      "authorization" // POST /me/bots/claim — the session says who, the bot's token proves control
+      "content-type",    // every JSON body
+      "authorization",   // POST /me/bots/claim — the session says who, the bot's token proves control
+      "if-match",        // webhook mutations compare the opaque slot revision
+      "x-dicechess-csrf" // webhook mutations require the explicit same-origin CSRF signal
     )
     app("https://play.jc.id.lv")
       .run(
@@ -149,6 +176,14 @@ class CorsSuite extends munit.CatsEffectSuite:
             s"a session-gated route sends `$header`, but the credentialed preflight does not advertise it: " +
               s"${resp.headers.get(ci"Access-Control-Allow-Headers")}"
           )
+
+  test("an allowed browser origin can read webhook revision and rate-limit response headers"):
+    app("https://play.jc.id.lv")
+      .run(Request[IO](Method.GET, uri"/health").putHeaders(origin("https://play.jc.id.lv")))
+      .map: resp =>
+        val exposed = headerValues(resp.headers, ci"Access-Control-Expose-Headers")
+        assert(exposed.contains("etag"), s"credentialed responses do not expose ETag: $exposed")
+        assert(exposed.contains("retry-after"), s"credentialed responses do not expose Retry-After: $exposed")
 
   test("an allow-list echoes a configured origin and omits the header for others"):
     val restricted = app("https://play.jc.id.lv,http://localhost:5173")

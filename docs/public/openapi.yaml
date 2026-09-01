@@ -37,6 +37,11 @@ tags:
       answers 503 until the rating batch has completed its first refresh.
   - name: Webhooks
     description: Register an HTTPS callback the server POSTs turns to. Registered bots only; enabled per server.
+  - name: Webhook management
+    description: >
+      Feature-gated owner/admin control plane for staged webhook setup, activation, CAS updates,
+      deletion, and bot-history telemetry. Uses the access_token account session, not a bot token.
+      Public design summary: https://github.com/fortemate/dicechess-play-api/issues/10.
   - name: Admin
     description: Break-glass operator controls and complete inventory. Gated by user session in PLAY_ADMINS.
 paths:
@@ -740,6 +745,376 @@ paths:
               schema: { $ref: '#/components/schemas/WebhookDeliveryStats' }
         '403': { $ref: '#/components/responses/RegisteredOnly' }
         '404': { description: Server runs without persistence. }
+  /me/bots/{team}/{name}/webhook:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    get:
+      tags: [Webhook management]
+      summary: Read an owned bot's webhook slot
+      description: >
+        Returns the authoritative redacted slot, including explicit null registration/pendingSetup
+        fields and a strong ETag. Requires the live account session to own this registered bot.
+        This staged API is feature-gated and disabled by default; its presence is not implied by
+        this contract or by the legacy Bot API being available.
+      security:
+        - cookieAuth: []
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+    delete:
+      tags: [Webhook management]
+      summary: Delete an owned bot's active and pending webhook state
+      description: >
+        Destroys active/candidate credentials and stops future deliveries while retaining audit
+        and bot-history telemetry. An already empty slot is a true no-op with the same ETag.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteManagedWebhook' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /me/bots/{team}/{name}/webhook/setups:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    post:
+      tags: [Webhook management]
+      summary: Create an owned bot's pending webhook setup
+      description: >
+        Creates the sole 15-minute candidate. The response is the only place its freshly minted
+        signing secret appears; store it before activation. Request variants and their fields are
+        exact. Create requires no active registration; replaceUrl/rotateSecret require one. A
+        supplied URL must be HTTPS with a host and no userinfo or fragment, and every freshly
+        resolved address must pass the public-address policy; policy failures return 422.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManagedWebhookSetupRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/ManagedWebhookSetupCreated' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '409': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '422': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '429': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '503': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /me/bots/{team}/{name}/webhook/setups/{setupId}/activate:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+      - { $ref: '#/components/parameters/WebhookSetupId' }
+    post:
+      tags: [Webhook management]
+      summary: Verify and activate an owned bot's pending setup
+      description: >
+        Runs verification-v2 against the candidate after the client confirms it stored the
+        one-time secret. The old registration remains active until the new generation commits.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActivateManagedWebhook' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '409': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '410': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '422': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '429': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '503': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /me/bots/{team}/{name}/webhook/setups/{setupId}:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+      - { $ref: '#/components/parameters/WebhookSetupId' }
+    delete:
+      tags: [Webhook management]
+      summary: Cancel an owned bot's pending setup
+      description: Cancels and scrubs the candidate without disturbing an active registration.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '410': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /me/bots/{team}/{name}/webhook/capabilities:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    patch:
+      tags: [Webhook management]
+      summary: Replace an owned bot's webhook capabilities
+      description: >
+        Replaces the selectable capability set while preserving URL, secret, verifiedAt,
+        registrationId, and generation-scoped health.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateManagedWebhookCapabilities' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '409': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '422': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /me/bots/{team}/{name}/webhook/stats:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    get:
+      tags: [Webhook management]
+      summary: Read an owned bot's bot-history webhook telemetry
+      description: >
+        Returns bot_history scoped windows that survive registration replacement/deletion, plus
+        the current registrationId when one exists.
+      security:
+        - cookieAuth: []
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookStats' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /admin/bots/{team}/{name}/webhook:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    get:
+      tags: [Webhook management, Admin]
+      summary: Read any registered bot's webhook slot as an administrator
+      description: >
+        Returns the same redacted slot and strong ETag as the owner root. Requires a live account
+        whose id is currently in PLAY_ADMINS.
+      security:
+        - cookieAuth: []
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+    delete:
+      tags: [Webhook management, Admin]
+      summary: Delete any bot's active and pending webhook state as an administrator
+      description: >
+        Same state transition, confirmation, CAS, redaction, and audit guarantees as the owner
+        root, but authorized by the live PLAY_ADMINS allow-list.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteManagedWebhook' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /admin/bots/{team}/{name}/webhook/setups:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    post:
+      tags: [Webhook management, Admin]
+      summary: Create any bot's pending webhook setup as an administrator
+      description: >
+        Same one-candidate, exact-variant, one-time-secret flow as the owner root. Administrator
+        authority is rechecked before a verified candidate can commit. Supplied URLs use the same
+        HTTPS-only, no-userinfo/no-fragment, freshly resolved public-address policy.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManagedWebhookSetupRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/ManagedWebhookSetupCreated' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '409': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '422': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '429': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '503': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /admin/bots/{team}/{name}/webhook/setups/{setupId}/activate:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+      - { $ref: '#/components/parameters/WebhookSetupId' }
+    post:
+      tags: [Webhook management, Admin]
+      summary: Verify and activate any bot's pending setup as an administrator
+      description: Runs the same verification-v2 and atomic cutover as the owner root.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActivateManagedWebhook' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '409': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '410': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '422': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '429': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '503': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /admin/bots/{team}/{name}/webhook/setups/{setupId}:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+      - { $ref: '#/components/parameters/WebhookSetupId' }
+    delete:
+      tags: [Webhook management, Admin]
+      summary: Cancel any bot's pending setup as an administrator
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '410': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /admin/bots/{team}/{name}/webhook/capabilities:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    patch:
+      tags: [Webhook management, Admin]
+      summary: Replace any bot's webhook capabilities as an administrator
+      description: Preserves URL, secret, verifiedAt, registrationId, and generation-scoped health.
+      security:
+        - cookieAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/ManagedWebhookOrigin' }
+        - { $ref: '#/components/parameters/ManagedWebhookCsrf' }
+        - { $ref: '#/components/parameters/ManagedWebhookIfMatch' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateManagedWebhookCapabilities' }
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookSlot' }
+        '400': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '409': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '412': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '415': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '422': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '428': { $ref: '#/components/responses/ManagedWebhookProblem' }
+  /admin/bots/{team}/{name}/webhook/stats:
+    parameters:
+      - { $ref: '#/components/parameters/BotTeam' }
+      - { $ref: '#/components/parameters/BotName' }
+    get:
+      tags: [Webhook management, Admin]
+      summary: Read any bot's bot-history webhook telemetry as an administrator
+      security:
+        - cookieAuth: []
+      responses:
+        '200': { $ref: '#/components/responses/ManagedWebhookStats' }
+        '401': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '403': { $ref: '#/components/responses/ManagedWebhookProblem' }
+        '404': { $ref: '#/components/responses/ManagedWebhookProblem' }
   /admin/bots:
     get:
       tags: [Admin]
@@ -804,12 +1179,14 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: 'Authorization: Bearer <token>. Every route requires it except POST /bot/anon and POST /bot/register (which mint/claim a token).'
+      description: >
+        Authorization: Bearer <token>. This is the default for Bot API operations; public routes
+        override security with [], while owner/admin operations override it with cookieAuth.
     cookieAuth:
       type: apiKey
       in: cookie
-      name: play_session
-      description: 'Session cookie minted by the play server during user login.'
+      name: access_token
+      description: 'HttpOnly session cookie minted by the play server during user login.'
   parameters:
     GameId:
       name: id
@@ -829,6 +1206,74 @@ components:
       required: true
       schema: { type: string }
       description: Seek id.
+    BotTeam:
+      name: team
+      in: path
+      required: true
+      schema: { type: string }
+      description: Registered bot team slug.
+    BotName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+      description: Registered bot name slug.
+    WebhookSetupId:
+      name: setupId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^whs_[A-Za-z0-9_-]+$'
+      description: Opaque setup id returned by the create response or redacted slot.
+    ManagedWebhookOrigin:
+      name: Origin
+      in: header
+      required: true
+      schema: { type: string }
+      description: Must exactly match one origin configured in PLAY_CORS_ORIGINS.
+    ManagedWebhookCsrf:
+      name: X-DiceChess-CSRF
+      in: header
+      required: true
+      schema:
+        type: string
+        enum: ['1']
+      description: Explicit session-mutation CSRF signal; the only accepted value is 1.
+    ManagedWebhookIfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^"whrev_[A-Za-z0-9_-]+"$'
+        example: '"whrev_0197f0a0-0000-7000-8000-000000000001"'
+      description: >
+        Exactly one strong ETag copied from the last slot response. Weak tags, wildcards, lists,
+        and unquoted revisions are rejected; treat the value as opaque.
+  headers:
+    ManagedWebhookEtag:
+      description: Strong opaque non-ABA revision for the returned/current webhook slot.
+      schema:
+        type: string
+        pattern: '^"whrev_[A-Za-z0-9_-]+"$'
+        example: '"whrev_0197f0a0-0000-7000-8000-000000000001"'
+    NoStore:
+      description: Session webhook responses must never be stored by browsers or intermediaries.
+      schema:
+        type: string
+        const: no-store
+    NoCache:
+      description: Additional protection on the sole secret-bearing setup response.
+      schema:
+        type: string
+        const: no-cache
+    ManagedWebhookLocation:
+      description: Canonical path of the newly created pending setup.
+      schema: { type: string }
+    RetryAfter:
+      description: Whole seconds until a verification budget can be attempted again.
+      schema: { type: integer, minimum: 1 }
   responses:
     Unauthorized:
       description: Missing, invalid, or expired Bearer token.
@@ -838,6 +1283,44 @@ components:
       description: Rate limited — check the `Retry-After` header.
     RegisteredOnly:
       description: The caller is anonymous or static; this feature needs a registered identity.
+    ManagedWebhookSlot:
+      description: Authoritative redacted webhook slot.
+      headers:
+        ETag: { $ref: '#/components/headers/ManagedWebhookEtag' }
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ManagedWebhookSlot' }
+    ManagedWebhookSetupCreated:
+      description: >
+        Pending setup created. This is the only response that reveals the candidate signing
+        secret; store it before activation because it cannot be recovered.
+      headers:
+        ETag: { $ref: '#/components/headers/ManagedWebhookEtag' }
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        Pragma: { $ref: '#/components/headers/NoCache' }
+        Location: { $ref: '#/components/headers/ManagedWebhookLocation' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ManagedWebhookSetupCreated' }
+    ManagedWebhookStats:
+      description: Bot-history scoped delivery telemetry and current registration generation.
+      headers:
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ManagedWebhookDeliveryStats' }
+    ManagedWebhookProblem:
+      description: >
+        Typed session webhook-management problem. A 412 includes current plus its ETag; a 429
+        includes Retry-After. Secret material and raw transport details are never returned.
+      headers:
+        ETag: { $ref: '#/components/headers/ManagedWebhookEtag' }
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ManagedWebhookProblem' }
   schemas:
     TokenResponse:
       type: object
@@ -1348,7 +1831,12 @@ components:
     RegisterWebhookRequest:
       type: object
       properties:
-        url: { type: string, format: uri }
+        url:
+          type: string
+          format: uri
+          description: >
+            HTTPS URL with a host and without userinfo or fragment. Every fresh DNS result must
+            contain only public addresses; dynamic policy failures return 422.
         capabilities:
           type: [array, 'null']
           description: >
@@ -1361,7 +1849,12 @@ components:
     WebhookCreated:
       type: object
       properties:
-        url: { type: string, format: uri }
+        url:
+          type: string
+          format: uri
+          description: >
+            Replacement HTTPS URL with a host and without userinfo or fragment. Every fresh DNS
+            result must contain only public addresses; dynamic policy failures return 422.
         secret: { type: string, description: Per-bot HMAC key; shown once. }
         capabilities:
           type: [array, 'null']
@@ -1380,14 +1873,260 @@ components:
           items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
           uniqueItems: true
       required: [url, verifiedAt]
+    ManagedWebhookRevision:
+      type: string
+      pattern: '^whrev_[A-Za-z0-9_-]+$'
+      description: Opaque non-ABA slot revision. Copy its quoted ETag; never derive or increment it.
+    ManagedWebhookRegistrationId:
+      type: string
+      pattern: '^whr_[A-Za-z0-9_-]+$'
+      description: Opaque active registration generation.
+    ManagedWebhookSetupId:
+      type: string
+      pattern: '^whs_[A-Za-z0-9_-]+$'
+      description: Opaque pending/terminal setup id.
+    ManagedWebhookSetupKind:
+      type: string
+      enum: [create, replaceUrl, rotateSecret]
+    ManagedWebhookRegistration:
+      type: object
+      additionalProperties: false
+      description: Active registration metadata; HMAC credentials are never represented.
+      properties:
+        registrationId: { $ref: '#/components/schemas/ManagedWebhookRegistrationId' }
+        url: { type: string, format: uri }
+        verifiedAt: { type: string, format: date-time }
+        capabilities:
+          type: array
+          items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
+          uniqueItems: true
+        lastFailure:
+          oneOf:
+            - { $ref: '#/components/schemas/LastDeliveryFailure' }
+            - { type: 'null' }
+      required: [registrationId, url, verifiedAt, capabilities, lastFailure]
+    ManagedPendingWebhookSetup:
+      type: object
+      additionalProperties: false
+      description: Redacted metadata for the sole live candidate; contains no secret.
+      properties:
+        setupId: { $ref: '#/components/schemas/ManagedWebhookSetupId' }
+        kind: { $ref: '#/components/schemas/ManagedWebhookSetupKind' }
+        candidateUrl: { type: string, format: uri }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        canActivate:
+          type: boolean
+          description: Whether the current actor is the setup's actor and may attempt activation.
+      required: [setupId, kind, candidateUrl, createdAt, expiresAt, canActivate]
+    ManagedWebhookSlot:
+      type: object
+      additionalProperties: false
+      description: >
+        Authoritative redacted state. registration and pendingSetup are explicit nulls when absent;
+        this object never includes active or candidate secrets.
+      properties:
+        revision: { $ref: '#/components/schemas/ManagedWebhookRevision' }
+        registration:
+          oneOf:
+            - { $ref: '#/components/schemas/ManagedWebhookRegistration' }
+            - { type: 'null' }
+        pendingSetup:
+          oneOf:
+            - { $ref: '#/components/schemas/ManagedPendingWebhookSetup' }
+            - { type: 'null' }
+      required: [revision, registration, pendingSetup]
+    ManagedWebhookCreateSetup:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: { type: string, const: create }
+        url: { type: string, format: uri }
+        capabilities:
+          type: array
+          items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
+          default: []
+      required: [kind, url, capabilities]
+    ManagedWebhookReplaceUrlSetup:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: { type: string, const: replaceUrl }
+        url: { type: string, format: uri }
+        confirmSecretRotation: { type: boolean, const: true }
+      required: [kind, url, confirmSecretRotation]
+    ManagedWebhookRotateSecretSetup:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: { type: string, const: rotateSecret }
+        cutoverMode: { type: string, const: dualKey }
+        confirm:
+          type: string
+          description: Must exactly equal the bot name (case-sensitive).
+      required: [kind, cutoverMode, confirm]
+    ManagedWebhookSetupRequest:
+      oneOf:
+        - { $ref: '#/components/schemas/ManagedWebhookCreateSetup' }
+        - { $ref: '#/components/schemas/ManagedWebhookReplaceUrlSetup' }
+        - { $ref: '#/components/schemas/ManagedWebhookRotateSecretSetup' }
+      discriminator:
+        propertyName: kind
+        mapping:
+          create: '#/components/schemas/ManagedWebhookCreateSetup'
+          replaceUrl: '#/components/schemas/ManagedWebhookReplaceUrlSetup'
+          rotateSecret: '#/components/schemas/ManagedWebhookRotateSecretSetup'
+    ManagedWebhookSetupCreated:
+      type: object
+      additionalProperties: false
+      description: Sole secret-bearing session-management response; never repeat or log it.
+      properties:
+        setupId: { $ref: '#/components/schemas/ManagedWebhookSetupId' }
+        kind: { $ref: '#/components/schemas/ManagedWebhookSetupKind' }
+        secret:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          readOnly: true
+          description: Candidate HMAC key, shown once. Store it before activation.
+        expiresAt: { type: string, format: date-time }
+        revision: { $ref: '#/components/schemas/ManagedWebhookRevision' }
+      required: [setupId, kind, secret, expiresAt, revision]
+    ActivateManagedWebhook:
+      type: object
+      additionalProperties: false
+      properties:
+        secretStored: { type: boolean, const: true }
+      required: [secretStored]
+    UpdateManagedWebhookCapabilities:
+      type: object
+      additionalProperties: false
+      properties:
+        capabilities:
+          type: array
+          items: { $ref: '#/components/schemas/SelectableWebhookCapability' }
+          default: []
+      required: [capabilities]
+    DeleteManagedWebhook:
+      type: object
+      additionalProperties: false
+      properties:
+        confirm:
+          type: string
+          description: Must exactly equal the bot name (case-sensitive).
+      required: [confirm]
+    ManagedWebhookDeliveryStats:
+      type: object
+      additionalProperties: false
+      properties:
+        scope:
+          type: string
+          const: bot_history
+          description: Windows survive replacement, rotation, and deletion of active registration state.
+        registrationId:
+          oneOf:
+            - { $ref: '#/components/schemas/ManagedWebhookRegistrationId' }
+            - { type: 'null' }
+          description: Current active generation, or null when no webhook is active.
+        last24h: { $ref: '#/components/schemas/DeliveryWindow' }
+        last7d: { $ref: '#/components/schemas/DeliveryWindow' }
+        lastFailure:
+          oneOf:
+            - { $ref: '#/components/schemas/LastDeliveryFailure' }
+            - { type: 'null' }
+      required: [scope, registrationId, last24h, last7d, lastFailure]
+    ManagedWebhookProblemCode:
+      type: string
+      description: Stable machine-readable reason; clients should branch on this, not detail text.
+      enum:
+        - authentication_required
+        - bot_not_found
+        - bot_not_owned
+        - admin_required
+        - csrf_origin_rejected
+        - webhook_revision_required
+        - malformed_request
+        - confirmation_mismatch
+        - webhook_verification_unavailable
+        - webhook_url_rejected
+        - webhook_verification_failed
+        - capability_rejected
+        - stale_webhook_revision
+        - webhook_verification_rate_limited
+        - webhook_already_registered
+        - webhook_not_registered
+        - pending_setup_exists
+        - activation_in_progress
+        - setup_actor_mismatch
+        - replacement_url_unchanged
+        - setup_not_found
+        - setup_consumed
+        - setup_cancelled
+        - setup_expired
+        - setup_invalidated
+        - setup_attempts_exhausted
+    ManagedWebhookProblem:
+      type: object
+      additionalProperties: false
+      description: >
+        RFC 9457-style error. current is present only for 412 and is the same redacted slot shape
+        as a successful read. Retry timing is conveyed only by the Retry-After header.
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        code: { $ref: '#/components/schemas/ManagedWebhookProblemCode' }
+        detail: { type: string }
+        instance: { type: string }
+        current: { $ref: '#/components/schemas/ManagedWebhookSlot' }
+      required: [type, title, status, code, detail, instance]
+    WebhookVerificationV2:
+      type: object
+      additionalProperties: false
+      description: >
+        Outbound activation challenge. The candidate request is signed with
+        HMAC-SHA256(secretUtf8, timestamp + "." + rawBodyBytes), using the normal
+        X-DiceChess-Timestamp and X-DiceChess-Signature headers.
+      properties:
+        type: { type: string, const: verification }
+        version: { type: integer, const: 2 }
+        bot:
+          type: object
+          additionalProperties: false
+          properties:
+            team: { type: string }
+            name: { type: string }
+          required: [team, name]
+        setupId: { $ref: '#/components/schemas/ManagedWebhookSetupId' }
+        revision: { $ref: '#/components/schemas/ManagedWebhookRevision' }
+        nonce:
+          type: string
+          pattern: '^[A-Za-z0-9_-]+$'
+          description: Fresh base64url value without padding.
+      required: [type, version, bot, setupId, revision, nonce]
+    WebhookVerificationV2Response:
+      type: object
+      additionalProperties: false
+      description: >
+        Exact body the candidate must return with HTTP 200 OK. proof is lowercase hex
+        HMAC-SHA256(secretUtf8, "dicechess-webhook-activate-v2\n" ||
+        rawVerificationBodyBytes). Other 2xx statuses are not accepted.
+      properties:
+        nonce:
+          type: string
+          description: Exact nonce from the request.
+        proof:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      required: [nonce, proof]
     DeliveryOutcomeCount:
       type: object
       properties:
         outcome:
           type: string
           description: >
-            applied, declined, refused, garbled, oversized_body, http_<code>, timed_out, or
-            unreachable.
+            applied, declined, refused, garbled, oversized_body, http_<code>, timed_out,
+            unreachable, or stale_registration (a response discarded after its generation lost
+            the registration fence).
         count: { type: integer, format: int64 }
       required: [outcome, count]
     DeliveryWindow:

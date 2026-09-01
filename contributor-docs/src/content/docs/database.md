@@ -1,6 +1,6 @@
 ---
 title: Database Schema
-description: The eleven tables of the play-api Postgres schema, what each is for, and the deliberate absence of some foreign keys.
+description: The play-api Postgres tables, what each is for, and the deliberate absence of some foreign keys.
 ---
 
 Persistence is **opt-in**: with no database URL configured the server runs fully in memory and
@@ -73,6 +73,12 @@ from live rooms in `GameRegistry` at the moment a game is seated: a persisted co
 a slot and lock a bot out of every future game, failing silently — strictly worse than the
 timeouts the column exists to prevent.
 
+V4 adds three webhook-control values to the identity row. `incarnation_id` distinguishes a bot
+that was deleted and later re-registered under the same team/name; `ownership_generation`
+invalidates an owner's pending setup on claim/release; and `webhook_revision` is the opaque,
+non-ABA compare-and-swap token exposed as a strong ETag. Legacy Bearer-token webhook writes also
+advance this state, so the old and staged APIs cannot silently overwrite each other.
+
 ### `bot_webhooks` — verified callback registration
 
 Where the server POSTs on a bot's turn. A row exists only after the ownership handshake
@@ -86,6 +92,67 @@ nullable — a bot with a clean history, or no deliveries yet, has neither. Writ
 genuine fault (`DeliveryOutcome.isFailure`); a usable move or a clean decline never overwrites
 them. They live here rather than in a second one-row-per-bot table because `bot_webhooks` is
 already exactly that shape.
+
+`registration_id` (V4) names one active webhook generation. Create, URL replacement, and secret
+rotation mint a new value; capability-only updates preserve it. Turn delivery carries the id it
+read and takes the same per-bot PostgreSQL advisory fence as control-plane mutations before it
+applies a response. A late response from a replaced/deleted registration is classified as
+`stale_registration` and cannot submit a move or overwrite current-health fields.
+
+### `bot_webhook_setups` — one pending candidate plus redacted tombstones
+
+The staged owner/admin API never replaces a live webhook merely because a browser asked it to.
+It first writes one pending candidate with its actor/authority generation, candidate URL and
+secret, capabilities, expiry, activation attempt count, and short verification lease. A partial
+unique index enforces one live setup per bot across every server instance. Activation leaves the
+old registration live until verification-v2 succeeds and the replacement commits atomically.
+
+An activation attempt is reserved atomically when the database grants the lease, before the
+outbound verification request begins. It is not charged later only when a failure response happens.
+The same lease transaction writes `webhook.activation.start` with the setup id and reserved attempt
+number, so even a verifier process crash leaves a durable explanation for the consumed attempt.
+At most five outbound attempts can therefore start, and a verifier process crash or abandoned
+lease cannot refund an attempt and bypass the cap. A failed fifth attempt becomes an
+`attempts_exhausted` tombstone immediately; an abandoned final lease is reconciled after its hard
+expiry instead of granting a sixth attempt.
+
+Terminal rows are deliberately destructive tombstones. Activation, cancellation, expiry,
+authority invalidation, or attempt exhaustion clears candidate URL, secret, capabilities,
+actor, lifecycle timestamps, attempt count, and lease material in the same update. Only the setup
+id, target bot/incarnation, terminal status, and terminal time remain long enough to answer
+deterministic `410 Gone` responses for 15 minutes. After that window the API treats the id as
+unknown. The table's redaction check constraint makes a half-scrubbed terminal row invalid.
+
+Setup creation/expiry, lease expiry, terminal timestamps, and tombstone cleanup use PostgreSQL's
+`clock_timestamp()` as the lifecycle authority. JVM timestamps contribute requested durations, not
+security deadlines, so clock skew between API replicas cannot extend a setup, steal a live lease,
+or retain a tombstone inconsistently.
+
+### `webhook_admin_authority_generations` — fail-closed allow-list epochs
+
+One row per SHA-256 generation of the parsed, sorted `PLAY_ADMINS` allow-list; no administrator id
+is stored in this table. Every enabled API instance refreshes its generation at startup and every
+5 seconds using the database clock. A row is live for 20 seconds. The store accepts admin webhook
+authority only when exactly one generation is live, so old/new allow-lists overlapping during a
+rolling deploy return `admin_required` instead of each authorizing its own pending setup.
+
+The same database-wide advisory fence serializes heartbeat refresh and admin webhook transactions.
+Once a sole generation remains, boot/background cleanup invalidates older-generation pending admin
+setups, scrubs their candidate material, advances the bot revision, and writes the system audit in
+the same transaction. Expired generation rows are only liveness markers and are deleted during
+refresh.
+
+### `webhook_verification_budgets` — cross-instance abuse limits
+
+Fixed-window counters for setup creation by actor+bot and activation by both actor+bot and source
+IP. Keys are one-way digests prepared by the service; raw account ids and IP addresses are not
+stored here. Keeping the counters in PostgreSQL means horizontal replicas enforce one budget,
+instead of each process granting a fresh allowance after a restart or load-balanced hop. Window
+start, reset and the returned `Retry-After` are derived from the same database clock; a skewed API
+instance cannot reset a window early or understate how long it remains closed.
+Each row also stores its authoritative `window_expires_at`; a bounded, indexed cleanup removes at
+most 128 expired keys on each consume without blocking live counters. This bounds retained source-IP
+and actor+bot digests while preserving atomic fixed-window increments under concurrency.
 
 ### `bot_webhook_stats` — delivery telemetry (#225)
 
@@ -213,7 +280,7 @@ entirely from Blitz evidence. Because the backfill can only ever run against his
 own database does not have, `PgGameStoreSuite` stages the real migration chain into a scratch
 schema, plants a history at V20, and applies V21 to it.
 
-### `admin_actions` — who did what to somebody else's bot (#273)
+### `admin_actions` — durable bot-control audit (#273, ADR-004)
 
 One row per action an administrator performs on a bot through the admin surface — the answer
 to "who retired this bot" (or rotated its token, or rewrote its card) when the bot's own
@@ -230,6 +297,15 @@ as "who did this"), and a cascade would erase exactly the history an audit exist
 parameter — the description text of catalog writes or `before -> after` capacity limits — and never
 secret material: `token.rotate` keeps it NULL. Operator-only, read with `psql`; never exposed on any
 wire type.
+
+V4 widens this stream to owner, administrator, bot and system actors and adds request id,
+before/after slot revisions, before/after registration ids, and safe JSON metadata. Every staged
+mutation and its audit row share one transaction, including lease reservation and failed verification.
+Legacy bot-token writes receive a transaction correlation id when there is no HTTP request id.
+Secret values, HMAC material, nonces, raw
+transport exceptions, and resolved infrastructure addresses are forbidden from both `detail` and
+`metadata`. Existing administrator actions remain readable; their historical `admin_user_id`
+continues to identify the actor.
 
 ## Two deliberate design choices
 

@@ -242,7 +242,7 @@ class WebhookRoutesSuite extends CatsEffectSuite:
         reason  <- refused.bodyText.compile.string
       yield
         assertEquals(refused.status, Status.UnprocessableEntity)
-        assert(reason.contains("non-public"), reason)
+        assertEquals(reason, "\"host resolves to a non-public address\"")
     }
 
   test("registration draws from a per-IP budget: the attempt after the limit is 429 with Retry-After"):

@@ -27,6 +27,7 @@ Regenerate with `mise run contrib-docs:schema` after adding a migration.
 erDiagram
     admin_actions
     bot_ratings
+    bot_webhook_setups
     bot_webhook_stats
     bot_webhooks
     bots
@@ -41,7 +42,10 @@ erDiagram
     user_identities
     user_ratings
     users
+    webhook_admin_authority_generations
+    webhook_verification_budgets
     bots ||--o{ bot_ratings : ""
+    bots ||--o{ bot_webhook_setups : ""
     bots ||--o{ bot_webhook_stats : ""
     bots ||--o| bot_webhooks : ""
     games ||--o| outbox : ""
@@ -69,17 +73,31 @@ admin who has since deleted their account, on a bot whose row may be long gone.
 | Column | Type | Null | Default | Key |
 | --- | --- | --- | --- | --- |
 | `id` | `bigint` | no | `nextval('admin_actions_id_seq'::regclass)` | PK |
-| `admin_user_id` | `uuid` | no | — | — |
+| `admin_user_id` | `uuid` | yes | — | — |
 | `team` | `text` | no | — | — |
 | `name` | `text` | no | — | — |
 | `action` | `text` | no | — | — |
 | `detail` | `text` | yes | — | — |
 | `created_at` | `timestamp with time zone` | no | `now()` | — |
+| `actor_kind` | `text` | no | `'admin'::text` | — |
+| `actor_id` | `text` | yes | — | — |
+| `request_id` | `text` | yes | — | — |
+| `before_revision` | `uuid` | yes | — | — |
+| `after_revision` | `uuid` | yes | — | — |
+| `before_registration_id` | `uuid` | yes | — | — |
+| `after_registration_id` | `uuid` | yes | — | — |
+| `bot_incarnation_id` | `uuid` | yes | — | — |
+| `metadata` | `jsonb` | no | `'{}'::jsonb` | — |
+
+Check constraints:
+
+- `CHECK ((actor_kind = ANY (ARRAY['owner'::text, 'admin'::text, 'bot'::text, 'system'::text])))`
 
 Indexes:
 
 - `admin_actions_bot_idx` — `CREATE INDEX admin_actions_bot_idx ON public.admin_actions USING btree (team, name, created_at)`
 - `admin_actions_pkey` — `CREATE UNIQUE INDEX admin_actions_pkey ON public.admin_actions USING btree (id)`
+- `admin_actions_request_idx` — `CREATE INDEX admin_actions_request_idx ON public.admin_actions USING btree (request_id) WHERE (request_id IS NOT NULL)`
 
 ### `bot_ratings`
 
@@ -99,6 +117,49 @@ Check constraints:
 Indexes:
 
 - `bot_ratings_pkey` — `CREATE UNIQUE INDEX bot_ratings_pkey ON public.bot_ratings USING btree (team, name, category)`
+
+### `bot_webhook_setups`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `setup_id` | `uuid` | no | — | PK |
+| `team` | `text` | no | — | FK → bots(team, name, incarnation_id) |
+| `name` | `text` | no | — | FK → bots(team, name, incarnation_id) |
+| `bot_incarnation_id` | `uuid` | no | — | FK → bots(team, name, incarnation_id) |
+| `kind` | `text` | yes | — | — |
+| `actor_kind` | `text` | yes | — | — |
+| `actor_id` | `text` | yes | — | — |
+| `authority_generation` | `text` | yes | — | — |
+| `activation_revision` | `uuid` | yes | — | — |
+| `candidate_url` | `text` | yes | — | — |
+| `candidate_secret` | `text` | yes | — | — |
+| `candidate_capabilities` | `text[]` | yes | — | — |
+| `created_at` | `timestamp with time zone` | yes | — | — |
+| `expires_at` | `timestamp with time zone` | yes | — | — |
+| `activation_attempts` | `integer` | yes | `0` | — |
+| `lease_id` | `uuid` | yes | — | — |
+| `lease_expires_at` | `timestamp with time zone` | yes | — | — |
+| `status` | `text` | no | `'pending'::text` | — |
+| `terminated_at` | `timestamp with time zone` | yes | — | — |
+
+Check constraints:
+
+- `CHECK (((actor_kind IS NULL) OR (actor_kind = ANY (ARRAY['owner'::text, 'admin'::text]))))`
+- `CHECK (((activation_attempts IS NULL) OR ((activation_attempts >= 0) AND (activation_attempts <= 5))))`
+- `CHECK (((status <> 'pending'::text) OR ((kind = 'create'::text) AND (candidate_capabilities IS NOT NULL)) OR ((kind = ANY (ARRAY['replaceUrl'::text, 'rotateSecret'::text])) AND (candidate_capabilities IS NULL))))`
+- `CHECK (((candidate_capabilities IS NULL) OR (candidate_capabilities = ARRAY[]::text[]) OR (candidate_capabilities = ARRAY['draws'::text])))`
+- `CHECK (((status <> 'pending'::text) OR (expires_at > created_at)))`
+- `CHECK (((kind IS NULL) OR (kind = ANY (ARRAY['create'::text, 'replaceUrl'::text, 'rotateSecret'::text]))))`
+- `CHECK (((lease_id IS NULL) = (lease_expires_at IS NULL)))`
+- `CHECK (((lease_id IS NULL) OR (activation_attempts > 0)))`
+- `CHECK ((((status = 'pending'::text) AND (kind IS NOT NULL) AND (actor_kind IS NOT NULL) AND (actor_id IS NOT NULL) AND (authority_generation IS NOT NULL) AND (activation_revision IS NOT NULL) AND (candidate_url IS NOT NULL) AND (candidate_secret IS NOT NULL) AND (created_at IS NOT NULL) AND (expires_at IS NOT NULL) AND (activation_attempts IS NOT NULL) AND (terminated_at IS NULL)) OR ((status <> 'pending'::text) AND (kind IS NULL) AND (actor_kind IS NULL) AND (actor_id IS NULL) AND (authority_generation IS NULL) AND (activation_revision IS NULL) AND (candidate_url IS NULL) AND (candidate_secret IS NULL) AND (candidate_capabilities IS NULL) AND (created_at IS NULL) AND (expires_at IS NULL) AND (activation_attempts IS NULL) AND (lease_id IS NULL) AND (lease_expires_at IS NULL) AND (terminated_at IS NOT NULL))))`
+- `CHECK ((status = ANY (ARRAY['pending'::text, 'activated'::text, 'cancelled'::text, 'expired'::text, 'invalidated'::text, 'attempts_exhausted'::text])))`
+
+Indexes:
+
+- `bot_webhook_setups_one_pending_idx` — `CREATE UNIQUE INDEX bot_webhook_setups_one_pending_idx ON public.bot_webhook_setups USING btree (team, name) WHERE (status = 'pending'::text)`
+- `bot_webhook_setups_pkey` — `CREATE UNIQUE INDEX bot_webhook_setups_pkey ON public.bot_webhook_setups USING btree (setup_id)`
+- `bot_webhook_setups_tombstone_expiry_idx` — `CREATE INDEX bot_webhook_setups_tombstone_expiry_idx ON public.bot_webhook_setups USING btree (terminated_at) WHERE (status <> 'pending'::text)`
 
 ### `bot_webhook_stats`
 
@@ -129,6 +190,7 @@ Indexes:
 | `last_failure_at` | `timestamp with time zone` | yes | — | — |
 | `last_failure_reason` | `text` | yes | — | — |
 | `capabilities` | `text[]` | no | `'{}'::text[]` | — |
+| `registration_id` | `uuid` | no | `gen_random_uuid()` | — |
 
 Check constraints:
 
@@ -142,8 +204,8 @@ Indexes:
 
 | Column | Type | Null | Default | Key |
 | --- | --- | --- | --- | --- |
-| `team` | `text` | no | — | PK |
-| `name` | `text` | no | — | PK |
+| `team` | `text` | no | — | PK, unique |
+| `name` | `text` | no | — | PK, unique |
 | `token_hash` | `text` | no | — | unique |
 | `created_at` | `timestamp with time zone` | no | `now()` | — |
 | `rotated_at` | `timestamp with time zone` | yes | — | — |
@@ -153,6 +215,9 @@ Indexes:
 | `description` | `text` | yes | — | — |
 | `max_concurrent_games` | `integer` | no | `1` | — |
 | `rated_for_humans` | `boolean` | no | `false` | — |
+| `incarnation_id` | `uuid` | no | `gen_random_uuid()` | unique |
+| `webhook_revision` | `uuid` | no | `gen_random_uuid()` | — |
+| `ownership_generation` | `bigint` | no | `0` | — |
 
 Check constraints:
 
@@ -163,6 +228,7 @@ Indexes:
 - `bots_owner_idx` — `CREATE INDEX bots_owner_idx ON public.bots USING btree (owner_external_id) WHERE (owner_external_id IS NOT NULL)`
 - `bots_pkey` — `CREATE UNIQUE INDEX bots_pkey ON public.bots USING btree (team, name)`
 - `bots_token_hash_key` — `CREATE UNIQUE INDEX bots_token_hash_key ON public.bots USING btree (token_hash)`
+- `bots_webhook_incarnation_unique` — `CREATE UNIQUE INDEX bots_webhook_incarnation_unique ON public.bots USING btree (team, name, incarnation_id)`
 
 ### `client_reports`
 
@@ -353,3 +419,40 @@ Indexes:
 
 - `users_nickname_ci_idx` — `CREATE UNIQUE INDEX users_nickname_ci_idx ON public.users USING btree (lower(nickname))`
 - `users_pkey` — `CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)`
+
+### `webhook_admin_authority_generations`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `authority_generation` | `text` | no | — | PK |
+| `heartbeat_at` | `timestamp with time zone` | no | `clock_timestamp()` | — |
+
+Check constraints:
+
+- `CHECK ((authority_generation ~ '^[0-9a-f]{64}$'::text))`
+
+Indexes:
+
+- `webhook_admin_authority_generations_pkey` — `CREATE UNIQUE INDEX webhook_admin_authority_generations_pkey ON public.webhook_admin_authority_generations USING btree (authority_generation)`
+- `webhook_admin_authority_heartbeat_idx` — `CREATE INDEX webhook_admin_authority_heartbeat_idx ON public.webhook_admin_authority_generations USING btree (heartbeat_at)`
+
+### `webhook_verification_budgets`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `budget_kind` | `text` | no | — | PK |
+| `budget_key` | `text` | no | — | PK |
+| `window_started_at` | `timestamp with time zone` | no | — | — |
+| `window_expires_at` | `timestamp with time zone` | no | — | — |
+| `attempts` | `integer` | no | — | — |
+
+Check constraints:
+
+- `CHECK ((attempts >= 1))`
+- `CHECK ((budget_kind = ANY (ARRAY['setup_actor_bot'::text, 'activation_actor_bot'::text, 'activation_source_ip'::text])))`
+- `CHECK ((window_expires_at > window_started_at))`
+
+Indexes:
+
+- `webhook_verification_budgets_expiry_idx` — `CREATE INDEX webhook_verification_budgets_expiry_idx ON public.webhook_verification_budgets USING btree (window_expires_at)`
+- `webhook_verification_budgets_pkey` — `CREATE UNIQUE INDEX webhook_verification_budgets_pkey ON public.webhook_verification_budgets USING btree (budget_kind, budget_key)`

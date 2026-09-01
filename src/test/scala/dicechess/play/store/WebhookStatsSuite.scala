@@ -20,10 +20,15 @@ class WebhookStatsSuite extends munit.FunSuite:
     assertEquals(DeliveryOutcome.key(DeliveryOutcome.HttpStatus(429)), "http_429")
     assertEquals(DeliveryOutcome.key(DeliveryOutcome.TimedOut), "timed_out")
     assertEquals(DeliveryOutcome.key(DeliveryOutcome.Unreachable), "unreachable")
+    assertEquals(DeliveryOutcome.key(DeliveryOutcome.StaleRegistration), "stale_registration")
 
   test("only a genuine fault counts as a failure — a clean decline does not overwrite last-failure"):
     assert(!DeliveryOutcome.isFailure(DeliveryOutcome.Applied), "a usable move is not a failure")
     assert(!DeliveryOutcome.isFailure(DeliveryOutcome.Declined), "an explicit decline is the bot behaving as designed")
+    assert(
+      !DeliveryOutcome.isFailure(DeliveryOutcome.StaleRegistration),
+      "a fenced old response must not overwrite the current registration's last failure"
+    )
     assert(DeliveryOutcome.isFailure(DeliveryOutcome.Refused))
     assert(DeliveryOutcome.isFailure(DeliveryOutcome.Garbled))
     assert(DeliveryOutcome.isFailure(DeliveryOutcome.OversizedBody))
@@ -40,7 +45,8 @@ class WebhookStatsSuite extends munit.FunSuite:
       DeliveryOutcome.OversizedBody,
       DeliveryOutcome.HttpStatus(503),
       DeliveryOutcome.TimedOut,
-      DeliveryOutcome.Unreachable
+      DeliveryOutcome.Unreachable,
+      DeliveryOutcome.StaleRegistration
     ).map(DeliveryOutcome.describe)
     assertEquals(described.distinct.size, described.size, s"expected all-distinct sentences, got: $described")
     assert(DeliveryOutcome.describe(DeliveryOutcome.HttpStatus(503)).contains("503"))

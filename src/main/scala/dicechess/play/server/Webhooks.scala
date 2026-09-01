@@ -16,7 +16,9 @@ import org.http4s.client.Client
 import org.typelevel.ci.CIString
 
 import java.time.Instant
+import java.util.UUID
 import scala.concurrent.duration.*
+import scala.util.control.NoStackTrace
 
 /** The turn envelope POSTed to a bot's webhook: the existing wire vocabulary verbatim — `state` is the same
   * `PublicGameState` every snapshot and `GET /games/{id}` serve (dfen with the pending dice pool, clocks, inline
@@ -58,6 +60,7 @@ final class Webhooks private (
     store: WebhookStore,
     client: Client[IO],
     checkUrl: String => IO[Either[String, Uri]],
+    transport: Option[WebhookTransport],
     config: Webhooks.Config,
     attached: Ref[IO, Set[(GameId, Seat)]],
     runners: Supervisor[IO],
@@ -81,27 +84,34 @@ final class Webhooks private (
     WebhookCapability.canonicalizeSelection(capabilities) match
       case Left(reason)    => IO.pure(Left(reason))
       case Right(selected) =>
-        checkUrl(url).flatMap:
-          case Left(reason) => IO.pure(Left(reason))
-          case Right(_)     =>
-            for
-              secret <- WebhookSecurity.randomHex(SecretBytes)
-              nonce  <- WebhookSecurity.randomHex(NonceBytes)
-              body = WebhookVerification("verification", nonce).asJson.noSpaces
-              answer <- post(url, secret, body, config.timeout)
-              stored <- answer match
-                case Left(reason)  => IO.pure(Left(s"verification failed: $reason"))
-                case Right(echoed) =>
-                  decode[WebhookNonceEcho](echoed) match
-                    case Right(WebhookNonceEcho(`nonce`)) =>
-                      IO.realTime.flatMap { now =>
-                        val hook =
-                          BotWebhook(bot.team, bot.name, url, secret, Instant.ofEpochMilli(now.toMillis), selected)
-                        store.put(hook).as(Right(hook))
-                      }
-                    case Right(_) => IO.pure(Left("verification failed: endpoint echoed a different nonce"))
-                    case Left(_)  => IO.pure(Left("verification failed: endpoint did not answer {\"nonce\": ...}"))
-            yield stored
+        for
+          secret <- WebhookSecurity.randomHex(SecretBytes)
+          nonce  <- WebhookSecurity.randomHex(NonceBytes)
+          body = WebhookVerification("verification", nonce).asJson.noSpaces
+          // `post` owns the single fresh URL-policy/DNS resolution and its end-to-end deadline. A separate preflight
+          // here would both resolve twice in production and leave the first DNS lookup outside that deadline.
+          answer <- postDetailed(url, secret, body, config.timeout)
+          stored <- answer match
+            // URL-policy reasons are part of the legacy POST /bot/webhook 422 contract and must remain verbatim.
+            // Only failures from the remote verification attempt carry the historical "verification failed" prefix.
+            case PostOutcome.PolicyRejected(reason) => IO.pure(Left(reason))
+            case PostOutcome.OversizedBody          =>
+              IO.pure(Left("verification failed: endpoint answered with an oversized body"))
+            case PostOutcome.HttpStatus(code) =>
+              IO.pure(Left(s"verification failed: endpoint answered HTTP $code"))
+            case PostOutcome.TimedOut | PostOutcome.Unreachable =>
+              IO.pure(Left("verification failed: could not reach the endpoint"))
+            case PostOutcome.Ok(echoed) =>
+              decode[WebhookNonceEcho](echoed) match
+                case Right(WebhookNonceEcho(`nonce`)) =>
+                  IO.realTime.flatMap { now =>
+                    val hook =
+                      BotWebhook(bot.team, bot.name, url, secret, Instant.ofEpochMilli(now.toMillis), selected)
+                    store.put(hook).as(Right(hook))
+                  }
+                case Right(_) => IO.pure(Left("verification failed: endpoint echoed a different nonce"))
+                case Left(_)  => IO.pure(Left("verification failed: endpoint did not answer {\"nonce\": ...}"))
+        yield stored
 
   def info(bot: Principal.Bot): IO[Option[BotWebhook]] = store.get(bot.team, bot.name)
 
@@ -146,7 +156,14 @@ final class Webhooks private (
   def statsLoop: IO[Nothing] =
     deliveryEvents.take.flatMap { event =>
       stats
-        .recordDelivery(event.team, event.name, event.outcome, event.elapsed, event.at)
+        .recordDeliveryFor(
+          event.team,
+          event.name,
+          event.registrationId,
+          event.outcome,
+          event.elapsed,
+          event.at
+        )
         .handleErrorWith(e => Console[IO].errorln(s"[play][webhook] stats write failed: $e"))
     }.foreverM
 
@@ -179,11 +196,6 @@ final class Webhooks private (
           })
     })
 
-  /** The per-(game, seat) runner: an ordinary subscriber that reacts to "your move" events until the game ends. The
-    * subscription's snapshot-then-live overlap can show one version twice — `lastVersion` dedupes, and it advances to
-    * whatever state each delivery actually saw, so a turn that was already answered from a fresher snapshot isn't
-    * re-answered when its own event arrives.
-    */
   /** The per-(game, seat) runner: an ordinary subscriber that reacts to "your move" and "draw decision" events until
     * the game ends. The subscription's snapshot-then-live overlap can show one version twice — `lastVersion` dedupes,
     * and it advances to whatever state each delivery actually saw, so a turn that was already answered from a fresher
@@ -238,36 +250,46 @@ final class Webhooks private (
           if !hook.capabilities.contains(WebhookCapability.Draws) then
             // Preserve legacy bot behavior: bots that did not opt in cannot answer a
             // draw decision, so decline before revealing dice and continue with yourTurn.
-            room.respondDraw(seat, accept = false).void
+            store
+              .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(
+                room.enqueueDrawResponse(seat, accept = false)
+              )
+              .flatMap:
+                case Some(await) => await.void
+                case None        => IO.cede *> deliver(id, room, seat, bot, lastVersion)
           else
-            // Keep the decision independent of the roll: capable bots decide before
-            // receiving dice in a drawDecision payload.
-            lastVersion.set(state.version) *> {
-              val body    = WebhookEnvelope("drawDecision", id.value, seat, state).asJson.noSpaces
-              val budget  = state.clocks.map(c => (if seat == Seat.White then c.white else c.black).millis)
-              val timeout = budget.fold(config.timeout)(_.min(config.timeout)).max(1.millisecond)
-              for
-                started <- IO.monotonic
-                attempt <- postDetailed(hook.url, hook.secret, body, timeout)
-                elapsed <- IO.monotonic.map(_ - started)
-                outcome <- classifyDrawDecision(id, seat, room, bot, attempt)
-                _       <- recordDelivery(bot, outcome, elapsed)
-              yield ()
-            }
-        else if isOurTurn then
-          lastVersion.set(state.version) *> {
-            val body    = WebhookEnvelope("yourTurn", id.value, seat, state).asJson.noSpaces
+          // Keep the decision independent of the roll: capable bots decide before
+          // receiving dice in a drawDecision payload.
+          {
+            val body    = WebhookEnvelope("drawDecision", id.value, seat, state).asJson.noSpaces
             val budget  = state.clocks.map(c => (if seat == Seat.White then c.white else c.black).millis)
             val timeout = budget.fold(config.timeout)(_.min(config.timeout)).max(1.millisecond)
             for
               started <- IO.monotonic
               attempt <- postDetailed(hook.url, hook.secret, body, timeout)
               elapsed <- IO.monotonic.map(_ - started)
-              outcome <- classifyTurn(id, seat, room, bot, attempt)
-              _       <- recordDelivery(bot, outcome, elapsed)
+              outcome <- classifyDrawDecision(id, seat, room, bot, hook, attempt)
+              _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
+              _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
+              _       <- (IO.cede *> deliver(id, room, seat, bot, lastVersion))
+                .whenA(outcome == DeliveryOutcome.StaleRegistration)
             yield ()
           }
-        else IO.unit
+        else if isOurTurn then {
+          val body    = WebhookEnvelope("yourTurn", id.value, seat, state).asJson.noSpaces
+          val budget  = state.clocks.map(c => (if seat == Seat.White then c.white else c.black).millis)
+          val timeout = budget.fold(config.timeout)(_.min(config.timeout)).max(1.millisecond)
+          for
+            started <- IO.monotonic
+            attempt <- postDetailed(hook.url, hook.secret, body, timeout)
+            elapsed <- IO.monotonic.map(_ - started)
+            outcome <- classifyTurn(id, seat, room, bot, hook, attempt)
+            _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
+            _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
+            _       <- (IO.cede *> deliver(id, room, seat, bot, lastVersion))
+              .whenA(outcome == DeliveryOutcome.StaleRegistration)
+          yield ()
+        } else IO.unit
     }
 
   private def classifyDrawDecision(
@@ -275,101 +297,134 @@ final class Webhooks private (
       seat: Seat,
       room: GameRoom,
       bot: Principal.Bot,
+      hook: BotWebhook,
       attempt: PostOutcome
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
       Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
+
+    def respond(accept: Boolean): IO[Option[GameRoom.TurnVerdict]] =
+      store
+        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(room.enqueueDrawResponse(seat, accept))
+        .flatMap(_.traverse(identity))
+
+    def declineThen(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
+      respond(accept = false).flatMap:
+        case None    => IO.pure(DeliveryOutcome.StaleRegistration)
+        case Some(_) => failed(reason, outcome)
+
+    def decision(accept: Boolean): IO[DeliveryOutcome] =
+      respond(accept).flatMap:
+        case None                                       => IO.pure(DeliveryOutcome.StaleRegistration)
+        case Some(GameRoom.TurnVerdict.Applied(_))      => IO.pure(DeliveryOutcome.Applied)
+        case Some(GameRoom.TurnVerdict.Refused(reason)) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
     attempt match
       case PostOutcome.Ok(answer) =>
         decode[BotMove](answer) match
           case Left(_) =>
             // Garbled response to drawDecision: decline draw offer and proceed to dice reveal
-            room.respondDraw(seat, accept = false) *> failed(
+            declineThen(
               "unparseable drawDecision response",
               DeliveryOutcome.Garbled
             )
           case Right(botMove) if botMove.acceptDraw.contains(true) =>
-            room
-              .respondDraw(seat, accept = true)
-              .flatMap:
-                case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Applied)
-                case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
+            decision(accept = true)
           case Right(_) =>
             // Any other response: decline draw offer and proceed to dice reveal
-            room
-              .respondDraw(seat, accept = false)
-              .flatMap:
-                case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Applied)
-                case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
+            decision(accept = false)
       case PostOutcome.OversizedBody =>
-        room.respondDraw(seat, accept = false) *> failed(
+        declineThen(
           "endpoint answered with an oversized body",
           DeliveryOutcome.OversizedBody
         )
       case PostOutcome.HttpStatus(code) =>
-        room.respondDraw(seat, accept = false) *> failed(
+        declineThen(
           s"endpoint answered HTTP $code",
           DeliveryOutcome.HttpStatus(code)
         )
       case PostOutcome.TimedOut =>
-        room.respondDraw(seat, accept = false) *> failed("could not reach the endpoint", DeliveryOutcome.TimedOut)
+        declineThen("could not reach the endpoint", DeliveryOutcome.TimedOut)
       case PostOutcome.Unreachable =>
-        room.respondDraw(seat, accept = false) *> failed("could not reach the endpoint", DeliveryOutcome.Unreachable)
+        declineThen("could not reach the endpoint", DeliveryOutcome.Unreachable)
       case PostOutcome.PolicyRejected(reason) =>
-        room.respondDraw(seat, accept = false) *> failed(reason, DeliveryOutcome.Unreachable)
+        declineThen(reason, DeliveryOutcome.Unreachable)
 
   private def classifyTurn(
       id: GameId,
       seat: Seat,
       room: GameRoom,
       bot: Principal.Bot,
+      hook: BotWebhook,
       attempt: PostOutcome
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
       Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
 
+    def ifCurrent(value: IO[DeliveryOutcome]): IO[DeliveryOutcome] =
+      store
+        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(IO.unit)
+        .flatMap:
+          case None    => IO.pure(DeliveryOutcome.StaleRegistration)
+          case Some(_) => value
+
+    def submit(move: BotMove): IO[DeliveryOutcome] =
+      store
+        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(
+          room.enqueueTurn(seat, move.moves, offerDraw = move.offerDraw)
+        )
+        .flatMap:
+          case None        => IO.pure(DeliveryOutcome.StaleRegistration)
+          case Some(await) =>
+            await.flatMap:
+              case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Applied)
+              case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
+
     attempt match
       case PostOutcome.Ok(answer) =>
         decode[BotMove](answer) match
-          case Left(_)                                 => failed("unparseable response", DeliveryOutcome.Garbled)
+          case Left(_) => ifCurrent(failed("unparseable response", DeliveryOutcome.Garbled))
           case Right(botMove) if botMove.moves.isEmpty =>
-            Console[IO]
-              .errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: declined (empty moves)")
-              .as(DeliveryOutcome.Declined)
+            ifCurrent(
+              Console[IO]
+                .errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: declined (empty moves)")
+                .as(DeliveryOutcome.Declined)
+            )
           case Right(botMove) =>
-            room
-              .submitTurn(seat, botMove.moves, offerDraw = botMove.offerDraw)
-              .flatMap:
-                case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Applied)
-                case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
+            submit(botMove)
       case PostOutcome.OversizedBody =>
-        failed("endpoint answered with an oversized body", DeliveryOutcome.OversizedBody)
-      case PostOutcome.HttpStatus(code) => failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code))
-      case PostOutcome.TimedOut         => failed("could not reach the endpoint", DeliveryOutcome.TimedOut)
-      case PostOutcome.Unreachable      => failed("could not reach the endpoint", DeliveryOutcome.Unreachable)
-      case PostOutcome.PolicyRejected(reason) => failed(reason, DeliveryOutcome.Unreachable)
+        ifCurrent(failed("endpoint answered with an oversized body", DeliveryOutcome.OversizedBody))
+      case PostOutcome.HttpStatus(code) =>
+        ifCurrent(failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code)))
+      case PostOutcome.TimedOut    => ifCurrent(failed("could not reach the endpoint", DeliveryOutcome.TimedOut))
+      case PostOutcome.Unreachable => ifCurrent(failed("could not reach the endpoint", DeliveryOutcome.Unreachable))
+      case PostOutcome.PolicyRejected(reason) => ifCurrent(failed(reason, DeliveryOutcome.Unreachable))
 
   /** Fire-and-forget into the drain queue (#225) — `tryOffer` never blocks a turn on a slow or backed-up stats writer.
     * Overflow (the queue is bounded, matching this class's own "delivery rate is structurally bounded" doctrine) drops
     * the event with one log line rather than either blocking or silently losing it unremarked.
     */
-  private def recordDelivery(bot: Principal.Bot, outcome: DeliveryOutcome, elapsed: FiniteDuration): IO[Unit] =
+  private def recordDelivery(
+      bot: Principal.Bot,
+      registrationId: UUID,
+      outcome: DeliveryOutcome,
+      elapsed: FiniteDuration
+  ): IO[Unit] =
     IO.realTime.map(t => Instant.ofEpochMilli(t.toMillis)).flatMap { at =>
-      deliveryEvents.tryOffer(DeliveryEvent(bot.team, bot.name, outcome, elapsed, at)).flatMap { accepted =>
-        Console[IO]
-          .errorln(
-            s"[play][webhook] delivery-stats queue full — dropped a ${DeliveryOutcome.key(outcome)} record " +
-              s"for ${bot.externalId}"
-          )
-          .unlessA(accepted)
+      deliveryEvents.tryOffer(DeliveryEvent(bot.team, bot.name, registrationId, outcome, elapsed, at)).flatMap {
+        accepted =>
+          Console[IO]
+            .errorln(
+              s"[play][webhook] delivery-stats queue full — dropped a ${DeliveryOutcome.key(outcome)} record " +
+                s"for ${bot.externalId}"
+            )
+            .unlessA(accepted)
       }
     }
 
-  /** The narrow shape three existing callers (`register`, `wake`, and the pre-#225 `deliverTurn`) all depend on: `post`
-    * itself is unchanged behaviorally, byte-for-byte, including every string it can return — it is now a thin view over
-    * [[postDetailed]]. Only `deliverTurn` needs the richer typed detail `postDetailed` exposes, so only it calls that
-    * directly.
+  /** The narrow legacy shape used by `wake`: `post` is a thin view over [[postDetailed]], preserving every pre-#225
+    * string. Registration calls the typed form directly so it can keep URL-policy failures verbatim while prefixing
+    * only failures from the remote ownership handshake.
     */
   private def post(url: String, secret: String, body: String, timeout: FiniteDuration): IO[Either[String, String]] =
     postDetailed(url, secret, body, timeout).map(_.legacy)
@@ -382,8 +437,29 @@ final class Webhooks private (
     * — see [[PostOutcome.legacy]] for why: the reason must not become a connectivity oracle against internal hosts).
     */
   private def postDetailed(url: String, secret: String, body: String, timeout: FiniteDuration): IO[PostOutcome] =
-    checkUrl(url).flatMap:
-      case Left(reason) => IO.pure(PostOutcome.PolicyRejected(reason))
+    transport match
+      case Some(pinned) =>
+        pinned
+          .postSigned(url, secret, body, timeout)
+          .map:
+            case WebhookTransport.Outcome.Ok(bytes) =>
+              PostOutcome.Ok(new String(bytes, java.nio.charset.StandardCharsets.UTF_8))
+            case WebhookTransport.Outcome.PolicyRejected(failure) => PostOutcome.PolicyRejected(failure.message)
+            case WebhookTransport.Outcome.OversizedBody           => PostOutcome.OversizedBody
+            case WebhookTransport.Outcome.HttpStatus(code)        => PostOutcome.HttpStatus(code)
+            case WebhookTransport.Outcome.TimedOut                => PostOutcome.TimedOut
+            case WebhookTransport.Outcome.Unreachable             => PostOutcome.Unreachable
+      case None => legacyPostDetailed(url, secret, body, timeout)
+
+  /** Compatibility transport seam for hermetic tests. Production always supplies [[WebhookTransport]]. */
+  private def legacyPostDetailed(
+      url: String,
+      secret: String,
+      body: String,
+      timeout: FiniteDuration
+  ): IO[PostOutcome] =
+    val attempt: IO[Either[PostOutcome, (Int, Array[Byte])]] = checkUrl(url).flatMap:
+      case Left(reason) => IO.pure(Left(PostOutcome.PolicyRejected(reason)))
       case Right(uri)   =>
         IO.realTime.map(_.toSeconds).flatMap { ts =>
           val request = Request[IO](Method.POST, uri)
@@ -402,27 +478,33 @@ final class Webhooks private (
                 .take(MaxResponseBytes + 1)
                 .compile
                 .to(Array)
-                .map(bytes => (response.status.code, bytes))
+                .flatMap: bytes =>
+                  if bytes.length > MaxResponseBytes then IO.raiseError(OversizedResponse)
+                  else IO.pure(Right((response.status.code, bytes)))
             }
-            .timeout(timeout)
-            .attempt
-            .flatMap:
-              case Right((200, bytes)) if bytes.length > MaxResponseBytes => IO.pure(PostOutcome.OversizedBody)
-              case Right((200, bytes))                                    =>
-                IO.pure(PostOutcome.Ok(new String(bytes, java.nio.charset.StandardCharsets.UTF_8)))
-              case Right((code, _)) => IO.pure(PostOutcome.HttpStatus(code))
-              case Left(error)      =>
-                // The transport detail (exception messages embed resolved addresses and distinguish refused
-                // from timed-out) goes to the server log only; the caller-visible reason stays generic so a
-                // 422 can't be used as a connectivity oracle against internal hosts (review). The TYPE returned
-                // here — TimedOut vs Unreachable — is server-internal telemetry (#225) and crosses no such
-                // boundary, so it may distinguish what the logged/caller-visible text deliberately does not.
-                Console[IO].errorln(s"[play][webhook] POST failed: ${error.toString.take(200)}").as {
-                  error match
-                    case _: java.util.concurrent.TimeoutException => PostOutcome.TimedOut
-                    case _                                        => PostOutcome.Unreachable
-                }
         }
+    // The one deadline starts before URL policy and DNS resolution. Oversized responses fail inside `use`, so an
+    // Ember-like response finalizer sees an error and closes rather than draining an unbounded remainder.
+    attempt
+      .timeout(timeout)
+      .attempt
+      .flatMap:
+        case Right(Left(outcome))       => IO.pure(outcome)
+        case Right(Right((200, bytes))) =>
+          IO.pure(PostOutcome.Ok(new String(bytes, java.nio.charset.StandardCharsets.UTF_8)))
+        case Right(Right((code, _))) => IO.pure(PostOutcome.HttpStatus(code))
+        case Left(OversizedResponse) => IO.pure(PostOutcome.OversizedBody)
+        case Left(error)             =>
+          // The transport detail (exception messages embed resolved addresses and distinguish refused
+          // from timed-out) goes to the server log only; the caller-visible reason stays generic so a
+          // 422 can't be used as a connectivity oracle against internal hosts (review). The TYPE returned
+          // here — TimedOut vs Unreachable — is server-internal telemetry (#225) and crosses no such
+          // boundary, so it may distinguish what the logged/caller-visible text deliberately does not.
+          Console[IO].errorln("[play][webhook] POST failed").as {
+            error match
+              case _: java.util.concurrent.TimeoutException => PostOutcome.TimedOut
+              case _                                        => PostOutcome.Unreachable
+          }
 
 object Webhooks:
 
@@ -436,6 +518,9 @@ object Webhooks:
     * make the server buffer. A truncated body simply fails JSON decoding and is treated as garbage.
     */
   private val MaxResponseBytes = 65536L
+
+  /** Internal signal used to force an error exit from the HTTP response resource before mapping to a safe outcome. */
+  private case object OversizedResponse extends RuntimeException with NoStackTrace
 
   /** The typed detail behind one POST attempt (#225) — see [[Webhooks.postDetailed]]. */
   private enum PostOutcome:
@@ -465,6 +550,7 @@ object Webhooks:
   final private case class DeliveryEvent(
       team: String,
       name: String,
+      registrationId: UUID,
       outcome: DeliveryOutcome,
       elapsed: FiniteDuration,
       at: Instant
@@ -543,9 +629,10 @@ object Webhooks:
       client: Client[IO],
       config: Config,
       checkUrl: String => IO[Either[String, Uri]] = WebhookSecurity.checkPublicHttps,
-      stats: WebhookStatsStore = WebhookStatsStore.noop
+      stats: WebhookStatsStore = WebhookStatsStore.noop,
+      transport: Option[WebhookTransport] = None
   ): Resource[IO, Webhooks] =
     Supervisor[IO](await = false).evalMap { runners =>
       (Ref.of[IO, Set[(GameId, Seat)]](Set.empty), Queue.bounded[IO, DeliveryEvent](DeliveryEventQueueCapacity))
-        .mapN(new Webhooks(registry, store, client, checkUrl, config, _, runners, stats, _))
+        .mapN(new Webhooks(registry, store, client, checkUrl, transport, config, _, runners, stats, _))
     }

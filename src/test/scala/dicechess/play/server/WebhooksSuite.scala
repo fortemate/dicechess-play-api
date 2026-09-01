@@ -1,6 +1,6 @@
 package dicechess.play.server
 
-import cats.effect.{IO, Ref}
+import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import dicechess.engine.search.BotRegistry
@@ -8,6 +8,7 @@ import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
 import dicechess.play.game.{BotConnection, GameRoom}
 import dicechess.play.store.{BotWebhook, DeliveryOutcome, GameStore, WebhookStats, WebhookStatsStore, WebhookStore}
+import fs2.Stream
 import io.circe.Json
 import io.circe.parser.decode
 import io.circe.syntax.*
@@ -20,6 +21,7 @@ import org.http4s.{HttpApp, HttpRoutes, Response, Status, Uri}
 import org.typelevel.ci.CIString
 
 import java.time.Instant
+import java.util.UUID
 import scala.concurrent.duration.*
 
 /** The webhook service end-to-end (#104): the ownership handshake, and full games where the "bot" is an HTTP endpoint
@@ -54,6 +56,105 @@ class WebhooksSuite extends munit.CatsEffectSuite:
     tree.children.toList.minByOption(_._1) match
       case None                => Nil
       case Some((move, child)) => move :: firstPath(child)
+
+  /** A deterministic store-side pause immediately before the registration fence. Reaching `fenceReached` proves the old
+    * endpoint response has already arrived and decoded; the test then changes the registration before allowing the
+    * current-generation check to continue. A second gate pauses the stale retry before its fresh `get`, making the
+    * absence of any old-generation room mutation directly observable rather than timing-dependent.
+    */
+  final private class ControlledWebhookStore(
+      current: Ref[IO, Option[BotWebhook]],
+      staleSeen: Ref[IO, Boolean],
+      val reads: Ref[IO, List[Option[UUID]]],
+      val acceptedEnqueues: Ref[IO, List[UUID]],
+      val fenceReached: Deferred[IO, Unit],
+      val releaseFence: Deferred[IO, Unit],
+      val rereadReached: Deferred[IO, Unit],
+      val releaseReread: Deferred[IO, Unit],
+      val rereadReturned: Deferred[IO, Unit]
+  ) extends WebhookStore:
+    def put(webhook: BotWebhook): IO[Unit] = current.set(Some(webhook))
+
+    def get(team: String, name: String): IO[Option[BotWebhook]] =
+      staleSeen.get.flatMap { afterStale =>
+        val pause =
+          (rereadReached.complete(()).attempt.void *> releaseReread.get).whenA(afterStale)
+        pause *> current.get.flatTap { hook =>
+          reads.update(_ :+ hook.map(_.registrationId)) *>
+            rereadReturned.complete(()).attempt.void.whenA(afterStale)
+        }
+      }
+
+    def delete(team: String, name: String): IO[Boolean] =
+      current.modify(existing => (None, existing.nonEmpty))
+
+    def enqueueIfCurrent[A](team: String, name: String, registrationId: UUID)(enqueue: IO[A]): IO[Option[A]] =
+      fenceReached.complete(()).attempt.void *>
+        releaseFence.get *>
+        current.get.flatMap:
+          case Some(hook) if hook.registrationId == registrationId =>
+            acceptedEnqueues.update(_ :+ registrationId) *> enqueue.map(Some(_))
+          case _ =>
+            staleSeen.set(true).as(None)
+
+  private object ControlledWebhookStore:
+    def create(initial: BotWebhook): IO[ControlledWebhookStore] =
+      for
+        current          <- Ref.of[IO, Option[BotWebhook]](Some(initial))
+        staleSeen        <- Ref.of[IO, Boolean](false)
+        reads            <- Ref.of[IO, List[Option[UUID]]](Nil)
+        acceptedEnqueues <- Ref.of[IO, List[UUID]](Nil)
+        fenceReached     <- Deferred[IO, Unit]
+        releaseFence     <- Deferred[IO, Unit]
+        rereadReached    <- Deferred[IO, Unit]
+        releaseReread    <- Deferred[IO, Unit]
+        rereadReturned   <- Deferred[IO, Unit]
+      yield ControlledWebhookStore(
+        current,
+        staleSeen,
+        reads,
+        acceptedEnqueues,
+        fenceReached,
+        releaseFence,
+        rereadReached,
+        releaseReread,
+        rereadReturned
+      )
+
+  final private class FenceStatsStore(
+      val calls: Ref[IO, List[(UUID, DeliveryOutcome)]],
+      val staleRecorded: Deferred[IO, Unit],
+      val appliedRecorded: Deferred[IO, Unit]
+  ) extends WebhookStatsStore:
+    def recordDelivery(
+        team: String,
+        name: String,
+        outcome: DeliveryOutcome,
+        elapsed: FiniteDuration,
+        at: Instant
+    ): IO[Unit] = IO.unit
+
+    override def recordDeliveryFor(
+        team: String,
+        name: String,
+        registrationId: UUID,
+        outcome: DeliveryOutcome,
+        elapsed: FiniteDuration,
+        at: Instant
+    ): IO[Unit] =
+      calls.update(_ :+ (registrationId, outcome)) *>
+        staleRecorded.complete(()).attempt.void.whenA(outcome == DeliveryOutcome.StaleRegistration) *>
+        appliedRecorded.complete(()).attempt.void.whenA(outcome == DeliveryOutcome.Applied)
+
+    def statsFor(team: String, name: String, now: Instant): IO[WebhookStats] = IO.pure(WebhookStats.empty)
+
+  private object FenceStatsStore:
+    def create: IO[FenceStatsStore] =
+      for
+        calls           <- Ref.of[IO, List[(UUID, DeliveryOutcome)]](Nil)
+        staleRecorded   <- Deferred[IO, Unit]
+        appliedRecorded <- Deferred[IO, Unit]
+      yield FenceStatsStore(calls, staleRecorded, appliedRecorded)
 
   /** The scripted bot endpoint: echoes verification nonces, and answers `yourTurn` envelopes with the first legal path
     * — after verifying the delivery's signature against the registered secrets (a bad MAC is a 401 and counted). When
@@ -94,6 +195,181 @@ class WebhooksSuite extends munit.CatsEffectSuite:
             }
       }
     }
+
+  private val OldRegistrationId     = UUID.fromString("10000000-0000-0000-0000-000000000001")
+  private val CurrentRegistrationId = UUID.fromString("10000000-0000-0000-0000-000000000002")
+  private val OldSecret             = "old-secret-" + ("a" * 53)
+  private val CurrentSecret         = "current-secret-" + ("b" * 49)
+
+  final private case class RegistrationMutation(
+      label: String,
+      current: Option[BotWebhook]
+  )
+
+  /** Answers a legal move and records which generation's secret authenticated each request. The registration is placed
+    * directly in the store, so this endpoint never receives the legacy ownership handshake.
+    */
+  private def fencedEndpoint(
+      registry: GameRegistry,
+      generations: Ref[IO, List[UUID]]
+  ): HttpApp[IO] =
+    HttpApp[IO] { req =>
+      req.bodyText.compile.string.flatMap { body =>
+        val timestamp  = req.headers.get(CIString(WebhookSecurity.TimestampHeader)).flatMap(_.head.value.toLongOption)
+        val signature  = req.headers.get(CIString(WebhookSecurity.SignatureHeader)).map(_.head.value)
+        val generation = timestamp.flatMap { ts =>
+          signature.flatMap { actual =>
+            List(OldRegistrationId -> OldSecret, CurrentRegistrationId -> CurrentSecret)
+              .find((_, secret) => WebhookSecurity.sign(secret, ts, body) == actual)
+              .map(_._1)
+          }
+        }
+
+        (generation, decode[WebhookEnvelope](body)) match
+          case (Some(registrationId), Right(envelope)) =>
+            val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
+              case Some(tree) => IO.pure(firstPath(tree))
+              case None       =>
+                registry
+                  .get(GameId(envelope.gameId))
+                  .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
+                  .map(firstPath)
+            generations.update(_ :+ registrationId) *> moves.flatMap(path => Ok(BotMove(path).asJson))
+          case _ =>
+            IO.pure(Response[IO](Status.Unauthorized))
+      }
+    }
+
+  private def awaitWhiteTurn(room: GameRoom): IO[PublicGameState] =
+    def loop: IO[PublicGameState] =
+      room.snapshot.flatMap { state =>
+        val ready = state.status == GameStatus.Active && state.activeSeat == Seat.White && state.dicePending &&
+          state.legalMoves.exists(_.children.nonEmpty)
+        if ready then IO.pure(state) else IO.cede *> loop
+      }
+    loop.timeoutTo(5.seconds, IO.raiseError(new RuntimeException("deterministic White turn never became ready")))
+
+  private def verifyRegistrationFence(mutation: RegistrationMutation): IO[Unit] =
+    val webhookBot: Principal.Bot = Principal.Bot("hooks", s"fence-${mutation.label}")
+    val opponent: Principal.Bot   = Principal.Bot("acme", s"opponent-${mutation.label}")
+    val oldHook                   = BotWebhook(
+      webhookBot.team,
+      webhookBot.name,
+      "https://old.example/hook",
+      OldSecret,
+      Instant.EPOCH,
+      registrationId = OldRegistrationId
+    )
+    val movableDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 2, 3)
+      def commit: String                                                       = "fence-commit"
+      def reveal: String                                                       = "fence-seed"
+
+    for
+      registry    <- GameRegistry.create(store = GameStore.noop)
+      store       <- ControlledWebhookStore.create(oldHook)
+      stats       <- FenceStatsStore.create
+      generations <- Ref.of[IO, List[UUID]](Nil)
+      made        <- registry.createWithDice(webhookBot, opponent, movableDice)
+      (_, room) = made.toOption.get
+      _       <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _       <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      initial <- awaitWhiteTurn(room)
+      _       <- Webhooks
+        .create(
+          registry,
+          store,
+          Client.fromHttpApp(fencedEndpoint(registry, generations)),
+          config,
+          allowAll,
+          stats
+        )
+        .use { webhooks =>
+          webhooks.statsLoop.background.use { _ =>
+            for
+              _ <- webhooks.attachSweep
+              _ <- store.fenceReached.get.timeoutTo(
+                5.seconds,
+                IO.raiseError(new RuntimeException(s"${mutation.label}: old response never reached the fence"))
+              )
+              _ <- mutation.current.fold(store.delete(webhookBot.team, webhookBot.name).void)(store.put)
+              _ <- store.releaseFence.complete(())
+              _ <- store.rereadReached.get.timeoutTo(
+                5.seconds,
+                IO.raiseError(new RuntimeException(s"${mutation.label}: stale delivery did not request a fresh read"))
+              )
+              _ <- stats.staleRecorded.get.timeoutTo(
+                5.seconds,
+                IO.raiseError(new RuntimeException(s"${mutation.label}: stale_registration telemetry was not recorded"))
+              )
+              fencedState    <- room.snapshot
+              fencedEnqueues <- store.acceptedEnqueues.get
+              _              <- IO {
+                assertEquals(
+                  fencedState.version,
+                  initial.version,
+                  s"${mutation.label}: the old response changed the room before the current registration was read"
+                )
+                assert(fencedState.dicePending, s"${mutation.label}: the old response consumed the pending roll")
+                assertEquals(fencedEnqueues, Nil, s"${mutation.label}: old-generation work reached the room queue")
+              }
+              _ <- store.releaseReread.complete(())
+              _ <- mutation.current match
+                case Some(_) =>
+                  stats.appliedRecorded.get.timeoutTo(
+                    5.seconds,
+                    IO.raiseError(
+                      new RuntimeException(s"${mutation.label}: current registration did not apply its move")
+                    )
+                  )
+                case None =>
+                  store.rereadReturned.get.timeoutTo(
+                    5.seconds,
+                    IO.raiseError(
+                      new RuntimeException(s"${mutation.label}: delete retry did not observe no registration")
+                    )
+                  )
+              finalState      <- room.snapshot
+              reads           <- store.reads.get
+              enqueues        <- store.acceptedEnqueues.get
+              deliveryCalls   <- stats.calls.get
+              usedGenerations <- generations.get
+              _               <- IO {
+                assert(
+                  reads.size >= 3,
+                  s"${mutation.label}: expected attach, delivery, and stale retry reads; got $reads"
+                )
+                assertEquals(reads.last, mutation.current.map(_.registrationId))
+                assert(
+                  deliveryCalls.contains(OldRegistrationId -> DeliveryOutcome.StaleRegistration),
+                  s"${mutation.label}: missing old-generation stale outcome: $deliveryCalls"
+                )
+                mutation.current match
+                  case Some(_) =>
+                    assertEquals(enqueues, List(CurrentRegistrationId))
+                    assertEquals(usedGenerations, List(OldRegistrationId, CurrentRegistrationId))
+                    assert(
+                      deliveryCalls.contains(CurrentRegistrationId -> DeliveryOutcome.Applied),
+                      s"${mutation.label}: current generation was not recorded as applied: $deliveryCalls"
+                    )
+                    assert(
+                      finalState.version > initial.version,
+                      s"${mutation.label}: current generation did not change the room"
+                    )
+                  case None =>
+                    assertEquals(enqueues, Nil)
+                    assertEquals(usedGenerations, List(OldRegistrationId))
+                    assertEquals(finalState.version, initial.version)
+              }
+              _ <- room.submit(Seat.White, GameCommand.Resign)
+              _ <- room.result.timeoutTo(
+                5.seconds,
+                IO.raiseError(new RuntimeException(s"${mutation.label}: room did not stop after cleanup"))
+              )
+            yield ()
+          }
+        }
+    yield ()
 
   // ── ownership handshake ──────────────────────────────────────────────────────
 
@@ -142,6 +418,48 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       assert(result.isLeft)
       assertEquals(stored, None)
 
+  test("the registration deadline includes URL policy and DNS resolution"):
+    val unused = Client[IO](_ => Resource.eval(IO.raiseError(RuntimeException("client must not run"))))
+    for
+      registry <- GameRegistry.create(store = GameStore.noop)
+      store    <- WebhookStore.inMemory
+      result   <- Webhooks
+        .create(
+          registry,
+          store,
+          unused,
+          Webhooks.Config(timeout = 30.millis),
+          checkUrl = _ => IO.never
+        )
+        .use(_.register(Principal.Bot("hooks", "dns-timeout"), "https://never.example/hook"))
+      stored <- store.get("hooks", "dns-timeout")
+    yield
+      assert(result.left.exists(_.contains("could not reach")), s"expected a bounded timeout result, got $result")
+      assertEquals(stored, None)
+
+  test("an oversized legacy response releases the client with an error instead of draining it"):
+    for
+      registry <- GameRegistry.create(store = GameStore.noop)
+      store    <- WebhookStore.inMemory
+      errored  <- Ref.of[IO, Boolean](false)
+      client = Client[IO] { _ =>
+        Resource.makeCase(
+          IO.pure(Response[IO](Status.Ok, body = Stream.constant(0.toByte).covary[IO]))
+        ) { (_, exitCase) =>
+          errored.set(exitCase match
+            case Resource.ExitCase.Errored(_) => true
+            case _                            => false)
+        }
+      }
+      result <- service(registry, store, client)
+        .use(_.register(Principal.Bot("hooks", "oversized"), "https://oversized.example/hook"))
+      errorExit <- errored.get
+      stored    <- store.get("hooks", "oversized")
+    yield
+      assert(result.left.exists(_.contains("oversized")), s"expected an oversized response, got $result")
+      assert(errorExit, "the response resource must see an error exit and skip its success-path drain")
+      assertEquals(stored, None)
+
   test("registration enforces the real URL policy when constructed with it — a private target never gets a POST"):
     for
       registry <- GameRegistry.create(store = GameStore.noop)
@@ -154,7 +472,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         .use(_.register(Principal.Bot("hooks", "alpha"), "https://192.168.10.3/hook"))
       posted <- calls.get
     yield
-      assert(result.left.exists(_.contains("non-public")), s"expected the SSRF reason, got $result")
+      assertEquals(result, Left("host resolves to a non-public address"))
       assertEquals(posted, 0, "the guard must reject BEFORE any request is made")
 
   test("the handshake round-trips over a real socket server and client (network-stack smoke)"):
@@ -185,6 +503,39 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         result <- service(registry, store, client).use(_.register(Principal.Bot("hooks", "alpha"), url))
       yield assert(result.isRight, s"real-socket handshake must succeed, got $result")
     }
+
+  test("late old-registration responses are fenced across replace, rotate, and delete; current retries still apply"):
+    val mutations = List(
+      RegistrationMutation(
+        "replace",
+        Some(
+          BotWebhook(
+            "hooks",
+            "fence-replace",
+            "https://current.example/hook",
+            CurrentSecret,
+            Instant.EPOCH,
+            registrationId = CurrentRegistrationId
+          )
+        )
+      ),
+      RegistrationMutation(
+        "rotate",
+        Some(
+          BotWebhook(
+            "hooks",
+            "fence-rotate",
+            "https://old.example/hook",
+            CurrentSecret,
+            Instant.EPOCH,
+            registrationId = CurrentRegistrationId
+          )
+        )
+      ),
+      RegistrationMutation("delete", None)
+    )
+
+    mutations.traverse_(verifyRegistrationFence)
 
   // ── delivery: full games ─────────────────────────────────────────────────────
 

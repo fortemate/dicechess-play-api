@@ -23,8 +23,45 @@ object Cors:
 
   private val EnvVar = "PLAY_CORS_ORIGINS"
 
+  /** Parsed `PLAY_CORS_ORIGINS` value shared by the browser CORS middleware and server-side origin guards.
+    *
+    * CORS is a browser response policy, not an authorization check. Session-backed mutation routes can therefore use
+    * [[allows]] themselves and reject a missing or unlisted `Origin` before performing any work. They should also
+    * require [[isExplicitlyConfigured]]: the historical empty configuration means "public, credential-less CORS", not
+    * "trust every origin for a cookie-authenticated mutation".
+    */
+  final class AllowedOrigins private (private val values: Set[String]):
+
+    /** Whether the deployment supplied at least one trusted origin. */
+    def isExplicitlyConfigured: Boolean = values.nonEmpty
+
+    /** Exact match against one concrete scheme/host/port origin. Opaque `Origin: null` is never trusted for an
+      * ambient-cookie request, even if an operator accidentally lists the literal word in the environment.
+      */
+    def allows(origin: Origin): Boolean = origin match
+      case concrete @ Origin.HostList(hosts) if hosts.tail.isEmpty => values.contains(render(concrete))
+      case _                                                       => false
+
+  object AllowedOrigins:
+    def parse(spec: String): AllowedOrigins =
+      val concrete = spec.split(',').iterator.map(_.trim).filter(_.nonEmpty).flatMap { raw =>
+        Origin
+          .parse(raw)
+          .toOption
+          .collect:
+            case origin @ Origin.HostList(hosts) if hosts.tail.isEmpty => render(origin)
+      }
+      new AllowedOrigins(concrete.toSet)
+
+  /** Read and parse the trusted browser origins without turning them into middleware yet. */
+  def allowedOriginsFromEnv: IO[AllowedOrigins] =
+    IO(sys.env.getOrElse(EnvVar, "")).map(AllowedOrigins.parse)
+
+  /** Parse a comma-separated origin allow-list for a server-side origin guard. */
+  def allowedOrigins(spec: String): AllowedOrigins = AllowedOrigins.parse(spec)
+
   /** Build the policy from `PLAY_CORS_ORIGINS` (empty/unset → allow all, credential-less). */
-  def fromEnv: IO[CORSPolicy] = IO(sys.env.getOrElse(EnvVar, "")).map(policy)
+  def fromEnv: IO[CORSPolicy] = allowedOriginsFromEnv.map(policy)
 
   /** The methods and headers a credentialed policy must enumerate. `*` is illegal alongside
     * `Access-Control-Allow-Credentials`, and http4s enforces that by answering a preflight with NO `Access-Control-*`
@@ -53,7 +90,10 @@ object Cors:
   private val CredentialedMethods: Set[Method] =
     Set(Method.GET, Method.POST, Method.PUT, Method.PATCH, Method.DELETE, Method.OPTIONS)
 
-  private val CredentialedHeaders: Set[CIString] = Set(ci"content-type", ci"authorization")
+  private val CredentialedHeaders: Set[CIString] =
+    Set(ci"content-type", ci"authorization", ci"if-match", ci"x-dicechess-csrf")
+
+  private val ExposedHeaders: Set[CIString] = Set(ci"etag", ci"retry-after")
 
   /** Build a policy from a comma-separated origin allow-list. An empty/blank spec allows any origin without
     * credentials; a non-empty list restricts origins AND lets responses carry credentials (the session cookie).
@@ -64,13 +104,18 @@ object Cors:
     * kept their headers, so the API looked healthy while every preflighted POST was blocked by the browser.
     */
   def policy(spec: String): CORSPolicy =
-    val allowed = spec.split(',').iterator.map(_.trim).filter(_.nonEmpty).toSet
-    if allowed.isEmpty then CORS.policy.withAllowMethodsAll.withAllowHeadersAll.withAllowOriginAll
+    policy(AllowedOrigins.parse(spec))
+
+  /** Build the middleware from the same parsed origin set used by server-side session mutation guards. */
+  def policy(allowed: AllowedOrigins): CORSPolicy =
+    if !allowed.isExplicitlyConfigured then
+      CORS.policy.withAllowMethodsAll.withAllowHeadersAll.withAllowOriginAll.withExposeHeadersIn(ExposedHeaders)
     else
       CORS.policy
-        .withAllowOriginHeader(o => allowed.contains(render(o)))
+        .withAllowOriginHeader(allowed.allows)
         .withAllowMethodsIn(CredentialedMethods)
         .withAllowHeadersIn(CredentialedHeaders)
+        .withExposeHeadersIn(ExposedHeaders)
         .withAllowCredentials(true)
 
   /** Render an `Origin` to its header form (`scheme://host[:port]`) for matching against the allow-list. */

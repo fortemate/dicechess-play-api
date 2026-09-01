@@ -106,21 +106,37 @@ final class GameRoom private (
     * caller is already durable. Stream events are unchanged.
     */
   def submitTurn(seat: Seat, moves: List[String], offerDraw: Boolean = false): IO[TurnVerdict] =
+    enqueueTurn(seat, moves, offerDraw).flatten
+
+  /** Linearize a turn command in the room inbox, returning the separate effect that awaits its durable verdict.
+    *
+    * Webhook delivery uses the split deliberately: its cross-instance registration fence is held only through the
+    * current-registration check and this enqueue, then released before awaiting the writer. The writer persists via the
+    * same Postgres pool, so holding a database connection while waiting for the verdict could otherwise self-starve the
+    * pool. Existing callers use [[submitTurn]] and observe exactly the same behaviour.
+    */
+  def enqueueTurn(seat: Seat, moves: List[String], offerDraw: Boolean = false): IO[IO[TurnVerdict]] =
     stateRef.get.flatMap: s =>
       // The writer fiber stops once the game ends, so an ended room would never drain the inbox — answer eagerly.
       // (A game ending in the gap between this check and the offer is caught by the caller's verdict timeout.)
-      if s.ended then IO.pure(TurnVerdict.Refused("game is over"))
+      if s.ended then IO.pure(IO.pure(TurnVerdict.Refused("game is over")))
       else
         (Deferred[IO, TurnVerdict], IO.monotonic).flatMapN: (reply, receivedAt) =>
-          inbox.offer(Msg.Command(seat, GameCommand.SubmitTurn(moves, offerDraw), receivedAt, Some(reply))) *> reply.get
+          inbox
+            .offer(Msg.Command(seat, GameCommand.SubmitTurn(moves, offerDraw), receivedAt, Some(reply)))
+            .as(reply.get)
 
   /** Respond to a pending draw offer (accept or decline explicitly) and await the writer's verdict. */
   def respondDraw(seat: Seat, accept: Boolean): IO[TurnVerdict] =
+    enqueueDrawResponse(seat, accept).flatten
+
+  /** The draw-decision equivalent of [[enqueueTurn]]; see that method for the database-fence rationale. */
+  def enqueueDrawResponse(seat: Seat, accept: Boolean): IO[IO[TurnVerdict]] =
     stateRef.get.flatMap: s =>
-      if s.ended then IO.pure(TurnVerdict.Refused("game is over"))
+      if s.ended then IO.pure(IO.pure(TurnVerdict.Refused("game is over")))
       else
         (Deferred[IO, TurnVerdict], IO.monotonic).flatMapN: (reply, receivedAt) =>
-          inbox.offer(Msg.Command(seat, GameCommand.RespondDraw(accept), receivedAt, Some(reply))) *> reply.get
+          inbox.offer(Msg.Command(seat, GameCommand.RespondDraw(accept), receivedAt, Some(reply))).as(reply.get)
 
   /** Begin the game (roll the first turn). Call after subscribers have attached. */
   def start: IO[Unit] = inbox.offer(Msg.Begin)

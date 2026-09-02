@@ -240,3 +240,47 @@ class HistoryRoutesSuite extends CatsEffectSuite with TestContainerForAll:
           assert(results.exists(_.gameId.value == id.value), "the game must still show as finished in game_results")
       }
     }
+
+  test("a technically aborted showcase game is served with no result, its origin, and sportingEligible=false (#47)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        val white = Principal.Guest("hr-showcase-abort-white")
+        val black = Principal.Bot("hr-team", "hr-showcase-bot")
+        for
+          id <- GameId.random
+          _  <- db.save(
+            id,
+            snapshotFixture(white, black, ended(GameResult.Draw, Termination.Aborted))
+              .copy(origin = Some(GameOrigin.Showcase), rated = Some(false))
+          )
+          resp <- get(app(db), id.value)
+          json <- resp.as[io.circe.Json]
+        yield
+          assertEquals(resp.status, Status.Ok, "an aborted showcase game IS archived (ADR-005 §8), so it replays")
+          val c = json.hcursor
+          assert(c.downField("result").focus.exists(_.isNull), "no fabricated outcome")
+          assertEquals(c.get[String]("termination").toOption, Some("aborted"))
+          assertEquals(c.get[String]("origin").toOption, Some("showcase"))
+          assertEquals(c.get[Boolean]("sportingEligible").toOption, Some(false))
+          assertEquals(c.downField("turns").downN(0).get[List[String]]("moves").toOption, Some(List("e2e4")))
+          assertEquals(c.downField("fairness").get[Option[String]]("seed").toOption, Some(Some("ab12cd34")))
+      }
+    }
+
+  test("a finished game keeps its integer result and reports itself as a sporting, legacy-origin record (#47)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        val white = Principal.Guest("hr-eligible-white")
+        val black = Principal.Bot("hr-team", "hr-eligible-bot")
+        for
+          id   <- GameId.random
+          _    <- db.save(id, snapshotFixture(white, black, ended()))
+          resp <- get(app(db), id.value)
+          json <- resp.as[io.circe.Json]
+        yield
+          val c = json.hcursor
+          assertEquals(c.get[Int]("result").toOption, Some(1))
+          assertEquals(c.get[String]("origin").toOption, Some("legacy"))
+          assertEquals(c.get[Boolean]("sportingEligible").toOption, Some(true))
+      }
+    }

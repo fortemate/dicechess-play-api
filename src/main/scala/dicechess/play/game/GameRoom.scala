@@ -38,7 +38,9 @@ final class GameRoom private (
     disconnectGrace: FiniteDuration,
     seedGrace: FiniteDuration,
     maxInlinePaths: Int,
-    persist: GameSnapshot => IO[Unit]
+    persist: GameSnapshot => IO[Unit],
+    mode: Durability,
+    stalledRef: Ref[IO, Boolean]
 ):
   import GameRoom.*
 
@@ -249,6 +251,15 @@ final class GameRoom private (
   /** The originating surface of the game (ADR-005, #44, #45, #47). */
   def origin: IO[GameOrigin] = stateRef.get.map(_.origin)
 
+  /** How this room treats its snapshot writes — decided by the registry from the origin (ADR-005 §7, #47). */
+  def durability: Durability = mode
+
+  /** Whether a required write is currently failing and being retried — the room has halted and is not publishing. The
+    * showcase coordinator (#46) reads this to answer `unavailable` instead of advertising a table that cannot move.
+    * Always `false` for a [[Durability.BestEffort]] room, which never halts.
+    */
+  def persistenceStalled: IO[Boolean] = stalledRef.get
+
   /** Current public state (for a REST snapshot or a freshly-joining client). */
   def snapshot: IO[PublicGameState] =
     (stateRef.get, IO.monotonic).mapN((s, now) => s.publicAt(now, maxInlinePaths))
@@ -266,11 +277,37 @@ final class GameRoom private (
     * game would otherwise be wedged forever — `done` never completes, the registry never evicts the room, and every
     * subscriber stream hangs. So on any non-success outcome we abort the game: publish a terminal `GameEnded` (to close
     * subscriber streams) and complete `done`, exactly once.
+    *
+    * A [[Durability.Required]] room does the same on failure — including the failure this mode itself introduces, an
+    * intermediate write that exhausted its retries ([[RequiredSaveAbandoned]]) — but the abort is then a fail-closed
+    * terminal write that may retry for as long as the database is away. It therefore runs as ordinary cancelable code,
+    * never inside a finalizer, and `abortIfActive` reads the abort's starting point from `stateRef`, which in this mode
+    * only ever holds a committed version: the game is aborted FROM ITS LAST DURABLE VERSION, and whatever the failed
+    * write carried is gone, exactly as if it had never been played. Cancellation (process shutdown) persists nothing —
+    * the last durable version is the truth the next boot resumes from — and only releases the subscribers so their
+    * transports close instead of waiting on a writer that no longer exists.
     */
   private def supervisedConsume: IO[Unit] =
-    consume.guaranteeCase:
-      case Outcome.Succeeded(_) => IO.unit // normal end already completed `done` in endGame
-      case _                    => abortIfActive
+    mode match
+      case Durability.BestEffort =>
+        consume.guaranteeCase:
+          case Outcome.Succeeded(_) => IO.unit // normal end already completed `done` in endGame
+          case _                    => abortIfActive
+      case _: Durability.Required =>
+        consume.attempt
+          .flatMap:
+            case Right(_)    => IO.unit
+            case Left(error) =>
+              Console[IO].errorln(
+                s"[play][persist][required] writer failed, aborting from the last durable version: $error"
+              )
+                *> abortIfActive.handleErrorWith(e =>
+                  // Only reachable under a BOUNDED terminal policy (never the production default): the abort could
+                  // not be committed either, and there is nothing durable left to do but say so. The room stays
+                  // unfinished until a restart resumes it from its last durable version.
+                  Console[IO].errorln(s"[play][persist][required] technical abort could not be committed: $e")
+                )
+          .onCancel(dropAllSubscribers)
 
   private def abortIfActive: IO[Unit] =
     stateRef.get.flatMap: s =>
@@ -411,20 +448,84 @@ final class GameRoom private (
   private def continue: IO[Unit] =
     stateRef.get.flatMap(s => if s.ended then IO.unit else consume)
 
-  /** Advance the session, write it, persist it, THEN broadcast — so the Ref always reflects the latest published event,
-    * and anything a player has seen is already durable (a fixed roll must never un-roll on a crash). A subscriber that
-    * registers just after a broadcast reads a current Snapshot (and acts), and one that registers just before catches
-    * the live event; broadcasting before the write would let a subscriber in that window miss both and hang.
+  /** Advance the session, commit it (write the Ref and persist, in the order the room's durability dictates — see
+    * [[commit]]), THEN broadcast — so the Ref always reflects the latest published event, and anything a player has
+    * seen is already durable (a fixed roll must never un-roll on a crash). A subscriber that registers just after a
+    * broadcast reads a current Snapshot (and acts), and one that registers just before catches the live event;
+    * broadcasting before the write would let a subscriber in that window miss both and hang.
     */
   private def emit(s: Session, make: Long => GameEvent): IO[Session] =
-    val s2 = s.copy(version = s.version + 1)
-    stateRef.set(s2) *> persistQuietly(s2) *> broadcast(make(s2.version)).as(s2)
+    commit(s.copy(version = s.version + 1)).flatTap(s2 => broadcast(make(s2.version)))
+
+  /** Make `s` the room's current state, durably or not according to the mode (ADR-005 §7):
+    *
+    *   - `BestEffort` writes the Ref first and then persists quietly, so a subscriber registering mid-write reads the
+    *     newest state and a store failure costs a log line, never the game.
+    *   - `Required` persists FIRST and writes the Ref only once the store has committed, so the Ref never holds a
+    *     version the database does not — no read (`snapshot`, a late `subscribe`, the abort path) can observe unsaved
+    *     state. The writer fiber is halted for as long as the write is retried, and the mover's clock is credited for
+    *     that stall: a database hiccup is the server's fault, not the player's.
+    */
+  private def commit(s: Session): IO[Session] =
+    mode match
+      case Durability.BestEffort         => stateRef.set(s) *> persistQuietly(s).as(s)
+      case required: Durability.Required =>
+        persistRequired(required, s).flatMap: stalledFor =>
+          val credited =
+            if stalledFor > Duration.Zero then s.copy(turnStartedAt = s.turnStartedAt.map(_ + stalledFor)) else s
+          stateRef.set(credited).as(credited)
 
   /** After the fail-closed creation snapshot, persistence is availability-first: a later store failure is logged and
     * the game plays on in memory rather than wedging the writer fiber mid-game.
     */
   private def persistQuietly(s: Session): IO[Unit] =
     persist(snapshotOf(s)).handleErrorWith(e => Console[IO].errorln(s"[play][persist] snapshot write failed: $e"))
+
+  /** The fail-closed write: retry per the policy that applies (terminal for an ending, intermediate otherwise), report
+    * every attempt to the telemetry sink, release the subscribers once the stall outlives the grace, and answer how
+    * long the writer was held up. Exhausting a bounded policy raises [[RequiredSaveAbandoned]], which the supervisor
+    * turns into a technical abort from the last durable version (`stateRef`, untouched by this method on failure).
+    */
+  private def persistRequired(required: Durability.Required, s: Session): IO[FiniteDuration] =
+    val policy   = if s.ended then required.terminal else required.intermediate
+    val snapshot = snapshotOf(s)
+
+    def attempt(failed: Int, startedAt: FiniteDuration, dropped: Boolean): IO[FiniteDuration] =
+      persist(snapshot).attempt.flatMap:
+        case Right(()) =>
+          if failed == 0 then IO.pure(Duration.Zero)
+          else
+            IO.monotonic.flatMap: now =>
+              val stalledFor = now - startedAt
+              stalledRef.set(false) *>
+                required.telemetry(PersistenceTelemetry.SaveRecovered(s.version, failed + 1, stalledFor)).as(stalledFor)
+        case Left(error) =>
+          val attempts = failed + 1
+          IO.monotonic.flatMap: now =>
+            val stalledFor = now - startedAt
+            if policy.exhausted(attempts) then
+              // Left stalled: the technical abort that follows is itself a required write, still under way.
+              stalledRef.set(true) *>
+                required.telemetry(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, None, error)) *>
+                required.telemetry(PersistenceTelemetry.SaveAbandoned(s.version, attempts)) *>
+                IO.raiseError(RequiredSaveAbandoned(s.version, attempts, error))
+            else
+              val delay   = policy.backoff(attempts)
+              val dropNow = !dropped && stalledFor >= required.stalledSubscriberGrace
+              stalledRef.set(true) *>
+                required.telemetry(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, Some(delay), error)) *>
+                (dropAllSubscribers *>
+                  required.telemetry(PersistenceTelemetry.SubscribersDropped(s.version, stalledFor))).whenA(dropNow) *>
+                IO.sleep(delay) *>
+                attempt(attempts, startedAt, dropped || dropNow)
+
+    IO.monotonic.flatMap(now => attempt(failed = 0, startedAt = now, dropped = false))
+
+  /** Interrupt every subscriber's stream — the transports close, a reconnecting client sees the last durable state.
+    * Used when a required write has been failing for longer than the grace (ADR-005 §11) and on shutdown.
+    */
+  private def dropAllSubscribers: IO[Unit] =
+    subscribers.get.flatMap(_.values.toList.traverse_(_.dropped.complete(()).attempt.void))
 
   /** The durable image of the session — enough to resume the room after a restart and, once ended, to hand the game to
     * analytics.
@@ -559,11 +660,10 @@ final class GameRoom private (
                   emit(s, v => GameEvent.Rejected(v, seat, s"seed must be $MinSeedChars..$MaxSeedChars characters"))
                 else
                   val seeded = s.copy(clientSeeds = s.clientSeeds.updated(seat, seed))
-                  // Persist the accepted seed (no event is emitted for it), then — if both seats are in and the game
+                  // Commit the accepted seed (no event is emitted for it), then — if both seats are in and the game
                   // already started — open the gate and roll the opening turn from the durable state.
-                  if seeded.started && seeded.hasAllSeeds then
-                    stateRef.set(seeded) *> persistQuietly(seeded) *> beginTurn(seeded)
-                  else persistQuietly(seeded).as(seeded)
+                  if seeded.started && seeded.hasAllSeeds then commit(seeded).flatMap(beginTurn)
+                  else commit(seeded)
 
           case GameCommand.RespondDraw(accept) =>
             seat.side match
@@ -860,7 +960,10 @@ object GameRoom:
       origin: GameOrigin = GameOrigin.Legacy,
       seedGrace: FiniteDuration = DefaultSeedGrace,
       maxInlinePaths: Int = DefaultMaxInlineTurnPaths,
-      persist: GameSnapshot => IO[Unit] = _ => IO.unit
+      persist: GameSnapshot => IO[Unit] = _ => IO.unit,
+      // How writes after the creation snapshot are treated (ADR-005 §7) — the registry passes `Required` for a
+      // showcase game; everything else keeps the availability-first default.
+      durability: Durability = Durability.BestEffort
   ): IO[Either[String, GameRoom]] =
     EngineOps.parse(initialDfen) match
       case Left(error)   => IO.pure(Left(error))
@@ -894,10 +997,13 @@ object GameRoom:
               disconnectGrace,
               seedGrace,
               maxInlinePaths,
-              persist
+              persist,
+              durability
             )
-            // Unlike later snapshots, the creation row is fail-closed: returning a room whose seat tokens and dice
-            // commitment were never durable would make a successful admission impossible to resume after a restart.
+            // Unlike later snapshots, the creation row is fail-closed in EVERY mode: returning a room whose seat tokens
+            // and dice commitment were never durable would make a successful admission impossible to resume after a
+            // restart. Not retried either — a failed creation is the caller's to compensate (the admission ticket is
+            // released, the claim fails), which is cheaper and more honest than a claim that hangs on a retry loop.
             _ <- poll(persist(room.snapshotOf(session0)))
             _ <- room.supervisedConsume.start
           yield Right(room)
@@ -921,7 +1027,8 @@ object GameRoom:
       disconnectGrace: FiniteDuration = DefaultDisconnectGrace,
       seedGrace: FiniteDuration = DefaultSeedGrace,
       maxInlinePaths: Int = DefaultMaxInlineTurnPaths,
-      persist: GameSnapshot => IO[Unit] = _ => IO.unit
+      persist: GameSnapshot => IO[Unit] = _ => IO.unit,
+      durability: Durability = Durability.BestEffort
   ): IO[Either[String, GameRoom]] =
     EngineOps.parse(snapshot.dfen) match
       case Left(error)   => IO.pure(Left(s"corrupt snapshot dfen: $error"))
@@ -947,9 +1054,8 @@ object GameRoom:
             // resolve that to unrated, exactly like createdAtEpochMs's own absent-key story.
             rated = snapshot.rated.getOrElse(false),
             ladder = snapshot.ladder.getOrElse(false),
-            origin = snapshot.origin.getOrElse(
-              if snapshot.ladder.contains(true) then GameOrigin.Ladder else GameOrigin.Legacy
-            ),
+            // One resolution rule for a legacy row, shared with the store's column projection and the V5 backfill.
+            origin = snapshot.effectiveOrigin,
             remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
             // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
             // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.
@@ -973,7 +1079,8 @@ object GameRoom:
             disconnectGrace,
             seedGrace,
             maxInlinePaths,
-            persist
+            persist,
+            durability
           )
             .flatTap(_.supervisedConsume.start)
             .map(Right(_))
@@ -987,7 +1094,8 @@ object GameRoom:
       disconnectGrace: FiniteDuration,
       seedGrace: FiniteDuration,
       maxInlinePaths: Int,
-      persist: GameSnapshot => IO[Unit]
+      persist: GameSnapshot => IO[Unit],
+      durability: Durability
   ): IO[GameRoom] =
     for
       ref         <- Ref.of[IO, Session](session0)
@@ -997,6 +1105,7 @@ object GameRoom:
       done        <- Deferred[IO, GameOver]
       presence    <- Ref.of[IO, Map[Seat, Int]](Map.empty)
       graceFibers <- Ref.of[IO, Map[Seat, Fiber[IO, Throwable, Unit]]](Map.empty)
+      stalled     <- Ref.of[IO, Boolean](false)
     yield new GameRoom(
       ref,
       inbox,
@@ -1011,7 +1120,9 @@ object GameRoom:
       disconnectGrace,
       seedGrace,
       maxInlinePaths,
-      persist
+      persist,
+      durability,
+      stalled
     )
 
   /** Starting clocks for a timed control: both seats get the initial bank (SuddenDeath/Fischer). PerMove keeps no bank

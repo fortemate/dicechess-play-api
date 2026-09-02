@@ -5,7 +5,7 @@ import cats.effect.std.Console
 import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
-import dicechess.play.game.GameRoom
+import dicechess.play.game.{Durability, GameRoom, PersistenceTelemetry}
 import dicechess.play.store.GameStore
 
 import scala.concurrent.duration.*
@@ -156,7 +156,12 @@ final class GameRegistry private (
         origin = origin
       )
 
-  /** Shared room-creation seam behind `create`: build the room, register it, start it. */
+  /** Shared room-creation seam behind `create`: build the room, register it, start it.
+    *
+    * A showcase room is refused outright over a store that is not durable (ADR-005 §7, #47): the table promises that
+    * every played game is recorded, and an in-memory store cannot keep it, so the honest answer is no room at all —
+    * returned as a `Left` so an admission caller releases its reservation like for any other creation failure.
+    */
   private def createRoom(
       id: GameId,
       players: Map[Seat, Principal],
@@ -166,32 +171,42 @@ final class GameRegistry private (
       ladder: Boolean,
       origin: GameOrigin
   ): IO[Either[String, (GameId, GameRoom)]] =
-    for
-      // Resolved here rather than inside the room: a room emits a snapshot on every move, so the seat faces must be
-      // decided once and carried. Doing it in the registry also means no caller of `create` has to know about it —
-      // direct games, lobby accepts, catalog games, bot challenges and ladder pairings all get named seats for free.
-      // Ratings (#290) follow the identical rationale: sampled once here, they ARE "the rating as of game start".
-      seatIds <- IO.pure(players.values.map(_.externalId).toList)
-      // The two resolvers read independent tables, so they run in parallel — one round-trip of latency, not two.
-      (names, ratings) <- (resolveNicknames(seatIds), ratingsFor(seatIds, timeControl)).parTupled
-      made             <- GameRoom.create(
-        players,
-        dice,
-        displayNames = names,
-        ratings = ratings,
-        disconnectGrace = disconnectGrace,
-        timeControl = timeControl,
-        rated = rated,
-        ladder = ladder,
-        origin = origin,
-        persist = store.save(id, _)
-      )
-      result <- made.traverse: room =>
-        val cleanup = room.abort *> abortAndDeregister(id)
-        (register(id, room) *> room.start.as((id, room)))
-          .onError(_ => cleanup)
-          .onCancel(cleanup)
-    yield result
+    if origin.isShowcase && !store.durable then IO.pure(Left(GameRegistry.ShowcaseRequiresPersistence))
+    else
+      for
+        // Resolved here rather than inside the room: a room emits a snapshot on every move, so the seat faces must be
+        // decided once and carried. Doing it in the registry also means no caller of `create` has to know about it —
+        // direct games, lobby accepts, catalog games, bot challenges and ladder pairings all get named seats for free.
+        // Ratings (#290) follow the identical rationale: sampled once here, they ARE "the rating as of game start".
+        seatIds <- IO.pure(players.values.map(_.externalId).toList)
+        // The two resolvers read independent tables, so they run in parallel — one round-trip of latency, not two.
+        (names, ratings) <- (resolveNicknames(seatIds), ratingsFor(seatIds, timeControl)).parTupled
+        made             <- GameRoom.create(
+          players,
+          dice,
+          displayNames = names,
+          ratings = ratings,
+          disconnectGrace = disconnectGrace,
+          timeControl = timeControl,
+          rated = rated,
+          ladder = ladder,
+          origin = origin,
+          persist = store.save(id, _),
+          durability = durabilityFor(id, origin)
+        )
+        result <- made.traverse: room =>
+          val cleanup = room.abort *> abortAndDeregister(id)
+          (register(id, room) *> room.start.as((id, room)))
+            .onError(_ => cleanup)
+            .onCancel(cleanup)
+      yield result
+
+  /** The write discipline a room gets from its origin (ADR-005 §7): fail-closed for the showcase table, whose every
+    * public version must be committed before anyone sees it, availability-first for every other game. The telemetry
+    * sink names the game, so an operator reading the log can tell which table is stalled and on which version.
+    */
+  private def durabilityFor(id: GameId, origin: GameOrigin): Durability =
+    if origin.isShowcase then Durability.required(GameRegistry.logPersistence(id)) else Durability.BestEffort
 
   /** Rebuild rooms for every game that was live when the process stopped; returns how many were revived. A snapshot
     * that fails to restore is logged and skipped — one corrupt row must not take the server down.
@@ -227,7 +242,10 @@ final class GameRegistry private (
                 displayNames = names,
                 ratings = RatingCategory.of(snapshot.timeControl).flatMap(byCategory.get).getOrElse(Map.empty),
                 disconnectGrace = disconnectGrace,
-                persist = store.save(id, _)
+                persist = store.save(id, _),
+                // A resumed showcase game is as fail-closed as it was before the restart: the origin travels in the
+                // snapshot precisely so the discipline can be re-derived from it.
+                durability = durabilityFor(id, snapshot.effectiveOrigin)
               )
             .map(id -> _)
         failures  = restored.collect { case (id, Left(error)) => id -> error }
@@ -337,6 +355,34 @@ final class GameRegistry private (
           room.seating.flatMap(players => room.abort *> deregister(id, players.values.toList.distinct))
 
 object GameRegistry:
+
+  /** The refusal a showcase creation gets over a non-durable store (ADR-005 §7, #47). Public so the coordinator (#46)
+    * can recognise it and answer `unavailable` rather than a generic failure.
+    */
+  val ShowcaseRequiresPersistence: String =
+    "showcase games require PostgreSQL persistence (PLAY_DB_URL); refusing to create one over an in-memory store"
+
+  /** The production telemetry sink for a fail-closed room: one stderr line per event, each naming the game and the
+    * version, each saying what happens next — the operator reading it should never have to guess whether the table is
+    * retrying, has given up, or is back.
+    */
+  private[server] def logPersistence(id: GameId)(event: PersistenceTelemetry): IO[Unit] =
+    val prefix = s"[play][persist][required] game ${id.value}"
+    event match
+      case PersistenceTelemetry.SaveFailed(version, attempt, terminal, retryIn, error) =>
+        val kind = if terminal then "terminal" else "intermediate"
+        val next = retryIn.fold("no attempts left")(d => s"retrying in $d")
+        Console[IO].errorln(s"$prefix v$version: $kind save attempt $attempt failed, $next: $error")
+      case PersistenceTelemetry.SaveRecovered(version, attempts, stalledFor) =>
+        Console[IO].errorln(
+          s"$prefix v$version: committed after $attempts attempts; the room was stalled for $stalledFor"
+        )
+      case PersistenceTelemetry.SaveAbandoned(version, attempts) =>
+        Console[IO].errorln(
+          s"$prefix v$version: ABANDONED after $attempts attempts — technical abort from durable v${version - 1} follows"
+        )
+      case PersistenceTelemetry.SubscribersDropped(version, stalledFor) =>
+        Console[IO].errorln(s"$prefix v$version: still failing after $stalledFor, subscribers released; retrying")
 
   /** `resolveNicknames` turns external ids into display names for the seats — `UserStore.nicknamesByExternalId` in
     * production. Passed as a function rather than the whole store (the `upsertOnLogin`/`freshNickname` precedent) so

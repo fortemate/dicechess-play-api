@@ -3,7 +3,7 @@ package dicechess.play.server
 import cats.effect.{IO, Ref}
 import cats.syntax.all.*
 import dicechess.play.core.*
-import dicechess.play.game.GameRoom
+import dicechess.play.game.{Durability, EngineOps, GameRoom}
 import dicechess.play.store.{GameSnapshot, GameStore}
 
 import scala.concurrent.duration.*
@@ -385,3 +385,144 @@ class GameRegistrySuite extends munit.CatsEffectSuite:
               assert(outcome.isLeft, "the store failure must not be silently swallowed this deep")
               assertEquals(seating, Map(Seat.White -> alice, Seat.Black -> alice), "no half-applied rebind")
         }
+
+  // ── Showcase durability routing (ADR-005 §7, #47) ─────────────────────────────────────────
+
+  /** A store that positively claims durability, keeps every write, and can be told to refuse terminal writes. */
+  private def durableStore(written: Ref[IO, Vector[GameSnapshot]], refuseEndings: Ref[IO, Boolean]): GameStore =
+    new GameStore:
+      override def durable: Boolean                          = true
+      def save(id: GameId, snapshot: GameSnapshot): IO[Unit] =
+        refuseEndings.get.flatMap: refuse =>
+          if refuse && snapshot.ended then IO.raiseError(RuntimeException("database unavailable"))
+          else written.update(_ :+ snapshot)
+      def loadActive: IO[List[(GameId, GameSnapshot)]] = IO.pure(Nil)
+
+  private def durableRegistry: IO[(GameRegistry, Ref[IO, Vector[GameSnapshot]], Ref[IO, Boolean])] =
+    for
+      written  <- Ref.of[IO, Vector[GameSnapshot]](Vector.empty)
+      refusing <- Ref.of[IO, Boolean](false)
+      registry <- GameRegistry.create(store = durableStore(written, refusing))
+    yield (registry, written, refusing)
+
+  private def isRequired(room: GameRoom): Boolean = room.durability match
+    case _: Durability.Required => true
+    case Durability.BestEffort  => false
+
+  test("a showcase room is refused over a store that is not durable — never a silent in-memory fallback (#47)"):
+    for
+      written   <- Ref.of[IO, Vector[GameSnapshot]](Vector.empty)
+      capturing <- GameRegistry.create(store = capturingStore(written))
+      inMemory  <- GameRegistry.create(store = GameStore.noop)
+      refused1  <- capturing.create(Principal.Guest("g1"), alice, Blitz, origin = GameOrigin.Showcase)
+      refused2  <- inMemory.create(Principal.Guest("g1"), alice, Blitz, origin = GameOrigin.Showcase)
+      rooms1    <- capturing.list
+      rooms2    <- inMemory.list
+      snapshots <- written.get
+    yield
+      assertEquals(refused1, Left(GameRegistry.ShowcaseRequiresPersistence))
+      assertEquals(refused2, Left(GameRegistry.ShowcaseRequiresPersistence))
+      assertEquals(rooms1, Nil, "no room was registered")
+      assertEquals(rooms2, Nil)
+      assertEquals(snapshots, Vector.empty, "and nothing was written")
+
+  test("durability follows the origin: a showcase room is fail-closed, every other origin stays best-effort (#47)"):
+    durableRegistry.flatMap { (registry, written, _) =>
+      for
+        showcase <- registry.create(Principal.Guest("g1"), alice, Blitz, origin = GameOrigin.Showcase)
+        lobby    <- registry.create(Principal.Guest("g2"), bob, Blitz, origin = GameOrigin.Lobby)
+        legacy   <- registry.create(Principal.Guest("g3"), bob, Blitz)
+        snaps    <- written.get
+      yield
+        val showcaseRoom = showcase.getOrElse(fail("showcase creation must succeed over a durable store"))._2
+        assert(isRequired(showcaseRoom), "a showcase room commits every version before publishing it")
+        assert(!isRequired(lobby.getOrElse(fail("lobby creation failed"))._2))
+        assert(!isRequired(legacy.getOrElse(fail("legacy creation failed"))._2))
+        assert(
+          snaps.exists(_.origin.contains(GameOrigin.Showcase)),
+          "the creation snapshot already carries the showcase origin — committed before the claim can be answered"
+        )
+    }
+
+  test("resume re-derives fail-closed durability from each snapshot's origin (#47)"):
+    val base = GameSnapshot(
+      version = 2L,
+      dfen = EngineOps.InitialDfen,
+      players = Map(Seat.White -> Principal.Guest("w"), Seat.Black -> alice),
+      seatTokens = Map(Seat.White -> "tok-w", Seat.Black -> "tok-b"),
+      serverSeed = "ab12cd34",
+      clientSeeds = Map.empty,
+      started = true,
+      ply = 0L,
+      pending = false,
+      status = GameStatus.Active,
+      timeControl = Blitz,
+      remainingMs = Map(Seat.White -> 300000L, Seat.Black -> 300000L),
+      lastRoll = Nil,
+      turns = Vector.empty
+    )
+    val showcaseId = GameId("11111111-1111-4111-8111-111111111111")
+    val ladderId   = GameId("22222222-2222-4222-8222-222222222222")
+    val resuming   = new GameStore:
+      override def durable: Boolean                          = true
+      def save(id: GameId, snapshot: GameSnapshot): IO[Unit] = IO.unit
+      def loadActive: IO[List[(GameId, GameSnapshot)]]       =
+        IO.pure(
+          List(showcaseId -> base.copy(origin = Some(GameOrigin.Showcase)), ladderId -> base.copy(ladder = Some(true)))
+        )
+    for
+      registry     <- GameRegistry.create(store = resuming)
+      resumed      <- registry.resume
+      showcase     <- registry.get(showcaseId)
+      ladder       <- registry.get(ladderId)
+      ladderOrigin <- ladder.traverse(_.origin)
+    yield
+      assertEquals(resumed, 2)
+      assert(showcase.exists(isRequired), "the resumed showcase game is as fail-closed as before the restart")
+      assert(ladder.exists(room => !isRequired(room)))
+      assertEquals(
+        ladderOrigin,
+        Some(GameOrigin.Ladder),
+        "a pre-origin ladder snapshot resolves to its explicit default"
+      )
+
+  test(
+    "the coordinator hears completion only after the terminal write commits, and duplicate completion is harmless (#47)"
+  ):
+    durableRegistry.flatMap { (registry, written, refusing) =>
+      for
+        completions <- Ref.of[IO, Vector[GameId]](Vector.empty)
+        _           <- registry.onDeregister(id => completions.update(_ :+ id))
+        created     <- registry.create(Principal.Guest("g1"), alice, Blitz, origin = GameOrigin.Showcase)
+        (id, room) = created.getOrElse(fail("showcase creation must succeed over a durable store"))
+        // The database goes away exactly when the game ends: the room retries the ending, the table stays closed.
+        _ <- refusing.set(true)
+        _ <- room.submit(Seat.White, GameCommand.Resign)
+        _ <- room.persistenceStalled
+          .flatTap(s => IO.sleep(20.millis).unlessA(s))
+          .iterateUntil(identity)
+          .timeoutTo(15.seconds, IO.raiseError(RuntimeException("the room never reported the stall")))
+        endedYet     <- room.hasEnded
+        completedYet <- completions.get
+        stillListed  <- registry.get(id)
+        _            <- refusing.set(false)
+        over         <- room.result.timeoutTo(15.seconds, IO.raiseError(RuntimeException("the ending never committed")))
+        _            <- completions.get
+          .flatTap(c => IO.sleep(20.millis).whenA(c.isEmpty))
+          .iterateUntil(_.nonEmpty)
+          .timeoutTo(15.seconds, IO.raiseError(RuntimeException("completion never reached the coordinator")))
+        seating      <- room.seating
+        _            <- registry.deregister(id, seating.values.toList.distinct) // a duplicate completion
+        _            <- registry.deregister(id, seating.values.toList.distinct) // and another
+        completedAll <- completions.get
+        listedAfter  <- registry.get(id)
+        snaps        <- written.get
+      yield
+        assert(!endedYet, "an uncommitted ending is not an ending")
+        assertEquals(completedYet, Vector.empty, "the coordinator was not told while the archive was not on disk")
+        assert(stillListed.isDefined, "the room — and with it the bot's reserved seat — is held until then")
+        assertEquals(over.termination, Termination.Resign)
+        assertEquals(completedAll, Vector(id), "exactly one completion, however many times deregistration runs")
+        assertEquals(listedAfter, None)
+        assert(snaps.last.ended && snaps.last.origin.contains(GameOrigin.Showcase))
+    }

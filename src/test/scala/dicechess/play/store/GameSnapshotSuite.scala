@@ -1,5 +1,6 @@
 package dicechess.play.store
 
+import dicechess.play.core.GameOrigin
 import io.circe.parser.decode
 
 /** Backward-compatible decoding of `GameSnapshot`: adding a field must never break decoding of a row persisted before
@@ -37,3 +38,19 @@ class GameSnapshotSuite extends munit.FunSuite:
     decode[GameSnapshot](s"""{$baseFields, "rated": true}""") match
       case Left(error) => fail(s"decode failed: $error")
       case Right(snap) => assertEquals(snap.rated, Some(true))
+
+  test("effectiveOrigin resolves a legacy row to an explicit default without reinterpreting the ladder flag (#47)"):
+    def originOf(extra: String): GameOrigin =
+      decode[GameSnapshot](if extra.isEmpty then s"{$baseFields}" else s"{$baseFields, $extra}") match
+        case Left(error) => fail(s"decode failed: $error")
+        case Right(snap) => snap.effectiveOrigin
+    assertEquals(originOf(""), GameOrigin.Legacy, "no origin, no ladder flag: the game predates both concepts")
+    assertEquals(originOf(""""ladder": true"""), GameOrigin.Ladder, "a pre-origin ladder game is still a ladder game")
+    assertEquals(originOf(""""ladder": false"""), GameOrigin.Legacy)
+    assertEquals(originOf(""""origin": null, "ladder": true"""), GameOrigin.Ladder, "an explicit null is 'absent'")
+    assertEquals(originOf(""""origin": "showcase""""), GameOrigin.Showcase)
+    assertEquals(
+      originOf(""""origin": "catalog", "ladder": true"""),
+      GameOrigin.Catalog,
+      "a recorded origin wins over the flag — the flag keeps its own meaning, it does not define origin"
+    )

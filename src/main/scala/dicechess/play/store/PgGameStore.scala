@@ -13,6 +13,7 @@ import doobie.util.ExecutionContexts
 import doobie.util.fragments
 import dicechess.play.core.{
   GameId,
+  GameOrigin,
   GameOver,
   GameStatus,
   Principal,
@@ -87,18 +88,31 @@ final class PgGameStore private (xa: Transactor[IO])
         identity
       )
 
+  /** The Postgres store is the durable one (ADR-005 §7): a committed `save` survives a restart, which is what lets
+    * `GameRegistry` create showcase rooms over it and nothing else.
+    */
+  override def durable: Boolean = true
+
   /** Upsert the snapshot — and, in the SAME transaction, enqueue the finished game's analytics payload and write its
     * `game_results` and `game_archive` (#177) rows: the snapshot write and all three handoffs are atomic, so a crash
     * can't record a finished game that analytics, the ladder/rating projection, or the durable history record never
     * hears about.
+    *
+    * This is also the showcase's terminal transaction (ADR-005 §7 barrier 3, #47): one commit covers the final
+    * snapshot, the result projection, the immutable archive and the outbox row, and every part of it is idempotent —
+    * the snapshot upserts, the three handoffs are `ON CONFLICT DO NOTHING` — so a retried or duplicated terminal save
+    * converges on exactly one of each row. The `origin` column on every table is the snapshot's own `effectiveOrigin`,
+    * projected out of the JSON so reconciliation and aggregation never have to decode it.
     */
   def save(id: GameId, snapshot: GameSnapshot): IO[Unit] =
     val status = if snapshot.ended then "ended" else "active"
+    val origin = snapshot.effectiveOrigin.wireName
     val upsert =
-      sql"""INSERT INTO play.games (id, status, snapshot)
-            VALUES (${id.value}::uuid, $status, ${snapshot.asJson})
+      sql"""INSERT INTO play.games (id, status, snapshot, origin)
+            VALUES (${id.value}::uuid, $status, ${snapshot.asJson}, $origin)
             ON CONFLICT (id) DO UPDATE
-            SET status = EXCLUDED.status, snapshot = EXCLUDED.snapshot, updated_at = now()""".update.run
+            SET status = EXCLUDED.status, snapshot = EXCLUDED.snapshot, origin = EXCLUDED.origin,
+                updated_at = now()""".update.run
     val enqueue = PlaysiteIngest.payload(id, snapshot) match
       case None          => ().pure[ConnectionIO]
       case Some(payload) =>
@@ -120,15 +134,15 @@ final class PgGameStore private (xa: Transactor[IO])
       case Some(fg) =>
         sql"""INSERT INTO play.game_results
                 (game_id, white_external_id, black_external_id, result, termination, rated, time_control,
-                 server_seed, ladder)
+                 server_seed, ladder, origin)
               VALUES (${id.value}::uuid, ${fg.whiteExternalId}, ${fg.blackExternalId}, ${fg.result},
-                      ${fg.termination}, ${fg.rated}, ${fg.timeControl}, ${fg.serverSeed}, ${fg.ladder})
+                      ${fg.termination}, ${fg.rated}, ${fg.timeControl}, ${fg.serverSeed}, ${fg.ladder}, $origin)
               ON CONFLICT (game_id) DO NOTHING""".update.run.void
-    val archive = GameArchive.payload(snapshot) match
-      case None          => ().pure[ConnectionIO]
-      case Some(payload) =>
-        sql"""INSERT INTO play.game_archive (game_id, payload)
-              VALUES (${id.value}::uuid, $payload)
+    val archive = GameArchive.entry(snapshot) match
+      case None        => ().pure[ConnectionIO]
+      case Some(entry) =>
+        sql"""INSERT INTO play.game_archive (game_id, payload, origin, sporting_eligible)
+              VALUES (${id.value}::uuid, ${entry.payload}, ${entry.origin.wireName}, ${entry.sportingEligible})
               ON CONFLICT (game_id) DO NOTHING""".update.run.void
     warnIfMalformed *> (upsert *> enqueue *> recordResult *> archive).transact(xa).timeout(SaveTimeout)
 
@@ -206,12 +220,17 @@ final class PgGameStore private (xa: Transactor[IO])
   // ── GameArchiveStore ────────────────────────────────────────────────────────
 
   def archiveFor(id: GameId): IO[Option[ArchivedGame]] =
-    sql"""SELECT payload, finished_at FROM play.game_archive WHERE game_id = ${id.value}::uuid"""
-      .query[(Json, Instant)]
+    sql"""SELECT payload, finished_at, origin, sporting_eligible
+          FROM play.game_archive WHERE game_id = ${id.value}::uuid"""
+      .query[(Json, Instant, String, Boolean)]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.map((payload, finishedAt) => ArchivedGame(payload, finishedAt)))
+      .map(
+        _.map((payload, finishedAt, origin, eligible) =>
+          ArchivedGame(payload, finishedAt, PgGameStore.storedOrigin(origin), eligible)
+        )
+      )
 
   /** See [[GameArchiveStore.backfillArchive]]. `LEFT JOIN game_results` rather than an inner one so a game missing its
     * projection row still gets archived (falling back to `games.updated_at` for `finished_at`) instead of being
@@ -238,15 +257,16 @@ final class PgGameStore private (xa: Transactor[IO])
       .flatMap { rows =>
         rows
           .traverse { (id, json, finishedAt) =>
-            PgGameStore.archivablePayload(json) match
+            PgGameStore.archivableEntry(json) match
               case Left(reason) =>
                 // Never silently dropped, and the cursor still moves past it (see ArchiveBackfillBatch). The reason is
                 // spelled out because a run over tens of thousands of rows is useless to an operator who cannot tell an
                 // expected skip from one worth investigating.
                 Console[IO].errorln(s"[play][backfill] game $id skipped: $reason").as(0)
-              case Right(payload) =>
-                sql"""INSERT INTO play.game_archive (game_id, payload, finished_at)
-                      VALUES ($id::uuid, $payload, $finishedAt)
+              case Right(entry) =>
+                sql"""INSERT INTO play.game_archive (game_id, payload, finished_at, origin, sporting_eligible)
+                      VALUES ($id::uuid, ${entry.payload}, $finishedAt, ${entry.origin.wireName},
+                              ${entry.sportingEligible})
                       ON CONFLICT (game_id) DO NOTHING""".update.run
                   .transact(xa)
                   .timeout(PgGameStore.BackfillTimeout)
@@ -2188,6 +2208,20 @@ final class PgGameStore private (xa: Transactor[IO])
         }
       }
 
+  /** The ids of every live showcase game — the singleton table's reconciliation read (ADR-005 §11, #46, #47): on boot
+    * the coordinator has to know whether exactly one, none, or (split-brain) several showcase games are active before
+    * it may advertise the table as open. Served by the V5 partial index `games_showcase_active_idx`, which is why the
+    * predicate is spelled out with literals rather than bound from a `GameOrigin` parameter: PostgreSQL only uses a
+    * partial index when it can prove the query's predicate implies the index's, and it cannot for a parameter.
+    */
+  def activeShowcaseGameIds: IO[List[GameId]] =
+    sql"""SELECT id::text FROM play.games WHERE origin = 'showcase' AND status = 'active' ORDER BY created_at"""
+      .query[String]
+      .to[List]
+      .transact(xa)
+      .timeout(BootTimeout)
+      .map(_.map(GameId(_)))
+
   // ── GameResultsStore ──────────────────────────────────────────────────────
 
   /** Two LIMIT-bounded, already-ordered subqueries (one per side) unioned and re-limited, rather than one `OR` across
@@ -2200,14 +2234,14 @@ final class PgGameStore private (xa: Transactor[IO])
     */
   def recentResultsFor(externalId: String, limit: Int): IO[List[GameResultRow]] =
     sql"""(SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                  server_seed, pairing_id::text, ladder, finished_at
+                  server_seed, pairing_id::text, ladder, finished_at, origin
            FROM play.game_results
            WHERE white_external_id = $externalId
            ORDER BY finished_at DESC
            LIMIT ${limit.toLong})
           UNION
           (SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                  server_seed, pairing_id::text, ladder, finished_at
+                  server_seed, pairing_id::text, ladder, finished_at, origin
            FROM play.game_results
            WHERE black_external_id = $externalId
            ORDER BY finished_at DESC
@@ -2222,7 +2256,7 @@ final class PgGameStore private (xa: Transactor[IO])
 
   def finishedRatedSince(since: Instant): IO[List[GameResultRow]] =
     sql"""SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                 server_seed, pairing_id::text, ladder, finished_at
+                 server_seed, pairing_id::text, ladder, finished_at, origin
           FROM play.game_results
           WHERE rated = true AND finished_at > $since
           ORDER BY finished_at ASC"""
@@ -2266,7 +2300,7 @@ final class PgGameStore private (xa: Transactor[IO])
     // checking parameter types altogether, which is the only way doobie reports a genuinely wrong binding too. The
     // store's own API keeps `limit: Int`, because a page size is not a Long; only the binding speaks the schema's type.
     fr"""SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                server_seed, pairing_id::text, ladder, finished_at
+                server_seed, pairing_id::text, ladder, finished_at, origin
          FROM play.game_results
           WHERE""" ++ where ++ fr" ORDER BY finished_at DESC LIMIT ${fetchLimit.toLong}"
 
@@ -2401,7 +2435,7 @@ final class PgGameStore private (xa: Transactor[IO])
 
   def unappliedRatedGames(limit: Int): IO[List[GameResultRow]] =
     sql"""SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                 server_seed, pairing_id::text, ladder, finished_at
+                 server_seed, pairing_id::text, ladder, finished_at, origin
           FROM play.game_results
           WHERE rated = true AND rating_applied_at IS NULL
           ORDER BY finished_at ASC
@@ -3107,22 +3141,22 @@ object PgGameStore:
           )
         }
 
-  /** A stored snapshot's archive payload, or `Left(reason)` naming WHY there isn't one (#199). The three causes are not
+  /** A stored snapshot's archive entry, or `Left(reason)` naming WHY there isn't one (#199). The three causes are not
     * equivalent to whoever is watching a backfill run: an aborted game is a correct, permanent skip, whereas a snapshot
     * that will not decode or is missing a seat is a data problem worth looking at. Collapsing them into one message —
     * and swallowing circe's decode error — would leave an operator scanning tens of thousands of rows with no way to
     * tell the two apart, which is exactly why `loadActive` logs its own decode failures in full.
     */
-  private def archivablePayload(json: Json): Either[String, Json] =
+  private def archivableEntry(json: Json): Either[String, GameArchive.Entry] =
     json.as[GameSnapshot] match
       case Left(error)     => Left(s"snapshot does not decode — investigate ($error)")
       case Right(snapshot) =>
-        GameArchive.payload(snapshot) match
-          case Some(payload) => Right(payload)
-          case None          =>
+        GameArchive.entry(snapshot) match
+          case Some(entry) => Right(entry)
+          case None        =>
             snapshot.status match
               case GameStatus.Ended(GameOver(_, Termination.Aborted)) =>
-                Left("aborted — expected, aborted games are never archived")
+                Left("aborted — expected, aborted games outside the showcase are never archived")
               // The SQL filters on `status = 'ended'`, so an active snapshot here means the column and the JSON
               // disagree — impossible through `save`, hence worth surfacing rather than quietly counting.
               case GameStatus.Active   => Left("column says ended but the snapshot says active — investigate")
@@ -3137,13 +3171,39 @@ object PgGameStore:
     BotRating(onLadder, owner)
 
   private[store] type ResultTuple =
-    (String, String, String, Option[Short], String, Boolean, String, String, Option[String], Boolean, Instant)
+    (
+        String,
+        String,
+        String,
+        Option[Short],
+        String,
+        Boolean,
+        String,
+        String,
+        Option[String],
+        Boolean,
+        Instant,
+        String
+    )
 
   private def toRow(t: ResultTuple): GameResultRow =
-    val (gameId, white, black, result, termination, rated, timeControl, serverSeed, pairingId, ladder, finishedAt) = t
+    val (
+      gameId,
+      white,
+      black,
+      result,
+      termination,
+      rated,
+      timeControl,
+      serverSeed,
+      pairingId,
+      ladder,
+      finishedAt,
+      origin
+    ) = t
     // `game_results.result` is a smallint, read as such so the checker holds every query to the schema's own types;
     // the domain row exposes the Int the rest of the server reasons in.
-    // Named, not positional: eleven arguments of which four are String and two Boolean, so a field reorder in
+    // Named, not positional: twelve arguments of which five are String and two Boolean, so a field reorder in
     // `GameResultRow` would bind the wrong values here and still compile.
     GameResultRow(
       gameId = GameId(gameId),
@@ -3156,8 +3216,19 @@ object PgGameStore:
       serverSeed = serverSeed,
       pairingId = pairingId,
       ladder = ladder,
-      finishedAt = finishedAt
+      finishedAt = finishedAt,
+      origin = storedOrigin(origin)
     )
+
+  /** Decode an `origin` column at the persistence boundary. The V5 CHECK constraints pin the column to
+    * `GameOrigin.wireName`'s vocabulary, so a value that does not parse is a hand-edited or half-migrated row — failed
+    * loudly, exactly like [[PgGameStore.webhookCapabilities]] does for its constrained array, rather than quietly read
+    * as `Legacy` and given semantics the typed model never assigned it.
+    */
+  private def storedOrigin(value: String): GameOrigin =
+    GameOrigin
+      .fromWireName(value)
+      .getOrElse(throw new IllegalStateException(s"invalid stored game origin: '$value'"))
 
   /** Bound on a per-event snapshot write: long enough for a slow LAN round trip, short enough that a stalled database
     * degrades the game to in-memory play instead of freezing its writer fiber.

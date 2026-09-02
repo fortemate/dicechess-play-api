@@ -380,3 +380,11 @@ class CodecsSuite extends munit.FunSuite:
     // `withDefaults` affects decoding only; pin the encoded shape so nothing silently starts omitting fields.
     assertEquals(BotCreateSeek().asJson.noSpaces, """{"timeControl":null,"rated":false}""")
     assertEquals(Wake(alive = true).asJson.noSpaces, """{"alive":true,"busy":false}""")
+
+  test("GameOrigin travels as its lowercase wire name, and only that vocabulary decodes (ADR-005, #47)"):
+    assertEquals(GameOrigin.Showcase.asJson.noSpaces, "\"showcase\"")
+    assertEquals(GameOrigin.Legacy.asJson.noSpaces, "\"legacy\"")
+    GameOrigin.valuesList.foreach { origin =>
+      assertEquals(decode[GameOrigin](origin.asJson.noSpaces), Right(origin), s"$origin must round-trip")
+    }
+    assert(decode[GameOrigin]("\"arena\"").isLeft, "an unknown origin must not decode to a default")

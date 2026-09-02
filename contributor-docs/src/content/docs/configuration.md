@@ -141,7 +141,11 @@ The singleton showcase table on the homepage (`/`) is controlled by the followin
 :::danger[Showcase requires PostgreSQL persistence]
 The showcase table enforces fail-closed durability: if `PLAY_DB_URL` is unset, the showcase table
 remains `unavailable` and rejects claims. Falling back to an in-memory store is strictly prohibited
-for showcase games.
+for showcase games. Concretely (#47): `GameRegistry` refuses to create a showcase room over a
+store that does not claim durability, and `SHOWCASE_ENABLED=true` without `PLAY_DB_URL` logs a
+`[play][showcase]` warning at boot — the seat reservation still applies (a silent fallback to
+unreserved capacity is what ADR-005 forbids), so fix the configuration rather than expecting the
+table to open.
 :::
 
 ## Staged webhook rollout runbook

@@ -87,7 +87,7 @@ class GameArchiveSuite extends munit.FunSuite:
     val record  = GameArchive.decode(json).getOrElse(fail(s"decode must succeed for its own payload: $json"))
     assertEquals(record.rated, true)
     assertEquals(record.timeControl, TimeControl.Fischer(300, 3))
-    assertEquals(record.result, 1)
+    assertEquals(record.result, Some(1))
     assertEquals(record.termination, "king_captured")
     assertEquals(record.whiteExternalId, "guest:w-uuid")
     assertEquals(record.blackExternalId, "bot:team:house:greedy")
@@ -132,3 +132,76 @@ class GameArchiveSuite extends munit.FunSuite:
       .getOrElse(fail("parse failed"))
     val record = GameArchive.decode(json).getOrElse(fail("decode must succeed for legacy archive JSON"))
     assertEquals(record.turns.map(_.thinkingTimeMs), List(None, None))
+
+  // ── Showcase origin and sporting eligibility (ADR-005 §8, #47) ─────────────────────────────
+
+  private def showcase(snapshot: GameSnapshot): GameSnapshot = snapshot.copy(origin = Some(GameOrigin.Showcase))
+
+  test("a technically aborted SHOWCASE game is archived with its full history but no sporting result (#47)"):
+    val fixture = showcase(snapshot(ended(GameResult.Draw, Termination.Aborted)))
+    val entry   = GameArchive.entry(fixture).getOrElse(fail("an aborted showcase game must produce an archive entry"))
+    val c       = entry.payload.hcursor
+    assertEquals(entry.origin, GameOrigin.Showcase)
+    assert(!entry.sportingEligible, "a technical abort is never a sporting result")
+    assert(c.downField("result").focus.exists(_.isNull), "no fabricated draw: the abort's placeholder result is null")
+    assertEquals(c.get[String]("termination").toOption, Some("aborted"))
+    assertEquals(c.get[String]("origin").toOption, Some("showcase"))
+    assertEquals(c.get[Boolean]("sporting_eligible").toOption, Some(false))
+    assertEquals(c.downField("turns").downN(1).get[List[Int]]("dice").toOption, Some(List(2, 3, 6)), "moves and dice")
+    assertEquals(c.downField("players").get[String]("black").toOption, Some("bot:team:house:greedy"), "participants")
+    assertEquals(c.downField("time_control").downField("Fischer").get[Int]("initialSeconds").toOption, Some(300))
+    assertEquals(c.downField("fairness").get[String]("server_seed").toOption, Some("ab12cd34"), "fairness material")
+
+  test("a finished showcase game is a sporting result that carries its origin (#47)"):
+    val entry = GameArchive
+      .entry(showcase(snapshot(ended(GameResult.Win(Side.Black), Termination.Timeout))))
+      .getOrElse(fail("a finished game must produce an archive entry"))
+    assertEquals(entry.origin, GameOrigin.Showcase)
+    assert(entry.sportingEligible)
+    assertEquals(entry.payload.hcursor.get[Int]("result").toOption, Some(-1))
+    assertEquals(entry.payload.hcursor.get[Boolean]("sporting_eligible").toOption, Some(true))
+
+  test("an aborted game OUTSIDE the showcase is still not archived — the pre-#47 rule is unchanged for it"):
+    assertEquals(GameArchive.entry(snapshot(ended(GameResult.Draw, Termination.Aborted))), None)
+    assertEquals(
+      GameArchive.entry(snapshot(ended(GameResult.Draw, Termination.Aborted)).copy(origin = Some(GameOrigin.Lobby))),
+      None
+    )
+
+  test("a snapshot without an origin archives as legacy, and a ladder-flagged one as ladder (#47)"):
+    val legacy = GameArchive.entry(snapshot(ended(GameResult.Draw, Termination.Draw))).getOrElse(fail("no entry"))
+    assertEquals(legacy.origin, GameOrigin.Legacy)
+    assertEquals(legacy.payload.hcursor.get[String]("origin").toOption, Some("legacy"))
+    val ladder = GameArchive
+      .entry(snapshot(ended(GameResult.Draw, Termination.Draw)).copy(ladder = Some(true)))
+      .getOrElse(fail("no entry"))
+    assertEquals(ladder.origin, GameOrigin.Ladder)
+
+  test("decode round-trips the aborted showcase shape: result None, origin and eligibility as written (#47)"):
+    val json =
+      GameArchive.payload(showcase(snapshot(ended(GameResult.Draw, Termination.Aborted)))).getOrElse(fail("no payload"))
+    val record = GameArchive.decode(json).getOrElse(fail(s"decode must succeed for its own payload: $json"))
+    assertEquals(record.result, None)
+    assertEquals(record.termination, "aborted")
+    assertEquals(record.origin, GameOrigin.Showcase)
+    assertEquals(record.sportingEligible, false)
+    assertEquals(record.turns.size, 2)
+
+  test("pre-#47 archive JSON without origin or sporting_eligible decodes to legacy, eligible, with its integer result"):
+    val json = io.circe.parser
+      .parse("""{
+        "started_at": 1782000000000,
+        "rated": false,
+        "time_control": {"Fischer": {"initialSeconds": 300, "incrementSeconds": 3}},
+        "result": -1,
+        "termination": "timeout",
+        "players": {"white": "guest:w-uuid", "black": "bot:team:house:greedy"},
+        "initial_dfen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "turns": [],
+        "fairness": {"commit": null, "server_seed": "ab12cd34", "client_seeds": {"white": "w", "black": "b"}}
+      }""")
+      .getOrElse(fail("parse failed"))
+    val record = GameArchive.decode(json).getOrElse(fail("decode must succeed for pre-#47 archive JSON"))
+    assertEquals(record.result, Some(-1))
+    assertEquals(record.origin, GameOrigin.Legacy)
+    assertEquals(record.sportingEligible, true)

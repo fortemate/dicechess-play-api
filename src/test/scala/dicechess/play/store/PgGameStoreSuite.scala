@@ -11,9 +11,12 @@ import dicechess.play.rating.{Glicko, Glicko2}
 import dicechess.play.server.GameRegistry
 import doobie.hikari.HikariTransactor
 import doobie.implicits.*
+import doobie.postgres.circe.jsonb.implicits.*
 import doobie.postgres.implicits.*
 import doobie.util.ExecutionContexts
 import doobie.util.fragment.Fragment
+import io.circe.Json
+import io.circe.syntax.*
 import munit.CatsEffectSuite
 import org.flywaydb.core.Flyway
 import org.flywaydb.core.api.MigrationVersion
@@ -4654,5 +4657,259 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             stored.exists((_, category) => category.isEmpty),
             "the fixture must include an uncategorised control, or the NULL branch goes unchecked"
           )
+      }
+    }
+
+  // ── V5: game origin projection and the showcase archive (ADR-005 §8, #47) ─────────────────
+
+  private def showcase(snapshot: GameSnapshot): GameSnapshot = snapshot.copy(origin = Some(GameOrigin.Showcase))
+
+  private def gamesOrigin(xa: doobie.Transactor[IO], id: GameId): IO[String] =
+    sql"SELECT origin FROM play.games WHERE id = ${id.value}::uuid".query[String].unique.transact(xa)
+
+  private def rowCount(xa: doobie.Transactor[IO], table: String, id: GameId): IO[Int] =
+    (fr"SELECT count(*)::int FROM" ++ Fragment.const(s"play.$table") ++ fr"WHERE game_id = ${id.value}::uuid")
+      .query[Int]
+      .unique
+      .transact(xa)
+
+  test("a showcase game's terminal save projects its origin into games, game_results and game_archive (#47)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val white = Principal.Guest("v5-showcase-white")
+        val black = Principal.Bot("v5-rpi3", "hunter-book")
+        for
+          id      <- GameId.random
+          _       <- db.save(id, showcase(endedResultFixture(white, black)))
+          origin  <- gamesOrigin(xa, id)
+          results <- db.recentResultsFor(white.externalId)
+          archive <- db.archiveFor(id)
+        yield
+          assertEquals(origin, "showcase")
+          val row = results.find(_.gameId.value == id.value).getOrElse(fail(s"no game_results row for $id"))
+          assertEquals(row.origin, GameOrigin.Showcase)
+          assert(row.sportingEligible, "a resignation is a sporting result")
+          assert(!row.ladder, "origin sits beside the ladder flag and never reinterprets it")
+          val archived = archive.getOrElse(fail(s"no game_archive row for $id"))
+          assertEquals(archived.origin, GameOrigin.Showcase)
+          assert(archived.sportingEligible)
+          assertEquals(archived.payload.hcursor.get[String]("origin").toOption, Some("showcase"))
+          assertEquals(archived.payload.hcursor.get[Boolean]("sporting_eligible").toOption, Some(true))
+      }
+    }
+
+  test("a technically aborted showcase game IS archived, with no sporting result and no outbox row (#47)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val white = Principal.Guest("v5-showcase-aborted-white")
+        val black = Principal.Bot("v5-rpi3", "hunter-book")
+        for
+          id <- GameId.random
+          _  <- db.save(id, showcase(endedResultFixture(white, black, rated = true, termination = Termination.Aborted)))
+          archive <- db.archiveFor(id)
+          results <- db.recentResultsFor(white.externalId)
+          outbox  <- rowCount(xa, "outbox", id)
+        yield
+          val archived = archive.getOrElse(fail("every ended showcase game has an archive row, aborts included"))
+          assertEquals(archived.origin, GameOrigin.Showcase)
+          assert(!archived.sportingEligible)
+          val c = archived.payload.hcursor
+          assert(c.downField("result").focus.exists(_.isNull), "no fabricated draw")
+          assertEquals(c.get[String]("termination").toOption, Some("aborted"))
+          assertEquals(c.downField("turns").downN(0).get[List[String]]("moves").toOption, Some(List("e2e4")))
+          assertEquals(c.downField("fairness").get[String]("server_seed").toOption, Some("ab12cd34"))
+          val row = results.find(_.gameId.value == id.value).getOrElse(fail(s"no game_results row for $id"))
+          assertEquals(row.result, None)
+          assert(!row.rated, "an abort is never rated, whatever was decided at creation")
+          assert(!row.sportingEligible)
+          assertEquals(row.origin, GameOrigin.Showcase)
+          assertEquals(outbox, 0, "analytics never hears about a game with no sporting result")
+      }
+    }
+
+  test("the showcase terminal save is idempotent: saved twice, one row of each and the snapshot stays ended (#47)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val white = Principal.Guest("v5-showcase-dup-white")
+        val black = Principal.Bot("v5-rpi3", "hunter-book")
+        for
+          id <- GameId.random
+          fixture = showcase(endedResultFixture(white, black, termination = Termination.Aborted))
+          _        <- db.save(id, fixture)
+          _        <- db.save(id, fixture)
+          archives <- rowCount(xa, "game_archive", id)
+          results  <- rowCount(xa, "game_results", id)
+          status   <- sql"SELECT status FROM play.games WHERE id = ${id.value}::uuid".query[String].unique.transact(xa)
+        yield
+          assertEquals(archives, 1)
+          assertEquals(results, 1)
+          assertEquals(status, "ended")
+      }
+    }
+
+  test("a snapshot without an origin projects the explicit default, and a ladder-flagged one projects ladder (#47)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val ladderWhite = Principal.Bot("v5-legacy", "ladder-white")
+        val plainWhite  = Principal.Bot("v5-legacy", "plain-white")
+        val black       = Principal.Bot("v5-legacy", "black")
+        for
+          ladderId    <- GameId.random
+          plainId     <- GameId.random
+          _           <- db.save(ladderId, endedResultFixture(ladderWhite, black, ladder = true))
+          _           <- db.save(plainId, endedResultFixture(plainWhite, black))
+          ladder      <- db.recentResultsFor(ladderWhite.externalId)
+          plain       <- db.recentResultsFor(plainWhite.externalId)
+          ladderGames <- gamesOrigin(xa, ladderId)
+          plainGames  <- gamesOrigin(xa, plainId)
+        yield
+          assertEquals(ladder.find(_.gameId.value == ladderId.value).map(_.origin), Some(GameOrigin.Ladder))
+          assertEquals(plain.find(_.gameId.value == plainId.value).map(_.origin), Some(GameOrigin.Legacy))
+          assertEquals(ladderGames, "ladder")
+          assertEquals(plainGames, "legacy")
+      }
+    }
+
+  test("activeShowcaseGameIds lists live showcase games only — the table's reconciliation read (#46, #47)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        for
+          live     <- GameId.random
+          general  <- GameId.random
+          finished <- GameId.random
+          _        <- db.save(live, showcase(snapshotFixture(GameStatus.Active)))
+          _        <- db.save(general, snapshotFixture(GameStatus.Active).copy(origin = Some(GameOrigin.Lobby)))
+          _        <- db.save(
+            finished,
+            showcase(snapshotFixture(GameStatus.Ended(GameOver(GameResult.Draw, Termination.Draw))))
+          )
+          ids <- db.activeShowcaseGameIds
+        yield
+          assert(ids.contains(live), s"the live showcase game must be listed: $ids")
+          assert(!ids.contains(general), "a live game of another origin is not")
+          assert(!ids.contains(finished), "nor an ended showcase game")
+      }
+    }
+
+  test(
+    "V5 backfills origin from the snapshot, the ladder flag and the result row, indexes showcase games, and is re-runnable (#47)"
+  ):
+    withContainers { pg =>
+      rawXa(pg).use { xa =>
+        val schema  = "mig_v5_origin"
+        val games   = Fragment.const(s"$schema.games")
+        val results = Fragment.const(s"$schema.game_results")
+        val archive = Fragment.const(s"$schema.game_archive")
+
+        val legacyId        = UUID.randomUUID()
+        val ladderId        = UUID.randomUUID()
+        val showcaseDoneId  = UUID.randomUUID()
+        val showcaseAbortId = UUID.randomUUID()
+        val white           = Principal.Guest("mig-v5-white")
+        val black           = Principal.Bot("mig-v5", "bot")
+        val ended           = endedResultFixture(white, black)
+        val aborted         = endedResultFixture(white, black, termination = Termination.Aborted)
+        // A truly pre-origin row has neither key; a pre-origin ladder row has only the flag.
+        val legacyJson        = snapshotFixture(GameStatus.Active).asJson.mapObject(_.remove("origin").remove("ladder"))
+        val ladderJson        = ended.copy(ladder = Some(true)).asJson.mapObject(_.remove("origin"))
+        val showcaseDoneJson  = showcase(ended).asJson
+        val showcaseAbortJson = showcase(aborted).asJson
+        // The pre-V5 archive payload carried neither origin nor eligibility.
+        val doneArchive = GameArchive
+          .payload(ended)
+          .getOrElse(fail("no payload"))
+          .mapObject(_.remove("origin").remove("sporting_eligible"))
+
+        def game(id: UUID, status: String, snapshot: Json) =
+          (fr"INSERT INTO" ++ games ++ fr"(id, status, snapshot) VALUES ($id, $status, $snapshot)").update.run
+        def result(id: UUID, ladder: Boolean, termination: String, outcome: Option[Short]) =
+          (fr"INSERT INTO" ++ results ++
+            fr"""(game_id, white_external_id, black_external_id, result, termination, rated, time_control,
+                  server_seed, ladder)
+                 VALUES ($id, ${white.externalId}, ${black.externalId}, $outcome, $termination, false,
+                         'Fischer(300,3)', 'ab12cd34', $ladder)""").update.run
+        val plant =
+          game(legacyId, "active", legacyJson) *>
+            game(ladderId, "ended", ladderJson) *> result(ladderId, ladder = true, "resign", Some(1)) *>
+            game(showcaseDoneId, "ended", showcaseDoneJson) *> result(
+              showcaseDoneId,
+              ladder = false,
+              "resign",
+              Some(1)
+            ) *>
+            (fr"INSERT INTO" ++ archive ++ fr"(game_id, payload) VALUES ($showcaseDoneId, $doneArchive)").update.run *>
+            game(showcaseAbortId, "ended", showcaseAbortJson) *> result(
+              showcaseAbortId,
+              ladder = false,
+              "aborted",
+              None
+            )
+
+        val gameOrigins =
+          (fr"SELECT id, origin FROM" ++ games ++ fr"ORDER BY origin").query[(UUID, String)].to[List].map(_.toMap)
+        val resultOrigins =
+          (fr"SELECT game_id, origin FROM" ++ results ++ fr"ORDER BY origin")
+            .query[(UUID, String)]
+            .to[List]
+            .map(_.toMap)
+        val archiveRows =
+          (fr"SELECT game_id, origin, sporting_eligible FROM" ++ archive).query[(UUID, String, Boolean)].to[List]
+        val indexes =
+          sql"""SELECT indexname FROM pg_indexes WHERE schemaname = $schema
+                AND indexname IN ('games_showcase_active_idx', 'game_results_origin_finished_idx',
+                                  'game_archive_origin_finished_idx')
+                ORDER BY indexname""".query[String].to[List]
+        val bogus =
+          (fr"INSERT INTO" ++ games ++ fr"(id, status, snapshot, origin) VALUES (${UUID.randomUUID()}, 'active', $legacyJson, 'arena')").update.run
+        val v5Sql = IO.blocking(
+          scala.util.Using
+            .resource(
+              scala.io.Source
+                .fromFile("src/main/resources/db/migration/V5__game_origin_and_showcase_archive.sql", "UTF-8")
+            )(
+              _.mkString
+            )
+        )
+        def rerun(sqlText: String) =
+          doobie.FC.raw { connection =>
+            val statement = connection.createStatement()
+            try
+              statement.execute(s"SET search_path TO $schema")
+              statement.execute(sqlText)
+              statement.execute("RESET search_path")
+            finally statement.close()
+          }
+
+        for
+          _         <- migrateInto(pg, schema, Some("4"))
+          _         <- plant.transact(xa)
+          _         <- migrateInto(pg, schema)
+          origins   <- gameOrigins.transact(xa)
+          rOrigins  <- resultOrigins.transact(xa)
+          archived  <- archiveRows.transact(xa)
+          idx       <- indexes.transact(xa)
+          rejected  <- bogus.transact(xa).attempt
+          sqlText   <- v5Sql
+          _         <- rerun(sqlText).transact(xa)
+          origins2  <- gameOrigins.transact(xa)
+          rOrigins2 <- resultOrigins.transact(xa)
+          archived2 <- archiveRows.transact(xa)
+        yield
+          assertEquals(origins(legacyId), "legacy", "no origin, no ladder flag: the explicit default")
+          assertEquals(origins(ladderId), "ladder", "a pre-origin ladder game is recognised by its flag")
+          assertEquals(origins(showcaseDoneId), "showcase", "a snapshot that recorded its origin keeps it")
+          assertEquals(origins(showcaseAbortId), "showcase")
+          assertEquals(rOrigins(ladderId), "ladder")
+          assertEquals(rOrigins(showcaseDoneId), "showcase", "the result row follows its snapshot")
+          assertEquals(rOrigins(showcaseAbortId), "showcase", "an aborted showcase result row too")
+          assertEquals(archived, List((showcaseDoneId, "showcase", true)), "existing archive rows are all sporting")
+          assertEquals(
+            idx,
+            List("game_archive_origin_finished_idx", "game_results_origin_finished_idx", "games_showcase_active_idx")
+          )
+          assert(rejected.isLeft, "the CHECK constraint pins the origin vocabulary")
+          assertEquals(origins2, origins, "re-running the migration changes nothing")
+          assertEquals(rOrigins2, rOrigins)
+          assertEquals(archived2, archived)
       }
     }

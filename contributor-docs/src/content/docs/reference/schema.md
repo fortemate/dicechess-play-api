@@ -256,9 +256,16 @@ Indexes:
 | `game_id` | `uuid` | no | — | PK |
 | `payload` | `jsonb` | no | — | — |
 | `finished_at` | `timestamp with time zone` | no | `now()` | — |
+| `origin` | `text` | no | `'legacy'::text` | — |
+| `sporting_eligible` | `boolean` | no | `true` | — |
+
+Check constraints:
+
+- `CHECK ((origin = ANY (ARRAY['showcase'::text, 'ladder'::text, 'catalog'::text, 'lobby'::text, 'direct'::text, 'legacy'::text])))`
 
 Indexes:
 
+- `game_archive_origin_finished_idx` — `CREATE INDEX game_archive_origin_finished_idx ON public.game_archive USING btree (origin, finished_at DESC)`
 - `game_archive_pkey` — `CREATE UNIQUE INDEX game_archive_pkey ON public.game_archive USING btree (game_id)`
 
 ### `game_results`
@@ -282,11 +289,17 @@ Indexes:
 | `black_rating_before` | `double precision` | yes | — | — |
 | `black_rating_after` | `double precision` | yes | — | — |
 | `category` | `text` | yes | — | — |
+| `origin` | `text` | no | `'legacy'::text` | — |
+
+Check constraints:
+
+- `CHECK ((origin = ANY (ARRAY['showcase'::text, 'ladder'::text, 'catalog'::text, 'lobby'::text, 'direct'::text, 'legacy'::text])))`
 
 Indexes:
 
 - `game_results_black_finished_idx` — `CREATE INDEX game_results_black_finished_idx ON public.game_results USING btree (black_external_id, finished_at DESC)`
 - `game_results_ladder_idx` — `CREATE INDEX game_results_ladder_idx ON public.game_results USING btree (ladder) WHERE ladder`
+- `game_results_origin_finished_idx` — `CREATE INDEX game_results_origin_finished_idx ON public.game_results USING btree (origin, finished_at DESC)`
 - `game_results_pairing_idx` — `CREATE INDEX game_results_pairing_idx ON public.game_results USING btree (pairing_id) WHERE (pairing_id IS NOT NULL)`
 - `game_results_pkey` — `CREATE UNIQUE INDEX game_results_pkey ON public.game_results USING btree (game_id)`
 - `game_results_rated_finished_idx` — `CREATE INDEX game_results_rated_finished_idx ON public.game_results USING btree (rated, finished_at)`
@@ -302,15 +315,18 @@ Indexes:
 | `snapshot` | `jsonb` | no | — | — |
 | `created_at` | `timestamp with time zone` | no | `now()` | — |
 | `updated_at` | `timestamp with time zone` | no | `now()` | — |
+| `origin` | `text` | no | `'legacy'::text` | — |
 
 Check constraints:
 
+- `CHECK ((origin = ANY (ARRAY['showcase'::text, 'ladder'::text, 'catalog'::text, 'lobby'::text, 'direct'::text, 'legacy'::text])))`
 - `CHECK ((status = ANY (ARRAY['active'::text, 'ended'::text])))`
 
 Indexes:
 
 - `games_active_idx` — `CREATE INDEX games_active_idx ON public.games USING btree (status) WHERE (status = 'active'::text)`
 - `games_pkey` — `CREATE UNIQUE INDEX games_pkey ON public.games USING btree (id)`
+- `games_showcase_active_idx` — `CREATE INDEX games_showcase_active_idx ON public.games USING btree (id) WHERE ((origin = 'showcase'::text) AND (status = 'active'::text))`
 
 ### `nickname_history`
 

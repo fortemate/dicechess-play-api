@@ -25,12 +25,20 @@ class AdmissionConcurrencySuite extends munit.CatsEffectSuite:
     reservedSeats = 1
   )
 
+  /** Showcase rooms are refused over a store that does not claim durability (#47). The admission invariants under test
+    * are independent of durability, so the harness uses an in-memory store that claims it and keeps nothing.
+    */
+  private val durableInMemory: GameStore = new GameStore:
+    override def durable: Boolean                          = true
+    def save(id: GameId, snapshot: GameSnapshot): IO[Unit] = IO.unit
+    def loadActive: IO[List[(GameId, GameSnapshot)]]       = IO.pure(Nil)
+
   private def harness(limit: Int = 3): IO[(BotStore, GameRegistry, AdmissionGuard)] =
     for
       bots     <- BotStore.inMemory
       _        <- bots.register(featuredBot.team, featuredBot.name, "hash-featured")
       _        <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, limit)
-      registry <- GameRegistry.create()
+      registry <- GameRegistry.create(store = durableInMemory)
       guard    <- AdmissionGuard.create(
         bots,
         showcaseConfig,

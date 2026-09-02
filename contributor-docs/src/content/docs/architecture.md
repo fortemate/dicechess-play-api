@@ -72,8 +72,19 @@ Routes are grouped by audience rather than by resource:
   from the session or a `?guest=` uuid.
 - **Public discovery** — `GET /games`, `GET /leaderboard`, `GET /bots/{team}/{name}`, plus the
   history and strength endpoints.
-- **Showcase table** — `GET /showcase` (discovery, state, spectator URL, clocks) and `POST /showcase/claim`
-  (idempotent atomic first-claim). The accepted state-machine and persistence contract is ADR-005 (#44).
+- **Showcase table** — `GET /showcase` and `POST /showcase/claim`. Exposes the homepage singleton table:
+  - `GET /showcase` returns the public table view: state (`unavailable`, `open`, `live`, `finishing`), featured bot
+    summary, time control (`5+3`), next human color when `open`, current game FEN and clocks when `live`/`finishing`,
+    and the public spectator WebSocket URL. It enforces `Cache-Control: no-cache, no-store, must-revalidate` for active
+    states (max-age 1s when `open`), requires no authentication, and **never exposes player credentials or internal tokens**.
+  - `POST /showcase/claim` is the atomic first-claim endpoint. Authentication accepts either a valid session cookie
+    (`user:<uuid>`) or a stable `guestId` (`guest:<uuid>`). It requires an `Idempotency-Key` header (UUIDv4) and accepts
+    optional `clientEntropy`. The atomic winner receives `200 OK` with `outcome: "playing"`, assigned color, and
+    `playerToken` in a `Cache-Control: no-store` body; concurrent losers and subsequent callers receive `200 OK` with
+    `outcome: "spectating"` and the spectator URL, with **no player credentials**. Errors use RFC 7807 problem details:
+    `400 Bad Request` (`missing_idempotency_key`), `409 Conflict` (`idempotency_conflict` on reused key with different
+    payload), `429 Too Many Requests` (per-IP and per-actor claim rate limits), or `503 Service Unavailable`
+    (`showcase_unavailable`). There is no queue and no rematch. The authoritative contract is ADR-005 (#44).
 - **Bot API** — everything under `/bot/…`: identity, challenges, seeks, gameplay, streams,
   webhooks, ladder.
 - **Account control** — `/me/…` uses the live `access_token` session and current ownership;
@@ -144,13 +155,27 @@ stateDiagram-v2
 2. `open`: The table is idle, advertising the configured featured bot, `5+3`, and the server-assigned
    next human color. Exactly 1 bot capacity slot is reserved.
 3. `live`: One active game against the featured bot is in progress. The winning claimant holds player
-   credentials (`playerToken`); spectators observe via WebSocket.
+   credentials (`playerToken`), which appears **only** in the winning `POST /showcase/claim` response body under
+   `Cache-Control: no-store`; spectators observe via WebSocket. `GET /showcase` and spectator outcomes
+   (`outcome: "spectating"`) never include player credentials.
 4. `finishing`: The game has ended in memory; terminal persistence is executing atomically. The table
    remains closed to new claims until the transaction commits.
 
-The contract enforces fail-closed durability: initial snapshots and each move must commit to PostgreSQL
-before publication, and the table cannot reopen until terminal persistence (final snapshot, `game_results`,
-immutable `game_archive` with `origin = 'showcase'`, and outbox payload) is committed. The full design is
-codified in ADR-005 (#44); concurrency and capacity invariants are detailed in
+### Fail-closed persistence and recovery rules
+
+Showcase games enforce strict, fail-closed durability fences:
+- Initial room snapshots and every intermediate move/roll must commit to PostgreSQL before turn acknowledgement,
+  client broadcast, or bot webhook dispatch.
+- If a required save fails, the room immediately halts forward game progress, retries with bounded backoff, and
+  suppresses turn acknowledgement, spectator event broadcast, and bot webhook delivery for the uncommitted version.
+- If persistence fails unrecoverably or times out, the table transitions directly to `unavailable`. Connected player
+  and spectator WebSocket sessions settle cleanly with close code 1011 (internal error) or a typed termination
+  notice, and the in-memory room is stopped.
+- The table cannot reopen or accept new claims until terminal persistence (final snapshot, `game_results`, immutable
+  `game_archive` with `origin = 'showcase'`, and outbox payload) has successfully committed. On server boot or after an
+  unclean restart, startup reconciliation reads the last durable snapshot or completes pending terminal persistence
+  before reopening the table.
+
+The full specification is codified in ADR-005 (#44); concurrency and capacity invariants are detailed in
 [Concurrency](/dicechess-play-api/concurrency/).
 

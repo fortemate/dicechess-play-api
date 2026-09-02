@@ -80,22 +80,32 @@ authority in service.
 
 The singleton showcase table introduces three strict concurrency invariants:
 
-### 1. First-claim linearizability ("first visitor wins")
+### 1. First-claim linearizability ("first visitor wins") and durable idempotency
 
 When the table is `open`, multiple visitors may submit `POST /showcase/claim` simultaneously:
-- Exactly one claim commits atomically. The server generates player credentials (`seatToken`) returned only to the
+- Exactly one claim commits atomically. The server generates player credentials (`playerToken`) returned only to the
   winner in a `Cache-Control: no-store` response.
 - Concurrent losers and subsequent callers receive a spectator outcome with the active game ID and WebSocket URL.
   Losers **never** receive player credentials.
-- Idempotency is keyed by `(actor_id, Idempotency-Key)` for both signed-in users (`user:<uuid>`) and guests (`guestId`).
-  Retrying with the same key returns the committed outcome; conflicting key reuse is rejected as `409 Conflict`.
 - Next human color strictly alternates (White $\leftrightarrow$ Black) upon successful durable room creation. Failed
   creation does not consume the next color.
 
-### 2. Dedicated capacity reservation and no-borrowing rule
+Idempotency is durable and enforced across process restarts:
+- The `Idempotency-Key` request header (UUIDv4) is mandatory. Requests missing the header fail immediately with
+  `400 Bad Request` (`missing_idempotency_key`).
+- Idempotency records are keyed by `(actor_id, idempotency_key)` in PostgreSQL, where `actor_id` is the verified account
+  (`user:<uuid>`) or stable guest identifier (`guest:<uuid>`).
+- If a subsequent request reuses the key with a conflicting payload (such as different `clientEntropy`), it is rejected
+  with `409 Conflict` (`idempotency_conflict`).
+- While the record is retained (24-hour retention window), identical retries replay the original committed response:
+  re-emitting player credentials (`playerToken`) if the game is still active, or returning the spectator view once the
+  game has ended. After the retention window expires, pruned keys are treated as fresh claims.
 
-The featured bot declares capacity 3 (`maxConcurrentGames = 3`). Showcase reserves 1 seat (`reservedConcurrentGames = 1`),
-leaving at most 2 seats for general admission:
+### 2. Dedicated capacity reservation, admission cleanup, and no-borrowing rule
+
+The featured bot declares capacity 3 (`maxConcurrentGames = 3`). When showcase is enabled, `SHOWCASE_RESERVED_SEATS`
+must be configured to exactly `1` (values `0` or `> 1` are rejected during configuration validation at boot), leaving
+exactly 2 seats for general admission:
 $$\text{occupancy}_{\text{general}} \le 2, \quad \text{occupancy}_{\text{showcase}} \le 1, \quad \text{occupancy}_{\text{total}} \le 3$$
 
 Every admission path is classified:
@@ -105,14 +115,25 @@ Every admission path is classified:
 - `showcase`: `POST /showcase/claim`. Exclusively consumes the reserved seat.
 
 General admission paths **never borrow** the reserved showcase slot, even if the showcase table is idle.
-The central `AdmissionGuard` uses an atomic `acquire -> create/register -> commit` protocol, replacing check-then-create
-to prevent concurrent overshooting.
 
-### 3. Single-node process-local coordinator
+The central `AdmissionGuard` uses an atomic `acquire -> create/register -> commit` protocol with explicit cleanup
+for every non-commit path:
+- The in-flight reservation carries a short lease timeout (5 seconds).
+- If room creation fails (e.g. engine error, bot unreachable, validation failure), database commit fails, or a duplicate
+  active room is detected, the acquisition is immediately aborted and rolled back, restoring the slot to available.
+- If the server process crashes mid-claim, the reservation lease expires automatically. On restart, startup reconciliation
+  clears uncommitted reservations from PostgreSQL so abandoned claims cannot permanently leak capacity or block
+  subsequent claims.
+
+### 3. Single-process topology constraint
 
 In this release, showcase coordination and `AdmissionGuard` are process-local in-memory structures backed by PostgreSQL
-transactions. **Horizontal scaling to multiple nodes is strictly prohibited** until a shared distributed coordinator
-lease (e.g. PostgreSQL row lock / advisory lock lease) is designed and implemented.
+transactions. **Showcase traffic must be routed to exactly one serving process**, not merely one node: multiple worker
+processes or replicas on the same node would maintain independent in-memory state and could both observe `open` and
+create competing rooms.
+
+Multi-process and multi-node horizontal scaling are strictly prohibited until a shared distributed coordinator
+(such as a PostgreSQL transactional lease or advisory locks) is designed and implemented.
 
 ## The server trusts nothing from the client
 

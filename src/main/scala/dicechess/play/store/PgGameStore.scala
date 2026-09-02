@@ -1936,11 +1936,30 @@ final class PgGameStore private (xa: Transactor[IO])
         _ <- sql"""DELETE FROM play.bot_webhook_setups
                     WHERE status <> 'pending' AND terminated_at <= $before""".update.run
       yield ()
-    val candidates =
+    val batchSize = WebhookManagementStore.SweepBatchSize
+
+    /** The bots this heartbeat will fence, in ONE query for two reasons.
+      *
+      * The rows: a pending setup past its TTL, plus — only while this generation is authoritative — a pending admin
+      * setup from a dead allow-list generation. Expiry is what destroys a candidate's plaintext secret and URL, and it
+      * is otherwise reached only per-bot from `preparedWebhookBot`/`put`/`delete`/ownership, so an owner who stages a
+      * setup and then abandons it would leave those columns readable until something happened to touch that bot again.
+      * A TTL is not an authority decision, so that half runs on every instance.
+      *
+      * The order: `ORDER BY team, name`, matching `deleteUser`, which is the other transaction that takes more than one
+      * `webhookFence`. Two transactions taking the same fences in different orders deadlock, so the order is part of
+      * the contract and must stay in SQL — sorting the ids in Scala instead would use JDK string ordering where
+      * `deleteUser` uses the database collation, and the two disagree on case.
+      */
+    def sweepTargets(now: Instant, includeStaleAdminSetups: Boolean) =
       sql"""SELECT team, name FROM play.bot_webhook_setups
-            WHERE status = 'pending' AND actor_kind = 'admin'
-              AND authority_generation <> $liveAuthorityGeneration
-            ORDER BY team, name""".query[(String, String)].to[List]
+            WHERE status = 'pending'
+              AND (expires_at <= $now
+                   OR ($includeStaleAdminSetups
+                       AND actor_kind = 'admin'
+                       AND authority_generation <> $liveAuthorityGeneration))
+            ORDER BY team, name
+            LIMIT $batchSize""".query[(String, String)].to[List]
     val refresh =
       for
         _   <- adminAuthorityFence
@@ -1955,13 +1974,15 @@ final class PgGameStore private (xa: Transactor[IO])
                     WHERE heartbeat_at <= $liveAfter""".update.run
         liveGeneration <- soleLiveAdminAuthorityGeneration(now)
         authoritative = liveGeneration.contains(liveAuthorityGeneration)
-        targets     <- if authoritative then candidates else List.empty[(String, String)].pure[ConnectionIO]
-        invalidated <- targets.traverse { case (team, name) =>
+        targets  <- sweepTargets(now, includeStaleAdminSetups = authoritative)
+        outcomes <- targets.traverse { case (team, name) =>
           for
             _      <- webhookFence(team, name)
             locked <- lockWebhookBot(team, name)
             botNow <- databaseClock
             bot    <- locked.traverse(expirePendingWebhookSetup(_, botNow, context))
+            // Expiry moves the revision only when it actually scrubbed a candidate, so this is the exact count.
+            scrubbed = locked.zip(bot).exists(pair => pair._1.revision != pair._2.revision)
             result <- bot.fold(0.pure[ConnectionIO]): current =>
               pendingWebhookSetup(current).flatMap:
                 case Some(setup)
@@ -1983,13 +2004,17 @@ final class PgGameStore private (xa: Transactor[IO])
                     )
                   yield 1
                 case _ => 0.pure[ConnectionIO]
-          yield result
+          yield (if scrubbed then 1 else 0, result)
         }
         completedAt <- databaseClock
         _           <- sql"""UPDATE play.webhook_admin_authority_generations
                     SET heartbeat_at = $completedAt
                     WHERE authority_generation = $liveAuthorityGeneration""".update.run
-      yield WebhookAdminAuthorityRefresh(authoritative, invalidated.sum)
+      yield WebhookAdminAuthorityRefresh(
+        authoritative,
+        invalidatedSetups = outcomes.map(_._2).sum,
+        expiredSetups = outcomes.map(_._1).sum
+      )
 
     purgeAllTombstones.transact(xa).timeout(SaveTimeout) *> refresh.transact(xa).timeout(BootTimeout)
 

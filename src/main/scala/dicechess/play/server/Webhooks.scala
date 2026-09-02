@@ -577,6 +577,12 @@ object Webhooks:
       * (`idleConnectionTime`), both below a budget a bot may legitimately spend on one turn, which is exactly how a
       * configured 210 s silently became 45 s in production (#188). The headroom keeps [[post]]'s own `.timeout` the
       * first deadline to fire, so a slow bot is logged as a slow bot rather than as a transport failure.
+      *
+      * These govern the SHARED client, which since ADR-004 serves ingest delivery and the hermetic test fallback in
+      * [[legacyPostDetailed]]. Production webhook delivery goes through [[WebhookTransport]] instead, which builds its
+      * own DNS-pinned client with both deadlines at `Duration.Inf` and relies solely on the caller's end-to-end
+      * `.timeout`. The two paths therefore agree on the property that matters — this config is the first deadline to
+      * fire — by different means.
       */
     def clientTimeout: FiniteDuration = timeout + Config.ClientTimeoutHeadroom
 
@@ -610,8 +616,10 @@ object Webhooks:
     * belong to their authors: a Cloudflare-proxied endpoint is cut at 100 s, an OCI API Gateway at 60 s, an AWS API
     * Gateway at 29 s by default. A bot behind a narrower limit hits it first and its proxy answers — which this server
     * logs as `endpoint answered HTTP …`, a diagnosable outcome, unlike the silent truncation an under-sized cap
-    * produces. Note that the derived client deadlines sit *above* this value ([[Config.clientTimeout]],
-    * [[Config.clientIdleTimeout]]), so a 120 s cap means holding a connection open for up to ~150 s.
+    * produces. This value is the only deadline production delivery has: [[WebhookTransport]] gives its per-request
+    * client `Duration.Inf` and lets this `.timeout` decide, so a 120 s cap means holding a connection open for up to
+    * ~120 s. The derived [[Config.clientTimeout]]/[[Config.clientIdleTimeout]] headroom still applies to the shared
+    * client behind [[legacyPostDetailed]] and to ingest delivery.
     *
     * 120 s is the deployed choice: it clears the engine's hard cap at a 600 s clock and keeps this server from being
     * the binding constraint for bots whose path allows more (Cloud Run 300 s, Azure 230 s). An operator whose bots all

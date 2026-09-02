@@ -177,13 +177,17 @@ class CorsSuite extends munit.CatsEffectSuite:
               s"${resp.headers.get(ci"Access-Control-Allow-Headers")}"
           )
 
-  test("an allowed browser origin can read webhook revision and rate-limit response headers"):
+  test("an allowed browser origin can read webhook revision, rate-limit and setup-location response headers"):
     app("https://play.jc.id.lv")
       .run(Request[IO](Method.GET, uri"/health").putHeaders(origin("https://play.jc.id.lv")))
       .map: resp =>
         val exposed = headerValues(resp.headers, ci"Access-Control-Expose-Headers")
         assert(exposed.contains("etag"), s"credentialed responses do not expose ETag: $exposed")
         assert(exposed.contains("retry-after"), s"credentialed responses do not expose Retry-After: $exposed")
+        // The 201 from POST .../webhook/setups documents Location, and Location is not CORS-safelisted: without
+        // this the browser client — the only caller these routes accept — cannot read the header the contract
+        // promises it.
+        assert(exposed.contains("location"), s"credentialed responses do not expose Location: $exposed")
 
   test("an allow-list echoes a configured origin and omits the header for others"):
     val restricted = app("https://play.jc.id.lv,http://localhost:5173")
@@ -193,3 +197,48 @@ class CorsSuite extends munit.CatsEffectSuite:
     yield
       assertEquals(allowOrigin(allowed.headers), Some("https://play.jc.id.lv"))
       assertEquals(allowOrigin(denied.headers), None)
+
+  test("unusable allow-list entries are reported, and a wholly unusable list is never read as 'unset'"):
+    // `parse` keeps its lenient contract for the server-side guard; `parseDetailed` is what tells a caller the
+    // difference between "the operator asked for nothing" and "the operator asked for something unusable".
+    val mixed = Cors.AllowedOrigins.parseDetailed("https://play.jc.id.lv, fortemate.com, null")
+    assert(mixed.allowed.isExplicitlyConfigured)
+    assert(mixed.allowed.allows(parsedOrigin("https://play.jc.id.lv")))
+    assertEquals(mixed.rejected, List("fortemate.com", "null"))
+    assert(!mixed.isEntirelyUnusable, "one usable origin is still a usable allow-list")
+
+    // `Origin.parse` is permissive where the header is not: it keeps `HTTPS` casing, folds a trailing path into the
+    // host, and keeps an explicit `:443` that the URL spec's origin serialization elides. All three parse, so none is
+    // "unparseable" — but a browser only ever sends the canonical form, so storing them would silently match nothing
+    // and leave the operator staring at a policy that refuses their own site. They must be reported like any other
+    // unusable entry.
+    val unmatchable =
+      Cors.AllowedOrigins.parseDetailed("https://ok.example/hook, HTTPS://OK.example, https://fortemate.com:443")
+    assertEquals(
+      unmatchable.rejected,
+      List("https://ok.example/hook", "HTTPS://OK.example", "https://fortemate.com:443")
+    )
+    assert(!unmatchable.allowed.isExplicitlyConfigured)
+    assert(unmatchable.isEntirelyUnusable)
+
+    // The forms a browser does send stay accepted: a non-default port and an IPv6 literal included.
+    val canonical =
+      Cors.AllowedOrigins.parseDetailed("http://localhost:5173, https://fortemate.com, http://[::1]:5173")
+    assertEquals(canonical.rejected, Nil)
+    assert(canonical.allowed.allows(parsedOrigin("http://localhost:5173")))
+    assert(canonical.allowed.allows(parsedOrigin("https://fortemate.com")))
+    assert(canonical.allowed.allows(parsedOrigin("http://[::1]:5173")))
+
+    val unusable = Cors.AllowedOrigins.parseDetailed("null, fortemate.com")
+    assert(!unusable.allowed.isExplicitlyConfigured)
+    assertEquals(unusable.rejected, List("null", "fortemate.com"))
+    assert(
+      unusable.isEntirelyUnusable,
+      "an allow-list none of whose entries parse must be distinguishable from an absent one: the empty set " +
+        "selects credential-less allow-all, so treating it as 'unset' turns one typo into a policy change"
+    )
+
+    val absent = Cors.AllowedOrigins.parseDetailed(" ,  ")
+    assert(!absent.allowed.isExplicitlyConfigured)
+    assertEquals(absent.rejected, Nil)
+    assert(!absent.isEntirelyUnusable, "a blank value is a deliberate allow-all, not a mistake")

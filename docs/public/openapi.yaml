@@ -41,6 +41,11 @@ tags:
     description: >
       Feature-gated owner/admin control plane for staged webhook setup, activation, CAS updates,
       deletion, and bot-history telemetry. Uses the access_token account session, not a bot token.
+      While the gate is closed these routes are NOT MOUNTED: every path below then answers a plain
+      404 with no application/problem+json body, which is also what an unknown path answers. Probe
+      with a read before branching on any other status. The 503 documented on the mutating
+      operations is a different condition — the server is running this API but has no outbound
+      verification transport — and it never stands in for the feature gate.
       Public design summary: https://github.com/fortemate/dicechess-play-api/issues/10.
   - name: Admin
     description: Break-glass operator controls and complete inventory. Gated by user session in PLAY_ADMINS.
@@ -669,11 +674,16 @@ paths:
       tags: [Webhooks]
       summary: Register a webhook
       description: >
-        Register an HTTPS callback the server POSTs turns to. The URL must be HTTPS and resolve to
-        a public address; the server runs an ownership handshake before storing it. Registered
-        bots only; enabled per server. Capability names are exact and case-sensitive: duplicate
-        selectable values are accepted and collapsed into canonical registry order, while unknown
-        values and recognized-but-reserved values return 422 with distinct plain-text reasons.
+        Register an HTTPS callback the server POSTs turns to. The URL must be HTTPS, carry a host
+        and no userinfo or fragment, use a valid port, and every freshly resolved address must be
+        globally routable — for IPv6 that means global unicast (2000::/3) outside the IANA
+        special-purpose blocks, so Teredo (2001::/23) and 6to4 (2002::/16) are refused. The same
+        policy is re-applied at send time on every delivery, so a registration that stops
+        satisfying it stops being delivered to. The server runs an ownership handshake before
+        storing the URL. Registered bots only; enabled per server. Capability names are exact and
+        case-sensitive: duplicate selectable values are accepted and collapsed into canonical
+        registry order, while unknown values and recognized-but-reserved values return 422 with
+        distinct plain-text reasons.
       requestBody:
         required: true
         content:
@@ -756,7 +766,8 @@ paths:
         Returns the authoritative redacted slot, including explicit null registration/pendingSetup
         fields and a strong ETag. Requires the live account session to own this registered bot.
         This staged API is feature-gated and disabled by default; its presence is not implied by
-        this contract or by the legacy Bot API being available.
+        this contract or by the legacy Bot API being available. A closed gate leaves the route
+        unmounted, so it answers 404 without a problem body — see the tag description.
       security:
         - cookieAuth: []
       responses:
@@ -1314,6 +1325,9 @@ components:
       description: >
         Typed session webhook-management problem. A 412 includes current plus its ETag; a 429
         includes Retry-After. Secret material and raw transport details are never returned.
+        A 503 (webhook_verification_unavailable) means this server has no outbound verification
+        transport configured, so staged setup and activation fail closed while reads keep working;
+        it is not the feature gate, which leaves the routes unmounted and answers 404 instead.
       headers:
         ETag: { $ref: '#/components/headers/ManagedWebhookEtag' }
         Cache-Control: { $ref: '#/components/headers/NoStore' }
@@ -2071,7 +2085,14 @@ components:
         RFC 9457-style error. current is present only for 412 and is the same redacted slot shape
         as a successful read. Retry timing is conveyed only by the Retry-After header.
       properties:
-        type: { type: string, format: uri }
+        type:
+          type: string
+          format: uri
+          description: >
+            Documentation anchor for this code on the Bot API webhook reference, formed as
+            https://bots.fortemate.com/reference/webhooks/#<code with underscores replaced by
+            dashes>. Informational: branch on code, which is the machine-readable discriminator.
+          example: https://bots.fortemate.com/reference/webhooks/#stale-webhook-revision
         title: { type: string }
         status: { type: integer, minimum: 400, maximum: 599 }
         code: { $ref: '#/components/schemas/ManagedWebhookProblemCode' }

@@ -23,6 +23,15 @@ import scala.util.control.NoStackTrace
   * A new one-request Ember pool is scoped to each call. This intentionally gives DNS pinning an obvious lifetime and
   * rules out connection reuse across independently validated results. The system TLS context is shared by the
   * long-lived [[WebhookTransport]] resource, so the per-call client does not rebuild trust material.
+  *
+  * '''Known cost, accepted deliberately.''' Turn delivery therefore pays a fresh TCP and TLS handshake every time,
+  * where the previous shared pool kept a connection alive between turns of the same game. Those two extra round trips
+  * are charged to the mover's clock (`deliver` sizes its timeout from the seat's remaining time), so on a distant
+  * endpoint they cost a bot real thinking budget and, at a very low clock, can turn a delivery that used to finish into
+  * `Outcome.TimedOut`. Keep-alive can be restored without weakening the guarantee — memoise the client on
+  * `(originalHost, port, selectedAddress)` and reuse it only when THIS call's fresh `resolvePublicHttps` returns the
+  * same pinned address — but that is a pool with its own lifetime and eviction rules, so it is deliberately not part of
+  * the initial rollout. Measure delivery latency after enabling the flag before deciding it is needed.
   */
 trait WebhookTransport:
   import WebhookTransport.Outcome

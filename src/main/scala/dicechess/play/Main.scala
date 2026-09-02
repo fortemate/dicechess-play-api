@@ -84,8 +84,10 @@ object Main extends IOApp.Simple:
   // registered bots die with the process).
   // The third slot is the concrete Postgres store when persistence is on: the rating batch and the public
   // leaderboard/profile routes both need its DB-only seams (RatingStore, LeaderboardStore) and are simply absent
-  // without a database. The outbound HTTP client is shared by every outbound feature (ingest delivery, webhook
-  // push) and is built from the webhook window above — an unused pool holds no connections.
+  // without a database. The shared outbound client now carries ingest delivery only: webhook push goes through
+  // `WebhookTransport`, whose DNS-pinned per-request client it cannot share (see below). It is still sized from the
+  // webhook window, because `Webhooks` keeps it as the fallback transport its hermetic tests use, and because an
+  // unused pool holds no connections.
   private def appResources
       : Resource[IO, (GameStore, BotStore, Option[PgGameStore], Client[IO], WebhookTransport, IO[Unit])] =
     (outboundClientBuilder(Webhooks.configFromEnv).build, WebhookTransport.resource).tupled.flatMap {
@@ -294,12 +296,15 @@ object Main extends IOApp.Simple:
         case Some(webhookConfig) =>
           Resource
             .eval(
-              // The effective window, said out loud at boot: the client's deadlines are derived from it and used to
-              // undercut it silently (#188), and a bot author cannot size their time management against a number
-              // nobody prints.
+              // The effective window, said out loud at boot: a bot author cannot size their time management against a
+              // number nobody prints, and an undercutting client deadline is exactly how a configured 210 s became a
+              // silent 45 s cut (#188). Delivery runs on the DNS-pinned transport, whose per-request client has no
+              // deadlines of its own, so this window is the whole story; the derived shared-client cuts are printed
+              // too because ingest and the hermetic fallback transport still answer to them.
               IO.println(
-                s"[play][webhook] per-turn window ${webhookConfig.timeout.toSeconds}s " +
-                  s"(client cut ${webhookConfig.clientTimeout.toSeconds}s, idle ${webhookConfig.clientIdleTimeout.toSeconds}s)"
+                s"[play][webhook] per-turn window ${webhookConfig.timeout.toSeconds}s, one pinned connection per " +
+                  s"delivery (shared client cut ${webhookConfig.clientTimeout.toSeconds}s, " +
+                  s"idle ${webhookConfig.clientIdleTimeout.toSeconds}s)"
               ) *> pgStore.fold(WebhookStore.inMemory)(pg => IO.pure(pg: WebhookStore))
             )
             .flatMap { webhookStore =>

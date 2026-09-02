@@ -80,8 +80,8 @@ Routes are grouped by audience rather than by resource:
   status mapping, CAS, redaction, verification, and audit cannot drift between them. They mount
   only behind `WEBHOOK_SESSION_MANAGEMENT_ENABLED` plus persistence, session verification, and an
   explicit origin allow-list; the legacy `/bot/webhook…` contract remains separate. The accepted
-  security/state-machine contract is
-  [ADR-004](https://internal.fortemate.com/decisions/adr-004-staged-webhook-management).
+  security/state-machine contract is ADR-004; this page and
+  [Concurrency](/dicechess-play-api/concurrency/) carry everything a contributor needs from it.
 
 The complete, authoritative reference for the bot-facing routes is the
 [Bot API site](https://bots.fortemate.com/), not this page.

@@ -446,6 +446,566 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  /** One activated registration on a fresh bot, so a test can start from the state the interesting operations act on
+    * instead of re-staging the whole machine each time. Returns the owner actor and the slot after activation.
+    */
+  private def activatedWebhook(
+      db: PgGameStore,
+      xa: HikariTransactor[IO],
+      team: String,
+      name: String,
+      userId: UUID,
+      url: String,
+      secret: String,
+      capabilities: List[WebhookCapability],
+      now: Instant
+  ): IO[(WebhookActor, ManagedWebhookSlot)] =
+    val owner   = s"user:$userId"
+    val actor   = WebhookActor(WebhookActorKind.Owner, owner)
+    val context = WebhookRequestContext(Some(s"request-fixture-$name"))
+    val setupId = UUID.randomUUID()
+    for
+      // Nicknames are unique case-insensitively, and every fixture bot here is called "staged", so key the nickname
+      // to the account id instead of the bot name.
+      _ <- sql"""INSERT INTO play.users (id, nickname, is_active)
+                 VALUES ($userId, ${s"Owner${userId.toString.takeRight(8)}"}, true)""".update.run.transact(xa)
+      _       <- db.register(team, name, s"hash-$team-$name", owner = Some(owner))
+      initial <- db.webhookSlot(team, name, actor, now, context)
+      initialSlot = managementValue(initial, "registered bot has no webhook slot")
+      created <- db.createWebhookSetup(
+        team,
+        name,
+        actor,
+        initialSlot.revision,
+        NewWebhookSetup(
+          setupId,
+          WebhookSetupKind.Create,
+          Some(url),
+          secret,
+          capabilities,
+          now,
+          now.plusSeconds(900)
+        ),
+        context
+      )
+      setup = managementValue(created, "setup creation failed")
+      acquired <- db.acquireWebhookActivation(
+        Principal.Bot(team, name),
+        actor,
+        WebhookActivationAttempt(setupId, setup.revision, UUID.randomUUID(), now.plusSeconds(1), now.plusSeconds(30)),
+        context
+      )
+      lease = managementValue(acquired, "activation lease failed")
+      done <- db.completeWebhookActivation(actor, lease, now.plusSeconds(2), context)
+      slot = managementValue(done, "activation commit failed")
+    yield (actor, slot)
+
+  test("a capability-only update rewrites the array in both directions and touches nothing else (#36)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val userId  = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a1")
+        val context = WebhookRequestContext(Some("request-capabilities"))
+        val now     = Instant.parse("2026-09-01T12:00:00Z")
+        for
+          fixture <- activatedWebhook(
+            db,
+            xa,
+            "webhook-caps",
+            "staged",
+            userId,
+            "https://caps.example/webhook",
+            "c" * 64,
+            // Deliberately starts EMPTY, so the first update below cannot pass by writing what is already stored.
+            Nil,
+            now
+          )
+          (actor, active) = fixture
+          enabled <- db.updateWebhookCapabilities(
+            "webhook-caps",
+            "staged",
+            actor,
+            active.revision,
+            List(WebhookCapability.Draws),
+            now.plusSeconds(3),
+            context
+          )
+          withDraws = managementValue(enabled, "enabling a capability failed")
+          disabled <- db.updateWebhookCapabilities(
+            "webhook-caps",
+            "staged",
+            actor,
+            withDraws.revision,
+            Nil,
+            now.plusSeconds(4),
+            context
+          )
+          withoutDraws = managementValue(disabled, "disabling a capability failed")
+          stored <- sql"""SELECT url, secret, verified_at, capabilities
+                          FROM play.bot_webhooks WHERE team = 'webhook-caps' AND name = 'staged'"""
+            .query[(String, String, Instant, Option[List[String]])]
+            .unique
+            .transact(xa)
+        yield
+          assertEquals(active.registration.map(_.capabilities), Some(Nil), "fixture must start with no capabilities")
+          assertEquals(
+            withDraws.registration.map(_.capabilities),
+            Some(List(WebhookCapability.Draws)),
+            "the update must actually write the new selection"
+          )
+          assertEquals(
+            withoutDraws.registration.map(_.capabilities),
+            Some(Nil),
+            "the reverse update must clear the selection again"
+          )
+          assertNotEquals(withDraws.revision, active.revision)
+          assertNotEquals(withoutDraws.revision, withDraws.revision)
+          assertEquals(
+            withoutDraws.registration.map(_.registrationId),
+            active.registration.map(_.registrationId),
+            "a capability change must not mint a new registration generation"
+          )
+          val (url, secret, verifiedAt, capabilities) = stored
+          assertEquals(url, "https://caps.example/webhook", "capability-only changes must not touch the URL")
+          assertEquals(secret, "c" * 64, "capability-only changes must not touch the secret")
+          assertEquals(
+            verifiedAt,
+            active.registration.map(_.verifiedAt).getOrElse(fail("registration disappeared")),
+            "capability-only changes must not re-open verification"
+          )
+          assert(
+            capabilities.forall(_.isEmpty),
+            s"the persisted array must be empty after the reverse update, was $capabilities"
+          )
+      }
+    }
+
+  test("an ordinary failed verification spends one attempt and leaves the previous registration deliverable (#36)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val userId  = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a2")
+        val context = WebhookRequestContext(Some("request-fail"))
+        val now     = Instant.parse("2026-09-01T12:00:00Z")
+        val setupId = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a3")
+        for
+          fixture <- activatedWebhook(
+            db,
+            xa,
+            "webhook-fail",
+            "staged",
+            userId,
+            "https://live.example/webhook",
+            "d" * 64,
+            List(WebhookCapability.Draws),
+            now
+          )
+          (actor, active) = fixture
+          created <- db.createWebhookSetup(
+            "webhook-fail",
+            "staged",
+            actor,
+            active.revision,
+            NewWebhookSetup(
+              setupId,
+              WebhookSetupKind.ReplaceUrl,
+              Some("https://next.example/webhook"),
+              "e" * 64,
+              Nil,
+              now.plusSeconds(3),
+              now.plusSeconds(903)
+            ),
+            context
+          )
+          setup = managementValue(created, "replacement setup failed")
+          acquired <- db.acquireWebhookActivation(
+            Principal.Bot("webhook-fail", "staged"),
+            actor,
+            WebhookActivationAttempt(
+              setupId,
+              setup.revision,
+              UUID.randomUUID(),
+              now.plusSeconds(4),
+              now.plusSeconds(64)
+            ),
+            context
+          )
+          lease = managementValue(acquired, "activation lease failed")
+          // The endpoint answered, but with a bad proof: authority is live and the lease has not expired, so this is
+          // the ordinary failure branch rather than one of the guard branches.
+          failed <- db.failWebhookActivation(
+            actor,
+            lease,
+            WebhookActivationFailureReason.ProofMismatch,
+            now.plusSeconds(5),
+            context
+          )
+          failure = managementValue(failed, "ordinary verification failure was not applied")
+          delivered <- db.get("webhook-fail", "staged")
+          row       <- sql"""SELECT status, activation_attempts, candidate_secret IS NOT NULL, lease_id IS NULL
+                       FROM play.bot_webhook_setups WHERE setup_id = $setupId"""
+            .query[(String, Int, Boolean, Boolean)]
+            .unique
+            .transact(xa)
+          audit <- sql"""SELECT action, metadata ->> 'reason' FROM play.admin_actions
+                         WHERE team = 'webhook-fail' AND name = 'staged' ORDER BY id DESC LIMIT 1"""
+            .query[(String, Option[String])]
+            .unique
+            .transact(xa)
+        yield
+          assertEquals(failure.attemptsExhausted, false, "one failure must not exhaust the five-attempt budget")
+          assertEquals(failure.slot.pendingSetup.map(_.setupId), Some(setupId), "the candidate must stay pending")
+          assertEquals(
+            failure.slot.registration.map(_.url),
+            Some("https://live.example/webhook"),
+            "a failed verification must leave the previously verified registration in place"
+          )
+          assertEquals(
+            delivered.map(hook => (hook.url, hook.secret)),
+            Some(("https://live.example/webhook", "d" * 64)),
+            "delivery must keep using the old URL and secret after a failed replacement"
+          )
+          assertEquals(row, ("pending", 1, true, true), "the attempt is spent, the lease released, the row pending")
+          assertEquals(audit._1, "webhook.activation.failed")
+          assertEquals(audit._2, Some("proof_mismatch"), "the audit records the closed reason, never transport text")
+      }
+    }
+
+  test("deleteManagedWebhook destroys the registration and the live candidate in one transaction (#36)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val userId  = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a4")
+        val context = WebhookRequestContext(Some("request-delete"))
+        val now     = Instant.parse("2026-09-01T12:00:00Z")
+        val setupId = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a5")
+        for
+          fixture <- activatedWebhook(
+            db,
+            xa,
+            "webhook-delete",
+            "staged",
+            userId,
+            "https://doomed.example/webhook",
+            "f" * 64,
+            List(WebhookCapability.Draws),
+            now
+          )
+          (actor, active) = fixture
+          created <- db.createWebhookSetup(
+            "webhook-delete",
+            "staged",
+            actor,
+            active.revision,
+            NewWebhookSetup(
+              setupId,
+              WebhookSetupKind.RotateSecret,
+              None,
+              "0" * 64,
+              Nil,
+              now.plusSeconds(3),
+              now.plusSeconds(903)
+            ),
+            context
+          )
+          staged = managementValue(created, "rotation setup failed")
+          deleted <- db.deleteManagedWebhook(
+            "webhook-delete",
+            "staged",
+            actor,
+            staged.revision,
+            now.plusSeconds(4),
+            context
+          )
+          removal = managementValue(deleted, "deletion failed")
+          legacy <- db.get("webhook-delete", "staged")
+          again  <- db.deleteManagedWebhook(
+            "webhook-delete",
+            "staged",
+            actor,
+            removal.slot.revision,
+            now.plusSeconds(5),
+            context
+          )
+          repeat = managementValue(again, "deleting an empty slot must succeed as a no-op")
+          tombstone <- sql"""SELECT status,
+                                    candidate_secret IS NULL AND candidate_url IS NULL AND actor_id IS NULL
+                                      AND authority_generation IS NULL AND candidate_capabilities IS NULL,
+                                    terminated_at IS NOT NULL
+                             FROM play.bot_webhook_setups WHERE setup_id = $setupId"""
+            .query[(String, Boolean, Boolean)]
+            .unique
+            .transact(xa)
+          audit <- sql"""SELECT action, metadata::text FROM play.admin_actions
+                         WHERE team = 'webhook-delete' AND name = 'staged' AND action = 'webhook.delete'"""
+            .query[(String, String)]
+            .unique
+            .transact(xa)
+        yield
+          assertEquals(removal.changed, true)
+          assertEquals(removal.slot.registration, None, "deletion must clear the active registration")
+          assertEquals(removal.slot.pendingSetup, None, "deletion must clear the live candidate too")
+          assertEquals(legacy, None, "the legacy delivery read must stop resolving the deleted registration")
+          assertEquals(repeat.changed, false, "an already empty slot is a true no-op")
+          assertEquals(repeat.slot.revision, removal.slot.revision, "a no-op deletion must not move the revision")
+          assertNotEquals(removal.slot.revision, staged.revision)
+          assertEquals(tombstone, ("cancelled", true, true), "the candidate must survive only as a redacted row")
+          assert(!audit._2.contains("f" * 64), s"the audit payload must not carry the active secret: ${audit._2}")
+          assert(!audit._2.contains("0" * 64), s"the audit payload must not carry the candidate secret: ${audit._2}")
+          assert(
+            !audit._2.contains("doomed.example"),
+            s"the audit payload must fingerprint the URL, not copy it: ${audit._2}"
+          )
+      }
+    }
+
+  test("replaceUrl and rotateSecret each change exactly their own field through the store (#36)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val userId  = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a6")
+        val context = WebhookRequestContext(Some("request-kinds"))
+        val now     = Instant.parse("2026-09-01T12:00:00Z")
+
+        def stage(kind: WebhookSetupKind, url: Option[String], secret: String, revision: UUID, at: Instant) =
+          val setupId = UUID.randomUUID()
+          for
+            created <- db.createWebhookSetup(
+              "webhook-kinds",
+              "staged",
+              WebhookActor(WebhookActorKind.Owner, s"user:$userId"),
+              revision,
+              NewWebhookSetup(setupId, kind, url, secret, Nil, at, at.plusSeconds(900)),
+              context
+            )
+            setup = managementValue(created, s"$kind setup failed")
+            acquired <- db.acquireWebhookActivation(
+              Principal.Bot("webhook-kinds", "staged"),
+              WebhookActor(WebhookActorKind.Owner, s"user:$userId"),
+              WebhookActivationAttempt(setupId, setup.revision, UUID.randomUUID(), at, at.plusSeconds(60)),
+              context
+            )
+            lease = managementValue(acquired, s"$kind lease failed")
+            done <- db.completeWebhookActivation(
+              WebhookActor(WebhookActorKind.Owner, s"user:$userId"),
+              lease,
+              at.plusSeconds(1),
+              context
+            )
+          yield managementValue(done, s"$kind activation failed")
+
+        for
+          fixture <- activatedWebhook(
+            db,
+            xa,
+            "webhook-kinds",
+            "staged",
+            userId,
+            "https://first.example/webhook",
+            "1" * 64,
+            List(WebhookCapability.Draws),
+            now
+          )
+          (_, active) = fixture
+          replaced <- stage(
+            WebhookSetupKind.ReplaceUrl,
+            Some("https://second.example/webhook"),
+            "2" * 64,
+            active.revision,
+            now.plusSeconds(3)
+          )
+          afterReplace <- db.get("webhook-kinds", "staged")
+          rotated      <- stage(WebhookSetupKind.RotateSecret, None, "3" * 64, replaced.revision, now.plusSeconds(10))
+          afterRotate  <- db.get("webhook-kinds", "staged")
+          unchanged    <- db.createWebhookSetup(
+            "webhook-kinds",
+            "staged",
+            WebhookActor(WebhookActorKind.Owner, s"user:$userId"),
+            rotated.revision,
+            NewWebhookSetup(
+              UUID.randomUUID(),
+              WebhookSetupKind.ReplaceUrl,
+              Some("https://second.example/webhook"),
+              "4" * 64,
+              Nil,
+              now.plusSeconds(20),
+              now.plusSeconds(920)
+            ),
+            context
+          )
+        yield
+          assertEquals(
+            afterReplace.map(hook => (hook.url, hook.secret, hook.capabilities)),
+            Some(("https://second.example/webhook", "2" * 64, List(WebhookCapability.Draws))),
+            "replaceUrl rotates URL and secret together and preserves the capability selection"
+          )
+          assertEquals(
+            afterRotate.map(hook => (hook.url, hook.secret, hook.capabilities)),
+            Some(("https://second.example/webhook", "3" * 64, List(WebhookCapability.Draws))),
+            "rotateSecret replaces only the secret and keeps the verified URL"
+          )
+          assertNotEquals(
+            afterRotate.map(_.registrationId),
+            afterReplace.map(_.registrationId),
+            "every activation must mint a fresh registration generation"
+          )
+          assertEquals(
+            unchanged,
+            WebhookManagementResult.Conflict(WebhookManagementConflict.ReplacementUrlUnchanged),
+            "replaceUrl must refuse the URL that is already active"
+          )
+      }
+    }
+
+  test("a stale expectedRevision is refused by the transactional CAS guard without writing (#36)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val userId  = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a7")
+        val context = WebhookRequestContext(Some("request-cas"))
+        val now     = Instant.parse("2026-09-01T12:00:00Z")
+        for
+          fixture <- activatedWebhook(
+            db,
+            xa,
+            "webhook-cas",
+            "staged",
+            userId,
+            "https://cas.example/webhook",
+            "5" * 64,
+            Nil,
+            now
+          )
+          (actor, active) = fixture
+          // A second browser tab acts first, so `active.revision` is now one generation behind.
+          moved <- db.updateWebhookCapabilities(
+            "webhook-cas",
+            "staged",
+            actor,
+            active.revision,
+            List(WebhookCapability.Draws),
+            now.plusSeconds(3),
+            context
+          )
+          current = managementValue(moved, "the first writer must succeed")
+          staleCapabilities <- db.updateWebhookCapabilities(
+            "webhook-cas",
+            "staged",
+            actor,
+            active.revision,
+            Nil,
+            now.plusSeconds(4),
+            context
+          )
+          staleSetup <- db.createWebhookSetup(
+            "webhook-cas",
+            "staged",
+            actor,
+            active.revision,
+            NewWebhookSetup(
+              UUID.randomUUID(),
+              WebhookSetupKind.RotateSecret,
+              None,
+              "6" * 64,
+              Nil,
+              now.plusSeconds(5),
+              now.plusSeconds(905)
+            ),
+            context
+          )
+          staleDelete <- db.deleteManagedWebhook(
+            "webhook-cas",
+            "staged",
+            actor,
+            active.revision,
+            now.plusSeconds(6),
+            context
+          )
+          after  <- db.get("webhook-cas", "staged")
+          setups <- sql"""SELECT count(*) FROM play.bot_webhook_setups
+                          WHERE team = 'webhook-cas' AND name = 'staged' AND status = 'pending'"""
+            .query[Int]
+            .unique
+            .transact(xa)
+        yield
+          def staleCurrent(result: WebhookManagementResult[?], clue: String): ManagedWebhookSlot = result match
+            case WebhookManagementResult.Stale(slot) => slot
+            case other                               => fail(s"$clue: expected Stale, got $other")
+
+          assertEquals(staleCurrent(staleCapabilities, "capability update").revision, current.revision)
+          assertEquals(staleCurrent(staleSetup, "setup creation").revision, current.revision)
+          assertEquals(staleCurrent(staleDelete, "deletion").revision, current.revision)
+          assertEquals(
+            after.map(hook => (hook.url, hook.secret, hook.capabilities)),
+            Some(("https://cas.example/webhook", "5" * 64, List(WebhookCapability.Draws))),
+            "a refused stale write must leave the winner's state exactly as it was"
+          )
+          assertEquals(setups, 0, "a refused stale setup must not leave a pending candidate behind")
+      }
+    }
+
+  test("the authority heartbeat expires an abandoned candidate and scrubs its secret (#36)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val userId     = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a8")
+        val owner      = s"user:$userId"
+        val actor      = WebhookActor(WebhookActorKind.Owner, owner)
+        val context    = WebhookRequestContext(Some("request-sweep"))
+        val now        = Instant.parse("2026-09-01T12:00:00Z")
+        val setupId    = UUID.fromString("0197f0a0-0000-7000-8000-0000000003a9")
+        val generation = "b" * 64
+        for
+          _ <- sql"""INSERT INTO play.users (id, nickname, is_active)
+                     VALUES ($userId, 'SweepOwner', true)""".update.run.transact(xa)
+          _       <- db.register("webhook-sweep", "staged", "hash-webhook-sweep", owner = Some(owner))
+          initial <- db.webhookSlot("webhook-sweep", "staged", actor, now, context)
+          initialSlot = managementValue(initial, "registered bot has no webhook slot")
+          created <- db.createWebhookSetup(
+            "webhook-sweep",
+            "staged",
+            actor,
+            initialSlot.revision,
+            NewWebhookSetup(
+              setupId,
+              WebhookSetupKind.Create,
+              Some("https://abandoned.example/webhook"),
+              "7" * 64,
+              Nil,
+              now,
+              now.plusSeconds(900)
+            ),
+            context
+          )
+          staged = managementValue(created, "setup creation failed")
+          // The owner closes the tab. Age the candidate past its TTL rather than sleeping for it; created_at moves
+          // with it so `bot_webhook_setups_expiry_check` still holds while the row is pending.
+          _ <- sql"""UPDATE play.bot_webhook_setups
+                     SET created_at = now() - interval '20 minutes',
+                         expires_at = now() - interval '5 minutes'
+                     WHERE setup_id = $setupId""".update.run.transact(xa)
+          beforeSweep <- sql"""SELECT status, candidate_secret FROM play.bot_webhook_setups
+                               WHERE setup_id = $setupId"""
+            .query[(String, Option[String])]
+            .unique
+            .transact(xa)
+          swept      <- db.refreshAdminWebhookAuthority(generation, context)
+          afterSweep <- sql"""SELECT status, candidate_secret IS NULL AND candidate_url IS NULL,
+                                     terminated_at IS NOT NULL
+                              FROM play.bot_webhook_setups WHERE setup_id = $setupId"""
+            .query[(String, Boolean, Boolean)]
+            .unique
+            .transact(xa)
+          slot  <- db.webhookSlot("webhook-sweep", "staged", actor, now.plusSeconds(1800), context)
+          again <- db.refreshAdminWebhookAuthority(generation, context)
+        yield
+          assertEquals(
+            beforeSweep,
+            ("pending", Some("7" * 64)),
+            "the fixture must really leave a plaintext candidate secret behind"
+          )
+          assertEquals(swept.expiredSetups, 1, "the heartbeat must expire the abandoned candidate")
+          assertEquals(afterSweep, ("expired", true, true), "expiry must leave only a redacted tombstone")
+          assertEquals(managementValue(slot, "slot read failed").pendingSetup, None)
+          assertNotEquals(managementValue(slot, "slot read failed").revision, staged.revision)
+          assertEquals(again.expiredSetups, 0, "a second sweep must find nothing left to do")
+      }
+    }
+
   test("authority loss at verification commit invalidates the leased candidate immediately (#36)"):
     withContainers { pg =>
       (store(pg), rawXa(pg)).tupled.use { (db, xa) =>

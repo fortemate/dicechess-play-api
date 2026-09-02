@@ -123,6 +123,14 @@ id, target bot/incarnation, terminal status, and terminal time remain long enoug
 deterministic `410 Gone` responses for 15 minutes. After that window the API treats the id as
 unknown. The table's redaction check constraint makes a half-scrubbed terminal row invalid.
 
+Expiry is reached two ways. Every per-bot control-plane transaction expires a stale candidate
+before it reads or acts on the slot, which is what makes an abandoned candidate unusable. That
+alone would leave the row physically present, secret included, until something happened to touch
+that bot again — so the admin-authority heartbeat additionally sweeps expired pending setups,
+bounded to 25 bots per tick and taking each bot's usual advisory fence, on every instance rather
+than only the authoritative one. A TTL is not an authority decision, and a candidate secret should
+not outlive its 15 minutes just because nobody came back for it.
+
 Setup creation/expiry, lease expiry, terminal timestamps, and tombstone cleanup use PostgreSQL's
 `clock_timestamp()` as the lifecycle authority. JVM timestamps contribute requested durations, not
 security deadlines, so clock skew between API replicas cannot extend a setup, steal a live lease,

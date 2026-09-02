@@ -158,6 +158,7 @@ Check constraints:
 Indexes:
 
 - `bot_webhook_setups_one_pending_idx` — `CREATE UNIQUE INDEX bot_webhook_setups_one_pending_idx ON public.bot_webhook_setups USING btree (team, name) WHERE (status = 'pending'::text)`
+- `bot_webhook_setups_pending_expiry_idx` — `CREATE INDEX bot_webhook_setups_pending_expiry_idx ON public.bot_webhook_setups USING btree (expires_at) WHERE (status = 'pending'::text)`
 - `bot_webhook_setups_pkey` — `CREATE UNIQUE INDEX bot_webhook_setups_pkey ON public.bot_webhook_setups USING btree (setup_id)`
 - `bot_webhook_setups_tombstone_expiry_idx` — `CREATE INDEX bot_webhook_setups_tombstone_expiry_idx ON public.bot_webhook_setups USING btree (terminated_at) WHERE (status <> 'pending'::text)`
 

@@ -104,6 +104,13 @@ CREATE INDEX bot_webhook_setups_tombstone_expiry_idx
     ON bot_webhook_setups (terminated_at)
     WHERE status <> 'pending';
 
+-- Drives the heartbeat's bounded expiry sweep. Without it an abandoned candidate keeps its plaintext
+-- secret until something else happens to touch that bot; the partial predicate keeps the index at one
+-- entry per bot, because bot_webhook_setups_one_pending_idx already caps pending rows at one.
+CREATE INDEX bot_webhook_setups_pending_expiry_idx
+    ON bot_webhook_setups (expires_at)
+    WHERE status = 'pending';
+
 -- Every live API generation heartbeats its admin-allowlist digest here. Admin webhook authority is
 -- deliberately fail-closed while two different generations overlap during a rolling rollout; once
 -- the old generation stops heartbeating, the surviving generation becomes authoritative.

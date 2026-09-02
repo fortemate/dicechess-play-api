@@ -1,6 +1,8 @@
 package dicechess.play.server
 
 import cats.effect.IO
+import cats.effect.std.Console
+import cats.syntax.all.*
 import org.http4s.Method
 import org.http4s.headers.Origin
 import org.http4s.server.middleware.{CORS, CORSPolicy}
@@ -42,20 +44,56 @@ object Cors:
       case concrete @ Origin.HostList(hosts) if hosts.tail.isEmpty => values.contains(render(concrete))
       case _                                                       => false
 
-  object AllowedOrigins:
-    def parse(spec: String): AllowedOrigins =
-      val concrete = spec.split(',').iterator.map(_.trim).filter(_.nonEmpty).flatMap { raw =>
-        Origin
-          .parse(raw)
-          .toOption
-          .collect:
-            case origin @ Origin.HostList(hosts) if hosts.tail.isEmpty => render(origin)
-      }
-      new AllowedOrigins(concrete.toSet)
+  /** A parsed allow-list together with the entries that were thrown away, so a caller can tell "the operator asked for
+    * nothing" apart from "the operator asked for something unusable".
+    */
+  final case class ParsedOrigins(allowed: AllowedOrigins, rejected: List[String]):
 
-  /** Read and parse the trusted browser origins without turning them into middleware yet. */
+    /** The dangerous case: the operator supplied entries and NONE survived parsing. Silently treating this as "unset"
+      * would swap a restricted, credentialed policy for the public allow-all one.
+      */
+    def isEntirelyUnusable: Boolean = rejected.nonEmpty && !allowed.isExplicitlyConfigured
+
+  object AllowedOrigins:
+    def parse(spec: String): AllowedOrigins = parseDetailed(spec).allowed
+
+    /** Same parse, but keeps the rejected entries. Pure, so tests can assert the diagnosis without an environment. */
+    def parseDetailed(spec: String): ParsedOrigins =
+      val (rejected, accepted) = spec
+        .split(',')
+        .iterator
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .toList
+        .partitionMap(raw => browserOrigin(raw).toRight(raw))
+      ParsedOrigins(new AllowedOrigins(accepted.toSet), rejected)
+
+  /** Read and parse the trusted browser origins without turning them into middleware yet.
+    *
+    * A rejected entry is reported, and a spec none of whose entries is usable aborts the boot. The alternative — the
+    * empty set — is not a smaller version of the operator's intent: [[policy]] reads it as the historical "no
+    * allow-list configured" case and serves credential-less allow-all, so one typo would silently trade a locked-down
+    * credentialed policy for a public one, break every cookie-authenticated browser call, and leave the staged webhook
+    * routes unmounted. `PLAY_CORS_ORIGINS` unset or blank still means allow-all; only a non-empty, wholly unusable
+    * value is an error.
+    */
   def allowedOriginsFromEnv: IO[AllowedOrigins] =
-    IO(sys.env.getOrElse(EnvVar, "")).map(AllowedOrigins.parse)
+    IO(sys.env.getOrElse(EnvVar, "")).flatMap { spec =>
+      val parsed = AllowedOrigins.parseDetailed(spec)
+      val report = Console[IO]
+        .errorln(s"[play][cors] ignoring unusable $EnvVar entries: ${parsed.rejected.mkString(", ")}")
+        .whenA(parsed.rejected.nonEmpty)
+      val abort = IO
+        .raiseError[Unit](
+          new IllegalArgumentException(
+            s"$EnvVar lists only unusable origins (${parsed.rejected.mkString(", ")}); " +
+              "each entry must be one concrete scheme://host[:port] origin. " +
+              s"Leave $EnvVar unset for the credential-less allow-all default."
+          )
+        )
+        .whenA(parsed.isEntirelyUnusable)
+      report *> abort.as(parsed.allowed)
+    }
 
   /** Parse a comma-separated origin allow-list for a server-side origin guard. */
   def allowedOrigins(spec: String): AllowedOrigins = AllowedOrigins.parse(spec)
@@ -93,7 +131,13 @@ object Cors:
   private val CredentialedHeaders: Set[CIString] =
     Set(ci"content-type", ci"authorization", ci"if-match", ci"x-dicechess-csrf")
 
-  private val ExposedHeaders: Set[CIString] = Set(ci"etag", ci"retry-after")
+  /** Response headers the browser client must be able to read. `etag` carries the `If-Match` revision the staged
+    * webhook API requires on every mutation, `retry-after` the verification budget's reset, and `location` the
+    * canonical path of a freshly created setup — none of the three is CORS-safelisted, so a page that cannot see them
+    * cannot follow the documented contract. `cache-control` and `pragma`, also set on those responses, are safelisted
+    * and need no entry here.
+    */
+  private val ExposedHeaders: Set[CIString] = Set(ci"etag", ci"retry-after", ci"location")
 
   /** Build a policy from a comma-separated origin allow-list. An empty/blank spec allows any origin without
     * credentials; a non-empty list restricts origins AND lets responses carry credentials (the session cookie).
@@ -120,3 +164,28 @@ object Cors:
 
   /** Render an `Origin` to its header form (`scheme://host[:port]`) for matching against the allow-list. */
   private def render(origin: Origin): String = Origin.headerInstance.value(origin)
+
+  /** The subset of `Origin` values a browser can actually send: exactly one concrete host, a lower-case scheme and
+    * host, no path, and no explicitly written default port.
+    *
+    * `Origin.parse` is far more permissive than the header it models — it accepts `HTTPS://OK.example` verbatim, folds
+    * a trailing path into the host (`https://ok.example/hook` parses with `host = "ok.example/hook"`), and keeps `:443`
+    * where the URL spec's origin serialization elides it. Since [[AllowedOrigins.allows]] matches the browser's
+    * rendered header exactly, and a browser always sends the canonical form, every such entry would be stored and then
+    * match nothing at all — the operator gets a policy that refuses their own site, with no diagnostic anywhere. They
+    * are the same silent misconfiguration as an unparseable entry, so they are reported the same way rather than
+    * accepted into the set.
+    */
+  private def browserOrigin(raw: String): Option[String] =
+    Origin.parse(raw).toOption match
+      case Some(origin @ Origin.HostList(hosts)) if hosts.tail.isEmpty =>
+        val host        = hosts.head
+        val scheme      = host.scheme.value
+        val defaultPort = if scheme == "https" then 443 else if scheme == "http" then 80 else -1
+        Option.when(
+          scheme == scheme.toLowerCase &&
+            host.host.value == host.host.value.toLowerCase &&
+            !host.host.value.contains('/') &&
+            !host.port.contains(defaultPort)
+        )(render(origin))
+      case _ => None

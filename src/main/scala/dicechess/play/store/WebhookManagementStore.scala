@@ -107,7 +107,16 @@ final case class WebhookActivationLease(
 
 final case class WebhookActivationFailure(slot: ManagedWebhookSlot, attemptsExhausted: Boolean)
 final case class WebhookDeletion(slot: ManagedWebhookSlot, changed: Boolean)
-final case class WebhookAdminAuthorityRefresh(authoritative: Boolean, invalidatedSetups: Int)
+
+/** One heartbeat's work. `invalidatedSetups` counts admin candidates scrubbed because their authority generation went
+  * stale; `expiredSetups` counts candidates scrubbed because their TTL ran out, which is independent of authority and
+  * therefore happens on every instance, authoritative or not.
+  */
+final case class WebhookAdminAuthorityRefresh(
+    authoritative: Boolean,
+    invalidatedSetups: Int,
+    expiredSetups: Int = 0
+)
 
 /** Closed, persistence-safe reasons for an activation outcome. Raw transport exceptions and caller text cannot cross
   * this boundary into the audit stream.
@@ -161,6 +170,14 @@ object WebhookManagementStore:
   val DefaultBudgetWindow: Duration          = 15.minutes
   val AdminHeartbeatInterval: FiniteDuration = 5.seconds
   val AdminHeartbeatLiveness: FiniteDuration = 20.seconds
+
+  /** How many bots one heartbeat may fence in a single sweep transaction — expired candidates and stale admin setups
+    * share this budget, because they share the transaction. Every target costs an advisory lock and a row lock held
+    * until commit, and each held fence blocks that bot's owner and admin control-plane operations, so the sweep must
+    * not scale with the backlog. At [[AdminHeartbeatInterval]] this still drains far faster than [[SetupTtl]] can
+    * create work.
+    */
+  val SweepBatchSize: Int = 25
 
 /** Transactional storage boundary for ADR-004's staged owner/admin webhook control plane. Implementations must keep
   * each visible state transition, revision change, secret destruction and audit insert in one transaction.

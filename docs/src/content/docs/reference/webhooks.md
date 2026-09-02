@@ -39,7 +39,13 @@ turning a session cookie into a bot token or changing this legacy wire contract.
 { "url": "https://my-function.example.com/dicechess", "capabilities": ["draws"] }
 ```
 
-The URL must be **HTTPS** and resolve to a **public** address — loopback, RFC1918, link-local, CGNAT and IPv6-ULA targets are rejected, so the server can never be pointed at anyone's internal network. Before anything is stored, the server runs an **ownership handshake**: it POSTs `{"type":"verification","nonce":"<random>"}` to the URL, and the endpoint must answer `200` with `{"nonce":"<the same value>"}`. This first legacy handshake cannot require HMAC verification: the endpoint receives its new secret only in the successful `201` response. Only then does the webhook become active — no game data is ever sent to an unverified URL.
+The URL must be **HTTPS**, carry a host, use a valid port, and contain **no userinfo and no fragment** (`https://user:pass@host/hook` and `https://host/hook#part` are both refused). Every freshly resolved address must be **globally routable** — loopback, RFC1918, link-local, CGNAT and IPv6-ULA targets are rejected, so the server can never be pointed at anyone's internal network. For IPv6 the requirement is global unicast (`2000::/3`) outside the IANA special-purpose blocks, which also refuses Teredo (`2001::/23`) and 6to4 (`2002::/16`).
+
+:::caution[Policy tightened]
+The userinfo, fragment, port and IPv6 rules above are newer than the original "HTTPS to a public address" wording, and the same policy is re-applied at send time on **every** delivery — not only at registration. A webhook registered before the change that no longer satisfies it keeps its stored row but stops receiving deliveries, reported as an unreachable endpoint. If you registered long ago, re-check your URL against the rules above.
+:::
+
+Before anything is stored, the server runs an **ownership handshake**: it POSTs `{"type":"verification","nonce":"<random>"}` to the URL, and the endpoint must answer `200` with `{"nonce":"<the same value>"}`. This first legacy handshake cannot require HMAC verification: the endpoint receives its new secret only in the successful `201` response. Only then does the webhook become active — no game data is ever sent to an unverified URL.
 
 - **Capabilities** (optional list of canonical names):
   - `"draws"`: Opt in to receive `drawDecision` webhook deliveries when an opponent offers a draw. If omitted, `null`, or empty (the default), draw offers are automatically declined by the server on behalf of the bot, immediately revealing dice and sending a normal `yourTurn` payload.
@@ -238,9 +244,49 @@ or the activation response is lost, the old key remains active.
 Errors use `application/problem+json` with stable `code`, `status`, `title`, `detail`, and
 `instance` fields. A stale-revision problem additionally carries `current`; a rate limit also
 carries `Retry-After`. Common outcomes include `409` for an incompatible state or another pending
-setup, `410` for a setup tombstone, `422` for URL/capability/verification rejection, `429` for the
-cross-instance verification budget, and `503` when verification is unavailable. Secret material,
-raw transport exceptions, and resolved infrastructure details never appear in errors.
+setup, `410` for a setup tombstone, `422` for URL/capability/verification rejection, and `429` for
+the cross-instance verification budget. Secret material, raw transport exceptions, and resolved
+infrastructure details never appear in errors.
+
+Branch on `code`, never on `detail`. The `type` field is `#code-with-dashes` appended to this
+page, so every problem links back to its row below.
+
+Two absences are easy to confuse. `503` (`webhook_verification_unavailable`) means the server runs
+this API but has no outbound verification transport, so reads keep working while setup and
+activation fail closed. The feature gate is different: while it is closed these routes are not
+mounted at all, and the server answers a plain `404` with no problem body — the same answer an
+unknown path gets. Probe with a read before branching on anything else.
+
+#### Problem types
+
+| `code` | `status` | Meaning |
+| --- | --- | --- |
+| <a id="malformed-request"></a>`malformed_request` | 400, 415 | Body is not exactly the shape the variant requires, or `Content-Type` is not `application/json`. |
+| <a id="confirmation-mismatch"></a>`confirmation_mismatch` | 400 | `confirm` does not match the bot name. |
+| <a id="authentication-required"></a>`authentication_required` | 401 | No live account session. |
+| <a id="bot-not-owned"></a>`bot_not_owned` | 403 | The session is valid but does not own this bot. |
+| <a id="admin-required"></a>`admin_required` | 403 | The `/admin` root needs an account listed in `PLAY_ADMINS`. |
+| <a id="csrf-origin-rejected"></a>`csrf_origin_rejected` | 403 | Missing/unlisted `Origin`, or missing `X-DiceChess-CSRF: 1`. |
+| <a id="bot-not-found"></a>`bot_not_found` | 404 | No registered bot at this path. |
+| <a id="setup-not-found"></a>`setup_not_found` | 404 | No setup at this path, or the id is malformed. |
+| <a id="webhook-already-registered"></a>`webhook_already_registered` | 409 | `create` needs an empty slot; use `replaceUrl` or `rotateSecret`. |
+| <a id="webhook-not-registered"></a>`webhook_not_registered` | 409 | `replaceUrl`/`rotateSecret` need an active registration. |
+| <a id="pending-setup-exists"></a>`pending_setup_exists` | 409 | One candidate at a time; cancel the live one first. |
+| <a id="activation-in-progress"></a>`activation_in_progress` | 409 | Another activation holds the lease; retry after it settles. |
+| <a id="setup-actor-mismatch"></a>`setup_actor_mismatch` | 409 | The candidate belongs to the other root's actor. |
+| <a id="replacement-url-unchanged"></a>`replacement_url_unchanged` | 409 | `replaceUrl` must supply a different URL. |
+| <a id="setup-consumed"></a>`setup_consumed` | 410 | Already activated. |
+| <a id="setup-cancelled"></a>`setup_cancelled` | 410 | Cancelled. |
+| <a id="setup-expired"></a>`setup_expired` | 410 | Past its 15-minute TTL. |
+| <a id="setup-invalidated"></a>`setup_invalidated` | 410 | Scrubbed because the actor's authority changed. |
+| <a id="setup-attempts-exhausted"></a>`setup_attempts_exhausted` | 410 | Five activation attempts spent. |
+| <a id="stale-webhook-revision"></a>`stale_webhook_revision` | 412 | `If-Match` is behind; the body carries `current`. |
+| <a id="webhook-url-rejected"></a>`webhook_url_rejected` | 422 | The URL failed the public HTTPS policy. |
+| <a id="webhook-verification-failed"></a>`webhook_verification_failed` | 422 | The endpoint did not return a valid verification-v2 proof. |
+| <a id="capability-rejected"></a>`capability_rejected` | 422 | Unknown capability, or one that is reserved rather than available. |
+| <a id="webhook-revision-required"></a>`webhook_revision_required` | 428 | Every mutation needs a strong `If-Match`. |
+| <a id="webhook-verification-rate-limited"></a>`webhook_verification_rate_limited` | 429 | Verification budget spent; see `Retry-After`. |
+| <a id="webhook-verification-unavailable"></a>`webhook_verification_unavailable` | 503 | This server has no outbound verification transport. |
 
 The session stats response adds `"scope": "bot_history"` and the current `registrationId` (or
 `null`) to the legacy two-window shape. Counts intentionally survive replacement, rotation, and

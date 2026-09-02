@@ -66,7 +66,7 @@ in their queues undelivered. Boot warns on stderr, and nothing else complains.
 | `RETENTION_BATCH_SIZE` | Optional, default `1000`. |
 | `PLAY_BOT_TOKENS` | Statically configured bots, as `team\|name\|token` CSV. |
 | `PLAY_ADMINS` | Comma-separated **account uuids** granted the admin bot surface (#273): `/admin/bots/{team}/{name}/…` drives any registered bot without its token — ladder, catalog, description, capacity, token rotation — every write audited in `admin_actions` (V19). Uuids, not nicknames: nicknames rename and release (V18). Needs `PLAY_SESSION_SECRET` **and** persistence; boot warns loudly when set without them. Malformed entries are skipped and reported by **position only** — never by value, since one of them may be a secret pasted into the wrong variable. When staged webhook management is enabled, the parsed, sorted allow-list is also hashed into the instance's admin-authority generation; the raw ids are not copied to the generation table. |
-| `PLAY_CORS_ORIGINS` | Exact comma-separated browser origins. Empty allows any origin only in credential-less CORS mode. A non-empty list enables credentialed CORS and is mandatory for staged webhook session mutations, whose server-side guard also requires an exact `Origin` match and `X-DiceChess-CSRF: 1`. |
+| `PLAY_CORS_ORIGINS` | Exact comma-separated browser origins, each one lower-case `scheme://host[:port]` with no path. Unset or blank allows any origin only in credential-less CORS mode. A non-empty list enables credentialed CORS and is mandatory for staged webhook session mutations, whose server-side guard also requires an exact `Origin` match and `X-DiceChess-CSRF: 1`. Unusable entries are reported on stderr and ignored; a non-empty value with **no** usable entry **fails startup** rather than silently degrading to allow-all — see the warning below. |
 | `APP_VERSION` | Surfaced at `GET /version`. Set by the CD workflow from the git tag. |
 
 ## Player accounts (Google sign-in)
@@ -85,6 +85,23 @@ boot — someone clearly tried to enable sign-in — instead of the usual silent
 
 With sign-in enabled, `PLAY_CORS_ORIGINS` must be a real allow-list: the empty allow-all mode
 stays credential-less by design, so the SPA's credentialed fetches would fail against it.
+
+:::caution[A typo here used to become a policy change]
+Each entry must be exactly what a browser puts in the `Origin` header: one concrete
+`scheme://host[:port]`, lower-case, with no path and no explicitly written default port.
+`https://fortemate.com` and `http://localhost:5173` are usable; `fortemate.com`,
+`HTTPS://Fortemate.com`, `https://fortemate.com/api`, `https://fortemate.com:443`, a wildcard
+host and the literal `null` are not. The middle ones matter because the header parser accepts
+them — they would be stored and then match nothing, which looks identical to a policy that is
+simply refusing you.
+
+Unusable entries are reported on stderr and ignored. If **every** entry is unusable, the empty
+set that remains is indistinguishable from "unset", which selects credential-less allow-all —
+that would swap a locked-down credentialed policy for a public one, break every
+cookie-authenticated browser call, and leave the staged webhook routes unmounted, all from one
+typo. The server therefore **refuses to start** in that case. Leave the variable unset if
+allow-all is what you actually want.
+:::
 
 The staged webhook-management surface is stricter still: it stays unmounted unless
 `WEBHOOK_SESSION_MANAGEMENT_ENABLED=true`, persistence, `PLAY_SESSION_SECRET`, and a non-empty
@@ -111,26 +128,32 @@ loop failure stops the process instead of leaving it serving stale administrator
 
 ## Staged webhook rollout runbook
 
-This is the required order from
-[ADR-004 §14](https://internal.fortemate.com/decisions/adr-004-staged-webhook-management).
+This is the required order from ADR-004 §14, reproduced here so the runbook stands on its own.
 The session feature flag is the safety boundary; a green build alone is not permission to skip a
 step.
 
 1. Apply the additive migration while `WEBHOOK_SESSION_MANAGEMENT_ENABLED` is unset or `false`.
    Do not mutate production registrations or rotate secrets as part of the migration.
-2. Deploy the revision/registration-generation-aware API with the session flag still off.
-3. Drain **and read back** every old webhook writer and delivery worker. Confirm from the platform,
+2. Before deploying, audit the existing `bot_webhooks` rows against the **tightened URL policy**.
+   `WebhookSecurity.checkPublicHttps` — the legacy `/bot/webhook` guard — now also rejects
+   userinfo, a fragment, an invalid port, and any IPv6 address outside global unicast
+   (`2000::/3`) or inside an IANA special-purpose block, Teredo (`2001::/23`) and 6to4
+   (`2002::/16`) included. The policy is re-applied at send time, so a stored registration that
+   no longer passes keeps its row and silently stops receiving deliveries. Report affected bot
+   owners before the deploy rather than after they notice missed turns.
+3. Deploy the revision/registration-generation-aware API with the session flag still off.
+4. Drain **and read back** every old webhook writer and delivery worker. Confirm from the platform,
    not only from the deploy command, that no old API instance can perform a legacy webhook write
    and no old delivery worker can run beside the generation-scoped apply/health path.
-4. Confirm that every remaining API instance reports the expected generation-aware build, and keep
+5. Confirm that every remaining API instance reports the expected generation-aware build, and keep
    the session flag off until the DNS-pinning integration proof passes: policy resolution must
    reject private/rebound destinations, the connection must use the validated public IP, and Host
    plus TLS SNI must retain the candidate hostname without a second DNS resolution.
-5. Wait for a versioned, compatible `dicechess-bot-runtime` release that implements
+6. Wait for a versioned, compatible `dicechess-bot-runtime` release that implements
    verification-v2 proof and dual-key pending configuration. Verify its vectors and deployment
    guidance; an endpoint must keep accepting deliveries signed by the active key while using the
    pending key only for activation-v2 proof.
-6. Only after all previous readbacks and proofs pass, set
+7. Only after all previous readbacks and proofs pass, set
    `WEBHOOK_SESSION_MANAGEMENT_ENABLED=true`. Confirm the initial database heartbeat and a sole live
    admin-authority generation before enabling any UI that performs session mutations.
 

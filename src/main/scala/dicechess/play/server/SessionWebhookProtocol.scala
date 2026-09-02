@@ -223,9 +223,19 @@ trait SessionWebhookService:
   ): IO[Either[ManagedWebhookFailure, ManagedWebhookDeliveryStats]]
 
 object ManagedWebhookProblem:
+
+  /** RFC 9457 `type` base. It must resolve on a host this project actually publishes: the Bot API site's webhook
+    * reference carries one anchor per problem code, so `<base>#<code-with-dashes>` lands on that code's row. Keep this
+    * in step with the "Problem types" table in `docs/src/content/docs/reference/webhooks.md` — a `type` pointing at a
+    * domain we do not own would be both a dead link and a namespace someone else can claim.
+    */
+  private val TypeBase = "https://bots.fortemate.com/reference/webhooks/"
+
+  def typeUri(code: String): String = s"$TypeBase#${code.replace('_', '-')}"
+
   given Encoder.AsObject[ManagedWebhookProblem] = Encoder.AsObject.instance { problem =>
     val base = JsonObject(
-      "type"     -> s"https://docs.dicechess.org/problems/${problem.code.replace('_', '-')}".asJson,
+      "type"     -> typeUri(problem.code).asJson,
       "title"    -> problem.title.asJson,
       "status"   -> problem.status.code.asJson,
       "code"     -> problem.code.asJson,

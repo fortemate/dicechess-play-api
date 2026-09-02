@@ -72,6 +72,8 @@ Routes are grouped by audience rather than by resource:
   from the session or a `?guest=` uuid.
 - **Public discovery** — `GET /games`, `GET /leaderboard`, `GET /bots/{team}/{name}`, plus the
   history and strength endpoints.
+- **Showcase table** — `GET /showcase` (discovery, state, spectator URL, clocks) and `POST /showcase/claim`
+  (idempotent atomic first-claim). The accepted state-machine and persistence contract is ADR-005 (#44).
 - **Bot API** — everything under `/bot/…`: identity, challenges, seeks, gameplay, streams,
   webhooks, ladder.
 - **Account control** — `/me/…` uses the live `access_token` session and current ownership;
@@ -113,3 +115,42 @@ architecture, not an operations afterthought: follow the
 [staged webhook rollout runbook](/dicechess-play-api/configuration/#staged-webhook-rollout-runbook),
 including the old-writer/worker drain, DNS-pinning proof, compatible runtime v2 dual-key release,
 and flag-off rollback.
+
+## Singleton showcase table
+
+The homepage (`fortemate.com`, route `/`) exposes exactly one permanent public Dice Chess table facing
+a configurable featured bot (initially `rpi3/hunter-book`) at casual/unrated `5+3`. When open, the first
+visitor to claim it atomically starts one game; all other visitors spectate that same game. The existing
+play site remains unchanged at `/play`.
+
+The table moves through four public states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> unavailable
+    unavailable --> open: Bot ready + DB healthy + no active game
+    unavailable --> live: Resumed active game
+    unavailable --> finishing: Resumed terminal game
+    open --> live: Atomic first claim committed
+    open --> unavailable: Bot down / DB outage
+    live --> finishing: Game ends (mate, flag, resign, abort)
+    live --> unavailable: Persistence failure (fail-closed)
+    finishing --> open: Terminal persistence committed (4 fences satisfied)
+    finishing --> unavailable: Terminal persistence exhausted
+```
+
+1. `unavailable`: The table cannot accept claims. Set when PostgreSQL is unconfigured or unreachable,
+   the featured bot's webhook is unresponsive, or startup reconciliation detects ambiguous state.
+2. `open`: The table is idle, advertising the configured featured bot, `5+3`, and the server-assigned
+   next human color. Exactly 1 bot capacity slot is reserved.
+3. `live`: One active game against the featured bot is in progress. The winning claimant holds player
+   credentials (`playerToken`); spectators observe via WebSocket.
+4. `finishing`: The game has ended in memory; terminal persistence is executing atomically. The table
+   remains closed to new claims until the transaction commits.
+
+The contract enforces fail-closed durability: initial snapshots and each move must commit to PostgreSQL
+before publication, and the table cannot reopen until terminal persistence (final snapshot, `game_results`,
+immutable `game_archive` with `origin = 'showcase'`, and outbox payload) is committed. The full design is
+codified in ADR-005 (#44); concurrency and capacity invariants are detailed in
+[Concurrency](/dicechess-play-api/concurrency/).
+

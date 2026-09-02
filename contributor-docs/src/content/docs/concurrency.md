@@ -76,6 +76,44 @@ surviving generation may invalidate and scrub pending setups created by an earli
 The heartbeat loop is supervised with the server, so losing it cannot silently leave stale admin
 authority in service.
 
+## Showcase admission and first-claim concurrency (ADR-005, #44)
+
+The singleton showcase table introduces three strict concurrency invariants:
+
+### 1. First-claim linearizability ("first visitor wins")
+
+When the table is `open`, multiple visitors may submit `POST /showcase/claim` simultaneously:
+- Exactly one claim commits atomically. The server generates player credentials (`seatToken`) returned only to the
+  winner in a `Cache-Control: no-store` response.
+- Concurrent losers and subsequent callers receive a spectator outcome with the active game ID and WebSocket URL.
+  Losers **never** receive player credentials.
+- Idempotency is keyed by `(actor_id, Idempotency-Key)` for both signed-in users (`user:<uuid>`) and guests (`guestId`).
+  Retrying with the same key returns the committed outcome; conflicting key reuse is rejected as `409 Conflict`.
+- Next human color strictly alternates (White $\leftrightarrow$ Black) upon successful durable room creation. Failed
+  creation does not consume the next color.
+
+### 2. Dedicated capacity reservation and no-borrowing rule
+
+The featured bot declares capacity 3 (`maxConcurrentGames = 3`). Showcase reserves 1 seat (`reservedConcurrentGames = 1`),
+leaving at most 2 seats for general admission:
+$$\text{occupancy}_{\text{general}} \le 2, \quad \text{occupancy}_{\text{showcase}} \le 1, \quad \text{occupancy}_{\text{total}} \le 3$$
+
+Every admission path is classified:
+- `general`: ladder matchmaking (`LadderScheduler`), catalog challenges (`POST /bot/challenge`), lobby bot play
+  (`POST /lobby/play-bot`), direct challenges (`POST /bot/challenges`), and bot seeks (`POST /bot/seeks`). None may
+  consume the reserved seat.
+- `showcase`: `POST /showcase/claim`. Exclusively consumes the reserved seat.
+
+General admission paths **never borrow** the reserved showcase slot, even if the showcase table is idle.
+The central `AdmissionGuard` uses an atomic `acquire -> create/register -> commit` protocol, replacing check-then-create
+to prevent concurrent overshooting.
+
+### 3. Single-node process-local coordinator
+
+In this release, showcase coordination and `AdmissionGuard` are process-local in-memory structures backed by PostgreSQL
+transactions. **Horizontal scaling to multiple nodes is strictly prohibited** until a shared distributed coordinator
+lease (e.g. PostgreSQL row lock / advisory lock lease) is designed and implemented.
+
 ## The server trusts nothing from the client
 
 No code path may accept a client-supplied FEN, dice roll, clock value, or result. Legality is

@@ -1,5 +1,6 @@
 package dicechess.play.server
 
+import cats.effect.kernel.Outcome
 import cats.effect.{IO, Ref}
 import cats.syntax.all.*
 import dicechess.play.core.*
@@ -24,7 +25,8 @@ final class Lobby private (
     botTtl: FiniteDuration,
     maxOpenSeeksPerBot: Int,
     admitBoth: (Principal, Principal) => IO[Boolean],
-    resolveNicknames: List[String] => IO[Map[String, String]]
+    resolveNicknames: List[String] => IO[Map[String, String]],
+    admissionGuard: Option[AdmissionGuard]
 ):
   import Lobby.*
 
@@ -92,16 +94,64 @@ final class Lobby private (
       case Right((_, _, rated)) if rated && GameRegistry.isAnonymous(accepter) =>
         IO.pure(Left(Rejected.RequiresAccount))
       case Right((creator, _, _)) =>
-        admitBoth(creator, accepter).ifM(seat(id, accepter), IO.pure(Left(Rejected.Busy)))
+        admissionGuard match
+          case Some(guard) =>
+            guard
+              .acquire(List(creator, accepter), AdmissionPurpose.Direct)
+              .flatMap:
+                case Left(AdmissionGuard.AdmissionError.Busy(_))     => IO.pure(Left(Rejected.Busy))
+                case Left(AdmissionGuard.AdmissionError.Failed(err)) => IO.pure(Left(Rejected.Failed(err)))
+                case Right(ticket)                                   =>
+                  seat(id, accepter, ticket).guaranteeCase:
+                    case Outcome.Succeeded(_) => IO.unit
+                    case Outcome.Errored(_)   => ticket.release
+                    case Outcome.Canceled()   => ticket.release
+          case None =>
+            admitBoth(creator, accepter).ifM(seatLegacy(id, accepter), IO.pure(Left(Rejected.Busy)))
     }
 
-  /** Claim the seek (so two accepters can't both seat a game) and start the game. */
-  private def seat(id: String, accepter: Principal): IO[Either[Rejected, Match]] =
+  /** Claim the seek (so two accepters can't both seat a game) and start the game within an atomic reservation. */
+  private def seat(
+      id: String,
+      accepter: Principal,
+      ticket: AdmissionGuard.AdmissionTicket
+  ): IO[Either[Rejected, Match]] =
+    (claim(id, accepter), randomBoolean).flatMapN {
+      case (Left(rejected), _) =>
+        ticket.release.as(Left(rejected))
+      case (Right((creator, tc, rated)), swapColor) =>
+        val (white, black) = if swapColor then (accepter, creator) else (creator, accepter)
+        registry.create(white, black, tc, requestedRated = rated, origin = GameOrigin.Lobby).flatMap {
+          case Left(error) =>
+            seeks.update(_.removed(id)) *>
+              ticket.release.as(Left(Rejected.Failed(error)))
+          case Right((gameId, room)) =>
+            val tokens                      = room.joinTokens
+            val (creatorSeat, accepterSeat) = if swapColor then (Seat.Black, Seat.White) else (Seat.White, Seat.Black)
+            (tokens.get(creatorSeat), tokens.get(accepterSeat)) match
+              case (Some(creatorToken), Some(accepterToken)) =>
+                ticket.commit(gameId) *>
+                  seeks
+                    .update(
+                      _.updatedWith(id)(
+                        _.map(
+                          _.copy(state = EntryState.Matched(Match(gameId.value, creatorToken, creatorSeat)))
+                        )
+                      )
+                    )
+                    .as(Right(Match(gameId.value, accepterToken, accepterSeat)))
+              case _ =>
+                seeks.update(_.removed(id)) *>
+                  ticket.release.as(Left(Rejected.Failed("missing seat token")))
+        }
+    }
+
+  private def seatLegacy(id: String, accepter: Principal): IO[Either[Rejected, Match]] =
     (claim(id, accepter), randomBoolean).flatMapN {
       case (Left(rejected), _)                      => IO.pure(Left(rejected))
       case (Right((creator, tc, rated)), swapColor) =>
         val (white, black) = if swapColor then (accepter, creator) else (creator, accepter)
-        registry.create(white, black, tc, requestedRated = rated).flatMap {
+        registry.create(white, black, tc, requestedRated = rated, origin = GameOrigin.Lobby).flatMap {
           case Left(error)           => seeks.update(_.removed(id)).as(Left(Rejected.Failed(error)))
           case Right((gameId, room)) =>
             val tokens                      = room.joinTokens
@@ -232,11 +282,12 @@ object Lobby:
       admitBoth: (Principal, Principal) => IO[Boolean] = AdmitAny,
       // Display names for seek creators — `UserStore.nicknamesByExternalId` in production. Same shape and same default
       // as `GameRegistry.create`: no accounts means every human offers anonymously, as before #194.
-      resolveNicknames: List[String] => IO[Map[String, String]] = _ => IO.pure(Map.empty)
+      resolveNicknames: List[String] => IO[Map[String, String]] = _ => IO.pure(Map.empty),
+      admissionGuard: Option[AdmissionGuard] = None
   ): IO[Lobby] =
     (Ref.of[IO, Map[String, Entry]](Map.empty), Ref.of[IO, Long](0L))
       .mapN((seeks, nextId) =>
-        new Lobby(seeks, registry, nextId, ttl, botTtl, maxOpenSeeksPerBot, admitBoth, resolveNicknames)
+        new Lobby(seeks, registry, nextId, ttl, botTtl, maxOpenSeeksPerBot, admitBoth, resolveNicknames, admissionGuard)
       )
 
   private def randomSecret: IO[String] = IO:

@@ -1,8 +1,9 @@
 package dicechess.play.server
 
+import cats.effect.kernel.Outcome
 import cats.effect.{IO, Ref}
 import cats.syntax.all.*
-import dicechess.play.core.{BotEvent, Challenge, Principal, RatingCategory, TimeControl}
+import dicechess.play.core.*
 
 import scala.concurrent.duration.*
 
@@ -19,7 +20,8 @@ final class Challenges private (
     nextId: Ref[IO, Long],
     ttl: FiniteDuration,
     maxPendingPerBot: Int,
-    admitBoth: (Principal, Principal) => IO[Boolean]
+    admitBoth: (Principal, Principal) => IO[Boolean],
+    admissionGuard: Option[AdmissionGuard]
 ):
   import Challenges.*
 
@@ -78,19 +80,62 @@ final class Challenges private (
     pending.get.map(resolve(_, by, id)).flatMap {
       case Left(rejected)   => IO.pure(Left(rejected))
       case Right(challenge) =>
-        admitBoth(challenge.challenger, challenge.target).ifM(
-          seat(by, id),
-          IO.pure(Left(Rejected.Busy))
-        )
+        admissionGuard match
+          case Some(guard) =>
+            guard
+              .acquire(List(challenge.challenger, challenge.target), AdmissionPurpose.Direct)
+              .flatMap:
+                case Left(AdmissionGuard.AdmissionError.Busy(_))     => IO.pure(Left(Rejected.Busy))
+                case Left(AdmissionGuard.AdmissionError.Failed(err)) => IO.pure(Left(Rejected.Failed(err)))
+                case Right(ticket)                                   =>
+                  seat(by, id, ticket).guaranteeCase:
+                    case Outcome.Succeeded(_) => IO.unit
+                    case Outcome.Errored(_)   => ticket.release
+                    case Outcome.Canceled()   => ticket.release
+          case None =>
+            admitBoth(challenge.challenger, challenge.target).ifM(
+              seatLegacy(by, id),
+              IO.pure(Left(Rejected.Busy))
+            )
     }
 
-  /** Claim the entry (so two accepts can't both seat a game) and start the game. */
-  private def seat(by: Principal, id: String): IO[Either[Rejected, String]] =
+  /** Claim the entry (so two accepts can't both seat a game) and start the game within an atomic reservation. */
+  private def seat(by: Principal, id: String, ticket: AdmissionGuard.AdmissionTicket): IO[Either[Rejected, String]] =
+    claim(by, id).flatMap {
+      case Left(rejected) =>
+        ticket.release.as(Left(rejected))
+      case Right(challenge) =>
+        registry
+          .create(
+            challenge.challenger,
+            challenge.target,
+            challenge.timeControl,
+            requestedRated = challenge.rated,
+            origin = GameOrigin.Direct
+          )
+          .flatMap {
+            case Left(error) =>
+              ticket.release.as(Left(Rejected.Failed(error)))
+            case Right((gameId, _)) =>
+              val started = BotEvent.GameStart(gameId.value)
+              ticket.commit(gameId) *>
+                events.publish(challenge.challenger, started) *>
+                events.publish(challenge.target, started).as(Right(gameId.value))
+          }
+    }
+
+  private def seatLegacy(by: Principal, id: String): IO[Either[Rejected, String]] =
     claim(by, id).flatMap {
       case Left(rejected)   => IO.pure(Left(rejected))
       case Right(challenge) =>
         registry
-          .create(challenge.challenger, challenge.target, challenge.timeControl, requestedRated = challenge.rated)
+          .create(
+            challenge.challenger,
+            challenge.target,
+            challenge.timeControl,
+            requestedRated = challenge.rated,
+            origin = GameOrigin.Direct
+          )
           .flatMap {
             case Left(error)        => IO.pure(Left(Rejected.Failed(error)))
             case Right((gameId, _)) =>
@@ -184,7 +229,8 @@ object Challenges:
       registry: GameRegistry,
       ttl: FiniteDuration = DefaultTtl,
       maxPendingPerBot: Int = DefaultMaxPendingPerBot,
-      admitBoth: (Principal, Principal) => IO[Boolean] = AdmitAny
+      admitBoth: (Principal, Principal) => IO[Boolean] = AdmitAny,
+      admissionGuard: Option[AdmissionGuard] = None
   ): IO[Challenges] =
     (Ref.of[IO, Map[String, Entry]](Map.empty), Ref.of[IO, Long](0L))
-      .mapN(new Challenges(_, events, registry, _, ttl, maxPendingPerBot, admitBoth))
+      .mapN(new Challenges(_, events, registry, _, ttl, maxPendingPerBot, admitBoth, admissionGuard))

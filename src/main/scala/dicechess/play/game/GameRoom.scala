@@ -237,6 +237,9 @@ final class GameRoom private (
     */
   def timeControl: IO[TimeControl] = stateRef.get.map(_.timeControl)
 
+  /** The originating surface of the game (ADR-005, #44, #45, #47). */
+  def origin: IO[GameOrigin] = stateRef.get.map(_.origin)
+
   /** Current public state (for a REST snapshot or a freshly-joining client). */
   def snapshot: IO[PublicGameState] =
     (stateRef.get, IO.monotonic).mapN((s, now) => s.publicAt(now, maxInlinePaths))
@@ -430,6 +433,7 @@ final class GameRoom private (
       timeControl = s.timeControl,
       rated = Some(s.rated), // always written going forward; only pre-existing rows lack the key (see GameSnapshot)
       ladder = Some(s.ladder),
+      origin = Some(s.origin),
       remainingMs = s.remaining.map((seat, left) => seat -> left.toMillis),
       lastRoll = s.lastRoll,
       turns = s.turns,
@@ -747,6 +751,7 @@ object GameRoom:
       // a scheduler-started game, which is what keeps a casual/challenge timeout from ever tripping ladder
       // auto-park (`RatingBatch.shouldPark`, #150).
       ladder: Boolean = false,
+      origin: GameOrigin = GameOrigin.Legacy,
       remaining: Map[Seat, FiniteDuration] = Map.empty,
       turnStartedAt: Option[FiniteDuration] = None,
       // Provably-fair dice gate: `started` flips on the first Begin; `startedAt` stamps it (to measure the seed grace);
@@ -840,6 +845,7 @@ object GameRoom:
       rated: Boolean = false,
       // Whether the ladder scheduler is starting this game — see `Session.ladder`. `false` outside the ladder.
       ladder: Boolean = false,
+      origin: GameOrigin = GameOrigin.Legacy,
       seedGrace: FiniteDuration = DefaultSeedGrace,
       maxInlinePaths: Int = DefaultMaxInlineTurnPaths,
       persist: GameSnapshot => IO[Unit] = _ => IO.unit
@@ -862,6 +868,7 @@ object GameRoom:
             timeControl,
             rated = rated,
             ladder = ladder,
+            origin = origin,
             remaining = initialRemaining(timeControl, players.keys),
             createdAtEpochMs = Some(createdAt.toMillis)
           )
@@ -927,6 +934,9 @@ object GameRoom:
             // resolve that to unrated, exactly like createdAtEpochMs's own absent-key story.
             rated = snapshot.rated.getOrElse(false),
             ladder = snapshot.ladder.getOrElse(false),
+            origin = snapshot.origin.getOrElse(
+              if snapshot.ladder.contains(true) then GameOrigin.Ladder else GameOrigin.Legacy
+            ),
             remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
             // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
             // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.

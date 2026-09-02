@@ -3,6 +3,7 @@ package dicechess.play.store
 import cats.effect.IO
 
 import java.time.Instant
+import java.util.UUID
 import scala.concurrent.duration.FiniteDuration
 
 /** The taxonomy of one webhook turn-delivery attempt (#225) — recorded so an author can tell apart the three
@@ -20,6 +21,7 @@ enum DeliveryOutcome:
   case HttpStatus(code: Int) // non-2xx, the status the endpoint actually sent (preserves it — the diagnosable case)
   case TimedOut              // the server's own per-turn deadline expired before any response arrived
   case Unreachable           // any other transport failure: refused connection, DNS, TLS, a URL-policy re-check
+  case StaleRegistration     // the response lost the registration fence after a replace, rotation, or delete
 
 object DeliveryOutcome:
 
@@ -28,22 +30,23 @@ object DeliveryOutcome:
     * classification stays one NOT NULL column (`bot_webhook_stats.outcome`), not a nullable side column.
     */
   def key(outcome: DeliveryOutcome): String = outcome match
-    case Applied          => "applied"
-    case Declined         => "declined"
-    case Refused          => "refused"
-    case Garbled          => "garbled"
-    case OversizedBody    => "oversized_body"
-    case HttpStatus(code) => s"http_$code"
-    case TimedOut         => "timed_out"
-    case Unreachable      => "unreachable"
+    case Applied           => "applied"
+    case Declined          => "declined"
+    case Refused           => "refused"
+    case Garbled           => "garbled"
+    case OversizedBody     => "oversized_body"
+    case HttpStatus(code)  => s"http_$code"
+    case TimedOut          => "timed_out"
+    case Unreachable       => "unreachable"
+    case StaleRegistration => "stale_registration"
 
   /** Whether this outcome should overwrite a bot's "last failure" (#225's other half of report-it-back). `Declined` is
     * excluded deliberately: an explicit empty-moves answer is the bot behaving exactly as designed, not a fault — the
     * same reasoning `Webhooks.deliverTurn`'s own log line already applies to it.
     */
   def isFailure(outcome: DeliveryOutcome): Boolean = outcome match
-    case Applied | Declined => false
-    case _                  => true
+    case Applied | Declined | StaleRegistration => false
+    case _                                      => true
 
   /** The human-facing sentence stored as `bot_webhooks.last_failure_reason` — written once, at record time, so the read
     * side never has to re-derive prose from the terse storage `key`. Mirrors the wording `Webhooks.deliverTurn`'s own
@@ -51,14 +54,15 @@ object DeliveryOutcome:
     * server log.
     */
   def describe(outcome: DeliveryOutcome): String = outcome match
-    case Applied          => "delivered and applied"
-    case Declined         => "the bot declined (empty moves)"
-    case Refused          => "the room refused the moves"
-    case Garbled          => "the response did not decode as a move"
-    case OversizedBody    => "the response exceeded the size cap"
-    case HttpStatus(code) => s"the endpoint answered HTTP $code"
-    case TimedOut         => "the server's own delivery window expired with no response"
-    case Unreachable      => "could not reach the endpoint"
+    case Applied           => "delivered and applied"
+    case Declined          => "the bot declined (empty moves)"
+    case Refused           => "the room refused the moves"
+    case Garbled           => "the response did not decode as a move"
+    case OversizedBody     => "the response exceeded the size cap"
+    case HttpStatus(code)  => s"the endpoint answered HTTP $code"
+    case TimedOut          => "the server's own delivery window expired with no response"
+    case Unreachable       => "could not reach the endpoint"
+    case StaleRegistration => "response discarded after webhook registration changed"
 
 /** Fixed log-spaced latency histogram — approximates percentiles to the bucket's own resolution, which is the point:
   * "is my endpoint fast or slow" needs a shape, not microsecond precision. Bounds are in milliseconds; the last one
@@ -162,6 +166,21 @@ trait WebhookStatsStore:
       elapsed: FiniteDuration,
       at: Instant
   ): IO[Unit]
+
+  /** Registration-aware write used by the fenced delivery path. Histogram counts remain bot-history scoped, while an
+    * active row's current-health fields may be updated only when this generation is still current. The default keeps
+    * existing test/in-memory stores source-compatible; Postgres overrides it with the guarded update.
+    */
+  def recordDeliveryFor(
+      team: String,
+      name: String,
+      registrationId: UUID,
+      outcome: DeliveryOutcome,
+      elapsed: FiniteDuration,
+      at: Instant
+  ): IO[Unit] =
+    val _ = registrationId
+    recordDelivery(team, name, outcome, elapsed, at)
 
   /** The aggregated windows an author reads: last 24h and last 7d over the histogram, plus the most recent genuine
     * failure (`None` if the bot has never had one — no deliveries yet, or every one so far succeeded or was a clean

@@ -74,6 +74,42 @@ Routes are grouped by audience rather than by resource:
   history and strength endpoints.
 - **Bot API** — everything under `/bot/…`: identity, challenges, seeks, gameplay, streams,
   webhooks, ladder.
+- **Account control** — `/me/…` uses the live `access_token` session and current ownership;
+  `/admin/…` additionally requires the account id in `PLAY_ADMINS`. The parallel staged webhook
+  roots share `SessionWebhookRoutes` and `WebhookManagement`, so only authorization differs —
+  status mapping, CAS, redaction, verification, and audit cannot drift between them. They mount
+  only behind `WEBHOOK_SESSION_MANAGEMENT_ENABLED` plus persistence, session verification, and an
+  explicit origin allow-list; the legacy `/bot/webhook…` contract remains separate. The accepted
+  security/state-machine contract is ADR-004; this page and
+  [Concurrency](/dicechess-play-api/concurrency/) carry everything a contributor needs from it.
 
 The complete, authoritative reference for the bot-facing routes is the
 [Bot API site](https://bots.fortemate.com/), not this page.
+
+## Staged webhook control plane
+
+The staged path deliberately separates browser authorization, durable credential state, and
+outbound networking:
+
+1. `SessionWebhookRoutes` authenticates the live owner/admin session and enforces exact Origin,
+   CSRF, content type, and strong `If-Match` requirements.
+2. `WebhookManagement` validates the typed transition, performs a DB-authoritative authority and
+   revision preflight, then consumes the shared verification budget and coordinates the lease
+   around verification-v2 without exposing stored candidate material. The store repeats authority
+   and CAS checks at mutation/commit time; unauthorized or stale requests spend no budget and cause
+   no DNS or outbound HTTP.
+3. `WebhookManagementStore` / `PgGameStore` own the authoritative revision, registration
+   generation, setup/tombstone lifecycle, admin-authority heartbeat and audit transaction. Security
+   deadlines use the PostgreSQL clock, and activation attempts are reserved when the lease is
+   acquired.
+4. `WebhookTransport` resolves and validates the candidate once, connects to that validated public
+   IP, and retains the hostname for HTTP Host and TLS SNI. The ordinary delivery path reuses this
+   DNS-pinned primitive and checks `registration_id` again before a response can enter `GameRoom`.
+
+`Main` mounts the routes and supervises the 5-second admin-generation heartbeat only when the
+complete staged configuration is present. A generation is live for 20 seconds; overlapping admin
+allow-list generations fail closed until the old one ages out. Deployment ordering is part of the
+architecture, not an operations afterthought: follow the
+[staged webhook rollout runbook](/dicechess-play-api/configuration/#staged-webhook-rollout-runbook),
+including the old-writer/worker drain, DNS-pinning proof, compatible runtime v2 dual-key release,
+and flag-off rollback.

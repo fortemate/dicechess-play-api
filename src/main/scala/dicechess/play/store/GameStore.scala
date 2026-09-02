@@ -452,7 +452,8 @@ final case class BotWebhook(
     url: String,
     secret: String,
     verifiedAt: java.time.Instant,
-    capabilities: List[WebhookCapability] = Nil
+    capabilities: List[WebhookCapability] = Nil,
+    registrationId: java.util.UUID = java.util.UUID.randomUUID()
 )
 
 /** Persistence seam for webhook registrations (F.2, #104). One webhook per bot identity; `put` replaces (re-register
@@ -466,19 +467,44 @@ trait WebhookStore:
   /** Remove the registration. False when the bot had none. */
   def delete(team: String, name: String): IO[Boolean]
 
+  /** Serialize the final current-generation check and the caller's enqueue effect with every registration-changing
+    * mutation. The effect should only enqueue work into the room and return promptly; it must not wait for the room to
+    * process that work while the cross-instance fence is held.
+    */
+  def enqueueIfCurrent[A](team: String, name: String, registrationId: java.util.UUID)(enqueue: IO[A]): IO[Option[A]]
+
 object WebhookStore:
   /** In-memory mode (no `PLAY_DB_URL`): registrations last for the process's lifetime, matching `BotStore.inMemory` —
     * the identities these webhooks belong to die with the process too.
     */
   def inMemory: IO[WebhookStore] =
-    cats.effect.Ref.of[IO, Map[(String, String), BotWebhook]](Map.empty).map { hooks =>
+    (
+      cats.effect.Ref.of[IO, Map[(String, String), BotWebhook]](Map.empty),
+      cats.effect.std.Mutex[IO]
+    ).mapN { (hooks, fence) =>
       new WebhookStore:
         def put(webhook: BotWebhook): IO[Unit] =
-          hooks.update(_.updated((webhook.team, webhook.name), webhook))
+          fence.lock.surround:
+            hooks.update(
+              _.updated(
+                (webhook.team, webhook.name),
+                webhook.copy(registrationId = java.util.UUID.randomUUID())
+              )
+            )
         def get(team: String, name: String): IO[Option[BotWebhook]] =
           hooks.get.map(_.get((team, name)))
         def delete(team: String, name: String): IO[Boolean] =
-          hooks.modify(m => (m.removed((team, name)), m.contains((team, name))))
+          fence.lock.surround:
+            hooks.modify(m => (m.removed((team, name)), m.contains((team, name))))
+        def enqueueIfCurrent[A](
+            team: String,
+            name: String,
+            registrationId: java.util.UUID
+        )(enqueue: IO[A]): IO[Option[A]] =
+          fence.lock.surround:
+            hooks.get.flatMap: current =>
+              if current.get((team, name)).exists(_.registrationId == registrationId) then enqueue.map(Some(_))
+              else IO.pure(None)
     }
 
 /** An undelivered analytics handoff: the game's `GameIngest` payload plus its retry bookkeeping. */

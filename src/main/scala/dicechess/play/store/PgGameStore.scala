@@ -28,6 +28,8 @@ import io.circe.syntax.*
 import org.flywaydb.core.Flyway
 
 import java.sql.SQLException
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import scala.concurrent.duration.*
@@ -53,6 +55,7 @@ final class PgGameStore private (xa: Transactor[IO])
     with LeaderboardStore
     with BotCatalogStore
     with WebhookStore
+    with WebhookManagementStore
     with WebhookStatsStore
     with UserStore:
   import PgGameStore.{
@@ -344,9 +347,17 @@ final class PgGameStore private (xa: Transactor[IO])
 
   /** Claim the identity atomically: the primary key makes a concurrent double-register lose cleanly. */
   def register(team: String, name: String, tokenHash: String, owner: Option[String]): IO[Boolean] =
-    sql"""INSERT INTO play.bots (team, name, token_hash, owner_external_id)
-          VALUES ($team, $name, $tokenHash, $owner)
-          ON CONFLICT (team, name) DO NOTHING""".update.run
+    val insert =
+      sql"""INSERT INTO play.bots (team, name, token_hash, owner_external_id)
+            VALUES ($team, $name, $tokenHash, $owner)
+            ON CONFLICT (team, name) DO NOTHING""".update.run
+    owner
+      .fold(insert): ownerExternalId =>
+        for
+          _    <- userAuthorityFence(ownerExternalId)
+          live <- lockUserAuthorityAccount(ownerExternalId)
+          rows <- if live then insert else 0.pure[ConnectionIO]
+        yield rows
       .transact(xa)
       .timeout(SaveTimeout)
       .map(_ == 1)
@@ -357,25 +368,111 @@ final class PgGameStore private (xa: Transactor[IO])
     * read distinguishes them for the caller's status code rather than guessing.
     */
   def claimOwner(team: String, name: String, ownerExternalId: String): IO[OwnerClaim] =
-    val claim =
-      sql"""UPDATE play.bots SET owner_external_id = $ownerExternalId
-            WHERE team = $team AND name = $name
-              AND (owner_external_id IS NULL OR owner_external_id = $ownerExternalId)""".update.run
-    val exists = sql"""SELECT 1 FROM play.bots WHERE team = $team AND name = $name""".query[Int].option
-    claim
-      .flatMap {
-        case 1 => OwnerClaim.Claimed.pure[ConnectionIO]
-        case _ => exists.map(_.fold(OwnerClaim.NotRegistered)(_ => OwnerClaim.ClaimedByAnother))
-      }
+    val actor   = WebhookActor(WebhookActorKind.Owner, ownerExternalId)
+    val context = WebhookRequestContext(None)
+    (for
+      _             <- userAuthorityFence(ownerExternalId)
+      authorityLive <- lockUserAuthorityAccount(ownerExternalId)
+      result        <-
+        if !authorityLive then OwnerClaim.ClaimedByAnother.pure[ConnectionIO]
+        else
+          for
+            _      <- webhookFence(team, name)
+            locked <- lockWebhookBot(team, name)
+            now    <- databaseClock
+            botOpt <- locked.traverse(expirePendingWebhookSetup(_, now, context))
+            result <- botOpt match
+              case None => OwnerClaim.NotRegistered.pure[ConnectionIO]
+              case Some(bot) if bot.ownerExternalId.exists(_ != ownerExternalId) =>
+                OwnerClaim.ClaimedByAnother.pure[ConnectionIO]
+              case Some(bot) if bot.ownerExternalId.contains(ownerExternalId) =>
+                OwnerClaim.Claimed.pure[ConnectionIO]
+              case Some(bot) =>
+                val nextRevision = UUID.randomUUID()
+                for
+                  registrationId <- activeRegistrationId(bot)
+                  pending        <- pendingWebhookSetup(bot)
+                  _              <- pending.traverse_ { setup =>
+                    terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
+                      auditWebhookTx(
+                        actor,
+                        bot,
+                        WebhookSetupInvalidateAction,
+                        context,
+                        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+                        Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "ownership_change".asJson)
+                      )
+                  }
+                  _ <- sql"""UPDATE play.bots
+                             SET owner_external_id = $ownerExternalId,
+                                 ownership_generation = ownership_generation + 1,
+                                 webhook_revision = $nextRevision
+                             WHERE team = $team AND name = $name AND owner_external_id IS NULL""".update.run
+                  _ <- auditWebhookTx(
+                    actor,
+                    bot,
+                    "webhook.authority.owner_claim",
+                    context,
+                    WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+                    Json.obj(
+                      "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
+                      "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson
+                    )
+                  )
+                yield OwnerClaim.Claimed
+          yield result
+    yield result)
       .transact(xa)
       .timeout(SaveTimeout)
 
   def releaseOwner(team: String, name: String, ownerExternalId: String): IO[Boolean] =
-    sql"""UPDATE play.bots SET owner_external_id = NULL
-          WHERE team = $team AND name = $name AND owner_external_id = $ownerExternalId""".update.run
+    val actor   = WebhookActor(WebhookActorKind.Owner, ownerExternalId)
+    val context = WebhookRequestContext(None)
+    (for
+      _      <- userAuthorityFence(ownerExternalId)
+      _      <- lockUserAuthorityAccount(ownerExternalId)
+      _      <- webhookFence(team, name)
+      locked <- lockWebhookBot(team, name)
+      now    <- databaseClock
+      botOpt <- locked.traverse(expirePendingWebhookSetup(_, now, context))
+      result <- botOpt match
+        case Some(bot) if bot.ownerExternalId.contains(ownerExternalId) =>
+          val nextRevision = UUID.randomUUID()
+          for
+            registrationId <- activeRegistrationId(bot)
+            pending        <- pendingWebhookSetup(bot)
+            _              <- pending.traverse_ { setup =>
+              terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
+                auditWebhookTx(
+                  actor,
+                  bot,
+                  WebhookSetupInvalidateAction,
+                  context,
+                  WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+                  Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "ownership_change".asJson)
+                )
+            }
+            _ <- sql"""UPDATE play.bots
+                       SET owner_external_id = NULL,
+                           ownership_generation = ownership_generation + 1,
+                           webhook_revision = $nextRevision
+                       WHERE team = $team AND name = $name AND owner_external_id = $ownerExternalId""".update.run
+            _ <- auditWebhookTx(
+              actor,
+              bot,
+              "webhook.authority.owner_release",
+              context,
+              WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+              Json.obj(
+                "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
+                "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson
+              )
+            )
+          yield true
+        case _ => false.pure[ConnectionIO]
+    yield result)
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_ == 1)
 
   /** The bot listings (this one, [[adminBots]], [[catalogBots]]) all show ONE rating per card, so each picks a category
     * and says which: [[RatingCategory.Default]], the same scale an unqualified `/leaderboard` answers on, so a card and
@@ -704,33 +801,1283 @@ final class PgGameStore private (xa: Transactor[IO])
 
   // ── WebhookStore (F.2, #104) ────────────────────────────────────────────────
 
-  /** Upsert: a re-register replaces URL and secret together (the old secret stops signing immediately). */
-  def put(webhook: BotWebhook): IO[Unit] =
-    val capabilities = webhook.capabilities.map(_.wireName)
-    sql"""INSERT INTO play.bot_webhooks (team, name, url, secret, verified_at, capabilities)
-          VALUES (${webhook.team}, ${webhook.name}, ${webhook.url}, ${webhook.secret}, ${webhook.verifiedAt}, $capabilities)
-          ON CONFLICT (team, name)
-          DO UPDATE SET url = EXCLUDED.url, secret = EXCLUDED.secret, verified_at = EXCLUDED.verified_at, capabilities = EXCLUDED.capabilities""".update.run
-      .transact(xa)
-      .timeout(SaveTimeout)
+  final private case class WebhookBotControl(
+      team: String,
+      name: String,
+      incarnationId: UUID,
+      revision: UUID,
+      ownerExternalId: Option[String],
+      ownershipGeneration: Long
+  )
+
+  final private case class PendingWebhookSetupRow(
+      setupId: UUID,
+      kind: WebhookSetupKind,
+      actorKind: String,
+      actorId: String,
+      authorityGeneration: String,
+      activationRevision: UUID,
+      candidateUrl: String,
+      candidateSecret: String,
+      candidateCapabilities: Option[List[String]],
+      createdAt: Instant,
+      expiresAt: Instant,
+      attempts: Int,
+      leaseId: Option[UUID],
+      leaseExpiresAt: Option[Instant]
+  )
+
+  final private case class WebhookAuditTransition(
+      beforeRevision: UUID,
+      afterRevision: UUID,
+      beforeRegistrationId: Option[UUID],
+      afterRegistrationId: Option[UUID]
+  )
+
+  private val WebhookSetupInvalidateAction = "webhook.setup.invalidate"
+
+  private def webhookFence(team: String, name: String): ConnectionIO[Unit] =
+    val key = s"${team.length}:$team$name"
+    sql"""SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($key, 0))""".query[Int].unique.void
+
+  /** Account deletion and every owner/admin control-plane transaction acquire this fence before any bot fence. The row
+    * lock additionally serializes a direct `is_active` revocation that does not know about the advisory-lock protocol.
+    */
+  private def userAuthorityFence(ownerExternalId: String): ConnectionIO[Unit] =
+    val identity = userAuthorityId(ownerExternalId).fold(ownerExternalId)(_.toString)
+    val key      = s"webhook-user-authority:$identity"
+    sql"""SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($key, 0))""".query[Int].unique.void
+
+  private def userAuthorityId(ownerExternalId: String): Option[UUID] =
+    scala.util.Try(UUID.fromString(ownerExternalId.stripPrefix("user:"))).toOption
+
+  private def sameUserAuthority(left: String, right: String): Boolean =
+    (userAuthorityId(left), userAuthorityId(right)).mapN(_ == _).getOrElse(left == right)
+
+  private def lockUserAuthorityAccount(ownerExternalId: String): ConnectionIO[Boolean] =
+    userAuthorityId(ownerExternalId).fold(false.pure[ConnectionIO]): userId =>
+      sql"""SELECT is_active FROM play.users WHERE id = $userId FOR UPDATE"""
+        .query[Boolean]
+        .option
+        .map(_.contains(true))
+
+  private def lockWebhookBot(team: String, name: String): ConnectionIO[Option[WebhookBotControl]] =
+    sql"""SELECT incarnation_id, webhook_revision, owner_external_id, ownership_generation
+          FROM play.bots
+          WHERE team = $team AND name = $name
+          FOR UPDATE"""
+      .query[(UUID, UUID, Option[String], Long)]
+      .option
+      .map(_.map { case (incarnation, revision, owner, generation) =>
+        WebhookBotControl(team, name, incarnation, revision, owner, generation)
+      })
+
+  private def webhookSetupKind(value: String): WebhookSetupKind =
+    WebhookSetupKind.values
+      .find(_.wireName == value)
+      .getOrElse(throw new IllegalStateException(s"invalid stored webhook setup kind: $value"))
+
+  private def webhookTerminalStatus(value: String): WebhookSetupTerminalStatus =
+    WebhookSetupTerminalStatus.values
+      .find(_.wireName == value)
+      .getOrElse(throw new IllegalStateException(s"invalid stored webhook setup status: $value"))
+
+  private def pendingWebhookSetup(bot: WebhookBotControl): ConnectionIO[Option[PendingWebhookSetupRow]] =
+    sql"""SELECT setup_id, kind, actor_kind, actor_id, authority_generation, activation_revision,
+                 candidate_url, candidate_secret, candidate_capabilities, created_at, expires_at,
+                 activation_attempts, lease_id, lease_expires_at
+          FROM play.bot_webhook_setups
+          WHERE team = ${bot.team} AND name = ${bot.name}
+            AND bot_incarnation_id = ${bot.incarnationId} AND status = 'pending'"""
+      .query[
+        (
+            UUID,
+            String,
+            String,
+            String,
+            String,
+            UUID,
+            String,
+            String,
+            Option[List[String]],
+            Instant,
+            Instant,
+            Int,
+            Option[UUID],
+            Option[Instant]
+        )
+      ]
+      .option
+      .map(_.map {
+        case (
+              setupId,
+              kind,
+              actorKind,
+              actorId,
+              authorityGeneration,
+              activationRevision,
+              candidateUrl,
+              candidateSecret,
+              capabilities,
+              createdAt,
+              expiresAt,
+              attempts,
+              leaseId,
+              leaseExpiresAt
+            ) =>
+          PendingWebhookSetupRow(
+            setupId,
+            webhookSetupKind(kind),
+            actorKind,
+            actorId,
+            authorityGeneration,
+            activationRevision,
+            candidateUrl,
+            candidateSecret,
+            capabilities,
+            createdAt,
+            expiresAt,
+            attempts,
+            leaseId,
+            leaseExpiresAt
+          )
+      })
+
+  private def actorAuthorized(bot: WebhookBotControl, actor: WebhookActor): Boolean = actor.kind match
+    case WebhookActorKind.Owner => bot.ownerExternalId.contains(actor.id)
+    case WebhookActorKind.Admin => true
+    case _                      => false
+
+  /** Lifecycle deadlines are compared against the database clock so replicas with skewed JVM clocks cannot steal a live
+    * activation lease, extend a setup, or reset a shared verification budget early.
+    */
+  private def databaseClock: ConnectionIO[Instant] =
+    sql"SELECT clock_timestamp()".query[Instant].unique
+
+  private def adminAuthorityFence: ConnectionIO[Unit] =
+    sql"SELECT 1 FROM pg_advisory_xact_lock(hashtextextended('webhook-admin-authority', 0))"
+      .query[Int]
+      .unique
       .void
 
+  private def soleLiveAdminAuthorityGeneration(at: Instant): ConnectionIO[Option[String]] =
+    val liveAfter = at.minusMillis(WebhookManagementStore.AdminHeartbeatLiveness.toMillis)
+    sql"""SELECT min(authority_generation)
+          FROM play.webhook_admin_authority_generations
+          WHERE heartbeat_at > $liveAfter
+          HAVING count(*) = 1""".query[String].option
+
+  private def adminAuthorityGenerationLive(generation: String): ConnectionIO[Boolean] =
+    databaseClock.flatMap { at =>
+      soleLiveAdminAuthorityGeneration(at).map(_.contains(generation))
+    }
+
+  private def actorAuthorityLive(bot: WebhookBotControl, actor: WebhookActor): ConnectionIO[Boolean] =
+    val userId = userAuthorityId(actor.id)
+    if !actorAuthorized(bot, actor) then false.pure[ConnectionIO]
+    else
+      userId.fold(false.pure[ConnectionIO]): id =>
+        sql"""SELECT is_active FROM play.users WHERE id = $id"""
+          .query[Boolean]
+          .option
+          .flatMap:
+            case Some(true) if actor.kind == WebhookActorKind.Admin =>
+              adminAuthorityGenerationLive(actor.authorityGeneration)
+            case active => active.contains(true).pure[ConnectionIO]
+
+  private def currentAuthorityGeneration(bot: WebhookBotControl, actor: WebhookActor): String = actor.kind match
+    case WebhookActorKind.Owner => bot.ownershipGeneration.toString
+    case _                      => actor.authorityGeneration
+
+  private def setupActorMatches(
+      bot: WebhookBotControl,
+      setup: PendingWebhookSetupRow,
+      actor: WebhookActor
+  ): Boolean =
+    setup.actorKind == actor.kind.wireName && setup.actorId == actor.id &&
+      setup.authorityGeneration == currentAuthorityGeneration(bot, actor)
+
+  private def activeRegistrationId(bot: WebhookBotControl): ConnectionIO[Option[UUID]] =
+    sql"""SELECT registration_id FROM play.bot_webhooks
+          WHERE team = ${bot.team} AND name = ${bot.name}""".query[UUID].option
+
+  private def webhookSlotTx(bot: WebhookBotControl, actor: WebhookActor): ConnectionIO[ManagedWebhookSlot] =
+    val registration =
+      sql"""SELECT registration_id, url, verified_at, capabilities, last_failure_at, last_failure_reason
+            FROM play.bot_webhooks
+            WHERE team = ${bot.team} AND name = ${bot.name}"""
+        .query[(UUID, String, Instant, List[String], Option[Instant], Option[String])]
+        .option
+        .map(_.map { case (registrationId, url, verifiedAt, capabilities, failureAt, failureReason) =>
+          ManagedWebhookRegistration(
+            registrationId,
+            url,
+            verifiedAt,
+            webhookCapabilities(capabilities),
+            (failureAt, failureReason).mapN(LastFailure.apply)
+          )
+        })
+    (registration, pendingWebhookSetup(bot)).mapN { (active, pending) =>
+      val redactedPending = pending.map: setup =>
+        ManagedPendingWebhookSetup(
+          setup.setupId,
+          setup.kind,
+          setup.candidateUrl,
+          setup.createdAt,
+          setup.expiresAt,
+          canActivate = setupActorMatches(bot, setup, actor)
+        )
+      ManagedWebhookSlot(bot.revision, active, redactedPending)
+    }
+
+  private def terminalWebhookSetup(
+      bot: WebhookBotControl,
+      setupId: UUID
+  ): ConnectionIO[Option[WebhookSetupTerminalStatus]] =
+    sql"""SELECT status FROM play.bot_webhook_setups
+          WHERE setup_id = $setupId AND team = ${bot.team} AND name = ${bot.name}
+            AND bot_incarnation_id = ${bot.incarnationId} AND status <> 'pending'"""
+      .query[String]
+      .option
+      .map(_.map(webhookTerminalStatus))
+
+  private def purgeWebhookTombstones(team: String, name: String, now: Instant): ConnectionIO[Unit] =
+    val before = now.minusMillis(WebhookManagementStore.TombstoneTtl.toMillis)
+    sql"""DELETE FROM play.bot_webhook_setups
+          WHERE team = $team AND name = $name
+            AND status <> 'pending' AND terminated_at <= $before""".update.run.void
+
+  private def terminateWebhookSetup(
+      setupId: UUID,
+      status: WebhookSetupTerminalStatus,
+      now: Instant
+  ): ConnectionIO[Unit] =
+    sql"""UPDATE play.bot_webhook_setups
+          SET status = ${status.wireName}, terminated_at = $now,
+              kind = NULL, actor_kind = NULL, actor_id = NULL, authority_generation = NULL,
+              activation_revision = NULL, candidate_url = NULL, candidate_secret = NULL,
+              candidate_capabilities = NULL, created_at = NULL, expires_at = NULL,
+              activation_attempts = NULL, lease_id = NULL, lease_expires_at = NULL
+          WHERE setup_id = $setupId AND status = 'pending'""".update.run.void
+
+  private def urlFingerprint(url: String): String =
+    MessageDigest
+      .getInstance("SHA-256")
+      .digest(url.getBytes(StandardCharsets.UTF_8))
+      .map(byte => f"${byte & 0xff}%02x")
+      .mkString
+
+  private def registrationAuditMetadata(registration: ManagedWebhookRegistration): Json =
+    Json.obj(
+      "urlFingerprint" -> urlFingerprint(registration.url).asJson,
+      "capabilities"   -> registration.capabilities.map(_.wireName).asJson
+    )
+
+  private def auditWebhookTx(
+      actor: WebhookActor,
+      bot: WebhookBotControl,
+      action: String,
+      context: WebhookRequestContext,
+      transition: WebhookAuditTransition,
+      metadata: Json
+  ): ConnectionIO[Unit] =
+    val adminUserId = Option.when(actor.kind == WebhookActorKind.Admin)(actor.id.stripPrefix("user:"))
+    sql"""INSERT INTO play.admin_actions
+            (admin_user_id, team, name, action, detail, actor_kind, actor_id, request_id,
+             before_revision, after_revision, before_registration_id, after_registration_id,
+             bot_incarnation_id, metadata)
+          VALUES ($adminUserId::uuid, ${bot.team}, ${bot.name}, $action, NULL, ${actor.kind.wireName}, ${actor.id},
+                  COALESCE(${context.requestId}, 'dbtx_' || txid_current()::text),
+                  ${transition.beforeRevision}, ${transition.afterRevision}, ${transition.beforeRegistrationId},
+                  ${transition.afterRegistrationId}, ${bot.incarnationId}, $metadata)""".update.run.void
+
+  private def expirePendingWebhookSetup(
+      bot: WebhookBotControl,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookBotControl] =
+    pendingWebhookSetup(bot).flatMap:
+      case Some(setup) if !setup.expiresAt.isAfter(now) =>
+        val nextRevision = UUID.randomUUID()
+        for
+          registrationId <- activeRegistrationId(bot)
+          _              <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Expired, now)
+          _              <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                     WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+          _ <- auditWebhookTx(
+            WebhookActor(WebhookActorKind.System, "webhook-expiry"),
+            bot,
+            "webhook.setup.expire",
+            context,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+            Json.obj("setupId" -> setup.setupId.toString.asJson)
+          )
+        yield bot.copy(revision = nextRevision)
+      case _ => bot.pure[ConnectionIO]
+
+  /** A sole live admin generation is the DB-authoritative allowlist epoch. Any request that reaches this bot after a
+    * rollout converges destroys a candidate created by the previous epoch before returning or mutating state.
+    */
+  private def invalidateStaleAdminWebhookSetup(
+      bot: WebhookBotControl,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookBotControl] =
+    pendingWebhookSetup(bot).flatMap:
+      case Some(setup) if setup.actorKind == WebhookActorKind.Admin.wireName =>
+        soleLiveAdminAuthorityGeneration(now).flatMap:
+          case Some(generation) if setup.authorityGeneration != generation =>
+            val nextRevision = UUID.randomUUID()
+            for
+              registrationId <- activeRegistrationId(bot)
+              _              <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now)
+              _              <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                         WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+              _ <- auditWebhookTx(
+                WebhookActor(WebhookActorKind.System, "webhook-authority-cleanup"),
+                bot,
+                WebhookSetupInvalidateAction,
+                context,
+                WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+                Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "admin_authority".asJson)
+              )
+            yield bot.copy(revision = nextRevision)
+          case _ => bot.pure[ConnectionIO]
+      case _ => bot.pure[ConnectionIO]
+
+  private def preparedWebhookBot(
+      team: String,
+      name: String,
+      actor: WebhookActor,
+      context: WebhookRequestContext
+  ): ConnectionIO[(Instant, Option[WebhookBotControl])] =
+    for
+      accountActor = actor.kind == WebhookActorKind.Owner || actor.kind == WebhookActorKind.Admin
+      _      <- userAuthorityFence(actor.id).whenA(accountActor)
+      _      <- lockUserAuthorityAccount(actor.id).void.whenA(accountActor)
+      _      <- adminAuthorityFence.whenA(actor.kind == WebhookActorKind.Admin)
+      _      <- webhookFence(team, name)
+      bot    <- lockWebhookBot(team, name)
+      now    <- databaseClock
+      _      <- purgeWebhookTombstones(team, name, now)
+      result <- bot.traverse { current =>
+        expirePendingWebhookSetup(current, now, context).flatMap { unexpired =>
+          if actor.kind == WebhookActorKind.Admin then invalidateStaleAdminWebhookSetup(unexpired, now, context)
+          else unexpired.pure[ConnectionIO]
+        }
+      }
+    yield now -> result
+
+  /** Upsert: a re-register replaces URL and secret together (the old secret stops signing immediately). */
+  def put(webhook: BotWebhook): IO[Unit] =
+    val capabilities   = webhook.capabilities.map(_.wireName)
+    val registrationId = UUID.randomUUID()
+    val nextRevision   = UUID.randomUUID()
+    val actor          = WebhookActor(WebhookActorKind.Bot, s"bot:${webhook.team}:${webhook.name}")
+    val context        = WebhookRequestContext(None)
+    (for
+      _          <- webhookFence(webhook.team, webhook.name)
+      locked     <- lockWebhookBot(webhook.team, webhook.name)
+      now        <- databaseClock
+      rawBot     <- locked.liftTo[ConnectionIO](new IllegalStateException("webhook bot is not registered"))
+      bot        <- expirePendingWebhookSetup(rawBot, now, context)
+      beforeSlot <- webhookSlotTx(bot, actor)
+      beforeRegistrationId = beforeSlot.registration.map(_.registrationId)
+      pending <- pendingWebhookSetup(bot)
+      _       <- pending.traverse_ { setup =>
+        terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
+          auditWebhookTx(
+            actor,
+            bot,
+            WebhookSetupInvalidateAction,
+            context,
+            WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, beforeRegistrationId),
+            Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "legacy_write".asJson)
+          )
+      }
+      _ <- sql"""INSERT INTO play.bot_webhooks
+                    (team, name, url, secret, verified_at, capabilities, registration_id)
+                  VALUES (${webhook.team}, ${webhook.name}, ${webhook.url}, ${webhook.secret},
+                          ${webhook.verifiedAt}, $capabilities, $registrationId)
+                  ON CONFLICT (team, name)
+                  DO UPDATE SET url = EXCLUDED.url, secret = EXCLUDED.secret,
+                                verified_at = EXCLUDED.verified_at, capabilities = EXCLUDED.capabilities,
+                                registration_id = EXCLUDED.registration_id,
+                                last_failure_at = NULL, last_failure_reason = NULL""".update.run
+      _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                 WHERE team = ${webhook.team} AND name = ${webhook.name}""".update.run
+      action = beforeSlot.registration match
+        case None                                      => "webhook.activate.create"
+        case Some(active) if active.url == webhook.url => "webhook.activate.rotate_secret"
+        case Some(_)                                   => "webhook.activate.replace_url"
+      afterMetadata = Json.obj(
+        "urlFingerprint" -> urlFingerprint(webhook.url).asJson,
+        "capabilities"   -> capabilities.asJson
+      )
+      _ <- auditWebhookTx(
+        actor,
+        bot,
+        action,
+        context,
+        WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, Some(registrationId)),
+        Json.obj(
+          "before" -> beforeSlot.registration.map(registrationAuditMetadata).asJson,
+          "after"  -> afterMetadata.asJson,
+          "legacy" -> true.asJson
+        )
+      )
+    yield ())
+      .transact(xa)
+      .timeout(SaveTimeout)
+
   def get(team: String, name: String): IO[Option[BotWebhook]] =
-    sql"""SELECT team, name, url, secret, verified_at, capabilities FROM play.bot_webhooks
+    sql"""SELECT team, name, url, secret, verified_at, capabilities, registration_id FROM play.bot_webhooks
           WHERE team = $team AND name = $name"""
-      .query[(String, String, String, String, Instant, List[String])]
-      .map { case (storedTeam, storedName, url, secret, verifiedAt, capabilities) =>
-        BotWebhook(storedTeam, storedName, url, secret, verifiedAt, webhookCapabilities(capabilities))
+      .query[(String, String, String, String, Instant, List[String], UUID)]
+      .map { case (storedTeam, storedName, url, secret, verifiedAt, capabilities, registrationId) =>
+        BotWebhook(
+          storedTeam,
+          storedName,
+          url,
+          secret,
+          verifiedAt,
+          webhookCapabilities(capabilities),
+          registrationId
+        )
       }
       .option
       .transact(xa)
       .timeout(SaveTimeout)
 
   def delete(team: String, name: String): IO[Boolean] =
-    sql"""DELETE FROM play.bot_webhooks WHERE team = $team AND name = $name""".update.run
+    val actor        = WebhookActor(WebhookActorKind.Bot, s"bot:$team:$name")
+    val context      = WebhookRequestContext(None)
+    val nextRevision = UUID.randomUUID()
+    (for
+      _      <- webhookFence(team, name)
+      locked <- lockWebhookBot(team, name)
+      now    <- databaseClock
+      botOpt <- locked.traverse(expirePendingWebhookSetup(_, now, context))
+      result <- botOpt.fold(false.pure[ConnectionIO]): bot =>
+        for
+          beforeSlot <- webhookSlotTx(bot, actor)
+          beforeRegistrationId = beforeSlot.registration.map(_.registrationId)
+          pending <- pendingWebhookSetup(bot)
+          deleted <- sql"""DELETE FROM play.bot_webhooks WHERE team = $team AND name = $name""".update.run
+          changed = deleted == 1 || pending.isDefined
+          _ <- pending.traverse_ { setup =>
+            terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
+              auditWebhookTx(
+                actor,
+                bot,
+                WebhookSetupInvalidateAction,
+                context,
+                WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, None),
+                Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "legacy_delete".asJson)
+              )
+          }
+          _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                     WHERE team = $team AND name = $name""".update.run.whenA(changed)
+          _ <- auditWebhookTx(
+            actor,
+            bot,
+            "webhook.delete",
+            context,
+            WebhookAuditTransition(bot.revision, nextRevision, beforeRegistrationId, None),
+            Json.obj(
+              "before" -> beforeSlot.registration.map(registrationAuditMetadata).asJson,
+              "after"  -> Json.Null,
+              "legacy" -> true.asJson
+            )
+          ).whenA(changed)
+        yield deleted == 1
+    yield result).transact(xa).timeout(SaveTimeout)
+
+  def enqueueIfCurrent[A](team: String, name: String, registrationId: UUID)(enqueue: IO[A]): IO[Option[A]] =
+    xa.liftF: lift =>
+      for
+        _       <- webhookFence(team, name)
+        current <- sql"""SELECT registration_id FROM play.bot_webhooks
+                         WHERE team = $team AND name = $name""".query[UUID].option
+        result <-
+          if current.contains(registrationId) then lift(enqueue).map(Some(_))
+          else none[A].pure[ConnectionIO]
+      yield result
+    .timeout(SaveTimeout)
+
+  def webhookSlot(
+      team: String,
+      name: String,
+      actor: WebhookActor,
+      now: Instant,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[ManagedWebhookSlot]] =
+    preparedWebhookBot(team, name, actor, context)
+      .flatMap:
+        case (_, None)      => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (_, Some(bot)) =>
+          actorAuthorityLive(bot, actor).flatMap:
+            case false => WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+            case true  => webhookSlotTx(bot, actor).map(WebhookManagementResult.Applied.apply)
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_ == 1)
+
+  def createWebhookSetup(
+      team: String,
+      name: String,
+      actor: WebhookActor,
+      expectedRevision: UUID,
+      setup: NewWebhookSetup,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[CreatedWebhookSetup]] =
+    val nextRevision = UUID.randomUUID()
+    val setupTtl     = java.time.Duration.between(setup.createdAt, setup.expiresAt)
+    preparedWebhookBot(team, name, actor, context)
+      .flatMap:
+        case (_, None)          => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (dbNow, Some(bot)) =>
+          val authoritativeSetup = setup.copy(createdAt = dbNow, expiresAt = dbNow.plus(setupTtl))
+          for
+            authorityLive <- actorAuthorityLive(bot, actor)
+            slot          <- webhookSlotTx(bot, actor)
+            result        <-
+              if !authorityLive then WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+              else if bot.revision != expectedRevision then WebhookManagementResult.Stale(slot).pure[ConnectionIO]
+              else if slot.pendingSetup.isDefined then
+                WebhookManagementResult
+                  .Conflict(WebhookManagementConflict.PendingSetupExists)
+                  .pure[ConnectionIO]
+              else createSetupAgainstSlot(bot, actor, slot, authoritativeSetup, nextRevision, context)
+          yield result
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  private def createSetupAgainstSlot(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      slot: ManagedWebhookSlot,
+      setup: NewWebhookSetup,
+      nextRevision: UUID,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[CreatedWebhookSetup]] =
+    val stateConflict = setup.kind match
+      case WebhookSetupKind.Create if slot.registration.isDefined =>
+        Some(WebhookManagementConflict.WebhookAlreadyRegistered)
+      case WebhookSetupKind.ReplaceUrl | WebhookSetupKind.RotateSecret if slot.registration.isEmpty =>
+        Some(WebhookManagementConflict.WebhookNotRegistered)
+      case WebhookSetupKind.ReplaceUrl if setup.requestedUrl.exists(url => slot.registration.exists(_.url == url)) =>
+        Some(WebhookManagementConflict.ReplacementUrlUnchanged)
+      case _ => None
+    stateConflict.fold(insertWebhookSetup(bot, actor, slot, setup, nextRevision, context))(conflict =>
+      WebhookManagementResult.Conflict(conflict).pure[ConnectionIO]
+    )
+
+  private def insertWebhookSetup(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      slot: ManagedWebhookSlot,
+      setup: NewWebhookSetup,
+      nextRevision: UUID,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[CreatedWebhookSetup]] =
+    val candidateUrl = setup.kind match
+      case WebhookSetupKind.RotateSecret => slot.registration.map(_.url)
+      case _                             => setup.requestedUrl
+    val candidateCapabilities = Option.when(setup.kind == WebhookSetupKind.Create)(
+      setup.capabilities.map(_.wireName)
+    )
+    candidateUrl.fold(
+      new IllegalArgumentException(s"${setup.kind.wireName} setup requires a candidate URL")
+        .raiseError[ConnectionIO, WebhookManagementResult[CreatedWebhookSetup]]
+    ): url =>
+      for
+        _ <- sql"""INSERT INTO play.bot_webhook_setups
+                      (setup_id, team, name, bot_incarnation_id, kind, actor_kind, actor_id,
+                       authority_generation, activation_revision, candidate_url, candidate_secret,
+                       candidate_capabilities, created_at, expires_at)
+                    VALUES (${setup.setupId}, ${bot.team}, ${bot.name}, ${bot.incarnationId}, ${setup.kind.wireName},
+                            ${actor.kind.wireName}, ${actor.id}, ${currentAuthorityGeneration(bot, actor)},
+                            $nextRevision, $url, ${setup.secret}, $candidateCapabilities,
+                            ${setup.createdAt}, ${setup.expiresAt})""".update.run
+        _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                   WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+        registrationId = slot.registration.map(_.registrationId)
+        _ <- auditWebhookTx(
+          actor,
+          bot,
+          "webhook.setup.create",
+          context,
+          WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+          Json.obj(
+            "setupId"        -> setup.setupId.toString.asJson,
+            "kind"           -> setup.kind.wireName.asJson,
+            "urlFingerprint" -> urlFingerprint(url).asJson,
+            "capabilities"   -> candidateCapabilities.asJson
+          )
+        )
+      yield WebhookManagementResult.Applied(
+        CreatedWebhookSetup(setup.setupId, setup.kind, setup.secret, setup.expiresAt, nextRevision)
+      )
+
+  def acquireWebhookActivation(
+      botIdentity: Principal.Bot,
+      actor: WebhookActor,
+      attempt: WebhookActivationAttempt,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[WebhookActivationLease]] =
+    val leaseDuration = java.time.Duration.between(attempt.requestedAt, attempt.leaseExpiresAt)
+    preparedWebhookBot(botIdentity.team, botIdentity.name, actor, context)
+      .flatMap:
+        case (_, None)          => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (dbNow, Some(bot)) =>
+          acquireWebhookActivationTx(
+            bot,
+            actor,
+            attempt.copy(requestedAt = dbNow, leaseExpiresAt = dbNow.plus(leaseDuration)),
+            context
+          )
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  private def acquireWebhookActivationTx(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      attempt: WebhookActivationAttempt,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[WebhookActivationLease]] =
+    val setupId          = attempt.setupId
+    val expectedRevision = attempt.expectedRevision
+    val leaseId          = attempt.leaseId
+    val now              = attempt.requestedAt
+    val leaseExpiresAt   = attempt.leaseExpiresAt
+    (terminalWebhookSetup(bot, setupId), pendingWebhookSetup(bot), actorAuthorityLive(bot, actor)).tupled.flatMap:
+      case (_, _, false)        => WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+      case (Some(status), _, _) => WebhookManagementResult.SetupTerminal(status).pure[ConnectionIO]
+      case (None, None, _)      => WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(setup), _) if setup.setupId != setupId =>
+        WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(_), true) if bot.revision != expectedRevision =>
+        webhookSlotTx(bot, actor).map(WebhookManagementResult.Stale.apply)
+      case (None, Some(setup), true) if !setupActorMatches(bot, setup, actor) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.SetupActorMismatch)
+          .pure[ConnectionIO]
+      case (None, Some(setup), true) if setup.leaseExpiresAt.exists(_.isAfter(now)) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.ActivationInProgress)
+          .pure[ConnectionIO]
+      case (None, Some(setup), true) if setup.attempts >= WebhookManagementStore.MaximumSetupAttempts =>
+        val nextRevision = UUID.randomUUID()
+        for
+          registrationId <- activeRegistrationId(bot)
+          _              <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.AttemptsExhausted, now)
+          _              <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                     WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+          _ <- auditWebhookTx(
+            actor,
+            bot,
+            "webhook.setup.attempts_exhausted",
+            context,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+            Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "lease_expired".asJson)
+          )
+        yield WebhookManagementResult.SetupTerminal(WebhookSetupTerminalStatus.AttemptsExhausted)
+      case (None, Some(setup), true) =>
+        sql"""UPDATE play.bot_webhook_setups
+              SET activation_attempts = activation_attempts + 1,
+                  lease_id = $leaseId, lease_expires_at = $leaseExpiresAt
+              WHERE setup_id = $setupId AND status = 'pending'
+                AND activation_revision = $expectedRevision
+                AND activation_attempts < ${WebhookManagementStore.MaximumSetupAttempts}""".update.run.flatMap:
+          case 1 =>
+            val attemptNumber = setup.attempts + 1
+            for
+              registrationId <- activeRegistrationId(bot)
+              _              <- auditWebhookTx(
+                actor,
+                bot,
+                "webhook.activation.start",
+                context,
+                WebhookAuditTransition(bot.revision, bot.revision, registrationId, registrationId),
+                Json.obj("setupId" -> setup.setupId.toString.asJson, "attempt" -> attemptNumber.asJson)
+              )
+            yield WebhookManagementResult.Applied(
+              WebhookActivationLease(
+                leaseId,
+                setup.setupId,
+                bot.team,
+                bot.name,
+                setup.kind,
+                setup.activationRevision,
+                setup.candidateUrl,
+                setup.candidateSecret,
+                attemptNumber,
+                setup.expiresAt,
+                leaseExpiresAt
+              )
+            )
+          case _ =>
+            WebhookManagementResult
+              .Conflict(WebhookManagementConflict.ActivationInProgress)
+              .pure[ConnectionIO]
+
+  def completeWebhookActivation(
+      actor: WebhookActor,
+      lease: WebhookActivationLease,
+      verifiedAt: Instant,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[ManagedWebhookSlot]] =
+    preparedWebhookBot(lease.team, lease.name, actor, context)
+      .flatMap:
+        case (_, None)          => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (dbNow, Some(bot)) => completeWebhookActivationTx(bot, actor, lease, dbNow, context)
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  private def completeWebhookActivationTx(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      lease: WebhookActivationLease,
+      verifiedAt: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[ManagedWebhookSlot]] =
+    (terminalWebhookSetup(bot, lease.setupId), pendingWebhookSetup(bot), actorAuthorityLive(bot, actor)).tupled.flatMap:
+      case (None, Some(setup), false) if setup.setupId == lease.setupId =>
+        invalidateWebhookSetupForAuthority(bot, actor, setup, verifiedAt, context)
+      case (_, _, false) => WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+      case (Some(_), _, true) if bot.revision != lease.revision =>
+        webhookSlotTx(bot, actor).map(WebhookManagementResult.Stale.apply)
+      case (Some(status), _, _) => WebhookManagementResult.SetupTerminal(status).pure[ConnectionIO]
+      case (None, None, _)      => WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(setup), _) if setup.setupId != lease.setupId =>
+        WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(setup), _) if bot.revision != lease.revision || setup.activationRevision != lease.revision =>
+        webhookSlotTx(bot, actor).map(WebhookManagementResult.Stale.apply)
+      case (None, Some(setup), _) if !setupActorMatches(bot, setup, actor) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.SetupActorMismatch)
+          .pure[ConnectionIO]
+      case (None, Some(setup), _) if !setup.leaseId.contains(lease.leaseId) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.ActivationInProgress)
+          .pure[ConnectionIO]
+      case (None, Some(setup), true) if !setup.leaseExpiresAt.exists(_.isAfter(verifiedAt)) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.ActivationInProgress)
+          .pure[ConnectionIO]
+      case (None, Some(setup), true) =>
+        activateWebhookSetup(bot, actor, setup, verifiedAt, context)
+
+  private def activateWebhookSetup(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      setup: PendingWebhookSetupRow,
+      verifiedAt: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[ManagedWebhookSlot]] =
+    val registrationId = UUID.randomUUID()
+    val nextRevision   = UUID.randomUUID()
+    for
+      beforeSlot   <- webhookSlotTx(bot, actor)
+      capabilities <- setup.kind match
+        case WebhookSetupKind.Create =>
+          webhookCapabilities(setup.candidateCapabilities.getOrElse(Nil)).pure[ConnectionIO]
+        case _ =>
+          beforeSlot.registration
+            .fold(
+              new IllegalStateException("active webhook disappeared while its setup fence was held")
+                .raiseError[ConnectionIO, List[WebhookCapability]]
+            )(_.capabilities.pure[ConnectionIO])
+      capabilityNames = capabilities.map(_.wireName)
+      _ <- sql"""INSERT INTO play.bot_webhooks
+                    (team, name, url, secret, verified_at, capabilities, registration_id,
+                     last_failure_at, last_failure_reason)
+                  VALUES (${bot.team}, ${bot.name}, ${setup.candidateUrl}, ${setup.candidateSecret},
+                          $verifiedAt, $capabilityNames, $registrationId, NULL, NULL)
+                  ON CONFLICT (team, name)
+                  DO UPDATE SET url = EXCLUDED.url, secret = EXCLUDED.secret,
+                                verified_at = EXCLUDED.verified_at, capabilities = EXCLUDED.capabilities,
+                                registration_id = EXCLUDED.registration_id,
+                                last_failure_at = NULL, last_failure_reason = NULL""".update.run
+      _ <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Activated, verifiedAt)
+      _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                 WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+      action = setup.kind match
+        case WebhookSetupKind.Create       => "webhook.activate.create"
+        case WebhookSetupKind.ReplaceUrl   => "webhook.activate.replace_url"
+        case WebhookSetupKind.RotateSecret => "webhook.activate.rotate_secret"
+      _ <- auditWebhookTx(
+        actor,
+        bot,
+        action,
+        context,
+        WebhookAuditTransition(
+          bot.revision,
+          nextRevision,
+          beforeSlot.registration.map(_.registrationId),
+          Some(registrationId)
+        ),
+        Json.obj(
+          "setupId" -> setup.setupId.toString.asJson,
+          "before"  -> beforeSlot.registration.map(registrationAuditMetadata).asJson,
+          "after"   -> Json.obj(
+            "urlFingerprint" -> urlFingerprint(setup.candidateUrl).asJson,
+            "capabilities"   -> capabilityNames.asJson
+          )
+        )
+      )
+      slot <- webhookSlotTx(bot.copy(revision = nextRevision), actor)
+    yield WebhookManagementResult.Applied(slot)
+
+  def failWebhookActivation(
+      actor: WebhookActor,
+      lease: WebhookActivationLease,
+      reason: WebhookActivationFailureReason,
+      now: Instant,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[WebhookActivationFailure]] =
+    preparedWebhookBot(lease.team, lease.name, actor, context)
+      .flatMap:
+        case (_, None)          => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (dbNow, Some(bot)) => failWebhookActivationTx(bot, actor, lease, reason, dbNow, context)
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  private def failWebhookActivationTx(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      lease: WebhookActivationLease,
+      reason: WebhookActivationFailureReason,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[WebhookActivationFailure]] =
+    (terminalWebhookSetup(bot, lease.setupId), pendingWebhookSetup(bot), actorAuthorityLive(bot, actor)).tupled.flatMap:
+      case (None, Some(setup), false) if setup.setupId == lease.setupId =>
+        invalidateWebhookSetupForAuthority(bot, actor, setup, now, context)
+      case (_, _, false) => WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+      case (Some(_), _, true) if bot.revision != lease.revision =>
+        webhookSlotTx(bot, actor).map(WebhookManagementResult.Stale.apply)
+      case (Some(status), _, _) => WebhookManagementResult.SetupTerminal(status).pure[ConnectionIO]
+      case (None, None, _)      => WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(setup), _) if setup.setupId != lease.setupId =>
+        WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(setup), _) if bot.revision != lease.revision || setup.activationRevision != lease.revision =>
+        webhookSlotTx(bot, actor).map(WebhookManagementResult.Stale.apply)
+      case (None, Some(setup), _) if !setupActorMatches(bot, setup, actor) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.SetupActorMismatch)
+          .pure[ConnectionIO]
+      case (None, Some(setup), _) if !setup.leaseId.contains(lease.leaseId) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.ActivationInProgress)
+          .pure[ConnectionIO]
+      case (None, Some(setup), _) if reason == WebhookActivationFailureReason.AuthorityChanged =>
+        invalidateWebhookSetupForAuthority(bot, actor, setup, now, context)
+      case (None, Some(setup), true) if !setup.leaseExpiresAt.exists(_.isAfter(now)) =>
+        WebhookManagementResult
+          .Conflict(WebhookManagementConflict.ActivationInProgress)
+          .pure[ConnectionIO]
+      case (None, Some(setup), true) =>
+        recordWebhookActivationFailure(bot, actor, setup, reason, now, context)
+
+  /** A live account/session is part of a staged credential's authority. If it disappears while the endpoint proof is in
+    * flight, scrub the exact leased candidate at commit time instead of merely leaving its secret parked until TTL. The
+    * revision and audit event commit with the redacted tombstone.
+    */
+  private def invalidateWebhookSetupForAuthority[A](
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      setup: PendingWebhookSetupRow,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[A]] =
+    val nextRevision = UUID.randomUUID()
+    for
+      registrationId <- activeRegistrationId(bot)
+      _              <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now)
+      _              <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                 WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+      _ <- auditWebhookTx(
+        actor,
+        bot,
+        WebhookSetupInvalidateAction,
+        context,
+        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+        Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "authority_changed".asJson)
+      )
+    yield WebhookManagementResult.AuthorityChanged
+
+  private def recordWebhookActivationFailure(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      setup: PendingWebhookSetupRow,
+      reason: WebhookActivationFailureReason,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[WebhookActivationFailure]] =
+    val attempts     = setup.attempts
+    val exhausted    = attempts >= WebhookManagementStore.MaximumSetupAttempts
+    val nextRevision = if exhausted then UUID.randomUUID() else bot.revision
+    for
+      registrationId <- activeRegistrationId(bot)
+      _              <- sql"""UPDATE play.bot_webhook_setups
+                 SET lease_id = NULL, lease_expires_at = NULL
+                 WHERE setup_id = ${setup.setupId} AND status = 'pending'""".update.run
+      _ <- auditWebhookTx(
+        actor,
+        bot,
+        "webhook.activation.failed",
+        context,
+        WebhookAuditTransition(bot.revision, bot.revision, registrationId, registrationId),
+        Json.obj(
+          "setupId" -> setup.setupId.toString.asJson,
+          "attempt" -> attempts.asJson,
+          "reason"  -> reason.wireName.asJson
+        )
+      )
+      _ <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.AttemptsExhausted, now).whenA(exhausted)
+      _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                 WHERE team = ${bot.team} AND name = ${bot.name}""".update.run.whenA(exhausted)
+      _ <- auditWebhookTx(
+        actor,
+        bot,
+        "webhook.setup.attempts_exhausted",
+        context,
+        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+        Json.obj("setupId" -> setup.setupId.toString.asJson)
+      ).whenA(exhausted)
+      slot <- webhookSlotTx(bot.copy(revision = nextRevision), actor)
+    yield WebhookManagementResult.Applied(WebhookActivationFailure(slot, exhausted))
+
+  def cancelWebhookSetup(
+      team: String,
+      name: String,
+      actor: WebhookActor,
+      setupId: UUID,
+      expectedRevision: UUID,
+      now: Instant,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[ManagedWebhookSlot]] =
+    preparedWebhookBot(team, name, actor, context)
+      .flatMap:
+        case (_, None)          => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (dbNow, Some(bot)) => cancelWebhookSetupTx(bot, actor, setupId, expectedRevision, dbNow, context)
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  private def cancelWebhookSetupTx(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      setupId: UUID,
+      expectedRevision: UUID,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[ManagedWebhookSlot]] =
+    (terminalWebhookSetup(bot, setupId), pendingWebhookSetup(bot), actorAuthorityLive(bot, actor)).tupled.flatMap:
+      case (_, _, false)        => WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+      case (Some(status), _, _) => WebhookManagementResult.SetupTerminal(status).pure[ConnectionIO]
+      case (None, None, _)      => WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(setup), _) if setup.setupId != setupId =>
+        WebhookManagementResult.SetupNotFound.pure[ConnectionIO]
+      case (None, Some(_), true) if bot.revision != expectedRevision =>
+        webhookSlotTx(bot, actor).map(WebhookManagementResult.Stale.apply)
+      case (None, Some(setup), true) =>
+        val nextRevision = UUID.randomUUID()
+        for
+          registrationId <- activeRegistrationId(bot)
+          _              <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Cancelled, now)
+          _              <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                     WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+          _ <- auditWebhookTx(
+            actor,
+            bot,
+            "webhook.setup.cancel",
+            context,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+            Json.obj("setupId" -> setup.setupId.toString.asJson)
+          )
+          slot <- webhookSlotTx(bot.copy(revision = nextRevision), actor)
+        yield WebhookManagementResult.Applied(slot)
+
+  def updateWebhookCapabilities(
+      team: String,
+      name: String,
+      actor: WebhookActor,
+      expectedRevision: UUID,
+      capabilities: List[WebhookCapability],
+      now: Instant,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[ManagedWebhookSlot]] =
+    preparedWebhookBot(team, name, actor, context)
+      .flatMap:
+        case (_, None)      => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (_, Some(bot)) =>
+          for
+            authorityLive <- actorAuthorityLive(bot, actor)
+            slot          <- webhookSlotTx(bot, actor)
+            result        <-
+              if !authorityLive then WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+              else if bot.revision != expectedRevision then WebhookManagementResult.Stale(slot).pure[ConnectionIO]
+              else if slot.pendingSetup.isDefined then
+                WebhookManagementResult
+                  .Conflict(WebhookManagementConflict.PendingSetupExists)
+                  .pure[ConnectionIO]
+              else
+                slot.registration match
+                  case None =>
+                    WebhookManagementResult
+                      .Conflict(WebhookManagementConflict.WebhookNotRegistered)
+                      .pure[ConnectionIO]
+                  case Some(active) =>
+                    val nextRevision = UUID.randomUUID()
+                    val names        = capabilities.map(_.wireName)
+                    for
+                      _ <- sql"""UPDATE play.bot_webhooks SET capabilities = $names
+                                 WHERE team = $team AND name = $name
+                                   AND registration_id = ${active.registrationId}""".update.run
+                      _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                                 WHERE team = $team AND name = $name""".update.run
+                      _ <- auditWebhookTx(
+                        actor,
+                        bot,
+                        "webhook.capabilities.update",
+                        context,
+                        WebhookAuditTransition(
+                          bot.revision,
+                          nextRevision,
+                          Some(active.registrationId),
+                          Some(active.registrationId)
+                        ),
+                        Json.obj(
+                          "before" -> active.capabilities.map(_.wireName).asJson,
+                          "after"  -> names.asJson
+                        )
+                      )
+                      updated <- webhookSlotTx(bot.copy(revision = nextRevision), actor)
+                    yield WebhookManagementResult.Applied(updated)
+          yield result
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  def deleteManagedWebhook(
+      team: String,
+      name: String,
+      actor: WebhookActor,
+      expectedRevision: UUID,
+      now: Instant,
+      context: WebhookRequestContext
+  ): IO[WebhookManagementResult[WebhookDeletion]] =
+    preparedWebhookBot(team, name, actor, context)
+      .flatMap:
+        case (_, None)          => WebhookManagementResult.BotNotFound.pure[ConnectionIO]
+        case (dbNow, Some(bot)) =>
+          for
+            authorityLive <- actorAuthorityLive(bot, actor)
+            slot          <- webhookSlotTx(bot, actor)
+            result        <-
+              if !authorityLive then WebhookManagementResult.AuthorityChanged.pure[ConnectionIO]
+              else if bot.revision != expectedRevision then WebhookManagementResult.Stale(slot).pure[ConnectionIO]
+              else deleteManagedWebhookTx(bot, actor, slot, dbNow, context)
+          yield result
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  private def deleteManagedWebhookTx(
+      bot: WebhookBotControl,
+      actor: WebhookActor,
+      slot: ManagedWebhookSlot,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[WebhookManagementResult[WebhookDeletion]] =
+    if slot.registration.isEmpty && slot.pendingSetup.isEmpty then
+      WebhookManagementResult.Applied(WebhookDeletion(slot, changed = false)).pure[ConnectionIO]
+    else
+      val nextRevision = UUID.randomUUID()
+      for
+        pending <- pendingWebhookSetup(bot)
+        _       <- sql"""DELETE FROM play.bot_webhooks
+                   WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+        _ <- pending.traverse_ { setup =>
+          terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Cancelled, now) *>
+            auditWebhookTx(
+              actor,
+              bot,
+              "webhook.setup.cancel",
+              context,
+              WebhookAuditTransition(bot.revision, nextRevision, slot.registration.map(_.registrationId), None),
+              Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "webhook_delete".asJson)
+            )
+        }
+        _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                   WHERE team = ${bot.team} AND name = ${bot.name}""".update.run
+        _ <- auditWebhookTx(
+          actor,
+          bot,
+          "webhook.delete",
+          context,
+          WebhookAuditTransition(bot.revision, nextRevision, slot.registration.map(_.registrationId), None),
+          Json.obj(
+            "before" -> slot.registration.map(registrationAuditMetadata).asJson,
+            "after"  -> Json.Null
+          )
+        )
+        updated <- webhookSlotTx(bot.copy(revision = nextRevision), actor)
+      yield WebhookManagementResult.Applied(WebhookDeletion(updated, changed = true))
+
+  def refreshAdminWebhookAuthority(
+      liveAuthorityGeneration: String,
+      context: WebhookRequestContext
+  ): IO[WebhookAdminAuthorityRefresh] =
+    val systemActor        = WebhookActor(WebhookActorKind.System, "webhook-authority-cleanup")
+    val purgeAllTombstones =
+      for
+        now <- databaseClock
+        before = now.minusMillis(WebhookManagementStore.TombstoneTtl.toMillis)
+        _ <- sql"""DELETE FROM play.bot_webhook_setups
+                    WHERE status <> 'pending' AND terminated_at <= $before""".update.run
+      yield ()
+    val batchSize = WebhookManagementStore.SweepBatchSize
+
+    /** The bots this heartbeat will fence, in ONE query for two reasons.
+      *
+      * The rows: a pending setup past its TTL, plus — only while this generation is authoritative — a pending admin
+      * setup from a dead allow-list generation. Expiry is what destroys a candidate's plaintext secret and URL, and it
+      * is otherwise reached only per-bot from `preparedWebhookBot`/`put`/`delete`/ownership, so an owner who stages a
+      * setup and then abandons it would leave those columns readable until something happened to touch that bot again.
+      * A TTL is not an authority decision, so that half runs on every instance.
+      *
+      * The order: `ORDER BY team, name`, matching `deleteUser`, which is the other transaction that takes more than one
+      * `webhookFence`. Two transactions taking the same fences in different orders deadlock, so the order is part of
+      * the contract and must stay in SQL — sorting the ids in Scala instead would use JDK string ordering where
+      * `deleteUser` uses the database collation, and the two disagree on case.
+      */
+    def sweepTargets(now: Instant, includeStaleAdminSetups: Boolean) =
+      sql"""SELECT team, name FROM play.bot_webhook_setups
+            WHERE status = 'pending'
+              AND (expires_at <= $now
+                   OR ($includeStaleAdminSetups
+                       AND actor_kind = 'admin'
+                       AND authority_generation <> $liveAuthorityGeneration))
+            ORDER BY team, name
+            LIMIT $batchSize""".query[(String, String)].to[List]
+    val refresh =
+      for
+        _   <- adminAuthorityFence
+        now <- databaseClock
+        _   <- sql"""INSERT INTO play.webhook_admin_authority_generations
+                      (authority_generation, heartbeat_at)
+                    VALUES ($liveAuthorityGeneration, $now)
+                    ON CONFLICT (authority_generation)
+                    DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at""".update.run
+        liveAfter = now.minusMillis(WebhookManagementStore.AdminHeartbeatLiveness.toMillis)
+        _ <- sql"""DELETE FROM play.webhook_admin_authority_generations
+                    WHERE heartbeat_at <= $liveAfter""".update.run
+        liveGeneration <- soleLiveAdminAuthorityGeneration(now)
+        authoritative = liveGeneration.contains(liveAuthorityGeneration)
+        targets  <- sweepTargets(now, includeStaleAdminSetups = authoritative)
+        outcomes <- targets.traverse { case (team, name) =>
+          for
+            _      <- webhookFence(team, name)
+            locked <- lockWebhookBot(team, name)
+            botNow <- databaseClock
+            bot    <- locked.traverse(expirePendingWebhookSetup(_, botNow, context))
+            // Expiry moves the revision only when it actually scrubbed a candidate, so this is the exact count.
+            scrubbed = locked.zip(bot).exists(pair => pair._1.revision != pair._2.revision)
+            result <- bot.fold(0.pure[ConnectionIO]): current =>
+              pendingWebhookSetup(current).flatMap:
+                case Some(setup)
+                    if setup.actorKind == WebhookActorKind.Admin.wireName &&
+                      setup.authorityGeneration != liveAuthorityGeneration =>
+                  val nextRevision = UUID.randomUUID()
+                  for
+                    registrationId <- activeRegistrationId(current)
+                    _ <- terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, botNow)
+                    _ <- sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                               WHERE team = $team AND name = $name""".update.run
+                    _ <- auditWebhookTx(
+                      systemActor,
+                      current,
+                      WebhookSetupInvalidateAction,
+                      context,
+                      WebhookAuditTransition(current.revision, nextRevision, registrationId, registrationId),
+                      Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "admin_authority".asJson)
+                    )
+                  yield 1
+                case _ => 0.pure[ConnectionIO]
+          yield (if scrubbed then 1 else 0, result)
+        }
+        completedAt <- databaseClock
+        _           <- sql"""UPDATE play.webhook_admin_authority_generations
+                    SET heartbeat_at = $completedAt
+                    WHERE authority_generation = $liveAuthorityGeneration""".update.run
+      yield WebhookAdminAuthorityRefresh(
+        authoritative,
+        invalidatedSetups = outcomes.map(_._2).sum,
+        expiredSetups = outcomes.map(_._1).sum
+      )
+
+    purgeAllTombstones.transact(xa).timeout(SaveTimeout) *> refresh.transact(xa).timeout(BootTimeout)
+
+  def consumeWebhookVerificationBudget(
+      kind: WebhookBudgetKind,
+      key: String,
+      limit: Int,
+      window: FiniteDuration,
+      now: Instant
+  ): IO[WebhookBudgetDecision] =
+    if limit <= 0 || window <= Duration.Zero then
+      IO.raiseError(new IllegalArgumentException("webhook verification budget must have a positive limit and window"))
+    else
+      val windowMillis = window.toMillis
+      val cleanup      =
+        sql"""DELETE FROM play.webhook_verification_budgets
+              WHERE ctid IN (
+                SELECT ctid
+                FROM play.webhook_verification_budgets
+                WHERE window_expires_at <= clock_timestamp()
+                ORDER BY window_expires_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 128
+              )""".update.run.void
+      val consume = for
+        consumed <- sql"""WITH observed AS (SELECT clock_timestamp() AS at)
+                           INSERT INTO play.webhook_verification_budgets
+                             (budget_kind, budget_key, window_started_at, window_expires_at, attempts)
+                           SELECT ${kind.wireName}, $key, at,
+                                  at + ($windowMillis * INTERVAL '1 millisecond'), 1
+                           FROM observed
+                           ON CONFLICT (budget_kind, budget_key)
+                           DO UPDATE SET
+                             window_started_at = CASE
+                               WHEN play.webhook_verification_budgets.window_started_at <=
+                                    EXCLUDED.window_started_at - ($windowMillis * INTERVAL '1 millisecond')
+                                 THEN EXCLUDED.window_started_at
+                               ELSE play.webhook_verification_budgets.window_started_at
+                             END,
+                             window_expires_at = CASE
+                               WHEN play.webhook_verification_budgets.window_started_at <=
+                                    EXCLUDED.window_started_at - ($windowMillis * INTERVAL '1 millisecond')
+                                 THEN EXCLUDED.window_expires_at
+                               ELSE play.webhook_verification_budgets.window_expires_at
+                             END,
+                             attempts = CASE
+                               WHEN play.webhook_verification_budgets.window_started_at <=
+                                    EXCLUDED.window_started_at - ($windowMillis * INTERVAL '1 millisecond')
+                                 THEN 1
+                               ELSE play.webhook_verification_budgets.attempts + 1
+                             END
+                           RETURNING attempts, window_expires_at"""
+          .query[(Int, Instant)]
+          .unique
+        observedAt <- databaseClock
+      yield (consumed._1, consumed._2, observedAt)
+      cleanup.transact(xa).timeout(SaveTimeout) *>
+        consume.transact(xa).timeout(SaveTimeout).map { case (attempts, expiresAt, observedAt) =>
+          if attempts <= limit then WebhookBudgetDecision.Allowed(limit - attempts)
+          else
+            val remainingMillis = java.time.Duration.between(observedAt, expiresAt).toMillis
+            WebhookBudgetDecision.Limited(math.max(1L, (remainingMillis + 999L) / 1000L))
+        }
 
   // ── WebhookStatsStore (#225) ─────────────────────────────────────────────────
 
@@ -747,6 +2094,26 @@ final class PgGameStore private (xa: Transactor[IO])
       elapsed: FiniteDuration,
       at: Instant
   ): IO[Unit] =
+    recordDeliveryTransaction(team, name, None, outcome, elapsed, at)
+
+  override def recordDeliveryFor(
+      team: String,
+      name: String,
+      registrationId: UUID,
+      outcome: DeliveryOutcome,
+      elapsed: FiniteDuration,
+      at: Instant
+  ): IO[Unit] =
+    recordDeliveryTransaction(team, name, Some(registrationId), outcome, elapsed, at)
+
+  private def recordDeliveryTransaction(
+      team: String,
+      name: String,
+      registrationId: Option[UUID],
+      outcome: DeliveryOutcome,
+      elapsed: FiniteDuration,
+      at: Instant
+  ): IO[Unit] =
     val key             = DeliveryOutcome.key(outcome)
     val bucket          = LatencyHistogram.bucketOf(elapsed)
     val upsertHistogram =
@@ -754,13 +2121,22 @@ final class PgGameStore private (xa: Transactor[IO])
             VALUES ($team, $name, date_trunc('hour', $at::timestamptz), $key, $bucket, 1)
             ON CONFLICT (team, name, hour, outcome, latency_bucket)
             DO UPDATE SET count = play.bot_webhook_stats.count + 1""".update.run.void
-    val markLastFailure =
-      sql"""UPDATE play.bot_webhooks SET last_failure_at = $at, last_failure_reason = ${DeliveryOutcome.describe(
-          outcome
-        )}
-            WHERE team = $team AND name = $name""".update.run.void
-        .whenA(DeliveryOutcome.isFailure(outcome))
-    (upsertHistogram *> markLastFailure).transact(xa).timeout(SaveTimeout)
+    val markLastFailure = registrationId match
+      case Some(currentRegistrationId) =>
+        sql"""UPDATE play.bot_webhooks SET last_failure_at = $at, last_failure_reason = ${DeliveryOutcome.describe(
+            outcome
+          )}
+              WHERE team = $team AND name = $name AND registration_id = $currentRegistrationId
+                AND (last_failure_at IS NULL OR last_failure_at <= $at)""".update.run.void
+      case None =>
+        sql"""UPDATE play.bot_webhooks SET last_failure_at = $at, last_failure_reason = ${DeliveryOutcome.describe(
+            outcome
+          )}
+              WHERE team = $team AND name = $name
+                AND (last_failure_at IS NULL OR last_failure_at <= $at)""".update.run.void
+    (upsertHistogram *> markLastFailure.whenA(DeliveryOutcome.isFailure(outcome)))
+      .transact(xa)
+      .timeout(SaveTimeout)
 
   /** `GET /bot/webhook/stats`'s read: one query covers both windows (7 days is the wider one; the 24h window is
     * re-aggregated from the same rows in Scala, in `DeliveryStatsWindow.aggregate` — no reason to hit Postgres twice
@@ -1601,11 +2977,93 @@ final class PgGameStore private (xa: Transactor[IO])
       .transact(xa)
       .timeout(SaveTimeout)
 
+  private def revokeDeletedUserFromBot(
+      ownerExternalId: String,
+      team: String,
+      name: String,
+      context: WebhookRequestContext
+  ): ConnectionIO[Unit] =
+    val actor = WebhookActor(WebhookActorKind.System, s"account-deletion:$ownerExternalId")
+    for
+      _      <- webhookFence(team, name)
+      locked <- lockWebhookBot(team, name)
+      now    <- databaseClock
+      _      <- locked.traverse_ { rawBot =>
+        expirePendingWebhookSetup(rawBot, now, context).flatMap { bot =>
+          pendingWebhookSetup(bot).flatMap { pending =>
+            val releasesOwnership = bot.ownerExternalId.contains(ownerExternalId)
+            val revokedSetup      =
+              pending.filter(setup => releasesOwnership || sameUserAuthority(setup.actorId, ownerExternalId))
+            if !releasesOwnership && revokedSetup.isEmpty then ().pure[ConnectionIO]
+            else
+              val nextRevision = UUID.randomUUID()
+              for
+                registrationId <- activeRegistrationId(bot)
+                _              <- revokedSetup.traverse_ { setup =>
+                  terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
+                    auditWebhookTx(
+                      actor,
+                      bot,
+                      WebhookSetupInvalidateAction,
+                      context,
+                      WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+                      Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "account_deletion".asJson)
+                    )
+                }
+                _ <-
+                  if releasesOwnership then
+                    sql"""UPDATE play.bots
+                           SET owner_external_id = NULL,
+                               ownership_generation = ownership_generation + 1,
+                               webhook_revision = $nextRevision
+                           WHERE team = $team AND name = $name AND owner_external_id = $ownerExternalId""".update.run.void
+                  else sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+                           WHERE team = $team AND name = $name""".update.run.void
+                _ <- auditWebhookTx(
+                  actor,
+                  bot,
+                  "webhook.authority.owner_release",
+                  context,
+                  WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+                  Json.obj(
+                    "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
+                    "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson,
+                    "reason"                    -> "account_deletion".asJson
+                  )
+                ).whenA(releasesOwnership)
+              yield ()
+          }
+        }
+      }
+    yield ()
+
   def deleteUser(userId: String): IO[Boolean] =
-    sql"""DELETE FROM play.users WHERE id = $userId::uuid""".update.run
+    val ownerExternalId = s"user:$userId"
+    val actorId         = userAuthorityId(ownerExternalId).fold(userId)(_.toString)
+    val context         = WebhookRequestContext(None)
+    (for
+      _      <- userAuthorityFence(ownerExternalId)
+      exists <- sql"""SELECT 1 FROM play.users WHERE id = $userId::uuid FOR UPDATE""".query[Int].option
+      result <- exists.fold(false.pure[ConnectionIO]): _ =>
+        for
+          targets <- sql"""SELECT team, name
+                            FROM (
+                              SELECT team, name FROM play.bots
+                              WHERE owner_external_id = $ownerExternalId
+                              UNION
+                              SELECT team, name FROM play.bot_webhook_setups
+                              WHERE status = 'pending'
+                                AND (actor_id = $ownerExternalId OR actor_id = $actorId)
+                            ) affected
+                            ORDER BY team, name""".query[(String, String)].to[List]
+          _ <- targets.traverse_ { case (team, name) =>
+            revokeDeletedUserFromBot(ownerExternalId, team, name, context)
+          }
+          deleted <- sql"""DELETE FROM play.users WHERE id = $userId::uuid""".update.run
+        yield deleted == 1
+    yield result)
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_ > 0)
 
 object PgGameStore:
 

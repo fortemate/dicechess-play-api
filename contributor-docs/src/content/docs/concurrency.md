@@ -35,6 +35,47 @@ A room depends only on `Principal`, `Seat`, and `PlayerConnection`. It never ref
 WebSocket, an HTTP response, or a webhook. Adding a transport means implementing
 `PlayerConnection`, not touching `GameRoom`.
 
+## Webhook responses need a registration fence
+
+A webhook turn can spend seconds outside this process while an owner rotates its secret, replaces
+its URL, or deletes the registration on another replica. Reading a registration before the HTTP
+call is therefore not authority to apply the response afterward. Every active row has a
+`registration_id`; delivery retains that generation and, before submitting moves, takes the same
+per-bot PostgreSQL advisory fence used by control-plane writes and rechecks that it is still
+current. Replacement/deletion wins cleanly: the late response is recorded as
+`stale_registration`, does not enter `GameRoom`, and cannot overwrite current-generation health.
+
+The network half is fenced too. URL policy resolution produces the public IP address that the
+client actually connects to; the request URI, HTTP Host, and TLS SNI retain the validated hostname.
+Never replace this with "resolve, inspect, then let the normal client resolve again" — that
+reopens DNS rebinding between policy and connect.
+
+## Staged webhook activation is a leased two-phase operation
+
+Setup creation and activation are cross-instance state machines, not process-local critical
+sections. Each mutation takes the per-bot PostgreSQL advisory fence and locks the bot row. Lease
+acquisition atomically binds an opaque lease id to the setup/revision and increments
+`activation_attempts` **before** the external verification request starts. The HTTP call then runs
+outside the database transaction; completion reacquires the fence and must still match the bot
+incarnation, actor authority, slot revision, setup, candidate, and unexpired lease. A second caller
+gets `409 activation_in_progress` while the lease is live.
+
+Reserving the attempt on acquisition is deliberate. If a process dies after sending the request,
+the hard lease expiry permits recovery but the attempt remains consumed; a crash loop cannot turn
+the five-attempt limit into an unlimited verifier. The lease reservation and its
+`webhook.activation.start` audit event commit together, so this crash case is observable even when
+no verification result is ever recorded. Setup, lease, budget, terminal and tombstone
+deadlines are evaluated against PostgreSQL `clock_timestamp()`. Application clocks express
+durations and wire timestamps only, never the cross-replica security boundary.
+
+Admin authority has a database-wide fence of its own. Each enabled instance heartbeats the digest
+of its parsed `PLAY_ADMINS` generation every 5 seconds, and PostgreSQL considers it live for 20
+seconds. Admin webhook requests proceed only when exactly one live generation matches the caller;
+zero live generations or an old/new overlap fail closed as `403 admin_required`. Only the sole
+surviving generation may invalidate and scrub pending setups created by an earlier allow-list.
+The heartbeat loop is supervised with the server, so losing it cannot silently leave stale admin
+authority in service.
+
 ## The server trusts nothing from the client
 
 No code path may accept a client-supplied FEN, dice roll, clock value, or result. Legality is

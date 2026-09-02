@@ -1,7 +1,9 @@
 package dicechess.play.server
 
 import cats.effect.IO
-import org.http4s.Method
+import cats.effect.std.Console
+import cats.syntax.all.*
+import org.http4s.{Method, Uri}
 import org.http4s.headers.Origin
 import org.http4s.server.middleware.{CORS, CORSPolicy}
 import org.typelevel.ci.{CIString, CIStringSyntax}
@@ -23,8 +25,81 @@ object Cors:
 
   private val EnvVar = "PLAY_CORS_ORIGINS"
 
+  /** Parsed `PLAY_CORS_ORIGINS` value shared by the browser CORS middleware and server-side origin guards.
+    *
+    * CORS is a browser response policy, not an authorization check. Session-backed mutation routes can therefore use
+    * [[allows]] themselves and reject a missing or unlisted `Origin` before performing any work. They should also
+    * require [[isExplicitlyConfigured]]: the historical empty configuration means "public, credential-less CORS", not
+    * "trust every origin for a cookie-authenticated mutation".
+    */
+  final class AllowedOrigins private (private val values: Set[String]):
+
+    /** Whether the deployment supplied at least one trusted origin. */
+    def isExplicitlyConfigured: Boolean = values.nonEmpty
+
+    /** Exact match against one concrete scheme/host/port origin. Opaque `Origin: null` is never trusted for an
+      * ambient-cookie request, even if an operator accidentally lists the literal word in the environment.
+      */
+    def allows(origin: Origin): Boolean = origin match
+      case concrete @ Origin.HostList(hosts) if hosts.tail.isEmpty => values.contains(render(concrete))
+      case _                                                       => false
+
+  /** A parsed allow-list together with the entries that were thrown away, so a caller can tell "the operator asked for
+    * nothing" apart from "the operator asked for something unusable".
+    */
+  final case class ParsedOrigins(allowed: AllowedOrigins, rejected: List[String]):
+
+    /** The dangerous case: the operator supplied entries and NONE survived parsing. Silently treating this as "unset"
+      * would swap a restricted, credentialed policy for the public allow-all one.
+      */
+    def isEntirelyUnusable: Boolean = rejected.nonEmpty && !allowed.isExplicitlyConfigured
+
+  object AllowedOrigins:
+    def parse(spec: String): AllowedOrigins = parseDetailed(spec).allowed
+
+    /** Same parse, but keeps the rejected entries. Pure, so tests can assert the diagnosis without an environment. */
+    def parseDetailed(spec: String): ParsedOrigins =
+      val (rejected, accepted) = spec
+        .split(',')
+        .iterator
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .toList
+        .partitionMap(raw => browserOrigin(raw).toRight(raw))
+      ParsedOrigins(new AllowedOrigins(accepted.toSet), rejected)
+
+  /** Read and parse the trusted browser origins without turning them into middleware yet.
+    *
+    * A rejected entry is reported, and a spec none of whose entries is usable aborts the boot. The alternative — the
+    * empty set — is not a smaller version of the operator's intent: [[policy]] reads it as the historical "no
+    * allow-list configured" case and serves credential-less allow-all, so one typo would silently trade a locked-down
+    * credentialed policy for a public one, break every cookie-authenticated browser call, and leave the staged webhook
+    * routes unmounted. `PLAY_CORS_ORIGINS` unset or blank still means allow-all; only a non-empty, wholly unusable
+    * value is an error.
+    */
+  def allowedOriginsFromEnv: IO[AllowedOrigins] =
+    IO(sys.env.getOrElse(EnvVar, "")).flatMap { spec =>
+      val parsed = AllowedOrigins.parseDetailed(spec)
+      val report = Console[IO]
+        .errorln(s"[play][cors] ignoring unusable $EnvVar entries: ${parsed.rejected.mkString(", ")}")
+        .whenA(parsed.rejected.nonEmpty)
+      val abort = IO
+        .raiseError[Unit](
+          new IllegalArgumentException(
+            s"$EnvVar lists only unusable origins (${parsed.rejected.mkString(", ")}); " +
+              "each entry must be one concrete scheme://host[:port] origin. " +
+              s"Leave $EnvVar unset for the credential-less allow-all default."
+          )
+        )
+        .whenA(parsed.isEntirelyUnusable)
+      report *> abort.as(parsed.allowed)
+    }
+
+  /** Parse a comma-separated origin allow-list for a server-side origin guard. */
+  def allowedOrigins(spec: String): AllowedOrigins = AllowedOrigins.parse(spec)
+
   /** Build the policy from `PLAY_CORS_ORIGINS` (empty/unset → allow all, credential-less). */
-  def fromEnv: IO[CORSPolicy] = IO(sys.env.getOrElse(EnvVar, "")).map(policy)
+  def fromEnv: IO[CORSPolicy] = allowedOriginsFromEnv.map(policy)
 
   /** The methods and headers a credentialed policy must enumerate. `*` is illegal alongside
     * `Access-Control-Allow-Credentials`, and http4s enforces that by answering a preflight with NO `Access-Control-*`
@@ -53,7 +128,16 @@ object Cors:
   private val CredentialedMethods: Set[Method] =
     Set(Method.GET, Method.POST, Method.PUT, Method.PATCH, Method.DELETE, Method.OPTIONS)
 
-  private val CredentialedHeaders: Set[CIString] = Set(ci"content-type", ci"authorization")
+  private val CredentialedHeaders: Set[CIString] =
+    Set(ci"content-type", ci"authorization", ci"if-match", ci"x-dicechess-csrf")
+
+  /** Response headers the browser client must be able to read. `etag` carries the `If-Match` revision the staged
+    * webhook API requires on every mutation, `retry-after` the verification budget's reset, and `location` the
+    * canonical path of a freshly created setup — none of the three is CORS-safelisted, so a page that cannot see them
+    * cannot follow the documented contract. `cache-control` and `pragma`, also set on those responses, are safelisted
+    * and need no entry here.
+    */
+  private val ExposedHeaders: Set[CIString] = Set(ci"etag", ci"retry-after", ci"location")
 
   /** Build a policy from a comma-separated origin allow-list. An empty/blank spec allows any origin without
     * credentials; a non-empty list restricts origins AND lets responses carry credentials (the session cookie).
@@ -64,14 +148,56 @@ object Cors:
     * kept their headers, so the API looked healthy while every preflighted POST was blocked by the browser.
     */
   def policy(spec: String): CORSPolicy =
-    val allowed = spec.split(',').iterator.map(_.trim).filter(_.nonEmpty).toSet
-    if allowed.isEmpty then CORS.policy.withAllowMethodsAll.withAllowHeadersAll.withAllowOriginAll
+    policy(AllowedOrigins.parse(spec))
+
+  /** Build the middleware from the same parsed origin set used by server-side session mutation guards. */
+  def policy(allowed: AllowedOrigins): CORSPolicy =
+    if !allowed.isExplicitlyConfigured then
+      CORS.policy.withAllowMethodsAll.withAllowHeadersAll.withAllowOriginAll.withExposeHeadersIn(ExposedHeaders)
     else
       CORS.policy
-        .withAllowOriginHeader(o => allowed.contains(render(o)))
+        .withAllowOriginHeader(allowed.allows)
         .withAllowMethodsIn(CredentialedMethods)
         .withAllowHeadersIn(CredentialedHeaders)
+        .withExposeHeadersIn(ExposedHeaders)
         .withAllowCredentials(true)
 
   /** Render an `Origin` to its header form (`scheme://host[:port]`) for matching against the allow-list. */
   private def render(origin: Origin): String = Origin.headerInstance.value(origin)
+
+  /** The subset of `Origin` values a browser can actually send: exactly one concrete host, a lower-case scheme and
+    * host, no path, and no explicitly written default port.
+    *
+    * `Origin.parse` is far more permissive than the header it models — it accepts `HTTPS://OK.example` verbatim, folds
+    * a trailing path into the host (`https://ok.example/hook` parses with `host = "ok.example/hook"`), and keeps `:443`
+    * where the URL spec's origin serialization elides it. Since [[AllowedOrigins.allows]] matches the browser's
+    * rendered header exactly, and a browser always sends the canonical form, every such entry would be stored and then
+    * match nothing at all — the operator gets a policy that refuses their own site, with no diagnostic anywhere. They
+    * are the same silent misconfiguration as an unparseable entry, so they are reported the same way rather than
+    * accepted into the set.
+    */
+  private def browserOrigin(raw: String): Option[String] =
+    Origin.parse(raw).toOption match
+      case Some(origin @ Origin.HostList(hosts)) if hosts.tail.isEmpty =>
+        val host        = hosts.head
+        val scheme      = host.scheme.value
+        val defaultPort = if scheme == "https" then 443 else if scheme == "http" then 80 else -1
+        Option.when(
+          scheme == scheme.toLowerCase &&
+            host.host.value == host.host.value.toLowerCase &&
+            nameableHost(host.host) &&
+            !host.port.contains(defaultPort)
+        )(render(origin))
+      case _ => None
+
+  /** Hosts within the `reg-name` grammar are still not all reachable names: `Origin.parse` happily accepts a wildcard
+    * host such as `*.fortemate.com`, which no browser can ever send, so it would be stored as a live entry that matches
+    * nothing while making the allow-list look configured — the credentialed policy mounts, the staged webhook routes
+    * mount, and every real request is refused. Address literals are structurally fine and skip the check; a registered
+    * name must look like one, which still admits `localhost`, punycode, hyphens and underscores.
+    */
+  private val NameableHost = "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$".r
+
+  private def nameableHost(host: Uri.Host): Boolean = host match
+    case _: Uri.Ipv4Address | _: Uri.Ipv6Address => true
+    case regName                                 => NameableHost.matches(regName.value)

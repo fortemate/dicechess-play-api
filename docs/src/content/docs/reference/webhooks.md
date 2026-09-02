@@ -5,7 +5,11 @@ description: Register one HTTPS callback and let the server POST your turns — 
 
 The push alternative to streams and polling (**registered bots only**): register an HTTPS callback once, and the server POSTs to it whenever it is your turn — **the HTTP response body is your move**. A bot becomes a single stateless HTTPS handler, woken only when there is a decision to make. Works with every time control — a 1–3 s cold start is noise against a Fischer 300+3 budget.
 
-Webhooks are enabled per server by the operator; when off, registration, inspection, and removal answer `503 Service Unavailable`, and no deliveries run. Two read-only exceptions remain available: the public [capability catalog](#discover-capabilities), because it describes the API contract rather than one bot's configuration, and [delivery stats](#how-to-see-what-is-happening), because they describe history. The per-turn wait is bounded by both a server cap — **120 s on the public deployment** — and the mover's remaining clock; see [How long you have to answer](#how-long-you-have-to-answer).
+Webhooks are enabled per server by the operator; when off, the legacy Bearer-token registration, inspection, and removal routes answer `503 Service Unavailable`, and no deliveries run. Two read-only exceptions remain available: the public [capability catalog](#discover-capabilities), because it describes the API contract rather than one bot's configuration, and [delivery stats](#how-to-see-what-is-happening), because they describe history. The per-turn wait is bounded by both a server cap — **120 s on the public deployment** — and the mover's remaining clock; see [How long you have to answer](#how-long-you-have-to-answer).
+
+The Bearer-token routes documented first are intentionally unchanged. A separate, staged
+[owner/admin management API](#owneradmin-staged-management) adds safe browser control without
+turning a session cookie into a bot token or changing this legacy wire contract.
 
 ## Discover capabilities
 
@@ -35,7 +39,13 @@ Webhooks are enabled per server by the operator; when off, registration, inspect
 { "url": "https://my-function.example.com/dicechess", "capabilities": ["draws"] }
 ```
 
-The URL must be **HTTPS** and resolve to a **public** address — loopback, RFC1918, link-local, CGNAT and IPv6-ULA targets are rejected, so the server can never be pointed at anyone's internal network. Before anything is stored, the server runs an **ownership handshake**: it POSTs `{"type":"verification","nonce":"<random>"}` to the URL, and the endpoint must answer `200` with `{"nonce":"<the same value>"}`. Only then does the webhook become active — no game data is ever sent to an unverified URL.
+The URL must be **HTTPS**, carry a host, use a valid port, and contain **no userinfo and no fragment** (`https://user:pass@host/hook` and `https://host/hook#part` are both refused). Every freshly resolved address must be **globally routable** — loopback, RFC1918, link-local, CGNAT and IPv6-ULA targets are rejected, so the server can never be pointed at anyone's internal network. For IPv6 the requirement is global unicast (`2000::/3`) outside the IANA special-purpose blocks, which also refuses Teredo (`2001::/23`) and 6to4 (`2002::/16`).
+
+:::caution[Policy tightened]
+The userinfo, fragment, port and IPv6 rules above are newer than the original "HTTPS to a public address" wording, and the same policy is re-applied at send time on **every** delivery — not only at registration. A webhook registered before the change that no longer satisfies it keeps its stored row but stops receiving deliveries, reported as an unreachable endpoint. If you registered long ago, re-check your URL against the rules above.
+:::
+
+Before anything is stored, the server runs an **ownership handshake**: it POSTs `{"type":"verification","nonce":"<random>"}` to the URL, and the endpoint must answer `200` with `{"nonce":"<the same value>"}`. This first legacy handshake cannot require HMAC verification: the endpoint receives its new secret only in the successful `201` response. Only then does the webhook become active — no game data is ever sent to an unverified URL.
 
 - **Capabilities** (optional list of canonical names):
   - `"draws"`: Opt in to receive `drawDecision` webhook deliveries when an opponent offers a draw. If omitted, `null`, or empty (the default), draw offers are automatically declined by the server on behalf of the bot, immediately revealing dice and sending a normal `yourTurn` payload.
@@ -56,6 +66,232 @@ The URL must be **HTTPS** and resolve to a **public** address — loopback, RFC1
 `GET /bot/webhook` → `200 { "url": …, "capabilities": ["draws"], "verifiedAt": "2026-07-17T12:00:00Z" }` (the secret is never shown again), or `404` if none. A non-empty `capabilities` array is always canonical; no selection remains backward-compatible as `"capabilities": null` (clients may also tolerate the optional field being absent).
 
 `DELETE /bot/webhook` → `204`; deliveries stop at the **next turn**. Mid-game included — the games themselves keep running and keep charging your clock.
+
+## Owner/admin staged management
+
+The session-management API is an additive control plane for the bot owner UI and break-glass
+administration. It does **not** replace `POST /bot/webhook`, and enabling its routes does not by
+itself enable turn delivery. The backend contract ships dark by default; a server exposes it only
+when its operator explicitly enables the feature and supplies PostgreSQL persistence, account
+sessions, and an exact browser-origin allow-list. This documentation describes the contract, not
+the deployment state of any particular server. The public design record and threat-model summary
+are tracked in [dicechess-play-api issue #10](https://github.com/fortemate/dicechess-play-api/issues/10).
+
+Every operation is available under two roots with identical state-machine behavior:
+
+| Operation | Owner route | Administrator route |
+| --- | --- | --- |
+| Read the redacted slot | `GET /me/bots/{team}/{name}/webhook` | `GET /admin/bots/{team}/{name}/webhook` |
+| Create a pending setup | `POST /me/bots/{team}/{name}/webhook/setups` | `POST /admin/bots/{team}/{name}/webhook/setups` |
+| Verify and activate it | `POST /me/bots/{team}/{name}/webhook/setups/{setupId}/activate` | `POST /admin/bots/{team}/{name}/webhook/setups/{setupId}/activate` |
+| Cancel it | `DELETE /me/bots/{team}/{name}/webhook/setups/{setupId}` | `DELETE /admin/bots/{team}/{name}/webhook/setups/{setupId}` |
+| Replace capabilities only | `PATCH /me/bots/{team}/{name}/webhook/capabilities` | `PATCH /admin/bots/{team}/{name}/webhook/capabilities` |
+| Delete active and pending state | `DELETE /me/bots/{team}/{name}/webhook` | `DELETE /admin/bots/{team}/{name}/webhook` |
+| Read delivery history | `GET /me/bots/{team}/{name}/webhook/stats` | `GET /admin/bots/{team}/{name}/webhook/stats` |
+
+The `/me` root requires the live `access_token` session to own the bot. The `/admin` root requires
+the live account id to be in `PLAY_ADMINS`. Both re-read live authority; an ownership transfer,
+account deactivation, or administrator removal cannot be hidden by an old cookie.
+
+During a rolling `PLAY_ADMINS` change, each enabled API instance heartbeats its hashed allow-list
+generation every 5 seconds and a generation remains live for 20 seconds. If old and new generations
+overlap — or no generation is live — the staged `/admin` routes fail closed with
+`403 admin_required` until the deployment converges. This prevents two replicas from activating
+setups under different administrator lists. The `/me` owner routes are unaffected.
+
+### Browser and concurrency contract
+
+All responses carry `Cache-Control: no-store`. Each slot response also carries a **strong** ETag,
+for example `ETag: "whrev_0197…"`. Treat the revision as opaque: never derive or increment it.
+Every mutation requires all of the following:
+
+- the `access_token` session cookie;
+- an `Origin` header that exactly matches one entry in `PLAY_CORS_ORIGINS`;
+- `X-DiceChess-CSRF: 1`;
+- the last strong ETag copied byte-for-byte into `If-Match`;
+- `Content-Type: application/json` whenever the route has a JSON body.
+
+A missing `If-Match` is `428 Precondition Required`. Wildcards, weak tags, lists, and unquoted
+revisions are `400 Bad Request`. A well-formed but stale revision is `412 Precondition Failed`;
+that problem response includes the current redacted slot and its ETag, so the UI can show what
+changed before asking the user to retry. Missing or unlisted Origin and a missing/wrong CSRF value
+are `403 Forbidden`; JSON-body routes answer `415 Unsupported Media Type` without JSON content.
+
+The redacted read is explicit even when nothing is configured:
+
+```json
+{
+  "revision": "whrev_0197…",
+  "registration": null,
+  "pendingSetup": null
+}
+```
+
+An active registration exposes its opaque `registrationId`, URL, verification time, canonical
+capabilities, and last safe failure summary. A pending setup exposes only its id, kind, candidate
+URL, timestamps, and whether this actor may activate it. Neither shape contains a secret.
+
+### Setup, store, activate
+
+There can be only one live pending setup per bot, and it expires after 15 minutes. Create exactly
+one of these request objects — fields are variant-specific and unknown or cross-variant fields are
+rejected:
+
+```json
+{ "kind": "create", "url": "https://bot.example/turn", "capabilities": ["draws"] }
+```
+
+```json
+{ "kind": "replaceUrl", "url": "https://bot-v2.example/turn", "confirmSecretRotation": true }
+```
+
+```json
+{ "kind": "rotateSecret", "cutoverMode": "dualKey", "confirm": "exact-bot-name" }
+```
+
+`create` is valid only without an active registration. `replaceUrl` and `rotateSecret` require
+one. Both replacement variants mint a new secret and eventually a new `registrationId`;
+`replaceUrl` also requires a different URL. A capability-only patch is separate:
+
+```json
+{ "capabilities": ["draws"] }
+```
+
+It preserves the URL, secret, verification time, registration id, and current health. Only the
+currently selectable capability (`draws`) is accepted; reserved or unknown names are `422`.
+
+Creating a setup returns `201` with `Location`, the new ETag, `Cache-Control: no-store`, and
+`Pragma: no-cache`:
+
+```json
+{
+  "setupId": "whs_0197…",
+  "kind": "create",
+  "secret": "64 lowercase hex characters",
+  "expiresAt": "2026-09-01T10:15:00Z",
+  "revision": "whrev_0197…"
+}
+```
+
+This is the **only** response that contains the candidate secret. Store it before activation. If
+the response is lost, read the slot, cancel the redacted pending setup, and create another one;
+there is no secret-recovery endpoint.
+
+After storing the secret, activate with the setup's current slot ETag:
+
+```json
+{ "secretStored": true }
+```
+
+Activation has one in-flight attempt at a time and at most five attempts. An attempt is consumed
+when the server acquires its database lease, before it sends verification-v2; a server crash or
+timeout after that point does not refund it. This means no more than five outbound verification
+requests can begin for one setup. A failed fifth verification atomically destroys the candidate
+and returns `410 Gone` with `setup_attempts_exhausted`; retry by creating a fresh setup from the
+new current revision. Setup expiry, lease expiry, the verification budgets and the
+15-minute tombstone window are decided against the shared PostgreSQL clock, so a skewed API
+instance cannot extend them. Treat `expiresAt` and `Retry-After` as server-authoritative.
+The old registration remains active until verification succeeds and the new registration commits.
+An activated, cancelled, expired, invalidated, or attempts-exhausted setup remains a redacted
+tombstone for 15 minutes (`410 Gone`), then becomes `404 Not Found`. Cancelling a live setup does
+not disturb the active registration. Deleting the webhook requires an exact bot-name confirmation:
+
+```json
+{ "confirm": "exact-bot-name" }
+```
+
+It destroys active and candidate credentials and stops future deliveries while retaining
+bot-history telemetry and the audit trail. Deleting an already empty slot is a true no-op: its ETag
+does not change and no audit action is invented.
+
+### Verification v2
+
+Activation POSTs a fresh, compact JSON body to the candidate URL:
+
+```json
+{
+  "type": "verification",
+  "version": 2,
+  "bot": { "team": "acme", "name": "greedy" },
+  "setupId": "whs_0197…",
+  "revision": "whrev_0197…",
+  "nonce": "base64url-without-padding"
+}
+```
+
+The request uses the same delivery headers and signature formula as normal webhook traffic:
+`HMAC-SHA256(secretUtf8, timestamp + "." + rawBodyBytes)`. Respond `200 OK` with exactly two fields:
+
+```json
+{ "nonce": "the-exact-request-nonce", "proof": "64 lowercase hex characters" }
+```
+
+Compute `proof` as
+`HMAC-SHA256(secretUtf8, "dicechess-webhook-activate-v2\n" || rawBodyBytes)`. Verify and sign the
+raw bytes, not parsed/reformatted JSON. The server requires an exact nonce echo and compares the
+proof in constant time. It uses a bounded verification timeout and connects only to the public IP
+address it validated for the candidate hostname; Host and TLS SNI remain the original hostname.
+
+For `replaceUrl` and `rotateSecret`, the endpoint needs dual-key pending configuration. Keep
+accepting ordinary game deliveries signed by the current active secret while using the candidate
+secret only to validate the activation-v2 signature and produce its proof. A successful challenge
+does not prove that the server committed the change: promote the pending key and retire the old key
+only after an authoritative slot `GET` shows the new `registrationId` and revision. If commit fails
+or the activation response is lost, the old key remains active.
+
+### Errors and stats scope
+
+Errors use `application/problem+json` with stable `code`, `status`, `title`, `detail`, and
+`instance` fields. A stale-revision problem additionally carries `current`; a rate limit also
+carries `Retry-After`. Common outcomes include `409` for an incompatible state or another pending
+setup, `410` for a setup tombstone, `422` for URL/capability/verification rejection, and `429` for
+the cross-instance verification budget. Secret material, raw transport exceptions, and resolved
+infrastructure details never appear in errors.
+
+Branch on `code`, never on `detail`. The `type` field is `#code-with-dashes` appended to this
+page, so every problem links back to its row below.
+
+Two absences are easy to confuse. `503` (`webhook_verification_unavailable`) means the server runs
+this API but has no outbound verification transport, so reads keep working while setup and
+activation fail closed. The feature gate is different: while it is closed these routes are not
+mounted at all, and the server answers a plain `404` with no problem body — the same answer an
+unknown path gets. Probe with a read before branching on anything else.
+
+#### Problem types
+
+| `code` | `status` | Meaning |
+| --- | --- | --- |
+| <a id="malformed-request"></a>`malformed_request` | 400, 415 | Body is not exactly the shape the variant requires, or `Content-Type` is not `application/json`. |
+| <a id="confirmation-mismatch"></a>`confirmation_mismatch` | 400 | `confirm` does not match the bot name. |
+| <a id="authentication-required"></a>`authentication_required` | 401 | No live account session. |
+| <a id="bot-not-owned"></a>`bot_not_owned` | 403 | The session is valid but does not own this bot. |
+| <a id="admin-required"></a>`admin_required` | 403 | The `/admin` root needs an account listed in `PLAY_ADMINS`. |
+| <a id="csrf-origin-rejected"></a>`csrf_origin_rejected` | 403 | Missing/unlisted `Origin`, or missing `X-DiceChess-CSRF: 1`. |
+| <a id="bot-not-found"></a>`bot_not_found` | 404 | No registered bot at this path. |
+| <a id="setup-not-found"></a>`setup_not_found` | 404 | No setup at this path, or the id is malformed. |
+| <a id="webhook-already-registered"></a>`webhook_already_registered` | 409 | `create` needs an empty slot; use `replaceUrl` or `rotateSecret`. |
+| <a id="webhook-not-registered"></a>`webhook_not_registered` | 409 | `replaceUrl`/`rotateSecret` need an active registration. |
+| <a id="pending-setup-exists"></a>`pending_setup_exists` | 409 | One candidate at a time; cancel the live one first. |
+| <a id="activation-in-progress"></a>`activation_in_progress` | 409 | Another activation holds the lease; retry after it settles. |
+| <a id="setup-actor-mismatch"></a>`setup_actor_mismatch` | 409 | The candidate belongs to the other root's actor. |
+| <a id="replacement-url-unchanged"></a>`replacement_url_unchanged` | 409 | `replaceUrl` must supply a different URL. |
+| <a id="setup-consumed"></a>`setup_consumed` | 410 | Already activated. |
+| <a id="setup-cancelled"></a>`setup_cancelled` | 410 | Cancelled. |
+| <a id="setup-expired"></a>`setup_expired` | 410 | Past its 15-minute TTL. |
+| <a id="setup-invalidated"></a>`setup_invalidated` | 410 | Scrubbed because the actor's authority changed. |
+| <a id="setup-attempts-exhausted"></a>`setup_attempts_exhausted` | 410 | Five activation attempts spent. |
+| <a id="stale-webhook-revision"></a>`stale_webhook_revision` | 412 | `If-Match` is behind; the body carries `current`. |
+| <a id="webhook-url-rejected"></a>`webhook_url_rejected` | 422 | The URL failed the public HTTPS policy. |
+| <a id="webhook-verification-failed"></a>`webhook_verification_failed` | 422 | The endpoint did not return a valid verification-v2 proof. |
+| <a id="capability-rejected"></a>`capability_rejected` | 422 | Unknown capability, or one that is reserved rather than available. |
+| <a id="webhook-revision-required"></a>`webhook_revision_required` | 428 | Every mutation needs a strong `If-Match`. |
+| <a id="webhook-verification-rate-limited"></a>`webhook_verification_rate_limited` | 429 | Verification budget spent; see `Retry-After`. |
+| <a id="webhook-verification-unavailable"></a>`webhook_verification_unavailable` | 503 | This server has no outbound verification transport. |
+
+The session stats response adds `"scope": "bot_history"` and the current `registrationId` (or
+`null`) to the legacy two-window shape. Counts intentionally survive replacement, rotation, and
+deletion: `registrationId` tells the UI which active generation owns current health, while the
+windows answer what has happened to this bot over time.
 
 ## Webhook deliveries
 
@@ -90,9 +326,10 @@ If your webhook declared the `"draws"` capability and the opponent offered a dra
 - Answer `200` with `{"acceptDraw": true}` to accept the draw (game ends ½–½).
 - Answer `200` with `{"acceptDraw": false}` (or empty `{}` / timeout) to decline the draw. The server immediately reveals your dice and sends a subsequent `yourTurn` payload!
 
-### Verify the signature
+### Verify delivery signatures
 
-Every delivery (the verification handshake included) carries two headers:
+Every ordinary `yourTurn`/`drawDecision` delivery, and every staged verification-v2 challenge,
+carries two headers:
 
 ```text
 X-DiceChess-Timestamp: 1752750000
@@ -100,6 +337,12 @@ X-DiceChess-Signature: <64-char hex HMAC-SHA256>
 ```
 
 Verify `HMAC-SHA256(secret, timestamp + "." + rawBody)` equals the signature header and the timestamp is within a few minutes before computing your move.
+
+The initial legacy `POST /bot/webhook` ownership handshake happens before its newly generated
+secret is disclosed. Echo its nonce without requiring HMAC; require HMAC for all deliveries after
+the `201` response. The staged owner/admin flow is different: its candidate secret is returned at
+setup creation, before activation, so verification-v2 must verify the request signature and return
+the proof described above.
 
 ### Respond with the move
 
@@ -171,7 +414,7 @@ GET /bot/webhook/stats
 }
 ```
 
-Two windows — 24 hours and 7 days — each with a count per outcome and three latency percentiles. Outcomes are named for what actually happened: `applied` (a usable move), `declined` (you sent `{"moves":[]}` on purpose), `refused` (the room rejected the moves — stale or illegal), `garbled` (the body didn't decode), `oversized_body`, `http_<code>` (your endpoint answered, just not `200` — this is exactly the "your own platform's request timeout" row from the table above, made visible: a `504` or `524` here means your gateway cut the turn, not this server), `timed_out` (nothing arrived within this server's own window), and `unreachable` (connection refused, DNS, or similar). `lastFailure` is the most recent of everything except `applied`/`declined` — the answer to "is it still broken, and since when" that a table of counts alone can't give.
+Two windows — 24 hours and 7 days — each with a count per outcome and three latency percentiles. Outcomes are named for what actually happened: `applied` (a usable move), `declined` (you sent `{"moves":[]}` on purpose), `refused` (the room rejected the moves — stale or illegal), `garbled` (the body didn't decode), `oversized_body`, `http_<code>` (your endpoint answered, just not `200` — this is exactly the "your own platform's request timeout" row from the table above, made visible: a `504` or `524` here means your gateway cut the turn, not this server), `timed_out` (nothing arrived within this server's own window), `unreachable` (connection refused, DNS, or similar), and `stale_registration` (the response arrived after its registration generation was replaced or deleted and was deliberately discarded). `lastFailure` is the most recent of everything except `applied`/`declined`/`stale_registration` — the answer to "is it still broken, and since when" that a table of counts alone can't give.
 
 Percentiles are bucket-resolution approximations (a fixed set of latency buckets, log-spaced from 50 ms to 300 s), not exact — enough to tell "my p99 moved from 2 s to 30 s" without needing millisecond precision. Recording never sits on the turn path: a delivery is classified and queued the instant it completes, and a slow or unavailable stats write only ever costs a dropped data point, never a turn.
 

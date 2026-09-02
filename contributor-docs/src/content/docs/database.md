@@ -24,6 +24,10 @@ restores a room by decoding one snapshot, not by replaying a log. A partial inde
 `status = 'active'` serves the boot-time resume scan, and a check constraint pins `status` to
 `active` or `ended`.
 
+Under the showcase contract (ADR-005, #44, #47), rows carry an `origin` (`showcase`, `ladder`,
+`catalog`, `lobby`, `direct`, `legacy`) with a partial index on `(id) WHERE origin = 'showcase' AND status = 'active'`
+serving startup reconciliation for the singleton showcase table.
+
 ### `outbox` — transactional delivery to analytics
 
 The finished game's analytics payload, written **in the same transaction as the terminal
@@ -226,6 +230,11 @@ the function, because nothing at this repository's test data volume can catch it
 A sanitized, immutable record of a finished game: play's own durable representation of history,
 independent of both the analytics wire contract and snapshot retention. Access is always by
 game id, so the primary key is the only index.
+
+Under the showcase contract (ADR-005, #44, #47), **every ended showcase game is archived**, including
+technical aborts. Technical aborts retain full move, dice, and fairness material for auditable history,
+but carry `sporting_eligible = false` to guarantee they never pollute sporting ratings or future
+bot-vs-human score totals.
 
 ### `users` — registered player accounts (#232, ADR-0017)
 

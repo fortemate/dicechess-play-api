@@ -126,6 +126,24 @@ invalidates and scrubs pending admin setups from older generations. The `/me` ow
 subject to this admin-generation fence. The heartbeat is a supervised server loop: a database or
 loop failure stops the process instead of leaving it serving stale administrator authority.
 
+## Showcase table (ADR-005, #44)
+
+The singleton showcase table on the homepage (`/`) is controlled by the following variables:
+
+| Variable | Effect |
+| --- | --- |
+| `SHOWCASE_ENABLED` | Enables the singleton showcase table coordinator and routes (`GET /showcase`, `POST /showcase/claim`). Unset or `false` disables the showcase surface entirely. |
+| `SHOWCASE_BOT_TEAM` | Team identifier of the featured bot (e.g. `rpi3`). Required when showcase is enabled. |
+| `SHOWCASE_BOT_NAME` | Name of the featured bot (e.g. `hunter-book`). Required when showcase is enabled. |
+| `SHOWCASE_RESERVED_SEATS` | Dedicated capacity reserved exclusively for the showcase table. When `SHOWCASE_ENABLED=true`, this value must be set to exactly `1`. Values `0` or `> 1` are rejected during configuration validation at boot time. |
+| `SHOWCASE_TIME_CONTROL` | Optional, fixed default `5+3`. The time control used for showcase games. |
+
+:::danger[Showcase requires PostgreSQL persistence]
+The showcase table enforces fail-closed durability: if `PLAY_DB_URL` is unset, the showcase table
+remains `unavailable` and rejects claims. Falling back to an in-memory store is strictly prohibited
+for showcase games.
+:::
+
 ## Staged webhook rollout runbook
 
 This is the required order from ADR-004 §14, reproduced here so the runbook stands on its own.

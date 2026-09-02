@@ -3,7 +3,7 @@ package dicechess.play.server
 import cats.effect.IO
 import cats.effect.std.Console
 import cats.syntax.all.*
-import org.http4s.Method
+import org.http4s.{Method, Uri}
 import org.http4s.headers.Origin
 import org.http4s.server.middleware.{CORS, CORSPolicy}
 import org.typelevel.ci.{CIString, CIStringSyntax}
@@ -185,7 +185,19 @@ object Cors:
         Option.when(
           scheme == scheme.toLowerCase &&
             host.host.value == host.host.value.toLowerCase &&
-            !host.host.value.contains('/') &&
+            nameableHost(host.host) &&
             !host.port.contains(defaultPort)
         )(render(origin))
       case _ => None
+
+  /** Hosts within the `reg-name` grammar are still not all reachable names: `Origin.parse` happily accepts a wildcard
+    * host such as `*.fortemate.com`, which no browser can ever send, so it would be stored as a live entry that matches
+    * nothing while making the allow-list look configured — the credentialed policy mounts, the staged webhook routes
+    * mount, and every real request is refused. Address literals are structurally fine and skip the check; a registered
+    * name must look like one, which still admits `localhost`, punycode, hyphens and underscores.
+    */
+  private val NameableHost = "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$".r
+
+  private def nameableHost(host: Uri.Host): Boolean = host match
+    case _: Uri.Ipv4Address | _: Uri.Ipv6Address => true
+    case regName                                 => NameableHost.matches(regName.value)

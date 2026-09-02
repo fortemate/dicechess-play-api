@@ -221,10 +221,25 @@ class CorsSuite extends munit.CatsEffectSuite:
     assert(!unmatchable.allowed.isExplicitlyConfigured)
     assert(unmatchable.isEntirelyUnusable)
 
-    // The forms a browser does send stay accepted: a non-default port and an IPv6 literal included.
-    val canonical =
-      Cors.AllowedOrigins.parseDetailed("http://localhost:5173, https://fortemate.com, http://[::1]:5173")
+    // A wildcard entry is the same class of mistake and the most tempting one to write, because it is what an
+    // operator reaches for after seeing an allow-list. It parses as a perfectly ordinary reg-name, so without an
+    // explicit check it would be stored, make the list look configured, mount the credentialed policy and the staged
+    // webhook routes — and then match nothing, refusing every real subdomain it was meant to admit.
+    val wildcard = Cors.AllowedOrigins.parseDetailed("https://*.fortemate.com")
+    assertEquals(wildcard.rejected, List("https://*.fortemate.com"))
+    assert(wildcard.isEntirelyUnusable, "a wildcard host must not pass for a configured allow-list")
+    assert(!wildcard.allowed.allows(parsedOrigin("https://app.fortemate.com")))
+
+    // The forms a browser does send stay accepted: a non-default port, an IPv4 and an IPv6 literal, punycode, and the
+    // hyphens and underscores that appear in real host names.
+    val canonical = Cors.AllowedOrigins.parseDetailed(
+      "http://localhost:5173, https://fortemate.com, http://[::1]:5173, http://127.0.0.1:5173, " +
+        "https://xn--80ak6aa92e.com, https://sub.a-b.example.com, https://fortemate_x.com"
+    )
     assertEquals(canonical.rejected, Nil)
+    assert(canonical.allowed.allows(parsedOrigin("http://127.0.0.1:5173")))
+    assert(canonical.allowed.allows(parsedOrigin("https://xn--80ak6aa92e.com")))
+    assert(canonical.allowed.allows(parsedOrigin("https://sub.a-b.example.com")))
     assert(canonical.allowed.allows(parsedOrigin("http://localhost:5173")))
     assert(canonical.allowed.allows(parsedOrigin("https://fortemate.com")))
     assert(canonical.allowed.allows(parsedOrigin("http://[::1]:5173")))

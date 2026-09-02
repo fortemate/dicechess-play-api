@@ -218,6 +218,7 @@ object Main extends IOApp.Simple:
       _ <- warnLegacyLadderVars
       _ <- warnDeprecatedRatedForHumans
       _ <- warnDeprecatedOpenToHumans
+      _ <- warnInertShowcase(enabled = showcaseConfig.enabled, persistenceOn = pgStore.isDefined)
       _ <- warnInertAdmins(sessionOn = authSession.isDefined, persistenceOn = pgStore.isDefined)
       _ <- warnInertWebhookManagement(
         enabled = managedWebhookConfig.isDefined,
@@ -541,6 +542,21 @@ object Main extends IOApp.Simple:
           "PLAY_SESSION_SECRET and PLAY_DB_URL/PLAY_DB_USER/PLAY_DB_PASSWORD. Set both or remove the variable."
       )
       .whenA(sys.env.contains(AdminBotRoutes.EnvVar) && !(sessionOn && persistenceOn))
+
+  /** The showcase table requires PostgreSQL persistence (ADR-005 §7, #47): `GameRegistry` refuses to create a showcase
+    * room over a non-durable store, so `SHOWCASE_ENABLED=true` without `PLAY_DB_URL` reserves a bot seat that nothing
+    * can ever use and answers every claim with a failure. That is the same "set but useless env var" class the ladder
+    * vars above document, so it is loud at boot like its siblings — the reservation itself is deliberately NOT disabled
+    * here, because a silent fallback to unreserved capacity is exactly what ADR-005 forbids.
+    */
+  private def warnInertShowcase(enabled: Boolean, persistenceOn: Boolean): IO[Unit] =
+    cats.effect.std
+      .Console[IO]
+      .errorln(
+        "[play][showcase] SHOWCASE_ENABLED is true but PLAY_DB_URL is unset — showcase games require PostgreSQL " +
+          "persistence and every showcase room creation will be refused. Configure PLAY_DB_URL or disable the showcase."
+      )
+      .whenA(enabled && !persistenceOn)
 
   /** ADR-004's feature flag must never produce a half-mounted cookie mutation surface. In particular, the historical
     * empty CORS setting means public credential-less reads; it is not an origin policy suitable for session writes.

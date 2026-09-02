@@ -161,20 +161,46 @@ stateDiagram-v2
 4. `finishing`: The game has ended in memory; terminal persistence is executing atomically. The table
    remains closed to new claims until the transaction commits.
 
-### Fail-closed persistence and recovery rules
+### Fail-closed persistence and recovery rules (#47)
 
-Showcase games enforce strict, fail-closed durability fences:
-- Initial room snapshots and every intermediate move/roll must commit to PostgreSQL before turn acknowledgement,
-  client broadcast, or bot webhook dispatch.
-- If a required save fails, the room immediately halts forward game progress, retries with bounded backoff, and
-  suppresses turn acknowledgement, spectator event broadcast, and bot webhook delivery for the uncommitted version.
-- If persistence fails unrecoverably or times out, the table transitions directly to `unavailable`. Connected player
-  and spectator WebSocket sessions settle cleanly with close code 1011 (internal error) or a typed termination
-  notice, and the in-memory room is stopped.
-- The table cannot reopen or accept new claims until terminal persistence (final snapshot, `game_results`, immutable
-  `game_archive` with `origin = 'showcase'`, and outbox payload) has successfully committed. On server boot or after an
-  unclean restart, startup reconciliation reads the last durable snapshot or completes pending terminal persistence
-  before reopening the table.
+A showcase room runs under `Durability.Required`; every other room keeps the availability-first
+`Durability.BestEffort` it always had (a failed snapshot write is logged and the game plays on in
+memory). `GameRegistry` picks the mode from the game's origin, at creation and again on resume,
+and refuses to create a showcase room at all over a store that does not claim durability
+(`GameStore.durable` — the in-memory store does not). Under the required mode:
+
+- **Nothing is published before it is committed.** The room's writer fiber persists a version
+  first and only then updates its state and broadcasts. Turn acknowledgement (`submitTurn`'s
+  verdict), spectator WebSocket events and the bot webhook's `yourTurn` are all downstream of that
+  broadcast, so none of them can carry an uncommitted version. The creation snapshot — with
+  `origin = 'showcase'` — is fail-closed in every mode and is what a claim's success answer
+  depends on.
+- **A failed write halts the room and is retried.** Forward progress stops (no command is
+  processed while the write is retried), the mover's clock is credited for the stall, and every
+  attempt is reported through `PersistenceTelemetry` — in production one stderr line per event
+  naming the game and version, saying whether the room is retrying, has given up, or is back.
+  Intermediate writes retry a bounded number of times (four, ~3 s of backoff, each attempt under
+  the store's own save timeout); the ending retries **without bound**, backing off to one attempt
+  every 30 s.
+- **An exhausted intermediate write is a technical abort from the last durable version.** The
+  unsaved move or roll is discarded — a subscriber never saw it — and the room ends with
+  `termination = aborted` built from the last committed state. That abort is itself a terminal
+  write and follows the terminal policy.
+- **Completion follows the commit.** `GameRoom.result` — and with it the registry's
+  deregistration, the admission release and the coordinator's completion hook — fires only once
+  the terminal transaction (final snapshot, `game_results`, immutable `game_archive`, outbox
+  payload) has committed. Duplicate deregistration is a no-op, so a repeated completion cannot
+  reopen the table early.
+- **Stalled sessions are released, not left hanging.** Once a write has been failing for longer
+  than the stall grace (15 s), the room drops its subscribers so their WebSockets close; the room
+  keeps retrying, `GameRoom.persistenceStalled` reads `true` for the coordinator to answer
+  `unavailable`, and a client that reconnects sees the last durable state.
+- **Restart resumes from the last durable version.** There is no partially finalised durable
+  state to reconcile: the terminal write is one transaction, so a game is either still `active`
+  in `games` (resumed by `GameRegistry.resume`, under the required mode again) or fully ended with
+  its archive row. An in-memory ending that never committed before a crash is therefore not an
+  ending — the game resumes at its last committed version, its clocks restart, and it ends again
+  by play, durably.
 
 The full specification is codified in ADR-005 (#44); concurrency and capacity invariants are detailed in
 [Concurrency](/dicechess-play-api/concurrency/).

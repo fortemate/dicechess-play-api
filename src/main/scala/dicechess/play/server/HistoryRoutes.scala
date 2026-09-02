@@ -43,8 +43,14 @@ final case class GameHistory(
     players: Players,
     rated: Boolean,
     timeControl: TimeControl,
-    result: Int,
+    // `None` (`null` on the wire) only for a technically aborted showcase game (ADR-005 §8, #47) — the one kind of
+    // archived game with no sporting outcome. Every other archived game has always had, and keeps, a plain integer.
+    result: Option[Int],
     termination: String,
+    // Where the game came from and whether its outcome counts as a sporting result — the same two values stored
+    // beside the archive payload, so a client never has to infer either from the players.
+    origin: GameOrigin,
+    sportingEligible: Boolean,
     finishedAt: Instant,
     initialDfen: String,
     turns: List[HistoryTurn],
@@ -83,8 +89,8 @@ object HistoryRoutes:
             archive
               .archiveFor(GameId(id))
               .flatMap:
-                case None                                    => NotFound()
-                case Some(ArchivedGame(payload, finishedAt)) =>
+                case None                                                                  => NotFound()
+                case Some(ArchivedGame(payload, finishedAt, storedOrigin, storedEligible)) =>
                   GameArchive.decode(payload) match
                     // The row was written by this same server — a decode failure here means the write/read shapes
                     // have drifted, a bug to surface loudly, not a client-facing 404 (the game plainly did finish
@@ -107,6 +113,12 @@ object HistoryRoutes:
                           timeControl = record.timeControl,
                           result = record.result,
                           termination = record.termination,
+                          // The V5 columns, not the payload's keys: a row archived before #47 has no such keys (the
+                          // decoder answers `Legacy`/`true` for it) while the migration back-filled its columns from
+                          // the snapshot, the ladder flag and the result row — so the columns are the authoritative
+                          // answer for every row, old or new.
+                          origin = storedOrigin,
+                          sportingEligible = storedEligible,
                           finishedAt = finishedAt,
                           initialDfen = record.initialDfen,
                           turns = record.turns.map(historyTurn),

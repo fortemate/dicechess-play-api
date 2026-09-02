@@ -24,9 +24,24 @@ restores a room by decoding one snapshot, not by replaying a log. A partial inde
 `status = 'active'` serves the boot-time resume scan, and a check constraint pins `status` to
 `active` or `ended`.
 
-Under the showcase contract (ADR-005, #44, #47), rows carry an `origin` (`showcase`, `ladder`,
-`catalog`, `lobby`, `direct`, `legacy`) with a partial index on `(id) WHERE origin = 'showcase' AND status = 'active'`
-serving startup reconciliation for the singleton showcase table.
+Under the showcase contract (ADR-005, #44, #47), rows carry an `origin` column (`showcase`,
+`ladder`, `catalog`, `lobby`, `direct`, `legacy`, pinned by a check constraint) projected out of
+the snapshot on every write, so reconciliation never decodes JSON. The partial index
+`games_showcase_active_idx` on `(id) WHERE origin = 'showcase' AND status = 'active'` serves the
+singleton table's startup question — "is exactly one showcase game live?" — through
+`PgGameStore.activeShowcaseGameIds`. V5 backfilled the column from the snapshot's own `origin`
+key where one was recorded, from the `ladder` flag otherwise, and to `legacy` for everything
+that predates both; `GameSnapshot.effectiveOrigin` is that same rule in Scala, and it is the
+one `GameRoom.restore` and the store's write path apply, so a legacy row resolves identically
+everywhere. `origin` sits **beside** `ladder`, never instead of it: the flag keeps its exact
+meaning for the rating batch's auto-park rule.
+
+A showcase room is created only over a store that positively claims durability
+(`GameStore.durable`) — the in-memory store does not, so `SHOWCASE_ENABLED=true` without
+`PLAY_DB_URL` refuses every showcase creation (and says so at boot) rather than silently playing
+in memory. Every version a showcase room publishes is committed here **first**: the room's
+writer fiber halts on a failed write, retries it, and only broadcasts once the row is in
+(`Durability.Required`; see [Architecture](/dicechess-play-api/architecture/)).
 
 ### `outbox` — transactional delivery to analytics
 
@@ -194,6 +209,14 @@ and `rating_applied_at` as the rating batch's work-queue marker. `result` follow
 convention — `1` white won, `-1` black won, `0` draw — enforced by application convention, not
 by a check constraint.
 
+`origin` (V5, ADR-005 §8, #47) is the same typed origin `games` carries, written in the terminal
+transaction and indexed with `finished_at` (`game_results_origin_finished_idx`) so a later
+bot-versus-human aggregate can read showcase results by time without parsing names or inferring
+anything from a bot id. Eligibility for such a score is already in the row: a technical abort
+has `result = NULL` and `termination = 'aborted'`, which `GameResultRow.sportingEligible` turns
+into the one boolean a reader needs. The V5 backfill took `origin` from the still-existing
+snapshot where there was one and from the `ladder` flag otherwise.
+
 The four `*_rating_before` / `*_rating_after` columns (V17, #296) record what the game did to
 each seat, written by the rating batch in the same transaction as the `rating_applied_at` stamp
 and the Glicko write — `before` is only knowable there, since the instant that transaction
@@ -228,13 +251,26 @@ the function, because nothing at this repository's test data volume can catch it
 ### `game_archive` — immutable history
 
 A sanitized, immutable record of a finished game: play's own durable representation of history,
-independent of both the analytics wire contract and snapshot retention. Access is always by
-game id, so the primary key is the only index.
+independent of both the analytics wire contract and snapshot retention. Access is by game id,
+so the primary key is the serving index.
 
-Under the showcase contract (ADR-005, #44, #47), **every ended showcase game is archived**, including
-technical aborts. Technical aborts retain full move, dice, and fairness material for auditable history,
-but carry `sporting_eligible = false` to guarantee they never pollute sporting ratings or future
-bot-vs-human score totals.
+Under the showcase contract (ADR-005 §8, #47), **every ended showcase game is archived**,
+technical aborts included — the one place the general rule "an aborted game has no history worth
+keeping" is overridden, and only for `origin = 'showcase'` (an aborted lobby or ladder game is
+still not archived, exactly as before). An aborted showcase row keeps the full moves, dice,
+participants, time control and fairness material, but its payload says `"result": null` and
+`"sporting_eligible": false`, so it can never be mistaken for a draw. The two V5 columns beside
+the payload, `origin` and `sporting_eligible`, are a projection of the same two payload keys
+(indexed with `finished_at` as `game_archive_origin_finished_idx`) so a reader can filter without
+decoding JSON; `GET /games/{id}/history` serves both, with `result` as `null` for such a game.
+Nothing else changes for an abort: the outbox still excludes it (analytics never sees a game
+without a sporting result) and `game_results` still records it with `result = NULL`.
+
+The write is the terminal transaction of ADR-005 §7: final snapshot, `game_results`, this row
+and the outbox payload commit together, every part `ON CONFLICT DO NOTHING`, so a retried or
+duplicated terminal save converges on one row of each. Retention never touches this table; it
+does prune the aborted showcase game's operational snapshot once the archive row exists, the same
+rule every other archived game follows.
 
 ### `users` — registered player accounts (#232, ADR-0017)
 

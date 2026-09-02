@@ -3,6 +3,7 @@ package dicechess.play.store
 import cats.effect.IO
 import cats.syntax.all.*
 import dicechess.play.core.*
+import dicechess.play.ingest.PlaysiteIngest
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.syntax.*
 import io.circe.{Codec, Decoder, Encoder, Json, JsonObject, KeyDecoder, KeyEncoder}
@@ -85,6 +86,14 @@ final case class GameSnapshot(
     case GameStatus.Ended(_) => true
     case GameStatus.Active   => false
 
+  /** The origin this snapshot is recorded under, resolved to a definite value (ADR-005, #47). A row written before
+    * origin tracking has no key: a ladder game is still recognisable by its `ladder` flag, and everything else is
+    * honestly `Legacy`. This is THE resolution rule — `GameRoom.restore`, `PgGameStore.save`'s column projection and
+    * the V5 backfill all apply it, so a legacy record decodes to the same explicit default everywhere.
+    */
+  def effectiveOrigin: GameOrigin =
+    origin.getOrElse(if ladder.contains(true) then GameOrigin.Ladder else GameOrigin.Legacy)
+
 object GameSnapshot:
   // Private storage codecs (NOT the public wire): reuse the protocol's shapes where they exist, and encode
   // seat-keyed maps by case name so a snapshot stays readable in psql.
@@ -102,6 +111,13 @@ trait GameStore:
   def save(id: GameId, snapshot: GameSnapshot): IO[Unit]
   def loadActive: IO[List[(GameId, GameSnapshot)]]
 
+  /** Whether a successful `save` means the snapshot survives a process restart (ADR-005 §7, #47). The showcase table
+    * requires it: `GameRegistry` refuses to create a showcase room over a store that answers `false`, so the table can
+    * never silently fall back to in-memory play. `false` by default — a store has to positively claim durability, and a
+    * store that forgot to is treated as the unsafe kind rather than the safe one.
+    */
+  def durable: Boolean = false
+
 object GameStore:
   /** In-memory mode: no persistence (local dev / tests without a database). Games die with the process. */
   val noop: GameStore = new GameStore:
@@ -109,10 +125,16 @@ object GameStore:
     def loadActive: IO[List[(GameId, GameSnapshot)]]       = IO.pure(Nil)
 
 /** One archived game as read back from `play.game_archive` (#177): the sanitized payload `GameArchive.payload` wrote,
-  * plus the column recording when it was written — needed by `GET /games/{id}/history` (#178) to answer `finishedAt`,
-  * which lives outside the JSONB payload itself.
+  * plus the columns stored beside it — when it was written (needed by `GET /games/{id}/history`, #178, to answer
+  * `finishedAt`), and since V5 (#47) the game's origin and whether its outcome is a sporting result. The latter two are
+  * also inside the payload; the columns exist so a reader can filter without decoding JSON.
   */
-final case class ArchivedGame(payload: Json, finishedAt: java.time.Instant)
+final case class ArchivedGame(
+    payload: Json,
+    finishedAt: java.time.Instant,
+    origin: GameOrigin = GameOrigin.Legacy,
+    sportingEligible: Boolean = true
+)
 
 /** One batch of the archive backfill (#199): how far the cursor advanced and what happened to the rows it scanned.
   *
@@ -565,8 +587,18 @@ final case class GameResultRow(
     // rated challenge between the same two bots. `RatingBatch.shouldPark`'s auto-park streak (#150) filters on
     // this so a casual/challenge timeout can never park a bot.
     ladder: Boolean,
-    finishedAt: java.time.Instant
-)
+    finishedAt: java.time.Instant,
+    // The surface the game was created from (ADR-005, #47) — `Showcase` for the singleton table, `Legacy` for every
+    // row that predates origin tracking. Alongside `ladder`, never instead of it: the flag keeps its exact meaning and
+    // every reader of it is untouched. Defaulted so the pre-#47 positional constructors still compile.
+    origin: GameOrigin = GameOrigin.Legacy
+):
+  /** Whether this row is a sporting result — one a win/draw/loss score may count (ADR-005 §8). A technical abort is
+    * recorded here for the operational record but has no outcome (`result = None`, `termination = "aborted"`), and that
+    * is the whole test: readers decide eligibility from the row, never from a participant's name or a bot id.
+    */
+  def sportingEligible: Boolean =
+    result.isDefined && termination != PlaysiteIngest.terminationOf(Termination.Aborted)
 
 /** Persistence seam for the queryable `game_results` projection (#98): the games table's own snapshot is opaque JSONB
   * (only `status` is indexed), so the ladder scheduler and rating batch need this to enumerate finished games by

@@ -54,7 +54,7 @@ mise run coverage   # Run tests with scoverage and generate report
 
 ## Code conventions
 
-- Scala 3 new/braceless syntax enforced by scalafmt (`convertToNewSyntax`, `removeOptionalBraces`), maxColumn 100.
+- Scala 3 new/braceless syntax enforced by scalafmt (`convertToNewSyntax`, `removeOptionalBraces`), maxColumn 120.
 - Effects: cats-effect `IO` everywhere; resources via `Resource` (`.use`/`.useForever`).
 - Doobie `ConnectionIO` for database interactions; transactional boundaries clearly demarcated.
 - Error handling: structured domain errors or HTTP status responses; no swallowed exceptions.

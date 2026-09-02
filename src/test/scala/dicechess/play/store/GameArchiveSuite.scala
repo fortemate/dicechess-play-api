@@ -133,8 +133,6 @@ class GameArchiveSuite extends munit.FunSuite:
     val record = GameArchive.decode(json).getOrElse(fail("decode must succeed for legacy archive JSON"))
     assertEquals(record.turns.map(_.thinkingTimeMs), List(None, None))
 
-  // ── Showcase origin and sporting eligibility (ADR-005 §8, #47) ─────────────────────────────
-
   private def showcase(snapshot: GameSnapshot): GameSnapshot = snapshot.copy(origin = Some(GameOrigin.Showcase))
 
   test("a technically aborted SHOWCASE game is archived with its full history but no sporting result (#47)"):

@@ -40,7 +40,8 @@ final class GameRoom private (
     maxInlinePaths: Int,
     persist: GameSnapshot => IO[Unit],
     mode: Durability,
-    stalledRef: Ref[IO, Boolean]
+    stalledRef: Ref[IO, Boolean],
+    inFlightReply: Ref[IO, Option[Deferred[IO, GameRoom.TurnVerdict]]]
 ):
   import GameRoom.*
 
@@ -292,7 +293,7 @@ final class GameRoom private (
       case Durability.BestEffort =>
         consume.guaranteeCase:
           case Outcome.Succeeded(_) => IO.unit // normal end already completed `done` in endGame
-          case _                    => abortIfActive
+          case _                    => abortIfActive *> settleInFlightReply
       case _: Durability.Required =>
         consume.attempt
           .flatMap:
@@ -307,7 +308,15 @@ final class GameRoom private (
                   // unfinished until a restart resumes it from its last durable version.
                   Console[IO].errorln(s"[play][persist][required] technical abort could not be committed: $e")
                 )
+                *> settleInFlightReply
           .onCancel(dropAllSubscribers)
+
+  /** Answer the command the writer was executing when it failed, once the abort has been dealt with: the caller of
+    * `submitTurn`/`respondDraw` learns the game is over instead of waiting on a reply nobody will ever complete. A
+    * no-op when the failed message carried no reply, or when `process` had already answered it.
+    */
+  private def settleInFlightReply: IO[Unit] =
+    inFlightReply.getAndSet(None).flatMap(answer(_, TurnVerdict.Refused(AbortedReason)))
 
   private def abortIfActive: IO[Unit] =
     stateRef.get.flatMap: s =>
@@ -339,14 +348,20 @@ final class GameRoom private (
                 else
                   IO.monotonic.flatMap { now =>
                     val started = if s.started then s else s.copy(started = true, startedAt = Some(now))
-                    // Persist `started` (and any seeds already in) before the opening roll, so a roll failure aborts
-                    // from current state rather than from stale state (dropping seeds / re-starting).
-                    stateRef.set(started) *>
-                      (if started.hasAllSeeds then beginTurn(started).flatMap(stateRef.set) else IO.unit)
+                    // Commit `started` (and any seeds already in) before the opening roll, so a roll failure aborts
+                    // from current state rather than from stale state (dropping seeds / re-starting) — and, in the
+                    // required mode, so `stateRef` keeps holding only committed state for the abort to start from.
+                    commit(started).flatMap: committed =>
+                      if committed.hasAllSeeds then beginTurn(committed).flatMap(stateRef.set) else IO.unit
                   }
               } *> continue
             case Msg.Command(seat, command, receivedAt, reply) =>
-              stateRef.get.flatMap(s => process(s, seat, command, receivedAt, reply)).flatMap(stateRef.set) *> continue
+              // The reply is parked while the command runs so a writer failure mid-command (a required write that
+              // exhausted its retries, an engine invariant) can still settle it AFTER the technical abort commits —
+              // otherwise `submitTurn` would wait on it forever. Cleared once `process` has answered it itself.
+              inFlightReply.set(reply) *>
+                stateRef.get.flatMap(s => process(s, seat, command, receivedAt, reply)).flatMap(stateRef.set) *>
+                inFlightReply.set(None) *> continue
             case Msg.Timeout =>
               stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
             case Msg.Abort =>
@@ -490,6 +505,13 @@ final class GameRoom private (
     val policy   = if s.ended then required.terminal else required.intermediate
     val snapshot = snapshotOf(s)
 
+    // Telemetry is observational: a sink that fails must never turn a committed write into a failed commit, nor skip
+    // a retry's delay. Its own failure is the one thing reported by the fallback logger instead.
+    def report(event: PersistenceTelemetry): IO[Unit] =
+      required
+        .telemetry(event)
+        .handleErrorWith(e => Console[IO].errorln(s"[play][persist][required] telemetry sink failed on $event: $e"))
+
     def attempt(failed: Int, startedAt: FiniteDuration, dropped: Boolean): IO[FiniteDuration] =
       persist(snapshot).attempt.flatMap:
         case Right(()) =>
@@ -498,7 +520,7 @@ final class GameRoom private (
             IO.monotonic.flatMap: now =>
               val stalledFor = now - startedAt
               stalledRef.set(false) *>
-                required.telemetry(PersistenceTelemetry.SaveRecovered(s.version, failed + 1, stalledFor)).as(stalledFor)
+                report(PersistenceTelemetry.SaveRecovered(s.version, failed + 1, stalledFor)).as(stalledFor)
         case Left(error) =>
           val attempts = failed + 1
           IO.monotonic.flatMap: now =>
@@ -506,16 +528,16 @@ final class GameRoom private (
             if policy.exhausted(attempts) then
               // Left stalled: the technical abort that follows is itself a required write, still under way.
               stalledRef.set(true) *>
-                required.telemetry(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, None, error)) *>
-                required.telemetry(PersistenceTelemetry.SaveAbandoned(s.version, attempts)) *>
+                report(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, None, error)) *>
+                report(PersistenceTelemetry.SaveAbandoned(s.version, attempts)) *>
                 IO.raiseError(RequiredSaveAbandoned(s.version, attempts, error))
             else
               val delay   = policy.backoff(attempts)
               val dropNow = !dropped && stalledFor >= required.stalledSubscriberGrace
               stalledRef.set(true) *>
-                required.telemetry(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, Some(delay), error)) *>
-                (dropAllSubscribers *>
-                  required.telemetry(PersistenceTelemetry.SubscribersDropped(s.version, stalledFor))).whenA(dropNow) *>
+                report(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, Some(delay), error)) *>
+                (dropAllSubscribers *> report(PersistenceTelemetry.SubscribersDropped(s.version, stalledFor)))
+                  .whenA(dropNow) *>
                 IO.sleep(delay) *>
                 attempt(attempts, startedAt, dropped || dropNow)
 
@@ -764,6 +786,7 @@ object GameRoom:
   private val MaxPlies           = 5000L
   private val FiftyMoveHalfMoves = 100
   private val GameOverReason     = "game is over"
+  private val AbortedReason      = "game aborted before the command could be applied"
 
   /** Per-subscriber fan-out buffer. A subscriber this many events behind is dropped, never blocking the writer. */
   private val DefaultFanOutBuffer = 256
@@ -1106,6 +1129,7 @@ object GameRoom:
       presence    <- Ref.of[IO, Map[Seat, Int]](Map.empty)
       graceFibers <- Ref.of[IO, Map[Seat, Fiber[IO, Throwable, Unit]]](Map.empty)
       stalled     <- Ref.of[IO, Boolean](false)
+      inFlight    <- Ref.of[IO, Option[Deferred[IO, TurnVerdict]]](None)
     yield new GameRoom(
       ref,
       inbox,
@@ -1122,7 +1146,8 @@ object GameRoom:
       maxInlinePaths,
       persist,
       durability,
-      stalled
+      stalled,
+      inFlight
     )
 
   /** Starting clocks for a timed control: both seats get the initial bank (SuddenDeath/Fischer). PerMove keeps no bank

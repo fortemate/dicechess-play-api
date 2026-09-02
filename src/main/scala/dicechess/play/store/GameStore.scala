@@ -3,6 +3,7 @@ package dicechess.play.store
 import cats.effect.IO
 import cats.syntax.all.*
 import dicechess.play.core.*
+import dicechess.play.ingest.PlaysiteIngest
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.syntax.*
 import io.circe.{Codec, Decoder, Encoder, Json, JsonObject, KeyDecoder, KeyEncoder}
@@ -596,7 +597,8 @@ final case class GameResultRow(
     * recorded here for the operational record but has no outcome (`result = None`, `termination = "aborted"`), and that
     * is the whole test: readers decide eligibility from the row, never from a participant's name or a bot id.
     */
-  def sportingEligible: Boolean = result.isDefined && termination != "aborted"
+  def sportingEligible: Boolean =
+    result.isDefined && termination != PlaysiteIngest.terminationOf(Termination.Aborted)
 
 /** Persistence seam for the queryable `game_results` projection (#98): the games table's own snapshot is opaque JSONB
   * (only `status` is indexed), so the ladder scheduler and rating batch need this to enumerate finished games by

@@ -4861,14 +4861,14 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
                 ORDER BY indexname""".query[String].to[List]
         val bogus =
           (fr"INSERT INTO" ++ games ++ fr"(id, status, snapshot, origin) VALUES (${UUID.randomUUID()}, 'active', $legacyJson, 'arena')").update.run
+        // From the classpath, like Flyway itself reads it, so the test does not depend on the JVM's working directory.
         val v5Sql = IO.blocking(
-          scala.util.Using
-            .resource(
-              scala.io.Source
-                .fromFile("src/main/resources/db/migration/V5__game_origin_and_showcase_archive.sql", "UTF-8")
-            )(
-              _.mkString
+          scala.util.Using.resource(
+            scala.io.Source.fromInputStream(
+              getClass.getResourceAsStream("/db/migration/V5__game_origin_and_showcase_archive.sql"),
+              "UTF-8"
             )
+          )(_.mkString)
         )
         def rerun(sqlText: String) =
           doobie.FC.raw { connection =>
@@ -4907,7 +4907,11 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             idx,
             List("game_archive_origin_finished_idx", "game_results_origin_finished_idx", "games_showcase_active_idx")
           )
-          assert(rejected.isLeft, "the CHECK constraint pins the origin vocabulary")
+          rejected match
+            case Left(error: java.sql.SQLException) =>
+              assertEquals(error.getSQLState, "23514", "the CHECK constraint pins the origin vocabulary")
+            case Left(other) => fail(s"expected the CHECK violation (SQLSTATE 23514), got $other")
+            case Right(_)    => fail("an out-of-vocabulary origin must be rejected")
           assertEquals(origins2, origins, "re-running the migration changes nothing")
           assertEquals(rOrigins2, rOrigins)
           assertEquals(archived2, archived)

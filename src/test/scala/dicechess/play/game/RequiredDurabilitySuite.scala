@@ -271,5 +271,55 @@ class RequiredDurabilitySuite extends munit.CatsEffectSuite:
       stalled   <- room.persistenceStalled
     yield
       assertEquals(over.termination, Termination.Resign)
-      assertEquals(written.map(_.version), Vector(0L), "only the fail-closed creation row ever reached the store")
+      // Two writes of version 0 — the fail-closed creation row and the committed `started` flag — and nothing after:
+      // every published version failed to persist and the game went on regardless.
+      assert(written.nonEmpty && written.forall(_.version == 0L), s"only version-0 rows reached the store: $written")
       assert(!stalled, "a best-effort room never reports a stall")
+
+  /** White's first legal turn at the position the room is holding, as the UCI path `submitTurn` takes. */
+  private def firstLegalTurn(room: GameRoom): IO[List[String]] =
+    room.legalMoves.flatMap: moves =>
+      IO.fromEither(EngineOps.parse(moves.dfen).left.map(RuntimeException(_)))
+        .map(state => EngineOps.legalMovePaths(state).head.map(EngineOps.toUci))
+
+  test("a turn whose write is abandoned answers its caller with a refusal once the abort has committed"):
+    for
+      st   <- store
+      room <- create(st, st.required(intermediateAttempts = Some(2)))
+      _    <- room.start
+      v1   <- await(st.written)(_.exists(_.version == 1L)).map(_.find(_.version == 1L).get)
+      // The move (v2) can never commit; the abort that follows is v2 too, built from durable v1.
+      _       <- st.failWhen(s => !s.ended && s.version == 2L)
+      path    <- firstLegalTurn(room)
+      verdict <- room
+        .submitTurn(Seat.White, path)
+        .timeoutTo(15.seconds, IO.raiseError(RuntimeException("the caller was never answered")))
+      over    <- room.result
+      written <- st.written.get
+    yield
+      assert(verdict.isInstanceOf[GameRoom.TurnVerdict.Refused], s"the caller must learn the game is over: $verdict")
+      assertEquals(over.termination, Termination.Aborted)
+      val terminal = written.last
+      assertEquals(terminal.version, 2L)
+      assertEquals(terminal.turns, Vector.empty, "the move that never committed is not in the durable record")
+      assertEquals(terminal.lastRoll, v1.lastRoll, "the abort starts from the durable roll")
+
+  test("a failing telemetry sink never turns a committed write into a failed commit, and `started` is committed"):
+    for
+      st       <- store
+      failures <- Ref.of[IO, Int](1)
+      _        <- st.failWhenIO(s => if s.version == 1L then failures.modify(n => (n - 1, n > 0)) else IO.pure(false))
+      broken = st.required().copy(telemetry = _ => IO.raiseError(RuntimeException("metrics backend down")))
+      room      <- create(st, broken)
+      (seen, _) <- observe(room)
+      _         <- room.start
+      _         <- await(seen)(_.exists(isRoll))
+      written   <- st.written.get
+      stalled   <- room.persistenceStalled
+    yield
+      assert(written.exists(_.version == 1L), "the roll committed although every telemetry call failed")
+      assert(!stalled, "and the recovery was still recorded on the room")
+      assert(
+        written.exists(s => s.started && s.ply == 0L && !s.ended),
+        "the start is committed before the opening roll, so an abort never starts from an uncommitted state"
+      )

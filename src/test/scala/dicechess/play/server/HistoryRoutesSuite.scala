@@ -284,3 +284,27 @@ class HistoryRoutesSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(c.get[Boolean]("sportingEligible").toOption, Some(true))
       }
     }
+
+  test("origin and eligibility come from the stored columns, which V5 back-filled, not from the payload's keys (#47)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val white = Principal.Guest("hr-columns-white")
+        val black = Principal.Bot("hr-team", "hr-columns-bot")
+        for
+          id <- GameId.random
+          _  <- db.save(id, snapshotFixture(white, black, ended()))
+          // A pre-#47 row: the payload knows neither key, the back-filled columns do.
+          _ <- sql"""UPDATE play.game_archive
+                     SET payload = payload - 'origin' - 'sporting_eligible',
+                         origin = 'showcase', sporting_eligible = false
+                     WHERE game_id = ${id.value}::uuid""".update.run.transact(xa)
+          resp <- get(app(db), id.value)
+          json <- resp.as[io.circe.Json]
+        yield
+          assertEquals(resp.status, Status.Ok)
+          val c = json.hcursor
+          assertEquals(c.get[String]("origin").toOption, Some("showcase"))
+          assertEquals(c.get[Boolean]("sportingEligible").toOption, Some(false))
+          assertEquals(c.get[Int]("result").toOption, Some(1), "the rest of the record still comes from the payload")
+      }
+    }

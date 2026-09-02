@@ -89,8 +89,8 @@ object HistoryRoutes:
             archive
               .archiveFor(GameId(id))
               .flatMap:
-                case None                                          => NotFound()
-                case Some(ArchivedGame(payload, finishedAt, _, _)) =>
+                case None                                                                  => NotFound()
+                case Some(ArchivedGame(payload, finishedAt, storedOrigin, storedEligible)) =>
                   GameArchive.decode(payload) match
                     // The row was written by this same server — a decode failure here means the write/read shapes
                     // have drifted, a bug to surface loudly, not a client-facing 404 (the game plainly did finish
@@ -113,8 +113,12 @@ object HistoryRoutes:
                           timeControl = record.timeControl,
                           result = record.result,
                           termination = record.termination,
-                          origin = record.origin,
-                          sportingEligible = record.sportingEligible,
+                          // The V5 columns, not the payload's keys: a row archived before #47 has no such keys (the
+                          // decoder answers `Legacy`/`true` for it) while the migration back-filled its columns from
+                          // the snapshot, the ladder flag and the result row — so the columns are the authoritative
+                          // answer for every row, old or new.
+                          origin = storedOrigin,
+                          sportingEligible = storedEligible,
                           finishedAt = finishedAt,
                           initialDfen = record.initialDfen,
                           turns = record.turns.map(historyTurn),

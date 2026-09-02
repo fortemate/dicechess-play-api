@@ -124,12 +124,16 @@ object Cors:
     * same cookie bypasses CORS entirely — nothing here forbids that, and an operator debugging with `curl` will find it
     * works — but no product path does it, so a verb missing from this list takes the route away from every real caller
     * while the server-side tests stay green, because the refusal happens in the browser.
+    *
+    * `idempotency-key` joined for `POST /showcase/claim` (ADR-005 §5, #46): the header is mandatory there, and a
+    * browser on the homepage sends it with the session cookie when the visitor is signed in, so its preflight has to
+    * name it.
     */
   private val CredentialedMethods: Set[Method] =
     Set(Method.GET, Method.POST, Method.PUT, Method.PATCH, Method.DELETE, Method.OPTIONS)
 
   private val CredentialedHeaders: Set[CIString] =
-    Set(ci"content-type", ci"authorization", ci"if-match", ci"x-dicechess-csrf")
+    Set(ci"content-type", ci"authorization", ci"if-match", ci"x-dicechess-csrf", ci"idempotency-key")
 
   /** Response headers the browser client must be able to read. `etag` carries the `If-Match` revision the staged
     * webhook API requires on every mutation, `retry-after` the verification budget's reset, and `location` the

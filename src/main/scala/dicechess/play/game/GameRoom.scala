@@ -192,6 +192,12 @@ final class GameRoom private (
       case None    => Resource.unit
       case Some(_) => Resource.make(onConnect(seat))(_ => onDisconnect(seat))
 
+  /** Whether at least one transport currently holds `seat`. The showcase coordinator's no-show check (#46) reads this:
+    * a claimant who was handed a seat token but never opened the socket is forfeited after the claim grace, so an
+    * abandoned claim cannot hold the table for the whole of its clock.
+    */
+  def seatConnected(seat: Seat): IO[Boolean] = presence.get.map(_.getOrElse(seat, 0) > 0)
+
   private def onConnect(seat: Seat): IO[Unit] =
     presence.update(m => m.updated(seat, m.getOrElse(seat, 0) + 1)) *> cancelGrace(seat)
 

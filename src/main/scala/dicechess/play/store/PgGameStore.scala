@@ -19,6 +19,7 @@ import dicechess.play.core.{
   Principal,
   RatingCategory,
   Seat,
+  Side,
   Termination,
   WebhookCapability
 }
@@ -58,7 +59,8 @@ final class PgGameStore private (xa: Transactor[IO])
     with WebhookStore
     with WebhookManagementStore
     with WebhookStatsStore
-    with UserStore:
+    with UserStore
+    with ShowcaseStore:
   import PgGameStore.{
     BootTimeout,
     ForeignKeyViolation,
@@ -2221,6 +2223,122 @@ final class PgGameStore private (xa: Transactor[IO])
       .transact(xa)
       .timeout(BootTimeout)
       .map(_.map(GameId(_)))
+
+  // ── ShowcaseStore (ADR-005 §5–§7, #46) ─────────────────────────────────────
+
+  private def decodeTableRow(row: (String, Option[String])): ShowcaseTableRecord =
+    val (color, current) = row
+    ShowcaseTableRecord(
+      ShowcaseStore
+        .parseColor(color)
+        .getOrElse(throw new IllegalStateException(s"invalid stored showcase colour: $color")),
+      current.map(GameId(_))
+    )
+
+  private val readTableRow =
+    sql"""SELECT next_human_color, current_game_id::text FROM play.showcase_table WHERE id = 1"""
+      .query[(String, Option[String])]
+      .unique
+
+  def showcaseTable: IO[ShowcaseTableRecord] =
+    readTableRow.transact(xa).timeout(SaveTimeout).map(decodeTableRow)
+
+  /** Bounded, opportunistic prune of expired claim records, run inside every claim write so the table never needs a
+    * sweeper of its own: at most 128 rows per write, by primary key, so it can never block a live claim for long.
+    */
+  private val pruneExpiredClaims: ConnectionIO[Int] =
+    sql"""DELETE FROM play.showcase_claims
+          WHERE (actor_id, idempotency_key) IN (
+            SELECT actor_id, idempotency_key FROM play.showcase_claims
+            WHERE expires_at <= now()
+            LIMIT 128
+          )""".update.run
+
+  def findShowcaseClaim(actorId: String, key: UUID): IO[Option[ShowcaseClaimRecord]] =
+    sql"""SELECT actor_id, idempotency_key, request_hash, outcome, game_id::text, human_color, created_at, expires_at
+          FROM play.showcase_claims
+          WHERE actor_id = $actorId AND idempotency_key = $key AND expires_at > now()"""
+      .query[(String, UUID, String, String, Option[String], Option[String], Instant, Instant)]
+      .option
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.map { (actor, storedKey, hash, outcome, gameId, color, createdAt, expiresAt) =>
+        ShowcaseClaimRecord(
+          actorId = actor,
+          idempotencyKey = storedKey,
+          requestHash = hash,
+          outcome = ShowcaseClaimOutcome
+            .fromWireName(outcome)
+            .getOrElse(throw new IllegalStateException(s"invalid stored showcase claim outcome: $outcome")),
+          gameId = gameId.map(GameId(_)),
+          humanColor = color.map(c =>
+            ShowcaseStore.parseColor(c).getOrElse(throw new IllegalStateException(s"invalid stored colour: $c"))
+          ),
+          createdAt = createdAt,
+          expiresAt = expiresAt
+        )
+      })
+
+  def commitShowcaseClaim(
+      actorId: String,
+      key: UUID,
+      requestHash: String,
+      gameId: GameId,
+      humanColor: Side,
+      expectedNextHumanColor: Side
+  ): IO[Boolean] =
+    val expected = ShowcaseStore.colorName(expectedNextHumanColor)
+    val advanced = ShowcaseStore.colorName(expectedNextHumanColor.opponent)
+    val human    = ShowcaseStore.colorName(humanColor)
+    // The fence: the colour must still be the one the coordinator seated the human on, and no game may be current. A
+    // zero-row update means the database disagrees with the coordinator, and the transaction then writes nothing.
+    val fence =
+      sql"""UPDATE play.showcase_table
+            SET next_human_color = $advanced, current_game_id = ${gameId.value}::uuid, updated_at = now()
+            WHERE id = 1 AND next_human_color = $expected AND current_game_id IS NULL""".update.run
+    val record =
+      sql"""INSERT INTO play.showcase_claims (actor_id, idempotency_key, request_hash, outcome, game_id, human_color)
+            VALUES ($actorId, $key, $requestHash, 'claimed', ${gameId.value}::uuid, $human)
+            ON CONFLICT (actor_id, idempotency_key) DO NOTHING""".update.run
+    (pruneExpiredClaims *> fence)
+      .flatMap(moved => if moved == 1 then record.as(true) else false.pure[ConnectionIO])
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  def recordSpectatingClaim(actorId: String, key: UUID, requestHash: String, gameId: Option[GameId]): IO[Unit] =
+    val game = gameId.map(_.value)
+    (pruneExpiredClaims *>
+      sql"""INSERT INTO play.showcase_claims (actor_id, idempotency_key, request_hash, outcome, game_id)
+            VALUES ($actorId, $key, $requestHash, 'spectating', $game::uuid)
+            ON CONFLICT (actor_id, idempotency_key) DO NOTHING""".update.run).void
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  def adoptShowcaseGame(gameId: GameId, humanColor: Side): IO[ShowcaseTableRecord] =
+    val human    = ShowcaseStore.colorName(humanColor)
+    val advanced = ShowcaseStore.colorName(humanColor.opponent)
+    sql"""UPDATE play.showcase_table
+          SET next_human_color = CASE
+                WHEN current_game_id IS DISTINCT FROM ${gameId.value}::uuid AND next_human_color = $human
+                THEN $advanced
+                ELSE next_human_color
+              END,
+              current_game_id = ${gameId.value}::uuid,
+              updated_at = now()
+          WHERE id = 1
+          RETURNING next_human_color, current_game_id::text"""
+      .query[(String, Option[String])]
+      .unique
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(decodeTableRow)
+
+  def clearShowcaseGame(gameId: GameId): IO[Boolean] =
+    sql"""UPDATE play.showcase_table SET current_game_id = NULL, updated_at = now()
+          WHERE id = 1 AND current_game_id = ${gameId.value}::uuid""".update.run
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_ == 1)
 
   // ── GameResultsStore ──────────────────────────────────────────────────────
 

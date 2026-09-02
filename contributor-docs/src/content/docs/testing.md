@@ -11,14 +11,16 @@ test names are full sentences describing behaviour:
 test("the game-end event reveals the server seed")
 ```
 
-Four suites need Docker, because they run against a real Postgres via Testcontainers:
-`PgGameStoreSuite`, `IngestDelivererSuite`, `RatingBatchSuite`, `HistoryRoutesSuite`.
-Everything else is Docker-free.
+Six suites need Docker, because they run against a real Postgres via Testcontainers:
+`PgGameStoreSuite`, `PgQueryCheckSuite`, `PgShowcaseStoreSuite`, `IngestDelivererSuite`,
+`RatingBatchSuite`, `HistoryRoutesSuite`. Everything else is Docker-free — including the showcase
+coordinator's own suites (`ShowcaseTableSuite`, `ShowcaseRoutesSuite`), which run over the in-memory
+harness in `ShowcaseHarness`.
 
 ## Suites run one at a time
 
 `Test / parallelExecution := false`. This is not a workaround left in place out of caution:
-running the four container suites concurrently under scoverage caused enough real CPU
+running the container suites concurrently under scoverage caused enough real CPU
 contention to **delay a cats-effect timer by 133 seconds**. Serial is also the *faster* option
 as measured — a steady 30 seconds versus a bimodal 30-or-313 — because container startup
 dominates and does not parallelise usefully.

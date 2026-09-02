@@ -123,8 +123,12 @@ final class Webhooks private (
     * so a wake probe never touches game state or needs a valid signature. The POST itself is what "wakes" a
     * scale-to-zero endpoint (e.g. Cloud Run): merely reaching it forces a cold start before a human commits to a game.
     * `false` for no registration, a network failure, a non-200, or a wrong/garbled echo — the caller only needs yes/no.
+    *
+    * `timeout` defaults to the per-turn window, which is what a catalog wake wants (a cold start may take that long).
+    * The showcase readiness probe (#46) passes a much shorter one: it runs on a timer against a bot that is supposed to
+    * be warm, and a table must not sit unadvertised for a whole turn window while one probe waits.
     */
-  def wake(bot: Principal.Bot): IO[Boolean] =
+  def wake(bot: Principal.Bot, timeout: FiniteDuration = config.timeout): IO[Boolean] =
     store
       .get(bot.team, bot.name)
       .flatMap:
@@ -132,7 +136,7 @@ final class Webhooks private (
         case Some(hook) =>
           WebhookSecurity.randomHex(NonceBytes).flatMap { nonce =>
             val body = WebhookVerification("verification", nonce).asJson.noSpaces
-            post(hook.url, hook.secret, body, config.timeout).map:
+            post(hook.url, hook.secret, body, timeout).map:
               case Left(_)       => false
               case Right(answer) =>
                 decode[WebhookNonceEcho](answer) match

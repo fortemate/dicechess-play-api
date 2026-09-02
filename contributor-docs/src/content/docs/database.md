@@ -43,6 +43,36 @@ in memory. Every version a showcase room publishes is committed here **first**: 
 writer fiber halts on a failed write, retries it, and only broadcasts once the row is in
 (`Durability.Required`; see [Architecture](/dicechess-play-api/architecture/)).
 
+### `showcase_table` — the singleton table's one row (V6, #46)
+
+The table's identity IS the row: `id` is constrained to `1`, so a second table cannot be recorded.
+`next_human_color` is the durable half of ADR-005 §6 — it flips only inside a claim's committing
+transaction, so a failed creation or a failed commit never consumes a colour, and it survives a
+restart. `current_game_id` is the claim fence of §5: `ShowcaseStore.commitShowcaseClaim` moves it
+from `NULL` to the new game in the same `UPDATE` that advances the colour, fenced on the colour the
+human was seated on, so two processes cannot both record a game as current (defence in depth behind
+the coordinator's mutex, not a substitute for it). It is cleared once the game's terminal
+transaction has committed and the coordinator has observed it (§7 barrier 4).
+
+Deliberately **no foreign key to `games`**: a stale pointer left by a crash between the terminal
+commit and the clear is exactly what startup reconciliation repairs (`GET /showcase` opens only after
+it has), and a cascade would hide that case. `adoptShowcaseGame` is the other repair: a live showcase
+game found on boot whose row still names the resumed human's own colour as "next" had its claim
+transaction lost, so the colour advances then — and only then, so a second reconciliation changes
+nothing.
+
+### `showcase_claims` — durable claim idempotency (V6, #46)
+
+One row per processed `POST /showcase/claim`, whatever its outcome, keyed by `(actor_id,
+idempotency_key)`. `request_hash` fingerprints the actor and body, which is what turns a key reused
+for a different request into `409 idempotency_conflict`; `outcome` is `claimed` or `spectating`, and
+a claimed row must carry `game_id` and `human_color` (a check constraint). Rows expire 24 hours after
+creation (`expires_at`, defaulted from the database clock), an expired row is invisible to the lookup
+and reads as a fresh claim, and the claim path prunes at most 128 expired rows per write by primary
+key — so the table needs no sweeper and never blocks a live claim for long. No foreign key to
+`games` for the same reason `game_results` has none: the record must outlive the snapshot
+retention prunes.
+
 ### `outbox` — transactional delivery to analytics
 
 The finished game's analytics payload, written **in the same transaction as the terminal

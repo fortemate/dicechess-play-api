@@ -162,3 +162,111 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
     assert(validConfig.isRight, "Valid configuration must succeed")
     assertEquals(validConfig.map(_.reservedSeats), Right(1))
     assertEquals(disabledConfig, Right(ShowcaseConfig.Disabled))
+
+  test("ShowcaseConfig extra edge cases and fromEnv"):
+    val defaultSeats = ShowcaseConfig.fromValues(
+      enabledRaw = Some("true"),
+      teamRaw = Some("rpi3"),
+      nameRaw = Some("hunter-book"),
+      reservedSeatsRaw = None
+    )
+    val invalidInt = ShowcaseConfig.fromValues(
+      enabledRaw = Some("true"),
+      teamRaw = Some("rpi3"),
+      nameRaw = Some("hunter-book"),
+      reservedSeatsRaw = Some("abc")
+    )
+    assertEquals(defaultSeats.map(_.reservedSeats), Right(1))
+    assert(invalidInt.isLeft)
+    assert(ShowcaseConfig.fromEnv.isRight)
+
+  test("GameOrigin and AdmissionPurpose methods and wire resolution"):
+    GameOrigin.valuesList.foreach { origin =>
+      assertEquals(GameOrigin.fromWireName(origin.wireName), Some(origin))
+    }
+    assertEquals(GameOrigin.fromWireName("unknown-origin"), None)
+    assertEquals(GameOrigin.Showcase.isShowcase, true)
+    assertEquals(GameOrigin.Ladder.isShowcase, false)
+    assertEquals(AdmissionPurpose.Showcase.isShowcase, true)
+    assertEquals(AdmissionPurpose.Showcase.isGeneral, false)
+    assertEquals(AdmissionPurpose.Ladder.isGeneral, true)
+    assertEquals(AdmissionPurpose.Ladder.isShowcase, false)
+
+  test("SeatGuard helpers, allowanceOf, Report and factory"):
+    for
+      bots      <- BotStore.inMemory
+      _         <- bots.register(featuredBot.team, featuredBot.name, "h")
+      _         <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, 3)
+      _         <- bots.openToHumans(featuredBot.team, featuredBot.name, None)
+      policyOpt <- bots.seatPolicyOf(featuredBot.team, featuredBot.name)
+      policy = policyOpt.get
+      registry <- GameRegistry.create()
+      sg       <- SeatGuard.create(bots, registry, showcaseConfig)
+    yield
+      import SeatGuard.*
+      assertEquals(AdmissionPurpose.Ladder.allowanceOf(policy), policy.ladderAllowance)
+      assertEquals(AdmissionPurpose.Direct.allowanceOf(policy), policy.maxConcurrentGames)
+      assertEquals(AdmissionPurpose.Showcase.allowanceOf(policy), 1)
+      val rep = SeatGuard.Report(policy, 1, 2, 1, 1, 0)
+      assertEquals(rep.generalAllowance, 2)
+      assertEquals(rep.generalOccupancy, 1)
+      assertEquals(rep.showcaseAllowance, 1)
+      assertEquals(rep.showcaseOccupancy, 0)
+      assert(sg.admissionGuard != null)
+
+  test("AdmissionGuard ticket methods, double commit/release, and exception recovery"):
+    for
+      bots  <- BotStore.inMemory
+      _     <- bots.register(featuredBot.team, featuredBot.name, "h")
+      _     <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, 3)
+      guard <- AdmissionGuard.create(bots, showcaseConfig)
+      // Test ticket getters and idempotency
+      ticketRes <- guard.acquire(List(featuredBot), AdmissionPurpose.Direct)
+      ticket = ticketRes.toOption.get
+      _      = assertEquals(ticket.admittedBots, List(featuredBot))
+      _      = assertEquals(ticket.ticketPurpose, AdmissionPurpose.Direct)
+      _      = assert(ticket.id > 0L)
+      _ <- ticket.commit(GameId("g-test"))
+      _ <- ticket.commit(GameId("g-test")) // idempotent second commit
+      _ <- ticket.release                  // settled, no-op
+      // Test admit with exception in action (Outcome.Errored)
+      errRes <- guard
+        .admit[Unit](List(featuredBot), AdmissionPurpose.Direct) { _ =>
+          cats.effect.IO.delay(throw new RuntimeException("boom"))
+        }
+        .attempt
+      // Unsafe constructor
+      unsafeGuard = AdmissionGuard.unsafe(bots, showcaseConfig)
+      diag <- unsafeGuard.diagnostics(featuredBot)
+    yield
+      assert(errRes.isLeft)
+      assertEquals(diag.map(_.generalOccupancy), Some(0))
+
+  test("AdmissionGuard totalOcc >= maxCap branch coverage"):
+    for
+      bots  <- BotStore.inMemory
+      _     <- bots.register(featuredBot.team, featuredBot.name, "h")
+      _     <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, 1)
+      guard <- AdmissionGuard.create(bots, showcaseConfig)
+      // Simulate existing general game in active
+      _ <- guard.reconcile(List((GameId("prev"), List(featuredBot), GameOrigin.Direct)))
+      // Now genOcc = 1, showOcc = 0, totalOcc = 1 >= maxCap (1)
+      // Showcase: showOcc < showAllowance (0 < 1), but totalOcc >= maxCap (1 >= 1)
+      showRes <- guard.acquire(List(featuredBot), AdmissionPurpose.Showcase)
+      _       <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, 2)
+      // Reconcile with 2 showcase games
+      _ <- guard.reconcile(
+        List(
+          (GameId("sh1"), List(featuredBot), GameOrigin.Showcase),
+          (GameId("sh2"), List(featuredBot), GameOrigin.Showcase)
+        )
+      )
+      // Now genOcc = 0, showOcc = 2, totalOcc = 2 >= 2
+      // genOcc < ladderCap (0 < 1), but totalOcc >= maxCap (2 >= 2)
+      ladderRes <- guard.acquire(List(featuredBot), AdmissionPurpose.Ladder)
+      // genOcc < genAllowance (0 < 1), but totalOcc >= maxCap (2 >= 2)
+      directRes <- guard.acquire(List(featuredBot), AdmissionPurpose.Direct)
+    yield
+      assert(showRes.isLeft && showRes.left.exists(_.isInstanceOf[AdmissionGuard.AdmissionError.Busy]))
+      assert(ladderRes.isLeft && ladderRes.left.exists(_.isInstanceOf[AdmissionGuard.AdmissionError.Busy]))
+      assert(directRes.isLeft && directRes.left.exists(_.isInstanceOf[AdmissionGuard.AdmissionError.Busy]))

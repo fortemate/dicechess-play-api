@@ -144,29 +144,41 @@ object Main extends IOApp.Simple:
         )
     )
 
-  private def serve(
-      resources: (GameStore, BotStore, Option[PgGameStore], Client[IO], WebhookTransport, IO[Unit])
-  ): IO[Unit] =
-    val (store, botStore, pgStore, httpClient, webhookTransport, deliverer) = resources
+  private[play] def initShowcaseConfig: IO[ShowcaseConfig] =
+    ShowcaseConfig.fromEnv match
+      case Left(error) =>
+        IO.raiseError(new IllegalArgumentException(s"[play] invalid showcase configuration: $error"))
+      case Right(cfg) => IO.pure(cfg)
+
+  private[play] def setupAdmission(
+      botStore: BotStore,
+      showcaseConfig: ShowcaseConfig,
+      registry: GameRegistry
+  ): IO[(AdmissionGuard, SeatGuard, Int)] =
     for
-      showcaseConfig <- ShowcaseConfig.fromEnv match
-        case Left(error) =>
-          IO.raiseError(new IllegalArgumentException(s"[play] invalid showcase configuration: $error"))
-        case Right(cfg) => IO.pure(cfg)
       _ <- IO
         .println(
           s"[play] showcase reservation enabled for featured bot ${showcaseConfig.featuredBot.map(b => s"${b.team}/${b.name}").getOrElse("")} (reservedSeats = ${showcaseConfig.reservedSeats})"
         )
         .whenA(showcaseConfig.enabled)
       admissionGuard <- AdmissionGuard.create(botStore, showcaseConfig)
-      registry       <- registryFor(store, pgStore)
       _              <- registry.attachAdmissionGuard(admissionGuard)
       resumed        <- registry.resume
       _              <- IO.println(s"[play] resumed $resumed live game(s)").whenA(resumed > 0)
-      botAuth        <- BotAuth.fromEnv(botStore)
-      botEvents      <- BotEvents.create
-      // Declared per-bot capacity (#189, #45). All admission paths pass through AdmissionGuard.
       seatGuard = SeatGuard(admissionGuard)
+    yield (admissionGuard, seatGuard, resumed)
+
+  private def serve(
+      resources: (GameStore, BotStore, Option[PgGameStore], Client[IO], WebhookTransport, IO[Unit])
+  ): IO[Unit] =
+    val (store, botStore, pgStore, httpClient, webhookTransport, deliverer) = resources
+    for
+      showcaseConfig                 <- initShowcaseConfig
+      registry                       <- registryFor(store, pgStore)
+      (admissionGuard, seatGuard, _) <- setupAdmission(botStore, showcaseConfig, registry)
+      botAuth                        <- BotAuth.fromEnv(botStore)
+      botEvents                      <- BotEvents.create
+      // Declared per-bot capacity (#189, #45). All admission paths pass through AdmissionGuard.
       admitBoth = (one: Principal, other: Principal) => seatGuard.admitsBoth(one, other, SeatGuard.Purpose.Direct)
       challenges <- Challenges.create(botEvents, registry, admitBoth = admitBoth, admissionGuard = Some(admissionGuard))
       mintLimit  <- AnonMintLimiter.create()

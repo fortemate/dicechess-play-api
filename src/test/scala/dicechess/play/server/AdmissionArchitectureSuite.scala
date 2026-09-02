@@ -212,3 +212,39 @@ class AdmissionArchitectureSuite extends munit.CatsEffectSuite:
         assertEquals(diag1.map(_.generalOccupancy), Some(1), "Direct room creation must be tracked by AdmissionGuard")
         assertEquals(diag2.map(_.generalOccupancy), Some(0), "Deregistration must release occupancy in AdmissionGuard")
     }
+
+  test("Lobby: successful accept commits admission in AdmissionGuard"):
+    harness().flatMap { (_, registry, guard, seatGuard) =>
+      for
+        lobby <- Lobby.create(
+          registry,
+          admitBoth = (a, b) => seatGuard.admitsBoth(a, b, SeatGuard.Purpose.Direct),
+          admissionGuard = Some(guard)
+        )
+        posted <- lobby.create(featuredBot, TimeControl.Unlimited, rated = false)
+        seekId = posted.toOption.get._1.id
+        accepted <- lobby.accept(seekId, humanGuest)
+        diag     <- guard.diagnostics(featuredBot)
+      yield
+        assert(accepted.isRight, "Lobby accept should succeed")
+        assertEquals(diag.map(_.generalOccupancy), Some(1))
+    }
+
+  test("Challenges: successful accept commits admission in AdmissionGuard"):
+    harness().flatMap { (_, registry, guard, seatGuard) =>
+      for
+        events     <- BotEvents.create
+        challenges <- Challenges.create(
+          events,
+          registry,
+          admitBoth = (a, b) => seatGuard.admitsBoth(a, b, SeatGuard.Purpose.Direct),
+          admissionGuard = Some(guard)
+        )
+        created <- challenges.create(opponentBot, featuredBot, TimeControl.Unlimited, rated = false)
+        challengeId = created.toOption.get.challenge.id
+        accepted     <- challenges.accept(featuredBot, challengeId)
+        diagFeatured <- guard.diagnostics(featuredBot)
+      yield
+        assert(accepted.isRight, "Challenge accept should succeed")
+        assertEquals(diagFeatured.map(_.generalOccupancy), Some(1))
+    }

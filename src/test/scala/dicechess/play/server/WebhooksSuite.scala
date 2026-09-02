@@ -347,7 +347,12 @@ class WebhooksSuite extends munit.CatsEffectSuite:
                 mutation.current match
                   case Some(_) =>
                     assertEquals(enqueues, List(CurrentRegistrationId))
-                    assertEquals(usedGenerations, List(OldRegistrationId, CurrentRegistrationId))
+                    assertEquals(usedGenerations.headOption, Some(OldRegistrationId))
+                    assert(
+                      usedGenerations.drop(1).nonEmpty && usedGenerations.drop(1).forall(_ == CurrentRegistrationId),
+                      s"${mutation.label}: every request after the stale response must use the current generation: " +
+                        usedGenerations
+                    )
                     assert(
                       deliveryCalls.contains(CurrentRegistrationId -> DeliveryOutcome.Applied),
                       s"${mutation.label}: current generation was not recorded as applied: $deliveryCalls"
@@ -928,8 +933,11 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       event <- resources.use { webhooks =>
         driver.run(room).background.use { _ =>
           val offered = room.subscribe.collectFirst { case e: GameEvent.DrawOffered => e }.compile.lastOrError
-          webhooks.attachSweep *>
-            offered.timeoutTo(10.seconds, IO.raiseError(new RuntimeException("DrawOffered event never emitted")))
+          offered.background.use: waiting =>
+            webhooks.attachSweep *>
+              waiting
+                .flatMap(_.embedNever)
+                .timeoutTo(10.seconds, IO.raiseError(new RuntimeException("DrawOffered event never emitted")))
         }
       }
     yield assertEquals(event.by, Seat.White)

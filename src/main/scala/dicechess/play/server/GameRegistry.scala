@@ -9,6 +9,8 @@ import dicechess.play.game.GameRoom
 import dicechess.play.store.GameStore
 
 import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
+import java.util.concurrent.CopyOnWriteArrayList
 
 /** In-memory registry of live game rooms (one authoritative node, for now). Rooms snapshot themselves into the
   * `GameStore` on every event, and `resume` rebuilds them on boot — so live games survive a restart or deploy.
@@ -20,7 +22,10 @@ final class GameRegistry private (
     store: GameStore,
     resolveNicknames: List[String] => IO[Map[String, String]],
     resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]],
-    diceSource: () => IO[DiceSource]
+    diceSource: () => IO[DiceSource],
+    registerHooks: CopyOnWriteArrayList[(GameId, List[Principal], GameOrigin) => IO[Unit]],
+    deregisterHooks: CopyOnWriteArrayList[GameId => IO[Unit]],
+    resumeHooks: CopyOnWriteArrayList[List[(GameId, List[Principal], GameOrigin)] => IO[Unit]]
 ):
 
   /** Seat ratings for one game's participants, in the game's OWN category (#290 + #280).
@@ -63,7 +68,8 @@ final class GameRegistry private (
 
   /** Create and start a room for two players. Dice come from a fresh commit-reveal source whose server seed is
     * committed before any client connects; each player then folds in its own post-commit seed (see GameRoom's gate).
-    * Errors (e.g. a bad initial position) are returned as a Left, never thrown.
+    * Domain errors (e.g. a bad initial position) are returned as a Left. Effect failures such as an unavailable durable
+    * store fail the creation effect so an admission caller can compensate the reservation and any partial registration.
     *
     * `requestedRated` is only a hint: the game is actually rated iff [[GameRegistry.isRated]] agrees, so an anonymous
     * participant on either side silently forces a casual game regardless of what was requested.
@@ -72,12 +78,51 @@ final class GameRegistry private (
     * only marker in `game_results` distinguishing that, which is what keeps a casual/challenge timeout from ever
     * tripping ladder auto-park (`RatingBatch.shouldPark`, #150).
     */
+  def onRegister(hook: (GameId, List[Principal], GameOrigin) => IO[Unit]): IO[Unit] =
+    IO.delay(registerHooks.add(hook)).void
+
+  def onDeregister(hook: GameId => IO[Unit]): IO[Unit] =
+    IO.delay(deregisterHooks.add(hook)).void
+
+  private val attachedGuard = new java.util.concurrent.atomic.AtomicReference[Option[AdmissionGuard]](None)
+
+  def attachedAdmissionGuard: Option[AdmissionGuard] = attachedGuard.get()
+
+  def onResume(hook: List[(GameId, List[Principal], GameOrigin)] => IO[Unit]): IO[Unit] =
+    IO.delay(resumeHooks.add(hook)).void
+
+  def attachAdmissionGuardSync(guard: AdmissionGuard): Unit =
+    attachedGuard.set(Some(guard))
+    registerHooks.add((id, players, origin) => guard.recordActive(id, players, origin))
+    deregisterHooks.add(guard.releaseGame)
+    resumeHooks.add(details => guard.reconcile(details).void)
+
+  def attachAdmissionGuard(guard: AdmissionGuard): IO[Unit] =
+    IO.delay(attachAdmissionGuardSync(guard))
+
   def create(
       white: Principal,
       black: Principal,
       timeControl: TimeControl = TimeControl.Unlimited,
       requestedRated: Boolean = false,
-      ladder: Boolean = false
+      ladder: Boolean = false,
+      origin: GameOrigin = GameOrigin.Legacy
+  ): IO[Either[String, (GameId, GameRoom)]] =
+    attachedGuard.get() match
+      case Some(guard) =>
+        guard
+          .admitAndCreate(this, white, black, timeControl, origin, requestedRated, ladder)
+          .map(_.left.map(_.message))
+      case None =>
+        createRoomInternal(white, black, timeControl, origin, requestedRated, ladder)
+
+  private[server] def createRoomInternal(
+      white: Principal,
+      black: Principal,
+      timeControl: TimeControl,
+      origin: GameOrigin,
+      requestedRated: Boolean,
+      ladder: Boolean
   ): IO[Either[String, (GameId, GameRoom)]] =
     (GameId.random, diceSource()).flatMapN { (id, dice) =>
       createRoom(
@@ -86,7 +131,8 @@ final class GameRegistry private (
         dice,
         timeControl,
         rated = GameRegistry.isRated(white, black, requestedRated, timeControl),
-        ladder = ladder
+        ladder = ladder,
+        origin = origin
       )
     }
 
@@ -96,7 +142,8 @@ final class GameRegistry private (
       dice: DiceSource,
       timeControl: TimeControl = TimeControl.Unlimited,
       requestedRated: Boolean = false,
-      ladder: Boolean = false
+      ladder: Boolean = false,
+      origin: GameOrigin = GameOrigin.Legacy
   ): IO[Either[String, (GameId, GameRoom)]] =
     GameId.random.flatMap: id =>
       createRoom(
@@ -105,7 +152,8 @@ final class GameRegistry private (
         dice,
         timeControl,
         rated = GameRegistry.isRated(white, black, requestedRated, timeControl),
-        ladder = ladder
+        ladder = ladder,
+        origin = origin
       )
 
   /** Shared room-creation seam behind `create`: build the room, register it, start it. */
@@ -115,14 +163,15 @@ final class GameRegistry private (
       dice: DiceSource,
       timeControl: TimeControl,
       rated: Boolean,
-      ladder: Boolean
+      ladder: Boolean,
+      origin: GameOrigin
   ): IO[Either[String, (GameId, GameRoom)]] =
     for
       // Resolved here rather than inside the room: a room emits a snapshot on every move, so the seat faces must be
       // decided once and carried. Doing it in the registry also means no caller of `create` has to know about it —
       // direct games, lobby accepts, catalog games, bot challenges and ladder pairings all get named seats for free.
       // Ratings (#290) follow the identical rationale: sampled once here, they ARE "the rating as of game start".
-      seatIds = players.values.map(_.externalId).toList
+      seatIds <- IO.pure(players.values.map(_.externalId).toList)
       // The two resolvers read independent tables, so they run in parallel — one round-trip of latency, not two.
       (names, ratings) <- (resolveNicknames(seatIds), ratingsFor(seatIds, timeControl)).parTupled
       made             <- GameRoom.create(
@@ -134,9 +183,14 @@ final class GameRegistry private (
         timeControl = timeControl,
         rated = rated,
         ladder = ladder,
+        origin = origin,
         persist = store.save(id, _)
       )
-      result <- made.traverse(room => register(id, room) *> room.start.as((id, room)))
+      result <- made.traverse: room =>
+        val cleanup = room.abort *> abortAndDeregister(id)
+        (register(id, room) *> room.start.as((id, room)))
+          .onError(_ => cleanup)
+          .onCancel(cleanup)
     yield result
 
   /** Rebuild rooms for every game that was live when the process stopped; returns how many were revived. A snapshot
@@ -181,6 +235,10 @@ final class GameRegistry private (
         _ <- failures.traverse_((id, error) => Console[IO].errorln(s"[play][resume] game ${id.value} skipped: $error"))
         _ <- successes.traverse_((id, room) => register(id, room))
         _ <- successes.traverse_((_, room) => room.start)
+        resumedDetails <- successes.traverse { (id, room) =>
+          (room.seating, room.origin).mapN((seats, orig) => (id, seats.values.toList, orig))
+        }
+        _ <- IO.defer(resumeHooks.asScala.toList.traverse_(_(resumedDetails)))
       yield successes.size
 
   /** Bind a seat to whoever redeemed its join token, and index the game under them (#285).
@@ -234,12 +292,13 @@ final class GameRegistry private (
             .unlessA(alive)
 
   private def register(id: GameId, room: GameRoom): IO[Unit] =
-    room.seating.flatMap: seats =>
+    (room.seating, room.origin).flatMapN: (seats, origin) =>
       val players = seats.values.toList
       rooms.update(_.updated(id, room)) *>
         byPlayer.update(index =>
           players.foldLeft(index)((acc, p) => acc.updated(p, acc.getOrElse(p, Set.empty) + id))
         ) *>
+        IO.defer(registerHooks.asScala.toList.traverse_(_(id, players, origin))) *>
         // Deregister against the room's FINAL seating, not the list captured here: a seat rebound mid-game (#285) adds
         // an index entry for the claimer, and cleaning up the original list would leak it forever — one `byPlayer`
         // entry per friend game, for the life of the process. A rebind only ever replaces one of two identical
@@ -251,13 +310,31 @@ final class GameRegistry private (
         // or without this line, which is worse than none.
         (room.result *> room.seating.flatMap(fin => deregister(id, fin.values.toList.distinct))).start.void
 
-  private def deregister(id: GameId, players: List[Principal]): IO[Unit] =
-    rooms.update(_.removed(id)) *>
-      byPlayer.update(index =>
-        players.foldLeft(index): (acc, p) =>
-          val rest = acc.getOrElse(p, Set.empty) - id
-          if rest.isEmpty then acc.removed(p) else acc.updated(p, rest)
-      )
+  private[server] def deregister(id: GameId, players: List[Principal]): IO[Unit] =
+    IO.uncancelable: _ =>
+      rooms
+        .modify(current => (current.removed(id), current.contains(id)))
+        .flatMap:
+          case false => IO.unit
+          case true  =>
+            byPlayer.update(index =>
+              players.foldLeft(index): (acc, p) =>
+                val rest = acc.getOrElse(p, Set.empty) - id
+                if rest.isEmpty then acc.removed(p) else acc.updated(p, rest)
+            ) *>
+              IO.defer(deregisterHooks.asScala.toList.traverse_(_(id)))
+
+  /** Compensate a room that was built and started but whose admission could not be committed. Aborting through the
+    * room's inbox terminates its consumer and persists an auditable technical result; explicit deregistration makes
+    * cleanup deterministic instead of waiting for the result-watcher fiber to be scheduled.
+    */
+  private[server] def abortAndDeregister(id: GameId): IO[Unit] =
+    rooms.get
+      .map(_.get(id))
+      .flatMap:
+        case None       => IO.unit
+        case Some(room) =>
+          room.seating.flatMap(players => room.abort *> deregister(id, players.values.toList.distinct))
 
 object GameRegistry:
 
@@ -278,8 +355,22 @@ object GameRegistry:
       resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]] = (_, _) => IO.pure(Map.empty),
       diceSource: () => IO[DiceSource] = () => DiceSource.newCommitReveal()
   ): IO[GameRegistry] =
-    (Ref.of[IO, Map[GameId, GameRoom]](Map.empty), Ref.of[IO, Map[Principal, Set[GameId]]](Map.empty))
-      .mapN(GameRegistry(_, _, disconnectGrace, store, resolveNicknames, resolveRatings, diceSource))
+    (
+      Ref.of[IO, Map[GameId, GameRoom]](Map.empty),
+      Ref.of[IO, Map[Principal, Set[GameId]]](Map.empty)
+    ).mapN: (rooms, byPlayer) =>
+      new GameRegistry(
+        rooms,
+        byPlayer,
+        disconnectGrace,
+        store,
+        resolveNicknames,
+        resolveRatings,
+        diceSource,
+        new CopyOnWriteArrayList(),
+        new CopyOnWriteArrayList(),
+        new CopyOnWriteArrayList()
+      )
 
   /** Whether `p` can sustain a meaningful rating at all: a human guest's identity is free to reset, and an anon-team
     * bot (`POST /bot/anon`) is the same kind of throwaway for bots — resetting either would make rating free. Shared by

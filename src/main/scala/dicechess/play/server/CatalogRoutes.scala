@@ -2,7 +2,7 @@ package dicechess.play.server
 
 import cats.effect.IO
 import cats.syntax.all.*
-import dicechess.play.core.{Principal, Seat, Side, TimeControl}
+import dicechess.play.core.*
 import dicechess.play.rating.Glicko2
 import dicechess.play.store.{BotCatalogListing, BotCatalogStore, BotStore}
 import dicechess.play.wire.Codecs.given
@@ -90,13 +90,16 @@ object CatalogRoutes:
       registry: GameRegistry,
       wakeLimiter: AnonMintLimiter,
       playBotLimiter: AnonMintLimiter,
-      session: Option[AuthSession] = None
+      session: Option[AuthSession] = None,
+      guard: Option[SeatGuard] = None
   ): HttpRoutes[IO] =
-    // Built once, not per request: it is a pure view over the two collaborators already threaded here.
-    val guard = SeatGuard(bots, registry)
+    // Built once, not per request: it is a pure view over the collaborators already threaded here.
+    val effectiveGuard = guard.getOrElse(SeatGuard(bots, registry))
     HttpRoutes.of[IO]:
       case GET -> Root / "lobby" / "bots" =>
-        catalog.catalogBots.flatMap(_.traverse(card(_, registry)).flatMap(cards => Ok(BotCatalog(cards))))
+        catalog.catalogBots.flatMap(
+          _.traverse(card(_, registry, effectiveGuard)).flatMap(cards => Ok(BotCatalog(cards)))
+        )
 
       // A visitor clicks a catalog card to start a game (ADR-0014): this wakes a scale-to-zero endpoint and reports
       // whether it answered, so the SPA knows whether to offer the game-config panel. 404 for a name outside the
@@ -121,7 +124,7 @@ object CatalogRoutes:
               bots.openToHumansBots.flatMap { open =>
                 if !open.contains(target) then NotFound()
                 else
-                  guard.admits(target, SeatGuard.Purpose.Direct).flatMap {
+                  effectiveGuard.admits(target, SeatGuard.Purpose.Direct).flatMap {
                     case false => Ok(Wake(alive = false, busy = true))
                     case true  =>
                       webhooks match
@@ -131,14 +134,19 @@ object CatalogRoutes:
               }
 
       case req @ POST -> Root / "lobby" / "play-bot" =>
-        playBot(req, bots, registry, guard, playBotLimiter, session)
+        playBot(req, bots, registry, effectiveGuard, playBotLimiter, session)
 
   /** Derive the catalog card from a stored listing, flagging (not hiding) a not-yet-converged rating — the same RD
-    * threshold the leaderboard uses to hide provisional bots. `available` (#224) is one in-memory registry lookup
-    * against the capacity already carried on the listing — no second database query per card.
+    * threshold the leaderboard uses to hide provisional bots. `available` (#224) is evaluated against
+    * listing.maxConcurrentGames minus any dedicated showcase reservation for the featured bot.
     */
-  private def card(listing: BotCatalogListing, registry: GameRegistry): IO[CatalogBot] =
-    registry.activeGamesFor(Principal.Bot(listing.team, listing.name)).map { active =>
+  private def card(listing: BotCatalogListing, registry: GameRegistry, guard: SeatGuard): IO[CatalogBot] =
+    val bot: Principal.Bot = Principal.Bot(listing.team, listing.name)
+    registry.activeGamesFor(bot).map { active =>
+      val maxAvailable =
+        if guard.admissionGuard.showcaseConfig.isFeatured(bot) then
+          math.max(0, listing.maxConcurrentGames - guard.admissionGuard.showcaseConfig.reservedSeats)
+        else listing.maxConcurrentGames
       CatalogBot(
         team = listing.team,
         name = listing.name,
@@ -146,7 +154,7 @@ object CatalogRoutes:
         rd = listing.rd,
         provisional = listing.rd > Glicko2.ProvisionalDeviationThreshold,
         description = listing.description,
-        available = active < listing.maxConcurrentGames
+        available = active < maxAvailable
       )
     }
 
@@ -207,32 +215,38 @@ object CatalogRoutes:
         val target: Principal.Bot = Principal.Bot(body.team, body.name)
         bots.openToHumansBots.flatMap { open =>
           if !open.contains(target) then NotFound()
-          else
-            // An explicit refusal, not a silent board (#189): a bot that declared one game at a time and is playing it
-            // must say so, or a visitor is left staring at a position nobody will answer.
-            guard.admits(target, SeatGuard.Purpose.Direct).flatMap {
-              case false => Conflict("that bot is busy — it is at its concurrent-game limit; try another or retry soon")
-              case true  => seatGame(player, body, target, registry)
-            }
+          else seatGame(player, body, target, registry, guard)
         }
     }
 
-  /** Assign seats and create the room; the human gets back its own seat token. */
+  /** Assign seats and create the room within the atomic admission boundary; the human gets back its own seat token. */
   private def seatGame(
       player: Principal,
       body: PlayBot,
       target: Principal.Bot,
-      registry: GameRegistry
+      registry: GameRegistry,
+      guard: SeatGuard
   ): IO[Response[IO]] =
     seatAssignment(body.preferredColor, player, target).flatMap { (white, black, playerSeat) =>
-      registry
-        .create(white, black, body.timeControl, requestedRated = body.rated)
+      guard.admissionGuard
+        .admitAndCreate(
+          registry,
+          white,
+          black,
+          body.timeControl,
+          GameOrigin.Catalog,
+          requestedRated = body.rated
+        )
         .flatMap:
-          case Left(error)           => BadRequest(error)
+          case Left(AdmissionGuard.AdmissionError.Busy(_)) =>
+            Conflict("that bot is busy — it is at its concurrent-game limit; try another or retry soon")
+          case Left(AdmissionGuard.AdmissionError.Failed(error)) =>
+            BadRequest(error)
           case Right((gameId, room)) =>
             room.joinTokens.get(playerSeat) match
               case Some(token) => Created(SeekMatch(gameId.value, token, playerSeat))
-              case None        => InternalServerError("missing seat token")
+              case None        =>
+                registry.abortAndDeregister(gameId) *> InternalServerError("missing seat token")
     }
 
   /** `(white, black, playerSeat)`: the human's chosen side if given, otherwise a coin flip — the ADR's "random by

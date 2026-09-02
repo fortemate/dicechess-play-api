@@ -65,11 +65,22 @@ final class LadderScheduler private (
           .find((a, b) => recent.get(a).forall(_ != b) && recent.get(b).forall(_ != a))
           .orElse(candidates.headOption)
 
-  private def startPair(botA: Principal.Bot, botB: Principal.Bot): IO[Unit] =
-    registry
-      .create(botA, botB, config.timeControl, requestedRated = true, ladder = true)
+  private[server] def startPair(botA: Principal.Bot, botB: Principal.Bot): IO[Unit] =
+    guard.admissionGuard
+      .admitAndCreate(
+        registry,
+        botA,
+        botB,
+        config.timeControl,
+        GameOrigin.Ladder,
+        requestedRated = true,
+        ladder = true
+      )
       .flatMap:
-        case Left(error)    => Console[IO].errorln(s"[play][ladder] pairing failed: $error")
+        case Left(AdmissionGuard.AdmissionError.Busy(msg)) =>
+          Console[IO].errorln(s"[play][ladder] pairing skipped (busy): $msg")
+        case Left(AdmissionGuard.AdmissionError.Failed(err)) =>
+          Console[IO].errorln(s"[play][ladder] pairing failed: $err")
         case Right((id, _)) =>
           // lastPairedWith is updated synchronously, before this method (hence tick) returns: the very next tick's
           // anti-repeat check depends on seeing this pairing immediately, not whenever a forked fiber happens to be
@@ -146,11 +157,18 @@ object LadderScheduler:
       botStore: BotStore,
       registry: GameRegistry,
       events: BotEvents,
-      config: Config = Config.Default
+      config: Config = Config.Default,
+      guard: Option[SeatGuard] = None
   ): IO[LadderScheduler] =
     (Ref.of[IO, Int](0), Ref.of[IO, Map[Principal.Bot, Principal.Bot]](Map.empty))
       .mapN((inFlight, lastPairedWith) =>
-        // The guard is built here rather than passed in: it is derived entirely from the two collaborators the
-        // scheduler already holds, so there is nothing for a caller to decide.
-        new LadderScheduler(botStore, registry, events, SeatGuard(botStore, registry), inFlight, lastPairedWith, config)
+        new LadderScheduler(
+          botStore,
+          registry,
+          events,
+          guard.getOrElse(SeatGuard(botStore, registry)),
+          inFlight,
+          lastPairedWith,
+          config
+        )
       )

@@ -101,39 +101,48 @@ Idempotency is durable and enforced across process restarts:
   re-emitting player credentials (`playerToken`) if the game is still active, or returning the spectator view once the
   game has ended. After the retention window expires, pruned keys are treated as fresh claims.
 
-### 2. Dedicated capacity reservation, admission cleanup, and no-borrowing rule
+### 2. Dedicated capacity reservation, admission cleanup, and no-borrowing rule (#45)
 
 The featured bot declares capacity 3 (`maxConcurrentGames = 3`). When showcase is enabled, `SHOWCASE_RESERVED_SEATS`
 must be configured to exactly `1` (values `0` or `> 1` are rejected during configuration validation at boot), leaving
 exactly 2 seats for general admission:
 $$\text{occupancy}_{\text{general}} \le 2, \quad \text{occupancy}_{\text{showcase}} \le 1, \quad \text{occupancy}_{\text{total}} \le 3$$
 
-Every admission path is classified:
-- `general`: ladder matchmaking (`LadderScheduler`), catalog challenges (`POST /bot/challenge`), lobby bot play
-  (`POST /lobby/play-bot`), direct challenges (`POST /bot/challenges`), and bot seeks (`POST /bot/seeks`). None may
-  consume the reserved seat.
-- `showcase`: `POST /showcase/claim`. Exclusively consumes the reserved seat.
+Every admission path in the server is classified under a unified `AdmissionPurpose`:
+- `general`: ladder matchmaking (`LadderScheduler`), catalog bot play (`POST /lobby/play-bot`), lobby seek accept
+  (`POST /lobby/accept`), bot-to-bot challenge accept (`POST /bot/challenge/{id}/accept`), and direct registry creation.
+  None may consume the reserved seat.
+- `showcase`: singleton showcase table claim (`POST /showcase/claim`). Exclusively consumes the reserved seat.
 
 General admission paths **never borrow** the reserved showcase slot, even if the showcase table is idle.
+Disabling the reservation requires an explicit configuration change (`SHOWCASE_ENABLED=false`).
 
-The central `AdmissionGuard` uses an atomic `acquire -> create/register -> commit` protocol with explicit cleanup
-for every non-commit path:
+The central `AdmissionGuard` component owns atomic `acquire -> create/register -> commit` reservations across all admission paths:
 - The in-flight reservation carries a short lease timeout (5 seconds).
-- If room creation fails (e.g. engine error, bot unreachable, validation failure), database commit fails, or a duplicate
-  active room is detected, the acquisition is immediately aborted and rolled back, restoring the slot to available.
-- If the server process crashes mid-claim, the reservation lease expires automatically. On restart, startup reconciliation
-  clears uncommitted reservations from PostgreSQL so abandoned claims cannot permanently leak capacity or block
-  subsequent claims.
+- `acquire` atomically checks and reserves capacity inside `Ref.modify`, eliminating concurrent race overshoot.
+- `admit` / `admitAndCreate` uses `guaranteeCase`: if room construction fails, durable write fails, or the calling fiber
+  is cancelled, provisional admission is released immediately and exactly once.
+- Once room creation succeeds, `commit` transitions the provisional ticket to an active admission held until terminal
+  room deregistration.
+- An architecture test (`AdmissionArchitectureSuite`) tests all 6 admission paths to prevent silent bypass of the
+  central admission boundary.
+- Startup reconciliation (`AdmissionGuard.reconcile`) rebuilds purpose-specific occupancy from resumed durable rooms
+  during server boot before any traffic or new admissions are enabled.
+- Dynamic capacity reduction under load never terminates an active game; it blocks new admissions until active load
+  naturally drops below the newly declared limit.
 
 ### 3. Single-process topology constraint
 
-In this release, showcase coordination and `AdmissionGuard` are process-local in-memory structures backed by PostgreSQL
-transactions. **Showcase traffic must be routed to exactly one serving process**, not merely one node: multiple worker
-processes or replicas on the same node would maintain independent in-memory state and could both observe `open` and
-create competing rooms.
+In this release, `AdmissionGuard` linearizability and state coordination are process-local in-memory structures;
+PostgreSQL persists durable room data only and does not coordinate in-memory admissions across processes.
+**Traffic must be routed to exactly one serving process**, not merely one node: multiple worker
+processes or replicas on the same node would maintain independent in-memory state and could both observe available
+seats and create competing rooms.
 
-Multi-process and multi-node horizontal scaling are strictly prohibited until a shared distributed coordinator
-(such as a PostgreSQL transactional lease or advisory locks) is designed and implemented.
+Cross-process admission safety would require `AdmissionGuard.acquire` and ticket settlement to be coordinated within
+one shared transaction or distributed coordinator. Until such a distributed coordinator (such as a PostgreSQL
+transactional lease or distributed lock manager) is designed and implemented, multi-process and multi-node
+horizontal scaling are strictly prohibited.
 
 ## The server trusts nothing from the client
 

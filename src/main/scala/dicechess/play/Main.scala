@@ -6,6 +6,7 @@ import com.comcast.ip4s.*
 import dicechess.play.core.{Principal, RatingCategory}
 import dicechess.play.server.{
   AdminBotRoutes,
+  AdmissionGuard,
   AnonMintLimiter,
   AuthRoutes,
   AuthSession,
@@ -31,6 +32,7 @@ import dicechess.play.server.{
   RatingRoutes,
   SeatGuard,
   SessionWebhookRoutes,
+  ShowcaseConfig,
   StrengthRoutes,
   ManagedWebhookVerifier,
   WebhookManagement,
@@ -142,22 +144,45 @@ object Main extends IOApp.Simple:
         )
     )
 
+  private[play] def initShowcaseConfig(
+      parsed: Either[String, ShowcaseConfig] = ShowcaseConfig.fromEnv
+  ): IO[ShowcaseConfig] =
+    parsed match
+      case Left(error) =>
+        IO.raiseError(new IllegalArgumentException(s"[play] invalid showcase configuration: $error"))
+      case Right(cfg) => IO.pure(cfg)
+
+  private[play] def setupAdmission(
+      botStore: BotStore,
+      showcaseConfig: ShowcaseConfig,
+      registry: GameRegistry
+  ): IO[(AdmissionGuard, SeatGuard, Int)] =
+    for
+      _ <- IO
+        .println(
+          s"[play] showcase reservation enabled for featured bot ${showcaseConfig.featuredBot.map(b => s"${b.team}/${b.name}").getOrElse("")} (reservedSeats = ${showcaseConfig.reservedSeats})"
+        )
+        .whenA(showcaseConfig.enabled)
+      admissionGuard <- AdmissionGuard.create(botStore, showcaseConfig, registry = Some(registry))
+      _              <- registry.attachAdmissionGuard(admissionGuard)
+      resumed        <- registry.resume
+      _              <- IO.println(s"[play] resumed $resumed live game(s)").whenA(resumed > 0)
+      seatGuard = SeatGuard(admissionGuard)
+    yield (admissionGuard, seatGuard, resumed)
+
   private def serve(
       resources: (GameStore, BotStore, Option[PgGameStore], Client[IO], WebhookTransport, IO[Unit])
   ): IO[Unit] =
     val (store, botStore, pgStore, httpClient, webhookTransport, deliverer) = resources
     for
-      registry  <- registryFor(store, pgStore)
-      resumed   <- registry.resume
-      _         <- IO.println(s"[play] resumed $resumed live game(s)").whenA(resumed > 0)
-      botAuth   <- BotAuth.fromEnv(botStore)
-      botEvents <- BotEvents.create
-      // Declared per-bot capacity (#189). Both accept paths take the same `Direct` allowance — the full declaration,
-      // not the ladder's reserved share: a bot accepting a challenge or holding an open seek chose that game itself,
-      // and the reservation exists to protect exactly these seats from being eaten by the scheduler.
-      seatGuard = SeatGuard(botStore, registry)
+      showcaseConfig                 <- initShowcaseConfig()
+      registry                       <- registryFor(store, pgStore)
+      (admissionGuard, seatGuard, _) <- setupAdmission(botStore, showcaseConfig, registry)
+      botAuth                        <- BotAuth.fromEnv(botStore)
+      botEvents                      <- BotEvents.create
+      // Declared per-bot capacity (#189, #45). All admission paths pass through AdmissionGuard.
       admitBoth = (one: Principal, other: Principal) => seatGuard.admitsBoth(one, other, SeatGuard.Purpose.Direct)
-      challenges <- Challenges.create(botEvents, registry, admitBoth = admitBoth)
+      challenges <- Challenges.create(botEvents, registry, admitBoth = admitBoth, admissionGuard = Some(admissionGuard))
       mintLimit  <- AnonMintLimiter.create()
       // Registration is rarer than anon minting by nature (one durable identity per team, not one per test session),
       // so it gets its own, much stricter per-IP budget.
@@ -166,7 +191,8 @@ object Main extends IOApp.Simple:
         registry,
         admitBoth = admitBoth,
         resolveNicknames =
-          pgStore.fold[List[String] => IO[Map[String, String]]](_ => IO.pure(Map.empty))(_.nicknamesByExternalId)
+          pgStore.fold[List[String] => IO[Map[String, String]]](_ => IO.pure(Map.empty))(_.nicknamesByExternalId),
+        admissionGuard = Some(admissionGuard)
       )
       allowedOrigins <- Cors.allowedOriginsFromEnv
       cors = Cors.policy(allowedOrigins)
@@ -223,7 +249,9 @@ object Main extends IOApp.Simple:
           IO.println("[play][ladder] LADDER_INTERVAL_SECONDS unset: no automatic ladder pairings")
             .as(IO.never: IO[Unit])
         case Some(ladderConfig) =>
-          LadderScheduler.create(botStore, registry, botEvents, ladderConfig).map(_.scheduler())
+          LadderScheduler
+            .create(botStore, registry, botEvents, ladderConfig, guard = Some(seatGuard))
+            .map(_.scheduler())
       // The strength cache (#181) is created unconditionally: StrengthRoutes below is mounted whenever persistence
       // is configured at all, independent of whether the rating batch (its only writer) ever actually runs.
       strengthCache <- StrengthCache.create
@@ -333,7 +361,16 @@ object Main extends IOApp.Simple:
           pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => LeaderboardRoutes(botStore, pg, pg, pg, users = Some(pg)))
         // Same DB-only gating: the human catalog reads the bots table's rating + description columns (ADR-0014).
         val catalog = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg =>
-          CatalogRoutes(pg, botStore, webhookService, registry, wakeLimit, playBotLimit, authSession)
+          CatalogRoutes(
+            pg,
+            botStore,
+            webhookService,
+            registry,
+            wakeLimit,
+            playBotLimit,
+            authSession,
+            guard = Some(seatGuard)
+          )
         )
         // A visitor's own finished games (#151) — same DB-only-seam idiom: no game_results projection without a
         // database, so the route is simply not mounted.

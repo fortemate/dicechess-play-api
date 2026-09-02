@@ -73,6 +73,9 @@ final case class GameSnapshot(
     // falling back, which would discard every active game as corrupt on the next resume. Resolved to a definite
     // `false` in `GameRoom.restore`, exactly like `rated`.
     ladder: Option[Boolean] = None,
+    // Originating surface of the game (ADR-005, #44, #45, #47). Option with None default so pre-existing snapshots
+    // without this field continue to decode cleanly.
+    origin: Option[GameOrigin] = None,
     // Whether a draw offer is currently pending (#327). `None` when no offer is pending.
     pendingDrawOffer: Option[Seat] = None,
     // The seat that last offered a draw, for the alternation anti-spam rule (#327).

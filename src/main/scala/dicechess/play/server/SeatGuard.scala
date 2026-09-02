@@ -1,65 +1,56 @@
 package dicechess.play.server
 
 import cats.effect.IO
-import cats.syntax.all.*
-import dicechess.play.core.Principal
+import dicechess.play.core.{AdmissionPurpose, Principal}
 import dicechess.play.store.{BotSeatPolicy, BotStore}
 
-/** Enforces the capacity a bot declared at registration (#189): the half of the bot contract where the *bot* says how
-  * much load it can take, mirroring the per-turn window the *server* publishes.
+/** Enforces the capacity a bot declared at registration (#189, #45): delegates all admission checks to the central
+  * atomic [[AdmissionGuard]].
   *
-  * **Why seating and not delivery.** Throttling in-flight webhook deliveries looks more precise, but a delivery held
-  * back inside a running game burns that bot's clock — and stopping the clock while it queues would turn the limit into
-  * free thinking time. Limiting entry into a game has neither problem: a bot is either not seated, or seated and served
-  * immediately under honest clocks.
-  *
-  * **Who is bounded.** Only registered bots, because only they have a row to declare on. Static (`PLAY_BOT_TOKENS`) and
-  * anonymous bots are unbounded exactly as before: the house bot must face every quickstart visitor at once, and an
-  * anon token is a throwaway test identity. Guests are unbounded here too — the catalog's own one-game rule is a
-  * different policy, about a person juggling boards, not about a machine's capacity.
-  *
-  * **The count can overshoot by one, and that is the right trade.** `activeGames` is derived from live rooms (see
-  * `GameRegistry.activeGamesFor`), so two accepts racing through the check can both pass and seat one game too many.
-  * The alternative — a reserved counter held across seating — reintroduces exactly the leak the derived count exists to
-  * avoid, and pays for it with a bot permanently locked out instead of momentarily one game over. The overshoot
-  * disappears on its own as soon as either game ends.
+  * Kept as a facade for backwards compatibility across existing routes and suites.
   */
-final class SeatGuard(bots: BotStore, registry: GameRegistry):
+final class SeatGuard(val admissionGuard: AdmissionGuard):
+
+  def this(bots: BotStore, registry: GameRegistry) =
+    this {
+      val guard = AdmissionGuard.unsafe(bots, registry = Some(registry))
+      registry.attachAdmissionGuardSync(guard)
+      guard
+    }
 
   /** Whether this participant may be seated in one more game for `purpose`. Always true for anyone without a declared
     * capacity — a static or anonymous bot, or a human.
     */
   def admits(principal: Principal, purpose: SeatGuard.Purpose): IO[Boolean] =
-    principal match
-      case bot: Principal.Bot =>
-        bots.seatPolicyOf(bot.team, bot.name).flatMap {
-          case None         => IO.pure(true)
-          case Some(policy) => registry.activeGamesFor(bot).map(_ < purpose.allowanceOf(policy))
-        }
-      case _ => IO.pure(true)
+    admissionGuard.admits(principal, purpose)
 
   /** Both sides of a proposed game at once — a seat is only free if nobody at the table is over their limit. */
   def admitsBoth(one: Principal, other: Principal, purpose: SeatGuard.Purpose): IO[Boolean] =
-    admits(one, purpose).flatMap(if _ then admits(other, purpose) else IO.pure(false))
+    admissionGuard.admitsBoth(one, other, purpose)
 
   /** The subset of a ladder candidate pool that can take another game right now. The scheduler filters *before*
     * pairing, so a busy bot is skipped this tick and picked up on a later one: capacity shapes how often a bot is
     * paired, it does not excuse it from being rated.
     */
   def availableForLadder(pool: List[BotSeatPolicy]): IO[List[Principal.Bot]] =
-    pool
-      .traverseFilter(policy =>
-        registry.activeGamesFor(policy.bot).map(active => Option.when(active < policy.ladderAllowance)(policy.bot))
-      )
+    admissionGuard.availableForLadder(pool)
 
   /** What a bot author needs to see to tell a low limit apart from being ignored: the declaration, what the ladder may
     * take of it, and how much is in use this second. `None` for a caller with no registered row.
     */
   def report(bot: Principal.Bot): IO[Option[SeatGuard.Report]] =
-    bots.seatPolicyOf(bot.team, bot.name).flatMap {
-      case None         => IO.pure(None)
-      case Some(policy) => registry.activeGamesFor(bot).map(active => Some(SeatGuard.Report(policy, active)))
-    }
+    admissionGuard
+      .diagnostics(bot)
+      .map:
+        _.map: d =>
+          SeatGuard.Report(
+            policy = d.policy,
+            activeGames = d.activeGames,
+            generalAllowance = d.generalAllowance,
+            generalOccupancy = d.generalOccupancy,
+            showcaseAllowance = d.showcaseAllowance,
+            showcaseOccupancy = d.showcaseOccupancy
+          )
 
 object SeatGuard:
 
@@ -69,14 +60,40 @@ object SeatGuard:
     *     the human catalog keeps a slot free for a person.
     *   - `Direct` — a challenge, a lobby seek, or a catalog game a human started. Bounded by the full declaration:
     *     these are the seats the reservation exists to protect, and a bot-initiated accept is its own consent.
+    *   - `Showcase` — singleton showcase table claim against the featured bot.
     */
-  enum Purpose:
-    case Ladder
-    case Direct
+  type Purpose = AdmissionPurpose
+  val Purpose = AdmissionPurpose
 
-    def allowanceOf(policy: BotSeatPolicy): Int = this match
-      case Ladder => policy.ladderAllowance
-      case Direct => policy.maxConcurrentGames
+  extension (purpose: AdmissionPurpose)
+    def allowanceOf(policy: BotSeatPolicy): Int = purpose match
+      case AdmissionPurpose.Ladder   => policy.ladderAllowance
+      case AdmissionPurpose.Direct   => policy.maxConcurrentGames
+      case AdmissionPurpose.Showcase => 1
 
   /** The capacity answer for `GET /bot/capacity`. */
-  final case class Report(policy: BotSeatPolicy, activeGames: Int)
+  final case class Report(
+      policy: BotSeatPolicy,
+      activeGames: Int,
+      generalAllowance: Int = 0,
+      generalOccupancy: Int = 0,
+      showcaseAllowance: Int = 0,
+      showcaseOccupancy: Int = 0
+  )
+
+  def apply(guard: AdmissionGuard): SeatGuard = new SeatGuard(guard)
+
+  def apply(bots: BotStore, registry: GameRegistry): SeatGuard =
+    registry.attachedAdmissionGuard match
+      case Some(guard) => new SeatGuard(guard)
+      case None        => new SeatGuard(bots, registry)
+
+  def create(
+      bots: BotStore,
+      registry: GameRegistry,
+      showcaseConfig: ShowcaseConfig = ShowcaseConfig.Disabled
+  ): IO[SeatGuard] =
+    AdmissionGuard
+      .create(bots, showcaseConfig, registry = Some(registry))
+      .flatMap: guard =>
+        registry.attachAdmissionGuard(guard).as(new SeatGuard(guard))

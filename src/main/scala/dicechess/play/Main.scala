@@ -144,8 +144,10 @@ object Main extends IOApp.Simple:
         )
     )
 
-  private[play] def initShowcaseConfig: IO[ShowcaseConfig] =
-    ShowcaseConfig.fromEnv match
+  private[play] def initShowcaseConfig(
+      parsed: Either[String, ShowcaseConfig] = ShowcaseConfig.fromEnv
+  ): IO[ShowcaseConfig] =
+    parsed match
       case Left(error) =>
         IO.raiseError(new IllegalArgumentException(s"[play] invalid showcase configuration: $error"))
       case Right(cfg) => IO.pure(cfg)
@@ -161,7 +163,7 @@ object Main extends IOApp.Simple:
           s"[play] showcase reservation enabled for featured bot ${showcaseConfig.featuredBot.map(b => s"${b.team}/${b.name}").getOrElse("")} (reservedSeats = ${showcaseConfig.reservedSeats})"
         )
         .whenA(showcaseConfig.enabled)
-      admissionGuard <- AdmissionGuard.create(botStore, showcaseConfig)
+      admissionGuard <- AdmissionGuard.create(botStore, showcaseConfig, registry = Some(registry))
       _              <- registry.attachAdmissionGuard(admissionGuard)
       resumed        <- registry.resume
       _              <- IO.println(s"[play] resumed $resumed live game(s)").whenA(resumed > 0)
@@ -173,7 +175,7 @@ object Main extends IOApp.Simple:
   ): IO[Unit] =
     val (store, botStore, pgStore, httpClient, webhookTransport, deliverer) = resources
     for
-      showcaseConfig                 <- initShowcaseConfig
+      showcaseConfig                 <- initShowcaseConfig()
       registry                       <- registryFor(store, pgStore)
       (admissionGuard, seatGuard, _) <- setupAdmission(botStore, showcaseConfig, registry)
       botAuth                        <- BotAuth.fromEnv(botStore)

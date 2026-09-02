@@ -245,7 +245,8 @@ object CatalogRoutes:
           case Right((gameId, room)) =>
             room.joinTokens.get(playerSeat) match
               case Some(token) => Created(SeekMatch(gameId.value, token, playerSeat))
-              case None        => InternalServerError("missing seat token")
+              case None        =>
+                registry.abortAndDeregister(gameId) *> InternalServerError("missing seat token")
     }
 
   /** `(white, black, playerSeat)`: the human's chosen side if given, otherwise a coin flip — the ADR's "random by

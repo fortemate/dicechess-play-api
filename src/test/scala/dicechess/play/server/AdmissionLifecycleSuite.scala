@@ -165,8 +165,8 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
     assertEquals(validConfig.map(_.reservedSeats), Right(1))
     assertEquals(disabledConfig, Right(ShowcaseConfig.Disabled))
 
-  test("ShowcaseConfig extra edge cases and fromEnv"):
-    val defaultSeats = ShowcaseConfig.fromValues(
+  test("ShowcaseConfig requires explicit reservation and rejects invalid enablement"):
+    val missingSeats = ShowcaseConfig.fromValues(
       enabledRaw = Some("true"),
       teamRaw = Some("rpi3"),
       nameRaw = Some("hunter-book"),
@@ -178,8 +178,15 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
       nameRaw = Some("hunter-book"),
       reservedSeatsRaw = Some("abc")
     )
-    assertEquals(defaultSeats.map(_.reservedSeats), Right(1))
+    val invalidEnabled = ShowcaseConfig.fromValues(
+      enabledRaw = Some("yes"),
+      teamRaw = Some("rpi3"),
+      nameRaw = Some("hunter-book"),
+      reservedSeatsRaw = Some("1")
+    )
+    assert(missingSeats.isLeft)
     assert(invalidInt.isLeft)
+    assert(invalidEnabled.isLeft)
     assertEquals(ShowcaseConfig.fromValues(None, None, None, None), Right(ShowcaseConfig.Disabled))
 
   test("GameOrigin and AdmissionPurpose methods and wire resolution"):
@@ -245,16 +252,14 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
           cats.effect.IO.delay(throw new RuntimeException("boom"))
         }
         .attempt
-      // Unsafe constructor
-      unsafeGuard = AdmissionGuard.unsafe(bots, showcaseConfig)
-      diag <- unsafeGuard.diagnostics(featuredBot)
+      diag <- guard.diagnostics(featuredBot)
     yield
       assert(c1)
       assert(!c2)
       assert(!committedAfterExpire, "Expired ticket commit must be rejected")
       assertEquals(diagExpired.map(_.totalOccupancy), Some(0), "Expired commit must not add active occupancy")
       assert(errRes.isLeft)
-      assertEquals(diag.map(_.generalOccupancy), Some(0))
+      assertEquals(diag.map(_.generalOccupancy), Some(1))
 
   test("AdmissionGuard totalOcc >= maxCap branch coverage"):
     for

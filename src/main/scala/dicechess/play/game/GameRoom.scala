@@ -141,6 +141,15 @@ final class GameRoom private (
   /** Begin the game (roll the first turn). Call after subscribers have attached. */
   def start: IO[Unit] = inbox.offer(Msg.Begin)
 
+  /** Terminate a room that was constructed but could not be committed by its caller. The abort is serialized through
+    * the room inbox, preserving the single-writer invariant and producing the same auditable technical result as any
+    * other internal room failure.
+    */
+  private[play] def abort: IO[Unit] =
+    stateRef.get.flatMap: state =>
+      if state.ended then IO.unit
+      else inbox.offer(Msg.Abort) *> done.get.void
+
   /** Bind `seat` to the identity that just redeemed its join token, if [[GameRoom.claimable]] allows it (#285). Answers
     * whether the seat was actually rebound, so a caller can log or test the outcome; `false` is the ordinary case, not
     * an error — every game that already has two distinct players says no.
@@ -303,6 +312,8 @@ final class GameRoom private (
               stateRef.get.flatMap(s => process(s, seat, command, receivedAt, reply)).flatMap(stateRef.set) *> continue
             case Msg.Timeout =>
               stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
+            case Msg.Abort =>
+              abortIfActive
             case Msg.ClaimSeat(seat, claimer, displayName, rating, reply) =>
               stateRef.get.flatMap(s => onClaimSeat(s, seat, claimer, displayName, rating, reply)) *> continue
 
@@ -409,8 +420,8 @@ final class GameRoom private (
     val s2 = s.copy(version = s.version + 1)
     stateRef.set(s2) *> persistQuietly(s2) *> broadcast(make(s2.version)).as(s2)
 
-  /** Persistence is availability-first: a store failure is logged and the game plays on in memory (degrading to exactly
-    * what the storeless mode offers) rather than wedging the writer fiber mid-game.
+  /** After the fail-closed creation snapshot, persistence is availability-first: a later store failure is logged and
+    * the game plays on in memory rather than wedging the writer fiber mid-game.
     */
   private def persistQuietly(s: Session): IO[Unit] =
     persist(snapshotOf(s)).handleErrorWith(e => Console[IO].errorln(s"[play][persist] snapshot write failed: $e"))
@@ -707,6 +718,7 @@ object GameRoom:
 
   private enum Msg:
     case Begin
+    case Abort
     case Command(
         seat: Seat,
         command: GameCommand,
@@ -853,41 +865,42 @@ object GameRoom:
     EngineOps.parse(initialDfen) match
       case Left(error)   => IO.pure(Left(error))
       case Right(state0) =>
-        for
-          createdAt <- IO.realTime
-          session0 = Session(
-            state0,
-            0L,
-            players,
-            displayNames,
-            ratings,
-            dice,
-            0L,
-            pending = false,
-            GameStatus.Active,
-            timeControl,
-            rated = rated,
-            ladder = ladder,
-            origin = origin,
-            remaining = initialRemaining(timeControl, players.keys),
-            createdAtEpochMs = Some(createdAt.toMillis)
-          )
-          seatTokens <- mintTokens(players.keys)
-          room       <- build(
-            session0,
-            seatTokens,
-            fanOutBuffer,
-            idleCheck,
-            disconnectGrace,
-            seedGrace,
-            maxInlinePaths,
-            persist
-          )
-          // The creation row must be durable before anyone plays: the seat tokens and the dice commitment have been
-          // handed out, so a restart in the first seconds must not lose them.
-          _ <- room.persistQuietly(session0)
-          _ <- room.supervisedConsume.start
-        yield Right(room)
+        IO.uncancelable: poll =>
+          for
+            createdAt <- IO.realTime
+            session0 = Session(
+              state0,
+              0L,
+              players,
+              displayNames,
+              ratings,
+              dice,
+              0L,
+              pending = false,
+              GameStatus.Active,
+              timeControl,
+              rated = rated,
+              ladder = ladder,
+              origin = origin,
+              remaining = initialRemaining(timeControl, players.keys),
+              createdAtEpochMs = Some(createdAt.toMillis)
+            )
+            seatTokens <- mintTokens(players.keys)
+            room       <- build(
+              session0,
+              seatTokens,
+              fanOutBuffer,
+              idleCheck,
+              disconnectGrace,
+              seedGrace,
+              maxInlinePaths,
+              persist
+            )
+            // Unlike later snapshots, the creation row is fail-closed: returning a room whose seat tokens and dice
+            // commitment were never durable would make a successful admission impossible to resume after a restart.
+            _ <- poll(persist(room.snapshotOf(session0)))
+            _ <- room.supervisedConsume.start
+          yield Right(room)
 
   /** Rebuild a room from a durable snapshot after a restart. Tokens, seeds, clocks and turn history come from the
     * snapshot; the caller re-derives the `DiceSource` from the stored server seed, so the committed dice sequence

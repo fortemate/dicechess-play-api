@@ -116,21 +116,22 @@ final class Lobby private (
       accepter: Principal,
       ticket: AdmissionGuard.AdmissionTicket
   ): IO[Either[Rejected, Match]] =
-    (claim(id, accepter), randomBoolean).flatMapN {
-      case (Left(rejected), _) =>
-        ticket.release.as(Left(rejected))
-      case (Right((creator, tc, rated)), swapColor) =>
-        val (white, black) = if swapColor then (accepter, creator) else (creator, accepter)
-        registry
-          .createRoomInternal(
-            white,
-            black,
-            tc,
-            origin = GameOrigin.Lobby,
-            requestedRated = rated,
-            ladder = false
-          )
-          .flatMap {
+    IO.uncancelable: poll =>
+      (claim(id, accepter), randomBoolean).flatMapN {
+        case (Left(rejected), _) =>
+          ticket.release.as(Left(rejected))
+        case (Right((creator, tc, rated)), swapColor) =>
+          val (white, black) = if swapColor then (accepter, creator) else (creator, accepter)
+          poll(
+            registry.createRoomInternal(
+              white,
+              black,
+              tc,
+              origin = GameOrigin.Lobby,
+              requestedRated = rated,
+              ladder = false
+            )
+          ).flatMap {
             case Left(error) =>
               seeks.update(_.removed(id)) *>
                 ticket.release.as(Left(Rejected.Failed(error)))
@@ -155,13 +156,14 @@ final class Lobby private (
                       case false =>
                         seeks.update(_.removed(id)) *>
                           registry
-                            .deregister(gameId, List(white, black))
+                            .abortAndDeregister(gameId)
                             .as(Left(Rejected.Failed("reservation lease expired before room creation completed")))
                 case _ =>
                   seeks.update(_.removed(id)) *>
+                    registry.abortAndDeregister(gameId) *>
                     ticket.release.as(Left(Rejected.Failed("missing seat token")))
           }
-    }
+      }
 
   private def seatLegacy(id: String, accepter: Principal): IO[Either[Rejected, Match]] =
     (claim(id, accepter), randomBoolean).flatMapN {

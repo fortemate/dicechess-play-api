@@ -32,9 +32,6 @@ final class AdmissionGuard private (
 ):
   import AdmissionGuard.*
 
-  def withRegistry(reg: GameRegistry): AdmissionGuard =
-    new AdmissionGuard(botStore, showcaseConfig, state, leaseTimeout, Some(reg))
-
   private def untrackedInRegistry(bot: Principal.Bot, active: Map[GameId, ActiveAdmission]): IO[Int] =
     registry match
       case None      => IO.pure(0)
@@ -100,28 +97,30 @@ final class AdmissionGuard private (
     */
   def admit[A](
       players: List[Principal],
-      purpose: AdmissionPurpose
+      purpose: AdmissionPurpose,
+      compensate: (GameId, A) => IO[Unit] = (gameId: GameId, _: A) => releaseGame(gameId)
   )(create: AdmissionTicket => IO[Either[String, (GameId, A)]]): IO[Either[AdmissionError, (GameId, A)]] =
     acquire(players, purpose).flatMap:
       case Left(err)     => IO.pure(Left(err))
       case Right(ticket) =>
-        create(ticket)
-          .flatMap:
-            case Left(err) =>
-              ticket.release.as(Left(AdmissionError.Failed(err)))
-            case Right((gameId, result)) =>
-              ticket
-                .commit(gameId)
-                .flatMap:
-                  case true  => IO.pure(Right((gameId, result)))
-                  case false =>
-                    releaseGame(gameId).as(
-                      Left(AdmissionError.Failed("reservation lease expired before room creation completed"))
-                    )
-          .guaranteeCase:
-            case Outcome.Succeeded(_) => IO.unit
-            case Outcome.Errored(_)   => ticket.release
-            case Outcome.Canceled()   => ticket.release
+        IO.uncancelable: poll =>
+          poll(create(ticket))
+            .flatMap:
+              case Left(err) =>
+                ticket.release.as(Left(AdmissionError.Failed(err)))
+              case Right((gameId, result)) =>
+                ticket
+                  .commit(gameId)
+                  .flatMap:
+                    case true  => IO.pure(Right((gameId, result)))
+                    case false =>
+                      compensate(gameId, result).as(
+                        Left(AdmissionError.Failed("reservation lease expired before room creation completed"))
+                      )
+            .guaranteeCase:
+              case Outcome.Succeeded(_) => IO.unit
+              case Outcome.Errored(_)   => ticket.release
+              case Outcome.Canceled()   => ticket.release
 
   /** Convenience method for room creation that does not involve intermediate claim steps. */
   def admitAndCreate(
@@ -133,7 +132,11 @@ final class AdmissionGuard private (
       requestedRated: Boolean = false,
       ladder: Boolean = false
   ): IO[Either[AdmissionError, (GameId, GameRoom)]] =
-    admit(List(white, black), origin.admissionPurpose): _ =>
+    admit[GameRoom](
+      List(white, black),
+      origin.admissionPurpose,
+      compensate = (gameId: GameId, _: GameRoom) => registry.abortAndDeregister(gameId)
+    ): _ =>
       registry.createRoomInternal(white, black, timeControl, origin, requestedRated, ladder)
 
   /** Advisory check: whether `principal` would currently be admitted for `purpose`. */
@@ -334,30 +337,32 @@ final class AdmissionGuard private (
       def ticketPurpose: AdmissionPurpose   = purpose
 
       def commit(gameId: GameId): IO[Boolean] =
-        IO.delay(settled.compareAndSet(false, true))
-          .flatMap:
-            case true =>
-              IO.monotonic.flatMap: now =>
-                state.modify: current =>
-                  current.inFlight.get(ticketId) match
-                    case Some(res) if res.expiresAt > now =>
-                      (
-                        current.copy(
-                          inFlight = current.inFlight.removed(ticketId),
-                          active = current.active.updated(gameId, ActiveAdmission(gameId, bots, purpose))
-                        ),
-                        true
-                      )
-                    case _ =>
-                      (current.copy(inFlight = current.inFlight.removed(ticketId)), false)
-            case false => IO.pure(false)
+        IO.uncancelable: _ =>
+          IO.delay(settled.compareAndSet(false, true))
+            .flatMap:
+              case true =>
+                IO.monotonic.flatMap: now =>
+                  state.modify: current =>
+                    current.inFlight.get(ticketId) match
+                      case Some(res) if res.expiresAt > now =>
+                        (
+                          current.copy(
+                            inFlight = current.inFlight.removed(ticketId),
+                            active = current.active.updated(gameId, ActiveAdmission(gameId, bots, purpose))
+                          ),
+                          true
+                        )
+                      case _ =>
+                        (current.copy(inFlight = current.inFlight.removed(ticketId)), false)
+              case false => IO.pure(false)
 
       def release: IO[Unit] =
-        IO.delay(settled.compareAndSet(false, true))
-          .flatMap:
-            case true =>
-              state.update(current => current.copy(inFlight = current.inFlight.removed(ticketId)))
-            case false => IO.unit
+        IO.uncancelable: _ =>
+          IO.delay(settled.compareAndSet(false, true))
+            .flatMap:
+              case true =>
+                state.update(current => current.copy(inFlight = current.inFlight.removed(ticketId)))
+              case false => IO.unit
 
   private case class UnboundedTicket(purpose: AdmissionPurpose) extends AdmissionTicket:
     def id: Long                            = 0L

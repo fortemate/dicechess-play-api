@@ -94,6 +94,6 @@ object SeatGuard:
       showcaseConfig: ShowcaseConfig = ShowcaseConfig.Disabled
   ): IO[SeatGuard] =
     AdmissionGuard
-      .create(bots, showcaseConfig)
+      .create(bots, showcaseConfig, registry = Some(registry))
       .flatMap: guard =>
         registry.attachAdmissionGuard(guard).as(new SeatGuard(guard))

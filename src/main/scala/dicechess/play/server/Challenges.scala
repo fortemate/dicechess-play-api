@@ -101,20 +101,21 @@ final class Challenges private (
 
   /** Claim the entry (so two accepts can't both seat a game) and start the game within an atomic reservation. */
   private def seat(by: Principal, id: String, ticket: AdmissionGuard.AdmissionTicket): IO[Either[Rejected, String]] =
-    claim(by, id).flatMap {
-      case Left(rejected) =>
-        ticket.release.as(Left(rejected))
-      case Right(challenge) =>
-        registry
-          .createRoomInternal(
-            challenge.challenger,
-            challenge.target,
-            challenge.timeControl,
-            origin = GameOrigin.Direct,
-            requestedRated = challenge.rated,
-            ladder = false
-          )
-          .flatMap {
+    IO.uncancelable: poll =>
+      claim(by, id).flatMap {
+        case Left(rejected) =>
+          ticket.release.as(Left(rejected))
+        case Right(challenge) =>
+          poll(
+            registry.createRoomInternal(
+              challenge.challenger,
+              challenge.target,
+              challenge.timeControl,
+              origin = GameOrigin.Direct,
+              requestedRated = challenge.rated,
+              ladder = false
+            )
+          ).flatMap {
             case Left(error) =>
               ticket.release.as(Left(Rejected.Failed(error)))
             case Right((gameId, _)) =>
@@ -127,10 +128,10 @@ final class Challenges private (
                       events.publish(challenge.target, started).as(Right(gameId.value))
                   case false =>
                     registry
-                      .deregister(gameId, List(challenge.challenger, challenge.target))
+                      .abortAndDeregister(gameId)
                       .as(Left(Rejected.Failed("reservation lease expired before room creation completed")))
           }
-    }
+      }
 
   private def seatLegacy(by: Principal, id: String): IO[Either[Rejected, String]] =
     claim(by, id).flatMap {

@@ -24,10 +24,17 @@ class MainSuite extends munit.CatsEffectSuite:
   test("without webhooks the outbound client keeps Ember's own defaults"):
     assertEquals(Main.outboundClientBuilder(None).timeout, EmberClientBuilder.default[IO].timeout)
 
-  test("initShowcaseConfig succeeds with defaults"):
-    Main.initShowcaseConfig.map { cfg =>
+  test("initShowcaseConfig accepts parsed configuration without reading the ambient environment"):
+    Main.initShowcaseConfig(Right(dicechess.play.server.ShowcaseConfig.Disabled)).map { cfg =>
       assertEquals(cfg, dicechess.play.server.ShowcaseConfig.Disabled)
     }
+
+  test("initShowcaseConfig rejects an invalid parsed configuration"):
+    Main
+      .initShowcaseConfig(Left("bad showcase config"))
+      .attempt
+      .map: result =>
+        assert(result.left.exists(_.getMessage.contains("bad showcase config")))
 
   test("setupAdmission attaches admissionGuard and resumes rooms"):
     for

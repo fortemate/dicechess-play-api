@@ -3,7 +3,7 @@ package dicechess.play.server
 import cats.effect.{Deferred, IO}
 import cats.syntax.all.*
 import dicechess.play.core.*
-import dicechess.play.store.BotStore
+import dicechess.play.store.{BotStore, GameSnapshot, GameStore}
 
 import scala.concurrent.duration.*
 
@@ -30,9 +30,14 @@ class AdmissionConcurrencySuite extends munit.CatsEffectSuite:
       bots     <- BotStore.inMemory
       _        <- bots.register(featuredBot.team, featuredBot.name, "hash-featured")
       _        <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, limit)
-      guard    <- AdmissionGuard.create(bots, showcaseConfig, leaseTimeout = 2.seconds)
       registry <- GameRegistry.create()
-      _        <- registry.attachAdmissionGuard(guard)
+      guard    <- AdmissionGuard.create(
+        bots,
+        showcaseConfig,
+        leaseTimeout = 2.seconds,
+        registry = Some(registry)
+      )
+      _ <- registry.attachAdmissionGuard(guard)
     yield (bots, registry, guard)
 
   test("general-only concurrency: exactly 2 out of N concurrent requests succeed when limit=3, reserved=1"):
@@ -166,6 +171,92 @@ class AdmissionConcurrencySuite extends munit.CatsEffectSuite:
           "slot 3 is busy (reserved for showcase)"
         )
     }
+
+  test("initial snapshot failure releases admission without registering or starting a room"):
+    for
+      bots <- BotStore.inMemory
+      _    <- bots.register(featuredBot.team, featuredBot.name, "hash-featured")
+      _    <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, 3)
+      failingStore = new GameStore:
+        def save(id: GameId, snapshot: GameSnapshot): IO[Unit] =
+          IO.raiseError(RuntimeException("initial snapshot failed"))
+        def loadActive: IO[List[(GameId, GameSnapshot)]] = IO.pure(Nil)
+      registry <- GameRegistry.create(store = failingStore)
+      guard    <- AdmissionGuard.create(bots, showcaseConfig, registry = Some(registry))
+      _        <- registry.attachAdmissionGuard(guard)
+      result   <- guard
+        .admitAndCreate(
+          registry,
+          featuredBot,
+          Principal.Bot("filler", "persist-failure"),
+          TimeControl.Unlimited,
+          GameOrigin.Direct
+        )
+        .attempt
+      rooms <- registry.list
+      diag  <- guard.diagnostics(featuredBot)
+    yield
+      assert(result.left.exists(_.getMessage.contains("initial snapshot failed")))
+      assertEquals(rooms, Nil)
+      assertEquals(diag.map(_.generalOccupancy), Some(0))
+
+  test("cancellation during registration aborts the room and releases admission"):
+    for
+      bots       <- BotStore.inMemory
+      _          <- bots.register(featuredBot.team, featuredBot.name, "hash-featured")
+      _          <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, 3)
+      registry   <- GameRegistry.create()
+      guard      <- AdmissionGuard.create(bots, showcaseConfig, registry = Some(registry))
+      _          <- registry.attachAdmissionGuard(guard)
+      registered <- Deferred[IO, Unit]
+      hold       <- Deferred[IO, Unit]
+      _          <- registry.onRegister((_, _, _) => registered.complete(()).void *> hold.get)
+      fiber      <- guard
+        .admitAndCreate(
+          registry,
+          featuredBot,
+          Principal.Bot("filler", "cancelled-registration"),
+          TimeControl.Unlimited,
+          GameOrigin.Direct
+        )
+        .start
+      _     <- registered.get
+      _     <- fiber.cancel
+      rooms <- registry.list
+      diag  <- guard.diagnostics(featuredBot)
+    yield
+      assertEquals(rooms, Nil)
+      assertEquals(diag.map(_.generalOccupancy), Some(0))
+
+  test("lease expiry after room creation aborts and deregisters the orphan"):
+    for
+      bots     <- BotStore.inMemory
+      _        <- bots.register(featuredBot.team, featuredBot.name, "hash-featured")
+      _        <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, 3)
+      registry <- GameRegistry.create(resolveNicknames = _ => IO.sleep(60.millis).as(Map.empty))
+      guard    <- AdmissionGuard.create(
+        bots,
+        showcaseConfig,
+        leaseTimeout = 20.millis,
+        registry = Some(registry)
+      )
+      _      <- registry.attachAdmissionGuard(guard)
+      result <- guard.admitAndCreate(
+        registry,
+        featuredBot,
+        Principal.Bot("filler", "expired-creation"),
+        TimeControl.Unlimited,
+        GameOrigin.Direct
+      )
+      rooms <- registry.list
+      diag  <- guard.diagnostics(featuredBot)
+    yield
+      assert(
+        result.left.exists(_.message == "reservation lease expired before room creation completed"),
+        s"expected expired admission failure, got $result"
+      )
+      assertEquals(rooms, Nil)
+      assertEquals(diag.map(_.generalOccupancy), Some(0))
 
   test("rollback on fiber cancellation: cancelled fiber releases reservation immediately"):
     harness().flatMap { (_, _, guard) =>

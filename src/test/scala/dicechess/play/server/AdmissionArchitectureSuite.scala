@@ -39,10 +39,10 @@ class AdmissionArchitectureSuite extends munit.CatsEffectSuite:
       _        <- bots.register(featuredBot.team, featuredBot.name, "hash-featured")
       _        <- bots.setMaxConcurrentGames(featuredBot.team, featuredBot.name, limit)
       _        <- bots.openToHumans(featuredBot.team, featuredBot.name, None)
-      guard    <- AdmissionGuard.create(bots, showcaseConfig)
       registry <- GameRegistry.create()
+      guard    <- AdmissionGuard.create(bots, showcaseConfig, registry = Some(registry))
       _        <- registry.attachAdmissionGuard(guard)
-      seatGuard = SeatGuard(guard.withRegistry(registry))
+      seatGuard = SeatGuard(guard)
     yield (bots, registry, guard, seatGuard)
 
   test("Path 1 - LadderScheduler: routes through AdmissionGuard and is rejected when general capacity is reached"):

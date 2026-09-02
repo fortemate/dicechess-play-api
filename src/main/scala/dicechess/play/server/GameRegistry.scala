@@ -68,7 +68,8 @@ final class GameRegistry private (
 
   /** Create and start a room for two players. Dice come from a fresh commit-reveal source whose server seed is
     * committed before any client connects; each player then folds in its own post-commit seed (see GameRoom's gate).
-    * Errors (e.g. a bad initial position) are returned as a Left, never thrown.
+    * Domain errors (e.g. a bad initial position) are returned as a Left. Effect failures such as an unavailable durable
+    * store fail the creation effect so an admission caller can compensate the reservation and any partial registration.
     *
     * `requestedRated` is only a hint: the game is actually rated iff [[GameRegistry.isRated]] agrees, so an anonymous
     * participant on either side silently forces a casual game regardless of what was requested.
@@ -185,7 +186,11 @@ final class GameRegistry private (
         origin = origin,
         persist = store.save(id, _)
       )
-      result <- made.traverse(room => register(id, room) *> room.start.as((id, room)))
+      result <- made.traverse: room =>
+        val cleanup = room.abort *> abortAndDeregister(id)
+        (register(id, room) *> room.start.as((id, room)))
+          .onError(_ => cleanup)
+          .onCancel(cleanup)
     yield result
 
   /** Rebuild rooms for every game that was live when the process stopped; returns how many were revived. A snapshot
@@ -306,13 +311,30 @@ final class GameRegistry private (
         (room.result *> room.seating.flatMap(fin => deregister(id, fin.values.toList.distinct))).start.void
 
   private[server] def deregister(id: GameId, players: List[Principal]): IO[Unit] =
-    rooms.update(_.removed(id)) *>
-      byPlayer.update(index =>
-        players.foldLeft(index): (acc, p) =>
-          val rest = acc.getOrElse(p, Set.empty) - id
-          if rest.isEmpty then acc.removed(p) else acc.updated(p, rest)
-      ) *>
-      IO.defer(deregisterHooks.asScala.toList.traverse_(_(id)))
+    IO.uncancelable: _ =>
+      rooms
+        .modify(current => (current.removed(id), current.contains(id)))
+        .flatMap:
+          case false => IO.unit
+          case true  =>
+            byPlayer.update(index =>
+              players.foldLeft(index): (acc, p) =>
+                val rest = acc.getOrElse(p, Set.empty) - id
+                if rest.isEmpty then acc.removed(p) else acc.updated(p, rest)
+            ) *>
+              IO.defer(deregisterHooks.asScala.toList.traverse_(_(id)))
+
+  /** Compensate a room that was built and started but whose admission could not be committed. Aborting through the
+    * room's inbox terminates its consumer and persists an auditable technical result; explicit deregistration makes
+    * cleanup deterministic instead of waiting for the result-watcher fiber to be scheduled.
+    */
+  private[server] def abortAndDeregister(id: GameId): IO[Unit] =
+    rooms.get
+      .map(_.get(id))
+      .flatMap:
+        case None       => IO.unit
+        case Some(room) =>
+          room.seating.flatMap(players => room.abort *> deregister(id, players.values.toList.distinct))
 
 object GameRegistry:
 

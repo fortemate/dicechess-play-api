@@ -84,7 +84,9 @@ object SeatGuard:
   def apply(guard: AdmissionGuard): SeatGuard = new SeatGuard(guard)
 
   def apply(bots: BotStore, registry: GameRegistry): SeatGuard =
-    new SeatGuard(bots, registry)
+    registry.attachedAdmissionGuard match
+      case Some(guard) => new SeatGuard(guard)
+      case None        => new SeatGuard(bots, registry)
 
   def create(
       bots: BotStore,

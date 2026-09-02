@@ -110,7 +110,14 @@ final class AdmissionGuard private (
             case Left(err) =>
               ticket.release.as(Left(AdmissionError.Failed(err)))
             case Right((gameId, result)) =>
-              ticket.commit(gameId).as(Right((gameId, result)))
+              ticket
+                .commit(gameId)
+                .flatMap:
+                  case true  => IO.pure(Right((gameId, result)))
+                  case false =>
+                    releaseGame(gameId).as(
+                      Left(AdmissionError.Failed("reservation lease expired before room creation completed"))
+                    )
           .guaranteeCase:
             case Outcome.Succeeded(_) => IO.unit
             case Outcome.Errored(_)   => ticket.release
@@ -245,62 +252,78 @@ final class AdmissionGuard private (
       genOcc: Int,
       showOcc: Int
   ): Either[AdmissionError, Unit] =
-    val totalOcc = genOcc + showOcc
-    val maxCap   = policy.maxConcurrentGames
+    if showcaseConfig.isFeatured(bot) then checkFeaturedCapacity(bot, policy, purpose, genOcc, showOcc)
+    else checkNonFeaturedCapacity(bot, policy, purpose, genOcc + showOcc)
 
-    if showcaseConfig.isFeatured(bot) then
-      val reserved      = showcaseConfig.reservedSeats
-      val genAllowance  = math.max(0, maxCap - reserved)
-      val showAllowance = reserved
+  private def checkFeaturedCapacity(
+      bot: Principal.Bot,
+      policy: BotSeatPolicy,
+      purpose: AdmissionPurpose,
+      genOcc: Int,
+      showOcc: Int
+  ): Either[AdmissionError, Unit] =
+    val totalOcc      = genOcc + showOcc
+    val maxCap        = policy.maxConcurrentGames
+    val reserved      = showcaseConfig.reservedSeats
+    val genAllowance  = math.max(0, maxCap - reserved)
+    val showAllowance = reserved
 
-      purpose match
-        case AdmissionPurpose.Showcase =>
-          if showOcc >= showAllowance then
-            Left(AdmissionError.Busy(s"showcase table is currently occupied for bot ${bot.team}/${bot.name}"))
-          else if totalOcc >= maxCap then
-            Left(AdmissionError.Busy(s"featured bot ${bot.team}/${bot.name} is at total capacity ($totalOcc/$maxCap)"))
-          else Right(())
+    purpose match
+      case AdmissionPurpose.Showcase =>
+        if showOcc >= showAllowance then
+          Left(AdmissionError.Busy(s"showcase table is currently occupied for bot ${bot.team}/${bot.name}"))
+        else if totalOcc >= maxCap then
+          Left(AdmissionError.Busy(s"featured bot ${bot.team}/${bot.name} is at total capacity ($totalOcc/$maxCap)"))
+        else Right(())
 
-        case AdmissionPurpose.Ladder =>
-          val ladderCap = math.min(policy.ladderAllowance, genAllowance)
-          if genOcc >= ladderCap then
-            Left(
-              AdmissionError.Busy(
-                s"featured bot ${bot.team}/${bot.name} is at general ladder limit ($genOcc/$ladderCap)"
-              )
+      case AdmissionPurpose.Ladder =>
+        val ladderCap = math.min(policy.ladderAllowance, genAllowance)
+        if genOcc >= ladderCap then
+          Left(
+            AdmissionError.Busy(
+              s"featured bot ${bot.team}/${bot.name} is at general ladder limit ($genOcc/$ladderCap)"
             )
-          else if totalOcc >= maxCap then
-            Left(AdmissionError.Busy(s"featured bot ${bot.team}/${bot.name} is at total capacity ($totalOcc/$maxCap)"))
-          else Right(())
+          )
+        else if totalOcc >= maxCap then
+          Left(AdmissionError.Busy(s"featured bot ${bot.team}/${bot.name} is at total capacity ($totalOcc/$maxCap)"))
+        else Right(())
 
-        case AdmissionPurpose.Direct =>
-          if genOcc >= genAllowance then
-            Left(
-              AdmissionError.Busy(
-                s"featured bot ${bot.team}/${bot.name} is at general capacity limit ($genOcc/$genAllowance)"
-              )
+      case AdmissionPurpose.Direct =>
+        if genOcc >= genAllowance then
+          Left(
+            AdmissionError.Busy(
+              s"featured bot ${bot.team}/${bot.name} is at general capacity limit ($genOcc/$genAllowance)"
             )
-          else if totalOcc >= maxCap then
-            Left(AdmissionError.Busy(s"featured bot ${bot.team}/${bot.name} is at total capacity ($totalOcc/$maxCap)"))
-          else Right(())
-    else
-      purpose match
-        case AdmissionPurpose.Showcase =>
-          Left(AdmissionError.Busy(s"bot ${bot.team}/${bot.name} is not the configured featured showcase bot"))
+          )
+        else if totalOcc >= maxCap then
+          Left(AdmissionError.Busy(s"featured bot ${bot.team}/${bot.name} is at total capacity ($totalOcc/$maxCap)"))
+        else Right(())
 
-        case AdmissionPurpose.Ladder =>
-          if totalOcc >= policy.ladderAllowance then
-            Left(
-              AdmissionError.Busy(
-                s"bot ${bot.team}/${bot.name} is at ladder allowance ($totalOcc/${policy.ladderAllowance})"
-              )
+  private def checkNonFeaturedCapacity(
+      bot: Principal.Bot,
+      policy: BotSeatPolicy,
+      purpose: AdmissionPurpose,
+      totalOcc: Int
+  ): Either[AdmissionError, Unit] =
+    purpose match
+      case AdmissionPurpose.Showcase =>
+        Left(AdmissionError.Busy(s"bot ${bot.team}/${bot.name} is not the configured featured showcase bot"))
+      case AdmissionPurpose.Ladder =>
+        if totalOcc >= policy.ladderAllowance then
+          Left(
+            AdmissionError.Busy(
+              s"bot ${bot.team}/${bot.name} is at ladder allowance ($totalOcc/${policy.ladderAllowance})"
             )
-          else Right(())
-
-        case AdmissionPurpose.Direct =>
-          if totalOcc >= maxCap then
-            Left(AdmissionError.Busy(s"bot ${bot.team}/${bot.name} is at declared capacity ($totalOcc/$maxCap)"))
-          else Right(())
+          )
+        else Right(())
+      case AdmissionPurpose.Direct =>
+        if totalOcc >= policy.maxConcurrentGames then
+          Left(
+            AdmissionError.Busy(
+              s"bot ${bot.team}/${bot.name} is at declared capacity ($totalOcc/${policy.maxConcurrentGames})"
+            )
+          )
+        else Right(())
 
   private def createTicket(ticketId: Long, bots: List[Principal.Bot], purpose: AdmissionPurpose): AdmissionTicket =
     new AdmissionTicket:
@@ -310,16 +333,24 @@ final class AdmissionGuard private (
       def admittedBots: List[Principal.Bot] = bots
       def ticketPurpose: AdmissionPurpose   = purpose
 
-      def commit(gameId: GameId): IO[Unit] =
+      def commit(gameId: GameId): IO[Boolean] =
         IO.delay(settled.compareAndSet(false, true))
           .flatMap:
             case true =>
-              state.update: current =>
-                current.copy(
-                  inFlight = current.inFlight.removed(ticketId),
-                  active = current.active.updated(gameId, ActiveAdmission(gameId, bots, purpose))
-                )
-            case false => IO.unit
+              IO.monotonic.flatMap: now =>
+                state.modify: current =>
+                  current.inFlight.get(ticketId) match
+                    case Some(res) if res.expiresAt > now =>
+                      (
+                        current.copy(
+                          inFlight = current.inFlight.removed(ticketId),
+                          active = current.active.updated(gameId, ActiveAdmission(gameId, bots, purpose))
+                        ),
+                        true
+                      )
+                    case _ =>
+                      (current.copy(inFlight = current.inFlight.removed(ticketId)), false)
+            case false => IO.pure(false)
 
       def release: IO[Unit] =
         IO.delay(settled.compareAndSet(false, true))
@@ -329,25 +360,25 @@ final class AdmissionGuard private (
             case false => IO.unit
 
   private case class UnboundedTicket(purpose: AdmissionPurpose) extends AdmissionTicket:
-    def id: Long                          = 0L
-    def admittedBots: List[Principal.Bot] = Nil
-    def ticketPurpose: AdmissionPurpose   = purpose
-    def commit(gameId: GameId): IO[Unit]  = IO.unit
-    def release: IO[Unit]                 = IO.unit
+    def id: Long                            = 0L
+    def admittedBots: List[Principal.Bot]   = Nil
+    def ticketPurpose: AdmissionPurpose     = purpose
+    def commit(gameId: GameId): IO[Boolean] = IO.pure(true)
+    def release: IO[Unit]                   = IO.unit
 
 object AdmissionGuard:
 
   val DefaultLeaseTimeout: FiniteDuration = 5.seconds
 
-  enum AdmissionError:
-    case Busy(message: String)
-    case Failed(cause: String)
+  enum AdmissionError(val message: String):
+    case Busy(override val message: String) extends AdmissionError(message)
+    case Failed(cause: String)              extends AdmissionError(cause)
 
   trait AdmissionTicket:
     def id: Long
     def admittedBots: List[Principal.Bot]
     def ticketPurpose: AdmissionPurpose
-    def commit(gameId: GameId): IO[Unit]
+    def commit(gameId: GameId): IO[Boolean]
     def release: IO[Unit]
 
   final case class Reservation(

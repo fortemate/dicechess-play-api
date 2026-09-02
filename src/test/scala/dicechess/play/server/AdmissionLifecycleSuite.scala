@@ -3,6 +3,8 @@ package dicechess.play.server
 import dicechess.play.core.*
 import dicechess.play.store.BotStore
 
+import scala.concurrent.duration.*
+
 /** Lifecycle test suite verifying startup reconciliation, capacity reduction under load, non-featured bots, unbounded
   * participants, and boot configuration validation for Issue #45.
   */
@@ -178,7 +180,7 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
     )
     assertEquals(defaultSeats.map(_.reservedSeats), Right(1))
     assert(invalidInt.isLeft)
-    assert(ShowcaseConfig.fromEnv.isRight)
+    assertEquals(ShowcaseConfig.fromValues(None, None, None, None), Right(ShowcaseConfig.Disabled))
 
   test("GameOrigin and AdmissionPurpose methods and wire resolution"):
     GameOrigin.valuesList.foreach { origin =>
@@ -202,6 +204,7 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
       policy = policyOpt.get
       registry <- GameRegistry.create()
       sg       <- SeatGuard.create(bots, registry, showcaseConfig)
+      diag     <- sg.admissionGuard.diagnostics(featuredBot)
     yield
       import SeatGuard.*
       assertEquals(AdmissionPurpose.Ladder.allowanceOf(policy), policy.ladderAllowance)
@@ -212,9 +215,9 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
       assertEquals(rep.generalOccupancy, 1)
       assertEquals(rep.showcaseAllowance, 1)
       assertEquals(rep.showcaseOccupancy, 0)
-      assert(sg.admissionGuard != null)
+      assert(diag.isDefined)
 
-  test("AdmissionGuard ticket methods, double commit/release, and exception recovery"):
+  test("AdmissionGuard ticket methods, double commit/release, expired commit rejection, and exception recovery"):
     for
       bots  <- BotStore.inMemory
       _     <- bots.register(featuredBot.team, featuredBot.name, "h")
@@ -226,9 +229,16 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
       _      = assertEquals(ticket.admittedBots, List(featuredBot))
       _      = assertEquals(ticket.ticketPurpose, AdmissionPurpose.Direct)
       _      = assert(ticket.id > 0L)
-      _ <- ticket.commit(GameId("g-test"))
-      _ <- ticket.commit(GameId("g-test")) // idempotent second commit
-      _ <- ticket.release                  // settled, no-op
+      c1 <- ticket.commit(GameId("g-test"))
+      c2 <- ticket.commit(GameId("g-test")) // idempotent second commit
+      _  <- ticket.release                  // settled, no-op
+      // Test commit rejection after lease expiry
+      expiredGuard <- AdmissionGuard.create(bots, showcaseConfig, leaseTimeout = 20.millis)
+      tExpRes      <- expiredGuard.acquire(List(featuredBot), AdmissionPurpose.Direct)
+      tExp = tExpRes.toOption.get
+      _                    <- cats.effect.IO.sleep(50.millis)
+      committedAfterExpire <- tExp.commit(GameId("g-expired"))
+      diagExpired          <- expiredGuard.diagnostics(featuredBot)
       // Test admit with exception in action (Outcome.Errored)
       errRes <- guard
         .admit[Unit](List(featuredBot), AdmissionPurpose.Direct) { _ =>
@@ -239,6 +249,10 @@ class AdmissionLifecycleSuite extends munit.CatsEffectSuite:
       unsafeGuard = AdmissionGuard.unsafe(bots, showcaseConfig)
       diag <- unsafeGuard.diagnostics(featuredBot)
     yield
+      assert(c1)
+      assert(!c2)
+      assert(!committedAfterExpire, "Expired ticket commit must be rejected")
+      assertEquals(diagExpired.map(_.totalOccupancy), Some(0), "Expired commit must not add active occupancy")
       assert(errRes.isLeft)
       assertEquals(diag.map(_.generalOccupancy), Some(0))
 

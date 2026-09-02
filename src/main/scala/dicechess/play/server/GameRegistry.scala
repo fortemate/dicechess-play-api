@@ -83,10 +83,15 @@ final class GameRegistry private (
   def onDeregister(hook: GameId => IO[Unit]): IO[Unit] =
     IO.delay(deregisterHooks.add(hook)).void
 
+  private val attachedGuard = new java.util.concurrent.atomic.AtomicReference[Option[AdmissionGuard]](None)
+
+  def attachedAdmissionGuard: Option[AdmissionGuard] = attachedGuard.get()
+
   def onResume(hook: List[(GameId, List[Principal], GameOrigin)] => IO[Unit]): IO[Unit] =
     IO.delay(resumeHooks.add(hook)).void
 
   def attachAdmissionGuardSync(guard: AdmissionGuard): Unit =
+    attachedGuard.set(Some(guard))
     registerHooks.add((id, players, origin) => guard.recordActive(id, players, origin))
     deregisterHooks.add(guard.releaseGame)
     resumeHooks.add(details => guard.reconcile(details).void)
@@ -102,17 +107,13 @@ final class GameRegistry private (
       ladder: Boolean = false,
       origin: GameOrigin = GameOrigin.Legacy
   ): IO[Either[String, (GameId, GameRoom)]] =
-    (GameId.random, diceSource()).flatMapN { (id, dice) =>
-      createRoom(
-        id,
-        Map(Seat.White -> white, Seat.Black -> black),
-        dice,
-        timeControl,
-        rated = GameRegistry.isRated(white, black, requestedRated, timeControl),
-        ladder = ladder,
-        origin = origin
-      )
-    }
+    attachedGuard.get() match
+      case Some(guard) =>
+        guard
+          .admitAndCreate(this, white, black, timeControl, origin, requestedRated, ladder)
+          .map(_.left.map(_.message))
+      case None =>
+        createRoomInternal(white, black, timeControl, origin, requestedRated, ladder)
 
   private[server] def createRoomInternal(
       white: Principal,

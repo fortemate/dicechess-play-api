@@ -121,29 +121,46 @@ final class Lobby private (
         ticket.release.as(Left(rejected))
       case (Right((creator, tc, rated)), swapColor) =>
         val (white, black) = if swapColor then (accepter, creator) else (creator, accepter)
-        registry.create(white, black, tc, requestedRated = rated, origin = GameOrigin.Lobby).flatMap {
-          case Left(error) =>
-            seeks.update(_.removed(id)) *>
-              ticket.release.as(Left(Rejected.Failed(error)))
-          case Right((gameId, room)) =>
-            val tokens                      = room.joinTokens
-            val (creatorSeat, accepterSeat) = if swapColor then (Seat.Black, Seat.White) else (Seat.White, Seat.Black)
-            (tokens.get(creatorSeat), tokens.get(accepterSeat)) match
-              case (Some(creatorToken), Some(accepterToken)) =>
-                ticket.commit(gameId) *>
-                  seeks
-                    .update(
-                      _.updatedWith(id)(
-                        _.map(
-                          _.copy(state = EntryState.Matched(Match(gameId.value, creatorToken, creatorSeat)))
-                        )
-                      )
-                    )
-                    .as(Right(Match(gameId.value, accepterToken, accepterSeat)))
-              case _ =>
-                seeks.update(_.removed(id)) *>
-                  ticket.release.as(Left(Rejected.Failed("missing seat token")))
-        }
+        registry
+          .createRoomInternal(
+            white,
+            black,
+            tc,
+            origin = GameOrigin.Lobby,
+            requestedRated = rated,
+            ladder = false
+          )
+          .flatMap {
+            case Left(error) =>
+              seeks.update(_.removed(id)) *>
+                ticket.release.as(Left(Rejected.Failed(error)))
+            case Right((gameId, room)) =>
+              val tokens                      = room.joinTokens
+              val (creatorSeat, accepterSeat) = if swapColor then (Seat.Black, Seat.White) else (Seat.White, Seat.Black)
+              (tokens.get(creatorSeat), tokens.get(accepterSeat)) match
+                case (Some(creatorToken), Some(accepterToken)) =>
+                  ticket
+                    .commit(gameId)
+                    .flatMap:
+                      case true =>
+                        seeks
+                          .update(
+                            _.updatedWith(id)(
+                              _.map(
+                                _.copy(state = EntryState.Matched(Match(gameId.value, creatorToken, creatorSeat)))
+                              )
+                            )
+                          )
+                          .as(Right(Match(gameId.value, accepterToken, accepterSeat)))
+                      case false =>
+                        seeks.update(_.removed(id)) *>
+                          registry
+                            .deregister(gameId, List(white, black))
+                            .as(Left(Rejected.Failed("reservation lease expired before room creation completed")))
+                case _ =>
+                  seeks.update(_.removed(id)) *>
+                    ticket.release.as(Left(Rejected.Failed("missing seat token")))
+          }
     }
 
   private def seatLegacy(id: String, accepter: Principal): IO[Either[Rejected, Match]] =

@@ -1,7 +1,9 @@
 package dicechess.play.server
 
 import cats.effect.IO
+import cats.syntax.all.*
 import dicechess.play.core.*
+import dicechess.play.game.GameRoom
 import dicechess.play.store.{BotCatalogListing, BotCatalogStore, BotStore}
 import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.{Method, Request, Status, Uri}
@@ -171,46 +173,59 @@ class AdmissionArchitectureSuite extends munit.CatsEffectSuite:
         assertEquals(pending._1.map(_.id), List(challengeId), "Challenge must remain pending when rejected as Busy")
     }
 
-  test("Path 5 - Showcase: table claim routes through AdmissionGuard and enforces singleton showcase occupancy"):
+  test("Path 5 - Showcase: concurrent table claims enforce singleton occupancy with exactly one winner"):
     harness().flatMap { (_, registry, guard, _) =>
+      def claimShowcase(visitor: Principal): IO[Either[AdmissionGuard.AdmissionError, (GameId, GameRoom)]] =
+        guard.admitAndCreate(
+          registry,
+          featuredBot,
+          visitor,
+          TimeControl.Unlimited,
+          origin = GameOrigin.Showcase
+        )
+
       for
-        // First showcase admission succeeds
-        s1 <- guard.admitAndCreate(
-          registry,
-          featuredBot,
-          humanGuest,
-          TimeControl.Unlimited,
-          origin = GameOrigin.Showcase
-        )
-        // Second showcase admission fails
-        s2 <- guard.admitAndCreate(
-          registry,
-          featuredBot,
-          Principal.Guest("22222222-2222-2222-2222-222222222222"),
-          TimeControl.Unlimited,
-          origin = GameOrigin.Showcase
-        )
+        gate <- cats.effect.Deferred[IO, Unit]
+        v1 = Principal.Guest("11111111-1111-1111-1111-111111111111")
+        v2 = Principal.Guest("22222222-2222-2222-2222-222222222222")
+        fiber   <- List(v1, v2).parTraverse(v => gate.get *> claimShowcase(v)).start
+        _       <- gate.complete(())
+        results <- fiber.joinWithNever
+        succeeded = results.count(_.isRight)
+        busy      = results.count {
+          case Left(AdmissionGuard.AdmissionError.Busy(_)) => true
+          case _                                           => false
+        }
+        diag <- guard.diagnostics(featuredBot)
       yield
-        assert(s1.isRight, "First showcase claim must succeed")
-        assert(
-          s2.isLeft && s2.left.exists(_.isInstanceOf[AdmissionGuard.AdmissionError.Busy]),
-          "Second showcase claim must be Busy"
-        )
+        assertEquals(succeeded, 1, "First-claim linearizability: exactly one concurrent claim must win")
+        assertEquals(busy, 1, "Concurrent loser must receive Busy")
+        assertEquals(diag.map(_.showcaseOccupancy), Some(1))
+        assertEquals(diag.map(_.generalOccupancy), Some(0))
     }
 
-  test("Path 6 - Direct Registry creation: automatically tracked by AdmissionGuard lifecycle hooks"):
+  test("Path 6 - Direct Registry creation: automatically guarded by attached AdmissionGuard"):
     harness().flatMap { (_, registry, guard, _) =>
       for
-        // Create room directly on registry
+        // First room creation succeeds
         c1 <- registry.create(featuredBot, opponentBot, TimeControl.Unlimited, origin = GameOrigin.Direct)
-        gameId = c1.toOption.get._1
+        gameId1 = c1.toOption.get._1
         diag1 <- guard.diagnostics(featuredBot)
-        // Deregister room
-        _     <- registry.deregister(gameId, List(featuredBot, opponentBot))
+        // Second room creation succeeds (fills 2/2 general allowance)
+        c2    <- registry.create(featuredBot, opponentBot, TimeControl.Unlimited, origin = GameOrigin.Direct)
         diag2 <- guard.diagnostics(featuredBot)
+        // Third direct creation fails because general seats are full
+        c3 <- registry.create(featuredBot, opponentBot, TimeControl.Unlimited, origin = GameOrigin.Direct)
+        // Deregister room 1
+        _     <- registry.deregister(gameId1, List(featuredBot, opponentBot))
+        diag3 <- guard.diagnostics(featuredBot)
       yield
-        assertEquals(diag1.map(_.generalOccupancy), Some(1), "Direct room creation must be tracked by AdmissionGuard")
-        assertEquals(diag2.map(_.generalOccupancy), Some(0), "Deregistration must release occupancy in AdmissionGuard")
+        assert(c1.isRight)
+        assert(c2.isRight)
+        assertEquals(diag1.map(_.generalOccupancy), Some(1))
+        assertEquals(diag2.map(_.generalOccupancy), Some(2))
+        assert(c3.isLeft, "Direct registry create must not bypass attached AdmissionGuard when capacity is full")
+        assertEquals(diag3.map(_.generalOccupancy), Some(1))
     }
 
   test("Lobby: successful accept commits admission in AdmissionGuard"):

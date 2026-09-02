@@ -106,21 +106,29 @@ final class Challenges private (
         ticket.release.as(Left(rejected))
       case Right(challenge) =>
         registry
-          .create(
+          .createRoomInternal(
             challenge.challenger,
             challenge.target,
             challenge.timeControl,
+            origin = GameOrigin.Direct,
             requestedRated = challenge.rated,
-            origin = GameOrigin.Direct
+            ladder = false
           )
           .flatMap {
             case Left(error) =>
               ticket.release.as(Left(Rejected.Failed(error)))
             case Right((gameId, _)) =>
-              val started = BotEvent.GameStart(gameId.value)
-              ticket.commit(gameId) *>
-                events.publish(challenge.challenger, started) *>
-                events.publish(challenge.target, started).as(Right(gameId.value))
+              ticket
+                .commit(gameId)
+                .flatMap:
+                  case true =>
+                    val started = BotEvent.GameStart(gameId.value)
+                    events.publish(challenge.challenger, started) *>
+                      events.publish(challenge.target, started).as(Right(gameId.value))
+                  case false =>
+                    registry
+                      .deregister(gameId, List(challenge.challenger, challenge.target))
+                      .as(Left(Rejected.Failed("reservation lease expired before room creation completed")))
           }
     }
 

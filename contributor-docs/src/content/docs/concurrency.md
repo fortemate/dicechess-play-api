@@ -133,13 +133,16 @@ The central `AdmissionGuard` component owns atomic `acquire -> create/register -
 
 ### 3. Single-process topology constraint
 
-In this release, `AdmissionGuard` linearizability and state coordination are process-local in-memory structures backed by
-PostgreSQL transactions. **Traffic must be routed to exactly one serving process**, not merely one node: multiple worker
-processes or replicas on the same node would maintain independent in-memory state and could both observe `open` and
-create competing rooms.
+In this release, `AdmissionGuard` linearizability and state coordination are process-local in-memory structures;
+PostgreSQL persists durable room data only and does not coordinate in-memory admissions across processes.
+**Traffic must be routed to exactly one serving process**, not merely one node: multiple worker
+processes or replicas on the same node would maintain independent in-memory state and could both observe available
+seats and create competing rooms.
 
-Multi-process and multi-node horizontal scaling are strictly prohibited until a shared distributed coordinator
-(such as a PostgreSQL transactional coordinator or distributed lease manager) is designed and implemented.
+Cross-process admission safety would require `AdmissionGuard.acquire` and ticket settlement to be coordinated within
+one shared transaction or distributed coordinator. Until such a distributed coordinator (such as a PostgreSQL
+transactional lease or distributed lock manager) is designed and implemented, multi-process and multi-node
+horizontal scaling are strictly prohibited.
 
 ## The server trusts nothing from the client
 

@@ -42,7 +42,7 @@ class AdmissionConcurrencySuite extends munit.CatsEffectSuite:
       guard    <- AdmissionGuard.create(
         bots,
         showcaseConfig,
-        leaseTimeout = 2.seconds,
+        leaseTimeout = 10.seconds,
         registry = Some(registry)
       )
       _ <- registry.attachAdmissionGuard(guard)
@@ -292,6 +292,80 @@ class AdmissionConcurrencySuite extends munit.CatsEffectSuite:
         )
         assert(t1.isRight)
         assert(t2.isRight)
+    }
+
+  test("double-counting window: holding general tickets post-registration permits reserved showcase acquire"):
+    harness().flatMap { (_, registry, guard) =>
+      for
+        gate1    <- Deferred[IO, Unit]
+        gate2    <- Deferred[IO, Unit]
+        proceed1 <- Deferred[IO, Unit]
+        proceed2 <- Deferred[IO, Unit]
+
+        gen1Fiber <- guard
+          .admit[dicechess.play.game.GameRoom](
+            List(featuredBot, Principal.Bot("filler", "gen-1")),
+            AdmissionPurpose.Direct
+          ) { ticket =>
+            registry
+              .createRoomInternal(
+                featuredBot,
+                Principal.Bot("filler", "gen-1"),
+                TimeControl.Unlimited,
+                GameOrigin.Direct,
+                requestedRated = false,
+                ladder = false
+              )
+              .flatMap {
+                case Right((id, room)) =>
+                  gate1.complete(()) *> proceed1.get *> ticket.commit(id).as(Right((id, room)))
+                case Left(err) =>
+                  IO.pure(Left(err))
+              }
+          }
+          .start
+
+        gen2Fiber <- guard
+          .admit[dicechess.play.game.GameRoom](
+            List(featuredBot, Principal.Bot("filler", "gen-2")),
+            AdmissionPurpose.Direct
+          ) { ticket =>
+            registry
+              .createRoomInternal(
+                featuredBot,
+                Principal.Bot("filler", "gen-2"),
+                TimeControl.Unlimited,
+                GameOrigin.Direct,
+                requestedRated = false,
+                ladder = false
+              )
+              .flatMap {
+                case Right((id, room)) =>
+                  gate2.complete(()) *> proceed2.get *> ticket.commit(id).as(Right((id, room)))
+                case Left(err) =>
+                  IO.pure(Left(err))
+              }
+          }
+          .start
+
+        _ <- gate1.get
+        _ <- gate2.get
+
+        diagDuringWindow <- guard.diagnostics(featuredBot)
+        showcaseAcquire  <- guard.acquire(List(featuredBot), AdmissionPurpose.Showcase)
+
+        _ <- proceed1.complete(())
+        _ <- proceed2.complete(())
+        _ <- gen1Fiber.join
+        _ <- gen2Fiber.join
+      yield
+        assertEquals(diagDuringWindow.map(_.generalOccupancy), Some(2))
+        assertEquals(diagDuringWindow.map(_.showcaseOccupancy), Some(0))
+        assertEquals(diagDuringWindow.map(_.totalOccupancy), Some(2))
+        assert(
+          showcaseAcquire.isRight,
+          s"showcase acquire should succeed during double-counting window, got: $showcaseAcquire"
+        )
     }
 
   test("lease timeout expiry: expired provisional tickets do not permanently consume capacity"):

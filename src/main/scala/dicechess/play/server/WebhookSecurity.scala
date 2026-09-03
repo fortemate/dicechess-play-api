@@ -102,6 +102,47 @@ object WebhookSecurity:
     */
   private[play] lazy val loopbackAllowed: Boolean = loopbackFlag(sys.env.get(LoopbackEnvVar))
 
+  private def validateTarget(uri: Uri, allowLoopback: Boolean): Either[WebhookUrlFailure, (String, Port)] =
+    val plaintext     = uri.scheme.contains(Uri.Scheme.http)
+    val allowedScheme = uri.scheme.contains(Uri.Scheme.https) || (allowLoopback && plaintext)
+    if !allowedScheme then Left(WebhookUrlFailure.HttpsRequired)
+    else if uri.userInfo.nonEmpty then Left(WebhookUrlFailure.UserInfoForbidden)
+    else if uri.fragment.nonEmpty then Left(WebhookUrlFailure.FragmentForbidden)
+    else
+      val defaultPort = if plaintext then 80 else 443
+      (uri.host.map(_.value), Port.fromInt(uri.port.getOrElse(defaultPort))) match
+        case (None, _)                => Left(WebhookUrlFailure.MissingHost)
+        case (_, None)                => Left(WebhookUrlFailure.InvalidPort)
+        case (Some(host), Some(port)) => Right((host, port))
+
+  private def classifyResolved(
+      uri: Uri,
+      host: String,
+      port: Port,
+      addresses: List[InetAddress],
+      allowLoopback: Boolean
+  ): Either[WebhookUrlFailure, ResolvedWebhookTarget] =
+    val plaintext = uri.scheme.contains(Uri.Scheme.http)
+    NonEmptyList.fromList(addresses) match
+      case None => Left(WebhookUrlFailure.HostDoesNotResolve(host))
+      case Some(resolved) if !resolved.forall(a => isPublic(a) || (allowLoopback && a.isLoopbackAddress)) =>
+        // Do not name the rejected address: a split-horizon resolver must not become an internal-DNS
+        // oracle through caller-visible policy errors.
+        Left(WebhookUrlFailure.NonPublicAddress)
+      case Some(resolved) if plaintext && !resolved.forall(_.isLoopbackAddress) =>
+        // The hatch concedes plaintext to a fixture on this host, never to a routable one: the HMAC and
+        // the turn body would otherwise cross a real network readable.
+        Left(WebhookUrlFailure.HttpsRequired)
+      case Some(resolved) =>
+        Right(
+          ResolvedWebhookTarget(
+            uri = uri,
+            originalHost = host,
+            port = port,
+            addresses = resolved.map(IpAddress.fromInetAddress)
+          )
+        )
+
   /** Test seam for deterministic DNS answers, including mixed public/private rebinding responses. `allowLoopback` is
     * required rather than defaulted to an ambient read of [[LoopbackEnvVar]]: every caller states the policy it means
     * to exercise, so exporting the hatch in the shell that runs the suite cannot quietly change what a test asserts.
@@ -114,40 +155,12 @@ object WebhookSecurity:
     Uri.fromString(url) match
       case Left(_)    => IO.pure(Left(WebhookUrlFailure.InvalidUrl))
       case Right(uri) =>
-        val plaintext     = uri.scheme.contains(Uri.Scheme.http)
-        val allowedScheme = uri.scheme.contains(Uri.Scheme.https) || (allowLoopback && plaintext)
-        if !allowedScheme then IO.pure(Left(WebhookUrlFailure.HttpsRequired))
-        else if uri.userInfo.nonEmpty then IO.pure(Left(WebhookUrlFailure.UserInfoForbidden))
-        else if uri.fragment.nonEmpty then IO.pure(Left(WebhookUrlFailure.FragmentForbidden))
-        else
-          val defaultPort = if plaintext then 80 else 443
-          (uri.host.map(_.value), Port.fromInt(uri.port.getOrElse(defaultPort))) match
-            case (None, _)                => IO.pure(Left(WebhookUrlFailure.MissingHost))
-            case (_, None)                => IO.pure(Left(WebhookUrlFailure.InvalidPort))
-            case (Some(host), Some(port)) =>
-              lookup(host).attempt.map:
-                case Left(_)          => Left(WebhookUrlFailure.HostDoesNotResolve(host))
-                case Right(addresses) =>
-                  NonEmptyList.fromList(addresses) match
-                    case None => Left(WebhookUrlFailure.HostDoesNotResolve(host))
-                    case Some(resolved)
-                        if !resolved.forall(a => isPublic(a) || (allowLoopback && a.isLoopbackAddress)) =>
-                      // Do not name the rejected address: a split-horizon resolver must not become an internal-DNS
-                      // oracle through caller-visible policy errors.
-                      Left(WebhookUrlFailure.NonPublicAddress)
-                    case Some(resolved) if plaintext && !resolved.forall(_.isLoopbackAddress) =>
-                      // The hatch concedes plaintext to a fixture on this host, never to a routable one: the HMAC and
-                      // the turn body would otherwise cross a real network readable.
-                      Left(WebhookUrlFailure.HttpsRequired)
-                    case Some(resolved) =>
-                      Right(
-                        ResolvedWebhookTarget(
-                          uri = uri,
-                          originalHost = host,
-                          port = port,
-                          addresses = resolved.map(IpAddress.fromInetAddress)
-                        )
-                      )
+        validateTarget(uri, allowLoopback) match
+          case Left(failure)       => IO.pure(Left(failure))
+          case Right((host, port)) =>
+            lookup(host).attempt.map:
+              case Left(_)          => Left(WebhookUrlFailure.HostDoesNotResolve(host))
+              case Right(addresses) => classifyResolved(uri, host, port, addresses, allowLoopback)
 
   /** Compatibility view used by the existing bot-token surface. New outbound calls should keep the resolved target and
     * pass it to [[WebhookTransport]], rather than discard it and trigger a second DNS lookup.

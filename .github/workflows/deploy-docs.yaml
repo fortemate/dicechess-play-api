@@ -1,8 +1,16 @@
 name: "CD: Deploy Bot API Docs"
 
+# The Bot API site (bots.fortemate.com) is built on every pull request that touches it, so a broken
+# page or a contract fixture that fails `npm run build`'s validation step is caught before merge
+# rather than by the production deploy. The deploy itself stays gated to pushes on main, mirroring
+# deploy-contributor-docs.yaml.
 on:
   push:
     branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yaml"
+  pull_request:
     paths:
       - "docs/**"
       - ".github/workflows/deploy-docs.yaml"
@@ -13,8 +21,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    name: Deploy to Cloudflare Workers
+  build:
+    name: Build Bot API Docs
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,7 +45,8 @@ jobs:
         run: npm run build
         working-directory: docs
 
-      - name: Deploy to Cloudflare
+      - name: Deploy to Cloudflare Workers
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

@@ -62,7 +62,7 @@ jobs:
           rm -rf target/covcache
           sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"
         env:
-          # Resolves lv.id.jc:dicechess-engine-scala from GitHub Packages
+          # Resolves com.fortemate:dicechess-engine from GitHub Packages
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

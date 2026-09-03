@@ -409,5 +409,5 @@ by the strength report, while the `ladder` boolean marks ladder-origin games and
   request — CI applies the migrations to a throwaway Postgres and fails if the committed page
   is stale.
 - Migrations against a shared database are an operator action, not a CI action.
-- The four suites that touch Postgres run against Testcontainers, so a migration that fails to
+- The five suites that touch Postgres run against Testcontainers, so a migration that fails to
   apply fails the build — see [Testing](/dicechess-play-api/testing/).

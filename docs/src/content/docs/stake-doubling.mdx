@@ -1,0 +1,204 @@
+---
+title: Reserved Stake-Doubling Contract
+description: The accepted future x2 stake and webhook contract. It is documented for implementers but is not enabled on the live API.
+---
+
+import ContractFixture from '../../components/ContractFixture.astro';
+
+:::caution[Reserved — not available yet]
+This page specifies the contract that the implementation must follow. The `doubling` webhook capability
+is still `reserved` and unselectable, and the live API does not yet accept staked games or the actions
+below. Schema publication does not enable behaviour.
+:::
+
+The authoritative engineering decision is
+[ADR-0019](https://fortemate.github.io/dicechess-play-api/stake-doubling/). The validated schema bundle
+and fixtures are available at
+[`/contracts/stake-doubling/v1/schema.json`](/contracts/stake-doubling/v1/schema.json) and
+[`/contracts/stake-doubling/v1/fixtures.json`](/contracts/stake-doubling/v1/fixtures.json). Every example
+on this page is rendered from those fixture files at build time, after the build has validated them, so
+the prose cannot drift from the published contract.
+
+## What a stake means
+
+Stake doubling is opt-in. The stake is one seat's exposure in positive integer `PLAY_CREDIT`, a
+closed-loop game credit with no purchase, redemption, cash, token, prize, or transfer meaning in this
+protocol. It is not the combined pot.
+
+Both seats reserve `initialStake * maximumMultiplier` before a game starts. A wallet may settle the
+result, but wallet ids, balances, reservation ids, credentials, and settlement internals never appear
+in the game or webhook payloads.
+
+The cube begins centered at `1`. Before rolling on its own turn, a seat may offer while the cube is
+centered or owned by that seat, no draw or double response is pending, and the cube is below the
+configured cap. Once accepted, the stake doubles and cube ownership moves to the responder; only that
+owner may offer a later double. The maximum multiplier is fixed at game creation and cannot exceed `64`.
+Declining loses the current pre-offer stake, not the proposed doubled amount.
+
+## Who can be admitted
+
+Staked games are casual, durable games between supported, authenticated participants. They are never
+ladder or showcase games. Omitting `stake` preserves the existing classic protocol.
+
+A bot qualifies only through an active webhook registration that selects the `doubling` capability;
+capabilities exist nowhere else in the protocol. Poll-only bots and the static `house` roster cannot
+register webhooks, so they cannot be seated in a staked game. The REST actions and stream events below
+are an alternative channel for admitted bots and for human clients, not a way in.
+
+## Creation opt-in
+
+The first version adds `stake` to authenticated `POST /lobby/play-bot` requests. `guestId` keeps its
+live meaning and is ignored when a session seats the player; a staked request without a session is
+rejected:
+
+<ContractFixture name="create-play-bot" />
+
+A direct registered-bot `POST /bot/challenge` carries the same complete agreement as part of the
+offer; an omitted `timeControl` keeps the live `Unlimited` default:
+
+<ContractFixture name="create-challenge" />
+
+The whole `stake` object is required when present. There are no partial defaults. `maximumMultiplier`
+must be one of `2, 4, 8, 16, 32, 64`, and the server validates the maximum amount without integer
+overflow. `rated: true`, a guest, unavailable durable storage or settlement, a bot without an active
+`doubling` webhook, or an unsupported creation surface is rejected rather than downgraded.
+
+## Public game state
+
+A classic game omits `doubling` or sends `null`. A staked game always sends the complete object. The
+schema names the pre-roll shape `StakedDecisionSnapshot`: the live `PublicGameState` with `doubling`
+present, `dicePending: false`, and `legalMoves: null`. Classic and post-roll snapshots keep the live
+`PublicGameState` shape, which gains the optional nullable `doubling` member.
+
+Before White rolls, an offer is legal:
+
+<ContractFixture name="state-opportunity" />
+
+After White offers, Black becomes the decision actor while White remains the seat whose turn resumes
+after a take. No dice exist yet, and the decision keeps its id; only `kind`, `seat`, and `offeredBy`
+change:
+
+<ContractFixture name="state-response" />
+
+`activeSeat` names the actor who must answer now. The active colour in `dfen` remains the actual chess
+side to move and matches `doubling.turnSeat`; during a response it deliberately differs from
+`activeSeat`. Runtime consumers use the explicit decision `seat` for the responder's perspective rather
+than treating DFEN as a decision-actor marker. The active actor's clock runs, so a client counts down
+the clock of `activeSeat`, not of the DFEN side to move; acceptance does not award an increment. Clocks
+are reported as of the carrying event: the offer above charged White five seconds and left Black
+untouched. On acceptance the active actor returns to `turnSeat`, the stake and cube are updated, and
+the roll follows immediately: cube ownership has moved to the responder, so the turn owner cannot
+immediately re-offer.
+
+`Unlimited` games carry `clocks: null`, exactly as today:
+
+<ContractFixture name="state-opportunity-unlimited" />
+
+## Commands and REST actions
+
+The transport-neutral command vocabulary, carried by the human client's game socket, is:
+
+<ContractFixture name="command-roll" />
+
+<ContractFixture name="command-offer" />
+
+<ContractFixture name="command-respond" />
+
+Equivalent authenticated Bot API operations are:
+
+| Operation | Request body |
+| --- | --- |
+| `POST /bot/game/{id}/roll` | `{ "decisionId": "..." }` |
+| `POST /bot/game/{id}/double/offer` | `{ "decisionId": "..." }` |
+| `POST /bot/game/{id}/double/accept` | `{ "decisionId": "..." }` |
+| `POST /bot/game/{id}/double/decline` | `{ "decisionId": "..." }` |
+
+One `decisionId` identifies a whole doubling episode: the opportunity, the offer, and the response
+share it, and `doubling.decision.kind` names the step currently awaiting an answer. An applied action
+returns the version it committed:
+
+<ContractFixture name="decision-outcome" />
+
+An identical retry for the same step returns the original outcome with `duplicate: true` and emits
+nothing:
+
+<ContractFixture name="decision-duplicate" />
+
+An unknown id, an already answered step, or a wrong-seat, conflicting, or wrong-kind action returns
+`409` with `applied: false` and `version: null`, as move verdicts do. Like move submissions, a bounded
+server wait may fall back to `202`; the stream or snapshot remains authoritative.
+
+<ContractFixture name="decision-conflict" />
+
+## Stream events
+
+An eligible staked pre-roll phase publishes a dice-free opportunity at the current version. If the cube
+belongs to the opponent or has reached the configured cap, the existing automatic roll path continues
+without a decision:
+
+<ContractFixture name="event-opportunity" />
+
+Offering, taking, and dropping each commit one version:
+
+<ContractFixture name="event-offered" />
+
+<ContractFixture name="event-accepted" />
+
+<ContractFixture name="event-declined" />
+
+`reason` is `declined`, `timeout`, or `disconnect`. Only an explicit `declined` response ends the game
+with the new `DoubleDeclined` termination, an additive member of `GameEnded.termination`; timeout and
+disconnect keep their factual `Timeout` and `Resign` terminations while settling the same current
+stake. Clients must tolerate unknown termination values, as they already should.
+
+## Webhook deliveries
+
+Only a bot admitted with the `doubling` capability receives these signed deliveries. Both are
+dice-free and carry exactly the snapshot a stream or `GET /games/{id}` would serve.
+
+Offer or roll:
+
+<ContractFixture name="webhook-opportunity" />
+
+<ContractFixture name="webhook-opportunity-response" />
+
+Take or drop:
+
+<ContractFixture name="webhook-decision" />
+
+<ContractFixture name="webhook-decision-response" />
+
+Transport failures are never read as a financial action, and the two deliveries fail differently. A
+missing, malformed, oversized, late, non-200, or wrong-kind answer to `doubleOpportunity` is treated
+exactly like `offerDouble: false`: the server rolls, as it does after a failed `drawDecision`. The same
+failure on `doubleDecision` is never read as an acceptance or a decline: the decision stays pending and
+the responder's clock decides. Runtime strategy defaults explicitly return `offerDouble: false` and
+`acceptDouble: false` only when the callback itself succeeds.
+
+## Ordering with draws, dice, and reconnects
+
+- A pending draw response always resolves before the next double opportunity. In a staked game every
+  draw-decline path, including `POST /bot/game/{id}/draw/decline`, an `acceptDraw: false` webhook
+  answer, and the server's automatic decline for a bot without `draws`, continues into the double
+  opportunity instead of the classic immediate reveal.
+- On the opening turn the client-seed window closes first; the first double opportunity opens only
+  then, and the seed-grace force-start enters the opportunity instead of rolling.
+- Dice are neither derived nor revealed while a draw or double decision is pending.
+- An accepted double returns to the original turn owner and then reveals the roll; it does not create
+  a redundant ineligible opportunity.
+- A forced pass is known only after the roll and follows the existing automatic pass path.
+- A reconnecting client receives the exact `decisionId`, decision kind, cube, stake, and turn owner in
+  `Snapshot`; it never infers the phase from `dicePending` alone.
+- Repeated identical actions for a decision id and step are idempotent. Conflicting actions are
+  rejected.
+- At game end, the existing seed and client-seed reveal still occurs immediately.
+
+## Capability rollout
+
+Publishing this contract does not change the current catalog:
+
+<ContractFixture name="capability-catalog" />
+
+The capability becomes available only after durable server state, settlement, runtime support,
+analytics, and compatible clients have passed end-to-end staging checks. Rollback first stops new
+staked admissions; active games keep their snapshotted contract until settlement.

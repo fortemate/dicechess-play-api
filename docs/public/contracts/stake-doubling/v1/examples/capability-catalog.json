@@ -1,0 +1,6 @@
+{
+  "capabilities": [
+    { "name": "draws", "status": "available", "selectable": true },
+    { "name": "doubling", "status": "reserved", "selectable": false }
+  ]
+}

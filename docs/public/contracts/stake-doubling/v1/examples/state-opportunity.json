@@ -1,0 +1,36 @@
+{
+  "version": 0,
+  "dfen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+  "activeSeat": "White",
+  "dicePending": false,
+  "status": { "Active": {} },
+  "timeControl": { "Fischer": { "initialSeconds": 300, "incrementSeconds": 3 } },
+  "clocks": { "white": 300000, "black": 300000 },
+  "commit": "5f64c3ed69253a39c08dd52f34a30e79f347a92fcdfb6f101c2f8db6393dcdfe",
+  "seed": null,
+  "clientSeeds": null,
+  "legalMoves": null,
+  "players": {
+    "white": { "kind": "Human", "name": null, "rating": null },
+    "black": { "kind": "Bot", "name": "acme aggressive", "rating": null }
+  },
+  "rated": false,
+  "drawOffer": null,
+  "mayOfferDraw": null,
+  "doubling": {
+    "currency": "PLAY_CREDIT",
+    "initialStake": 10,
+    "currentStake": 10,
+    "cubeValue": 1,
+    "cubeOwner": null,
+    "maximumMultiplier": 64,
+    "mayOfferDouble": true,
+    "turnSeat": "White",
+    "decision": {
+      "id": "double_01K4F4Y7M8R2",
+      "kind": "offer",
+      "seat": "White",
+      "proposedStake": 20
+    }
+  }
+}

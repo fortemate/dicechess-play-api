@@ -57,6 +57,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Architecture', link: '/architecture/' },
 						{ label: 'Concurrency Doctrine', link: '/concurrency/' },
+						{ label: 'Stake Doubling ADR', link: '/stake-doubling/' },
 						{ label: 'Configuration', link: '/configuration/' },
 					],
 				},

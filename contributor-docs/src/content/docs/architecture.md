@@ -109,6 +109,10 @@ Routes are grouped by audience rather than by resource:
 The complete, authoritative reference for the bot-facing routes is the
 [Bot API site](https://bots.fortemate.com/), not this page.
 
+The accepted but still disabled stake-doubling state machine is specified separately in
+[ADR-0019](/dicechess-play-api/stake-doubling/). Its `doubling` webhook capability remains reserved;
+the ADR and fixtures do not enable a route, registration, wallet, or production game.
+
 ## Staged webhook control plane
 
 The staged path deliberately separates browser authorization, durable credential state, and
@@ -250,4 +254,3 @@ and refuses to create a showcase room at all over a store that does not claim du
 
 The full specification is codified in ADR-005 (#44); concurrency and capacity invariants are detailed in
 [Concurrency](/dicechess-play-api/concurrency/).
-

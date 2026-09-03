@@ -39,6 +39,7 @@ import dicechess.play.server.{
   ManagedWebhookVerifier,
   WebhookManagement,
   WebhookRoutes,
+  WebhookSecurity,
   WebhookTransport,
   Webhooks
 }
@@ -342,7 +343,14 @@ object Main extends IOApp.Simple:
                 s"[play][webhook] per-turn window ${webhookConfig.timeout.toSeconds}s, one pinned connection per " +
                   s"delivery (shared client cut ${webhookConfig.clientTimeout.toSeconds}s, " +
                   s"idle ${webhookConfig.clientIdleTimeout.toSeconds}s)"
-              ) *> pgStore.fold(WebhookStore.inMemory)(pg => IO.pure(pg: WebhookStore))
+              ) *> IO
+                .println(
+                  s"[play][webhook] ALERT: ${WebhookSecurity.LoopbackEnvVar} enabled — private loopback allowed for testing"
+                )
+                .whenA(
+                  sys.env.get(WebhookSecurity.LoopbackEnvVar).exists(v => v.equalsIgnoreCase("true") || v == "1")
+                ) *>
+                pgStore.fold(WebhookStore.inMemory)(pg => IO.pure(pg: WebhookStore))
             )
             .flatMap { webhookStore =>
               // Delivery telemetry (#225) is Postgres-only, like the leaderboard/catalog: in-memory mode still

@@ -82,6 +82,11 @@ object WebhookSecurity:
   def resolvePublicHttps(url: String): IO[Either[WebhookUrlFailure, ResolvedWebhookTarget]] =
     resolvePublicHttps(url, systemLookup)
 
+  val LoopbackEnvVar = "WEBHOOK_ALLOW_LOOPBACK"
+
+  private def loopbackAllowed: Boolean =
+    sys.env.get(LoopbackEnvVar).exists(v => v.equalsIgnoreCase("true") || v == "1")
+
   /** Test seam for deterministic DNS answers, including mixed public/private rebinding responses. */
   private[server] def resolvePublicHttps(
       url: String,
@@ -90,11 +95,14 @@ object WebhookSecurity:
     Uri.fromString(url) match
       case Left(_)    => IO.pure(Left(WebhookUrlFailure.InvalidUrl))
       case Right(uri) =>
-        if !uri.scheme.contains(Uri.Scheme.https) then IO.pure(Left(WebhookUrlFailure.HttpsRequired))
+        val allowedScheme =
+          uri.scheme.contains(Uri.Scheme.https) || (loopbackAllowed && uri.scheme.contains(Uri.Scheme.http))
+        if !allowedScheme then IO.pure(Left(WebhookUrlFailure.HttpsRequired))
         else if uri.userInfo.nonEmpty then IO.pure(Left(WebhookUrlFailure.UserInfoForbidden))
         else if uri.fragment.nonEmpty then IO.pure(Left(WebhookUrlFailure.FragmentForbidden))
         else
-          (uri.host.map(_.value), Port.fromInt(uri.port.getOrElse(443))) match
+          val defaultPort = if uri.scheme.contains(Uri.Scheme.http) then 80 else 443
+          (uri.host.map(_.value), Port.fromInt(uri.port.getOrElse(defaultPort))) match
             case (None, _)                => IO.pure(Left(WebhookUrlFailure.MissingHost))
             case (_, None)                => IO.pure(Left(WebhookUrlFailure.InvalidPort))
             case (Some(host), Some(port)) =>
@@ -103,7 +111,8 @@ object WebhookSecurity:
                 case Right(addresses) =>
                   NonEmptyList.fromList(addresses) match
                     case None => Left(WebhookUrlFailure.HostDoesNotResolve(host))
-                    case Some(resolved) if !resolved.forall(isPublic) =>
+                    case Some(resolved)
+                        if !resolved.forall(a => isPublic(a) || (loopbackAllowed && a.isLoopbackAddress)) =>
                       // Do not name the rejected address: a split-horizon resolver must not become an internal-DNS
                       // oracle through caller-visible policy errors.
                       Left(WebhookUrlFailure.NonPublicAddress)

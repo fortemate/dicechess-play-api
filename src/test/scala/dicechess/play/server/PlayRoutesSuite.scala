@@ -342,12 +342,17 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
 
           val playAndFinish = room.submit(Seat.White, GameCommand.Resign)
 
-          (streamFrames, playAndFinish).parMapN((frames, _) => frames)
+          (streamFrames, playAndFinish)
+            .parMapN((frames, _) => frames)
             .timeoutTo(5.seconds, IO.raiseError(RuntimeException("clientFrames did not complete")))
       }
       .map: frames =>
         assert(frames.nonEmpty, "frames must not be empty")
-        assertEquals(frames.last, WebSocketFrame.Close(), "the final frame in clientFrames must be WebSocketFrame.Close")
+        assertEquals(
+          frames.last,
+          WebSocketFrame.Close(),
+          "the final frame in clientFrames must be WebSocketFrame.Close"
+        )
 
   private def tokenOf(created: CreatedGame, seat: Seat): String =
     created.tokens.find(_.seat == seat).map(_.token).getOrElse(sys.error(s"no join token for $seat"))

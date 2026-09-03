@@ -169,6 +169,10 @@ object BotRoutes:
 
   private object NameParam extends OptionalQueryParamDecoderMatcher[String]("name")
 
+  /** The two per-IP budgets the un-gated mint routes carry, grouped because they are always wired together. Both are
+    * `AnonMintLimiter`s, so a swapped pair still compiles and only the field names tell them apart: `anon` is the
+    * ephemeral `POST /bot/anon` budget, `register` the stricter durable `POST /bot/register` one.
+    */
   final case class MintLimiters(anon: AnonMintLimiter, register: AnonMintLimiter)
 
   def apply(

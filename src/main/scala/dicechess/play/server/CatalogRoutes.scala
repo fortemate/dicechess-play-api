@@ -83,6 +83,9 @@ final case class PlayBot(
   */
 object CatalogRoutes:
 
+  /** The two per-IP budgets this unauthenticated surface carries. Same type, so only the field names distinguish them:
+    * `wake` gates the scale-to-zero probe, `playBot` the game start the visitor reaches through it.
+    */
   final case class CatalogLimiters(wake: AnonMintLimiter, playBot: AnonMintLimiter)
 
   def apply(

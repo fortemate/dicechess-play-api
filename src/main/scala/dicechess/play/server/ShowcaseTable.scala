@@ -604,6 +604,9 @@ object ShowcaseTable:
     */
   def alertToStderr(message: String): IO[Unit] = Console[IO].errorln(s"[play][showcase] ALERT: $message")
 
+  /** The table's three schedule knobs, defaulted to the production values above. Only the tests override them — they
+    * park the tick and shrink the backoff so a suite never waits on wall-clock time.
+    */
   final case class Timings(
       claimGrace: FiniteDuration = DefaultClaimGrace,
       tickInterval: FiniteDuration = DefaultTickInterval,

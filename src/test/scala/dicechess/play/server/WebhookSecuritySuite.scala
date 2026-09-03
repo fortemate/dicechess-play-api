@@ -75,6 +75,23 @@ class WebhookSecuritySuite extends CatsEffectSuite:
       assertEquals(fragment, Left(WebhookUrlFailure.FragmentForbidden))
       assertEquals(count, 0)
 
+  test("precedence between simultaneously failing conditions is maintained"):
+    for
+      calls <- Ref.of[IO, Int](0)
+      lookup = (_: String) => calls.update(_ + 1).as(List(InetAddress.getByName("1.1.1.1")))
+      // userinfo + fragment => UserInfoForbidden (userinfo checked before fragment)
+      userInfoAndFrag <- WebhookSecurity.resolvePublicHttps("https://user:pass@example.com/hook#private", lookup)
+      // private IP literal + fragment => FragmentForbidden (fragment checked before DNS/address check)
+      privateIpAndFrag <- WebhookSecurity.resolvePublicHttps("https://192.168.1.1/hook#private", lookup)
+      // non-https + userinfo => HttpsRequired (scheme checked before userinfo)
+      httpAndUserInfo <- WebhookSecurity.resolvePublicHttps("http://user:pass@example.com/hook", lookup)
+      count           <- calls.get
+    yield
+      assertEquals(userInfoAndFrag, Left(WebhookUrlFailure.UserInfoForbidden))
+      assertEquals(privateIpAndFrag, Left(WebhookUrlFailure.FragmentForbidden))
+      assertEquals(httpAndUserInfo, Left(WebhookUrlFailure.HttpsRequired))
+      assertEquals(count, 0)
+
   test("one non-public answer rejects the complete DNS result"):
     val lookup = (_: String) => IO.pure(List(InetAddress.getByName("1.1.1.1"), InetAddress.getByName("127.0.0.1")))
     WebhookSecurity

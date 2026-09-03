@@ -580,6 +580,20 @@ class WebhooksSuite extends munit.CatsEffectSuite:
 
   test("a dead endpoint forfeits on the clock without hanging the room"):
     val dead = Client[IO](_ => cats.effect.Resource.eval(IO.raiseError(new java.net.ConnectException("refused"))))
+    // The scripted game (die faces: 1 = pawn, 2 = knight, 3 = bishop, 4 = rook, 5 = queen, 6 = king). Turn 0, White:
+    // bishop/rook/queen have no legal turn from the initial position, so the room passes for White itself — a forced
+    // pass never starts the mover's clock. Turn 1, Black: knights, a small tree the greedy driver answers at once. Turn
+    // 2, White: pawns — a real decision, so the clock starts and the dead endpoint has to answer or flag. Before this
+    // script the dice were random, and a run of forced passes for White (roughly (4/6)^3 per turn at the start) let
+    // the greedy Black reach the White king before any clock had ticked: the game ended `KingCaptured` in 36 ms.
+    val scriptedDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] =
+        ply match
+          case 0L => List(3, 4, 5)
+          case 1L => List(2, 2, 2)
+          case _  => List(1, 1, 1)
+      def commit: String = "dead-commit"
+      def reveal: String = "dead-seed"
     for
       registry <- GameRegistry.create(store = GameStore.noop)
       store    <- WebhookStore.inMemory
@@ -588,7 +602,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       // and this test is about a webhook that DIED AFTER registration.
       _ <- store.put(BotWebhook("hooks", "silent", "https://gone.example/hook", "s" * 64, Instant.EPOCH))
       opponent = Principal.Bot("acme", "greedy")
-      made <- registry.create(silent, opponent, TimeControl.SuddenDeath(2))
+      made <- registry.createWithDice(silent, opponent, scriptedDice, TimeControl.SuddenDeath(2))
       (_, room) = made.toOption.get
       _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
       _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
@@ -603,9 +617,19 @@ class WebhooksSuite extends munit.CatsEffectSuite:
                 20.seconds,
                 IO.raiseError(new RuntimeException("the room hung instead of flagging the dead webhook"))
               )
+      // A fresh subscription opens with the room's own snapshot, whose history is every completed turn.
+      history <- room.subscribe.head.compile.lastOrError.map {
+        case GameEvent.Snapshot(_, _, history) => history
+        case other                             => fail(s"a subscription must open with a snapshot, got $other")
+      }
     yield
       assertEquals(over.termination, Termination.Timeout)
       assertEquals(over.result, GameResult.Win(Side.Black), "the webhook seat (White) must lose on time")
+      assertEquals(
+        history.map(turn => (turn.seat, turn.dice, turn.moves.isEmpty)),
+        List((Seat.White, List(3, 4, 5), true), (Seat.Black, List(2, 2, 2), false)),
+        "White's forced pass, one Black turn, then White flagged on its first real decision — no other turn completed"
+      )
 
   test("garbage and non-200 responses submit nothing — the game stays untouched for the clock to decide"):
     for

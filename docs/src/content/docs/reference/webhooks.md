@@ -27,7 +27,7 @@ turning a session cookie into a bot token or changing this legacy wire contract.
 | Name | Status | Selectable | Meaning |
 | --- | --- | --- | --- |
 | `draws` | `available` | `true` | May be selected now; enables the [`drawDecision`](#draw-decision-delivery-drawdecision) delivery described below. |
-| `doubling` | `reserved` | `false` | The canonical name is fixed, but it cannot be selected, stored, or acted on yet. The authoritative events and state machine belong to [play-api issue #37](https://github.com/fortemate/dicechess-play-api/issues/37). |
+| `doubling` | `reserved` | `false` | The canonical name and [future contract](../../stake-doubling/) are fixed, but it cannot be selected, stored, or acted on yet. |
 
 `available` means accepted by registration; `reserved` does **not** imply a partially implemented behavior. A registry update is an explicit API change — a reserved capability never becomes active merely because its name is present in this response.
 

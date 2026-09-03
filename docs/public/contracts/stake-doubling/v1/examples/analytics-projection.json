@@ -1,0 +1,9 @@
+{
+  "mode": "x2",
+  "stake_currency": "PLAY_CREDIT",
+  "initial_stake_amount": 10,
+  "final_stake_amount": 20,
+  "white_money_delta": 20,
+  "black_money_delta": -20,
+  "termination": "king_captured"
+}

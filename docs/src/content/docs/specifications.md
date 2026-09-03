@@ -12,6 +12,12 @@ Everything on this site is backed by two machine-readable specifications. They a
 | **OpenAPI 3.1** | the REST Bot API — every endpoint, request, and response | [`openapi.yaml`](../openapi.yaml) |
 | **AsyncAPI 3.1** | the two ndjson event streams and their message payloads | [`asyncapi.yaml`](../asyncapi.yaml) |
 
+The accepted but disabled stake-doubling extension has a separate
+[`v1 JSON Schema`](../contracts/stake-doubling/v1/schema.json) and
+[validated fixtures](../contracts/stake-doubling/v1/fixtures.json). Keeping a reserved extension
+separate prevents client generators from mistaking a design contract for an endpoint the live server
+already serves. It is folded into OpenAPI and AsyncAPI only when the implementation is available.
+
 The rendered REST reference in the sidebar (**REST API (OpenAPI)**) is generated from `openapi.yaml` at build time, so it can never drift from the file you download.
 
 ## Generate a REST client

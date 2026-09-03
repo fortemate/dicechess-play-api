@@ -1,0 +1,400 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bots.fortemate.com/contracts/stake-doubling/v1/schema.json",
+  "title": "Reserved DiceChess stake-doubling contract",
+  "description": "Machine-readable v1 contract accepted by ADR-0019. Publication does not enable the reserved capability.",
+  "$defs": {
+    "Seat": {
+      "type": "string",
+      "enum": ["White", "Black"]
+    },
+    "DecisionId": {
+      "type": "string",
+      "pattern": "^double_[A-Za-z0-9_-]+$"
+    },
+    "StakeAgreement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "type": "integer", "minimum": 1 },
+        "currency": { "const": "PLAY_CREDIT" },
+        "maximumMultiplier": { "type": "integer", "enum": [2, 4, 8, 16, 32, 64] }
+      },
+      "required": ["amount", "currency", "maximumMultiplier"]
+    },
+    "PlayBotRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "team": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "timeControl": { "type": "object", "minProperties": 1 },
+        "preferredColor": { "$ref": "#/$defs/Seat" },
+        "rated": { "const": false },
+        "stake": { "$ref": "#/$defs/StakeAgreement" }
+      },
+      "required": ["team", "name", "timeControl", "rated", "stake"]
+    },
+    "ChallengeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "team": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "timeControl": { "type": "object", "minProperties": 1 },
+        "rated": { "const": false },
+        "stake": { "$ref": "#/$defs/StakeAgreement" }
+      },
+      "required": ["team", "name", "rated", "stake"]
+    },
+    "OfferDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/DecisionId" },
+        "kind": { "const": "offer" },
+        "seat": { "$ref": "#/$defs/Seat" },
+        "proposedStake": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["id", "kind", "seat", "proposedStake"]
+    },
+    "ResponseDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/DecisionId" },
+        "kind": { "const": "response" },
+        "seat": { "$ref": "#/$defs/Seat" },
+        "offeredBy": { "$ref": "#/$defs/Seat" },
+        "proposedStake": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["id", "kind", "seat", "offeredBy", "proposedStake"]
+    },
+    "DoublingState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "currency": { "const": "PLAY_CREDIT" },
+        "initialStake": { "type": "integer", "minimum": 1 },
+        "currentStake": { "type": "integer", "minimum": 1 },
+        "cubeValue": { "type": "integer", "enum": [1, 2, 4, 8, 16, 32, 64] },
+        "cubeOwner": {
+          "oneOf": [
+            { "$ref": "#/$defs/Seat" },
+            { "type": "null" }
+          ]
+        },
+        "maximumMultiplier": { "type": "integer", "enum": [2, 4, 8, 16, 32, 64] },
+        "mayOfferDouble": { "type": "boolean" },
+        "turnSeat": { "$ref": "#/$defs/Seat" },
+        "decision": {
+          "oneOf": [
+            { "$ref": "#/$defs/OfferDecision" },
+            { "$ref": "#/$defs/ResponseDecision" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": [
+        "currency",
+        "initialStake",
+        "currentStake",
+        "cubeValue",
+        "cubeOwner",
+        "maximumMultiplier",
+        "mayOfferDouble",
+        "turnSeat",
+        "decision"
+      ]
+    },
+    "PublicGameState": {
+      "type": "object",
+      "properties": {
+        "version": { "type": "integer", "minimum": 0 },
+        "dfen": { "type": "string", "minLength": 1 },
+        "activeSeat": { "$ref": "#/$defs/Seat" },
+        "dicePending": { "const": false },
+        "status": { "type": "object", "minProperties": 1 },
+        "timeControl": { "type": "object", "minProperties": 1 },
+        "clocks": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "white": { "type": "integer", "minimum": 0 },
+            "black": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["white", "black"]
+        },
+        "commit": { "type": "string" },
+        "seed": {},
+        "clientSeeds": {},
+        "legalMoves": {},
+        "players": {},
+        "rated": { "const": false },
+        "drawOffer": {},
+        "mayOfferDraw": {},
+        "doubling": { "$ref": "#/$defs/DoublingState" }
+      },
+      "required": [
+        "version",
+        "dfen",
+        "activeSeat",
+        "dicePending",
+        "status",
+        "timeControl",
+        "clocks",
+        "commit",
+        "doubling"
+      ],
+      "additionalProperties": true
+    },
+    "RequestRollCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "RequestRoll": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "decisionId": { "$ref": "#/$defs/DecisionId" } },
+          "required": ["decisionId"]
+        }
+      },
+      "required": ["RequestRoll"]
+    },
+    "OfferDoubleCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "OfferDouble": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "decisionId": { "$ref": "#/$defs/DecisionId" } },
+          "required": ["decisionId"]
+        }
+      },
+      "required": ["OfferDouble"]
+    },
+    "RespondDoubleCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "RespondDouble": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "decisionId": { "$ref": "#/$defs/DecisionId" },
+            "accept": { "type": "boolean" }
+          },
+          "required": ["decisionId", "accept"]
+        }
+      },
+      "required": ["RespondDouble"]
+    },
+    "DecisionOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "applied": { "type": "boolean" },
+        "version": { "type": "integer", "minimum": 0 },
+        "decisionId": { "$ref": "#/$defs/DecisionId" },
+        "duplicate": { "type": "boolean" },
+        "reason": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": ["applied", "version", "decisionId", "duplicate", "reason"]
+    },
+    "DoubleOpportunityEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "DoubleOpportunity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": { "type": "integer", "minimum": 0 },
+            "decisionId": { "$ref": "#/$defs/DecisionId" },
+            "seat": { "$ref": "#/$defs/Seat" },
+            "mayOfferDouble": { "const": true },
+            "currentStake": { "type": "integer", "minimum": 1 },
+            "proposedStake": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["v", "decisionId", "seat", "mayOfferDouble", "currentStake", "proposedStake"]
+        }
+      },
+      "required": ["DoubleOpportunity"]
+    },
+    "DoubleOfferedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "DoubleOffered": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": { "type": "integer", "minimum": 0 },
+            "offerId": { "$ref": "#/$defs/DecisionId" },
+            "by": { "$ref": "#/$defs/Seat" },
+            "to": { "$ref": "#/$defs/Seat" },
+            "currentStake": { "type": "integer", "minimum": 1 },
+            "proposedStake": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["v", "offerId", "by", "to", "currentStake", "proposedStake"]
+        }
+      },
+      "required": ["DoubleOffered"]
+    },
+    "DoubleAcceptedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "DoubleAccepted": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": { "type": "integer", "minimum": 0 },
+            "offerId": { "$ref": "#/$defs/DecisionId" },
+            "by": { "$ref": "#/$defs/Seat" },
+            "currentStake": { "type": "integer", "minimum": 1 },
+            "cubeValue": { "type": "integer", "enum": [2, 4, 8, 16, 32, 64] },
+            "cubeOwner": { "$ref": "#/$defs/Seat" }
+          },
+          "required": ["v", "offerId", "by", "currentStake", "cubeValue", "cubeOwner"]
+        }
+      },
+      "required": ["DoubleAccepted"]
+    },
+    "DoubleDeclinedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "DoubleDeclined": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": { "type": "integer", "minimum": 0 },
+            "offerId": { "$ref": "#/$defs/DecisionId" },
+            "by": { "$ref": "#/$defs/Seat" },
+            "currentStake": { "type": "integer", "minimum": 1 },
+            "proposedStake": { "type": "integer", "minimum": 1 },
+            "reason": { "type": "string", "enum": ["declined", "timeout", "disconnect"] }
+          },
+          "required": ["v", "offerId", "by", "currentStake", "proposedStake", "reason"]
+        }
+      },
+      "required": ["DoubleDeclined"]
+    },
+    "DoubleOpportunityWebhook": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "doubleOpportunity" },
+        "gameId": { "type": "string", "minLength": 1 },
+        "seat": { "$ref": "#/$defs/Seat" },
+        "state": { "$ref": "#/$defs/PublicGameState" }
+      },
+      "required": ["type", "gameId", "seat", "state"]
+    },
+    "DoubleOpportunityResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decisionId": { "$ref": "#/$defs/DecisionId" },
+        "offerDouble": { "type": "boolean" }
+      },
+      "required": ["decisionId", "offerDouble"]
+    },
+    "DoubleDecisionWebhook": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "doubleDecision" },
+        "gameId": { "type": "string", "minLength": 1 },
+        "seat": { "$ref": "#/$defs/Seat" },
+        "state": { "$ref": "#/$defs/PublicGameState" }
+      },
+      "required": ["type", "gameId", "seat", "state"]
+    },
+    "DoubleDecisionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decisionId": { "$ref": "#/$defs/DecisionId" },
+        "acceptDouble": { "type": "boolean" }
+      },
+      "required": ["decisionId", "acceptDouble"]
+    },
+    "DoubleOfferAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decisionId": { "$ref": "#/$defs/DecisionId" },
+        "offerDouble": { "type": "boolean", "default": false }
+      },
+      "required": ["decisionId", "offerDouble"]
+    },
+    "DoubleResponseAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decisionId": { "$ref": "#/$defs/DecisionId" },
+        "acceptDouble": { "type": "boolean", "default": false }
+      },
+      "required": ["decisionId", "acceptDouble"]
+    },
+    "CapabilityCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "contains": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": { "const": "doubling" },
+              "status": { "const": "reserved" },
+              "selectable": { "const": false }
+            },
+            "required": ["name", "status", "selectable"]
+          }
+        }
+      },
+      "required": ["capabilities"]
+    },
+    "AnalyticsProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "const": "x2" },
+        "stake_currency": { "const": "PLAY_CREDIT" },
+        "initial_stake_amount": { "type": "integer", "minimum": 1 },
+        "final_stake_amount": { "type": "integer", "minimum": 1 },
+        "white_money_delta": {
+          "type": "integer",
+          "description": "Legacy analytics column name; for PLAY_CREDIT this is a closed-loop credit change, not money."
+        },
+        "black_money_delta": {
+          "type": "integer",
+          "description": "Legacy analytics column name; for PLAY_CREDIT this is a closed-loop credit change, not money."
+        },
+        "termination": {
+          "type": "string",
+          "enum": ["king_captured", "resign", "timeout", "draw_agreement", "double_declined", "unknown"]
+        }
+      },
+      "required": [
+        "mode",
+        "stake_currency",
+        "initial_stake_amount",
+        "final_stake_amount",
+        "white_money_delta",
+        "black_money_delta",
+        "termination"
+      ]
+    }
+  }
+}

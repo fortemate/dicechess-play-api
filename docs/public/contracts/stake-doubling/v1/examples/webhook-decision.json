@@ -1,0 +1,32 @@
+{
+  "type": "doubleDecision",
+  "gameId": "game-uuid",
+  "seat": "Black",
+  "state": {
+    "version": 18,
+    "dfen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "activeSeat": "Black",
+    "dicePending": false,
+    "status": { "Active": {} },
+    "timeControl": { "Fischer": { "initialSeconds": 300, "incrementSeconds": 3 } },
+    "clocks": { "white": 294000, "black": 299000 },
+    "commit": "c0ffee",
+    "doubling": {
+      "currency": "PLAY_CREDIT",
+      "initialStake": 10,
+      "currentStake": 10,
+      "cubeValue": 1,
+      "cubeOwner": null,
+      "maximumMultiplier": 64,
+      "mayOfferDouble": false,
+      "turnSeat": "White",
+      "decision": {
+        "id": "double_01K4F4Y7M8R2",
+        "kind": "response",
+        "seat": "Black",
+        "offeredBy": "White",
+        "proposedStake": 20
+      }
+    }
+  }
+}

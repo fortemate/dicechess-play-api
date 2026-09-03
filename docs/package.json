@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
-    "build": "astro build",
+    "build": "npm run validate:contracts && astro build",
+    "validate:contracts": "node scripts/validate-stake-doubling-contract.mjs",
     "preview": "astro preview",
     "astro": "astro"
   },
@@ -19,6 +20,7 @@
     "starlight-openapi": "^0.26.1"
   },
   "devDependencies": {
+    "ajv": "^8.17.1",
     "wrangler": "^4.125.0"
   }
 }

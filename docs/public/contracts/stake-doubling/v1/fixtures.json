@@ -1,0 +1,26 @@
+{
+  "$schema": "https://bots.fortemate.com/contracts/stake-doubling/v1/schema.json",
+  "description": "Canonical valid examples for the reserved ADR-0019 contract.",
+  "fixtures": [
+    { "path": "examples/create-play-bot.json", "schemaRef": "#/$defs/PlayBotRequest" },
+    { "path": "examples/create-challenge.json", "schemaRef": "#/$defs/ChallengeRequest" },
+    { "path": "examples/state-opportunity.json", "schemaRef": "#/$defs/PublicGameState" },
+    { "path": "examples/state-response.json", "schemaRef": "#/$defs/PublicGameState" },
+    { "path": "examples/command-roll.json", "schemaRef": "#/$defs/RequestRollCommand" },
+    { "path": "examples/command-offer.json", "schemaRef": "#/$defs/OfferDoubleCommand" },
+    { "path": "examples/command-respond.json", "schemaRef": "#/$defs/RespondDoubleCommand" },
+    { "path": "examples/decision-outcome.json", "schemaRef": "#/$defs/DecisionOutcome" },
+    { "path": "examples/decision-duplicate.json", "schemaRef": "#/$defs/DecisionOutcome" },
+    { "path": "examples/decision-conflict.json", "schemaRef": "#/$defs/DecisionOutcome" },
+    { "path": "examples/event-opportunity.json", "schemaRef": "#/$defs/DoubleOpportunityEvent" },
+    { "path": "examples/event-offered.json", "schemaRef": "#/$defs/DoubleOfferedEvent" },
+    { "path": "examples/event-accepted.json", "schemaRef": "#/$defs/DoubleAcceptedEvent" },
+    { "path": "examples/event-declined.json", "schemaRef": "#/$defs/DoubleDeclinedEvent" },
+    { "path": "examples/webhook-opportunity.json", "schemaRef": "#/$defs/DoubleOpportunityWebhook" },
+    { "path": "examples/webhook-opportunity-response.json", "schemaRef": "#/$defs/DoubleOpportunityResponse" },
+    { "path": "examples/webhook-decision.json", "schemaRef": "#/$defs/DoubleDecisionWebhook" },
+    { "path": "examples/webhook-decision-response.json", "schemaRef": "#/$defs/DoubleDecisionResponse" },
+    { "path": "examples/capability-catalog.json", "schemaRef": "#/$defs/CapabilityCatalog" },
+    { "path": "examples/analytics-projection.json", "schemaRef": "#/$defs/AnalyticsProjection" }
+  ]
+}

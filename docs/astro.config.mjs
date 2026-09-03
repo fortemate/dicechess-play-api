@@ -44,6 +44,7 @@ export default defineConfig({
 					label: 'Playing',
 					items: [
 						{ label: 'Game Mechanics', link: '/game-mechanics/' },
+						{ label: 'Stake Doubling (Reserved)', link: '/stake-doubling/' },
 						{ label: 'Connection Modes', link: '/connection-modes/' },
 						{ label: 'Provably-Fair Dice', link: '/provably-fair/' },
 						{ label: 'Play Against Your Bot', link: '/play-your-bot/' },

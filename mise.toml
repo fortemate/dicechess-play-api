@@ -90,7 +90,7 @@ dir = "docs"
 run = "npm run build"
 
 # Contributor docs (contributor-docs/) — architecture, schema, conventions; GitHub Pages.
-# Separate site from docs/ above, which is the public Bot API reference on bots.jc.id.lv.
+# Separate site from docs/ above, which is the public Bot API reference on bots.fortemate.com.
 
 [tasks."contrib-docs:install"]
 description = "📦 Install the contributor documentation site's npm dependencies"

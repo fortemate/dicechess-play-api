@@ -4572,7 +4572,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  test("V21's rating_category is the same function as RatingCategory.ofStored, control for control"):
+  test("play.rating_category is the same function as RatingCategory.ofStored, control for control"):
     withContainers { pg =>
       rawXa(pg).use { xa =>
         val schema = "mig_v21_fn"

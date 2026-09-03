@@ -49,3 +49,20 @@ class MainSuite extends munit.CatsEffectSuite:
     yield
       assertEquals(resumed, 0)
       assert(seatGuard.admissionGuard eq admissionGuard)
+
+  test("showcaseReadiness returns false when featuredBot is None"):
+    for
+      botStore <- dicechess.play.store.BotStore.inMemory
+      ready    <- Main.showcaseReadiness(dicechess.play.server.ShowcaseConfig.Disabled, botStore, None)
+    yield assertEquals(ready, false)
+
+  test("showcaseReadiness returns false when webhooks is None"):
+    val cfg = dicechess.play.server.ShowcaseConfig(
+      enabled = true,
+      featuredBot = Some(dicechess.play.core.Principal.Bot("rpi3", "hunter-book")),
+      reservedSeats = 1
+    )
+    for
+      botStore <- dicechess.play.store.BotStore.inMemory
+      ready    <- Main.showcaseReadiness(cfg, botStore, None)
+    yield assertEquals(ready, false)

@@ -67,7 +67,7 @@ import scala.concurrent.duration.*
 object Main extends IOApp.Simple:
 
   private val host    = host"0.0.0.0"
-  private val port    = port"8080"
+  private val port    = sys.env.get("PORT").flatMap(Port.fromString).getOrElse(port"8080")
   private val version = sys.env.getOrElse("APP_VERSION", "dev")
 
   /** The shared outbound client, with deadlines that clear the webhook window.

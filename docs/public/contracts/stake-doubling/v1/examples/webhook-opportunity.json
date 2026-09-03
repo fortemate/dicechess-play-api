@@ -1,16 +1,26 @@
 {
   "type": "doubleOpportunity",
-  "gameId": "game-uuid",
+  "gameId": "3f0e2b4c-9a17-4d6e-8b52-1c7d9e0f4a68",
   "seat": "White",
   "state": {
-    "version": 17,
+    "version": 0,
     "dfen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     "activeSeat": "White",
     "dicePending": false,
     "status": { "Active": {} },
     "timeControl": { "Fischer": { "initialSeconds": 300, "incrementSeconds": 3 } },
-    "clocks": { "white": 295000, "black": 300000 },
-    "commit": "c0ffee",
+    "clocks": { "white": 300000, "black": 300000 },
+    "commit": "5f64c3ed69253a39c08dd52f34a30e79f347a92fcdfb6f101c2f8db6393dcdfe",
+    "seed": null,
+    "clientSeeds": null,
+    "legalMoves": null,
+    "players": {
+      "white": { "kind": "Human", "name": null, "rating": null },
+      "black": { "kind": "Bot", "name": "acme aggressive", "rating": null }
+    },
+    "rated": false,
+    "drawOffer": null,
+    "mayOfferDraw": null,
     "doubling": {
       "currency": "PLAY_CREDIT",
       "initialStake": 10,

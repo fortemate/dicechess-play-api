@@ -324,7 +324,7 @@ If your webhook declared the `"draws"` capability and the opponent offered a dra
 ```
 
 - Answer `200` with `{"acceptDraw": true}` to accept the draw (game ends ½–½).
-- Answer `200` with `{"acceptDraw": false}` (or empty `{}` / timeout) to decline the draw. The server immediately reveals your dice and sends a subsequent `yourTurn` payload!
+- Answer `200` with `{"acceptDraw": false}` (or empty `{}` / timeout) to decline the draw. The server immediately reveals your dice and sends a subsequent `yourTurn` payload! (In a reserved staked game the decline continues into the pre-roll double opportunity instead; see [Stake Doubling](../../stake-doubling/).)
 
 ### Verify delivery signatures
 

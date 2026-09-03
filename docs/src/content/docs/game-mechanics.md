@@ -84,7 +84,7 @@ Dice Chess supports turn-anchored draw offers via a pre-roll gate:
 - **Turn-anchored offer**: A player offers a draw by piggybacking the offer onto their completed turn (`offerDraw: true` in `POST /bot/game/{id}/move` or webhook response).
 - **Pre-roll gate**: When an offer is pending for the active player, **auto-roll is suspended**. The board state displays the position after the offerer's move (with no dice revealed). The responder's clock ticks down while they decide.
 - **Acceptance**: The receiver may accept the draw offer via `acceptDraw: true` in their move submission or by calling `POST /bot/game/{id}/draw/accept`. This immediately terminates the game with `GameEnded(result = Draw, termination = Draw)` before any dice are revealed.
-- **Decline and dice reveal**: Calling `POST /bot/game/{id}/draw/decline` (or responding `acceptDraw: false`) explicitly declines the offer, which emits a `DrawDeclined` event, rolls and reveals the dice, and opens the move phase.
+- **Decline and dice reveal**: Calling `POST /bot/game/{id}/draw/decline` (or responding `acceptDraw: false`) explicitly declines the offer, which emits a `DrawDeclined` event, rolls and reveals the dice, and opens the move phase. In a reserved staked game the decline instead continues into the pre-roll double opportunity described under [Stake Doubling](../stake-doubling/).
 - **Anti-goals resolved**:
   - *No mid-turn distraction attacks*: Draw offers cannot be made mid-turn; they are strictly bound to completed turn submissions.
   - *No free dice option*: A player is never allowed to view their dice before deciding on an opponent's draw offer.

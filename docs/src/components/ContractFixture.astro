@@ -1,0 +1,26 @@
+---
+/**
+ * Render one validated stake-doubling fixture from public/contracts/stake-doubling/v1/examples/ as a JSON code block.
+ * Reading the file at build time keeps the page byte-identical to the fixture the build has already validated, so
+ * the prose can never drift from the published contract.
+ */
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { publicDir } from 'astro:config/server';
+import { Code } from '@astrojs/starlight/components';
+
+interface Props {
+	/** Fixture file name without the `.json` extension, e.g. `state-opportunity`. */
+	name: string;
+}
+
+const { name } = Astro.props;
+if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`ContractFixture: "${name}" is not a fixture name`);
+
+const publicRoot = typeof publicDir === 'string' ? publicDir : fileURLToPath(publicDir);
+const file = path.join(publicRoot, 'contracts/stake-doubling/v1/examples', `${name}.json`);
+const code = (await readFile(file, 'utf8')).trimEnd();
+---
+
+<Code code={code} lang="json" title={`examples/${name}.json`} />

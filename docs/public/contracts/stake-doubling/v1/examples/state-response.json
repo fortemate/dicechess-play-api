@@ -1,16 +1,19 @@
 {
-  "version": 18,
+  "version": 1,
   "dfen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
   "activeSeat": "Black",
   "dicePending": false,
   "status": { "Active": {} },
   "timeControl": { "Fischer": { "initialSeconds": 300, "incrementSeconds": 3 } },
-  "clocks": { "white": 294000, "black": 299000 },
-  "commit": "c0ffee",
+  "clocks": { "white": 295000, "black": 300000 },
+  "commit": "5f64c3ed69253a39c08dd52f34a30e79f347a92fcdfb6f101c2f8db6393dcdfe",
   "seed": null,
   "clientSeeds": null,
   "legalMoves": null,
-  "players": null,
+  "players": {
+    "white": { "kind": "Human", "name": null, "rating": null },
+    "black": { "kind": "Bot", "name": "acme aggressive", "rating": null }
+  },
   "rated": false,
   "drawOffer": null,
   "mayOfferDraw": null,

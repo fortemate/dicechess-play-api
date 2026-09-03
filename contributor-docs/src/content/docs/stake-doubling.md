@@ -46,17 +46,22 @@ public protocol carries amounts and the fixed currency name, but never wallet id
 reservation ids, credentials, or settlement implementation details. Pre-reserving the maximum avoids
 mid-game balance checks, affordability leaks, and an involuntary drop caused by insufficient funds.
 
-Staked games are always casual (`rated = false`) and require durable PostgreSQL-backed operation.
-Requests combining a stake with `rated = true`, an anonymous participant, an unsupported creation
-surface, unavailable persistence, an unreserved seat, or a bot without the `doubling` capability are
-rejected rather than silently downgraded.
+Staked games are always casual (`rated = false`) and require durable PostgreSQL-backed operation. A bot
+qualifies only through an active webhook registration that selects `doubling`: capabilities exist
+nowhere else in the protocol, so poll-only bots and the static `house` roster, which cannot register
+webhooks, cannot be seated in a staked game. The REST actions and stream events remain available to
+admitted webhook bots as an alternative channel; they are not a way in. Requests combining a stake with
+`rated = true`, an anonymous participant, an unsupported creation surface, unavailable persistence, an
+unreserved seat, or a bot without the `doubling` capability are rejected rather than silently
+downgraded.
 
 ### Supported admission surfaces
 
 The first protocol version permits explicit opt-in on:
 
-- `POST /lobby/play-bot` for a signed-in human and a catalog bot whose current registration selects
-  `doubling`;
+- `POST /lobby/play-bot` for a signed-in human and a catalog bot whose active webhook registration
+  selects `doubling`. The live `guestId` member keeps its meaning and is ignored when a session seats
+  the player; a staked request without a session is rejected;
 - `POST /bot/challenge` for two registered bots. The challenge stores the complete stake offer. The
   challenger reservation is held while the challenge is pending; the target reservation and current
   `doubling` capability are checked atomically on acceptance. Decline or expiry releases the held
@@ -119,11 +124,17 @@ The complete order is:
 
 1. Finish the previous turn and commit its `TurnPlayed` event.
 2. If that turn offered a draw, resolve the draw first. No doubling decision exists while a draw is
-   pending.
+   pending. In a staked game every draw-decline path (an explicit `RespondDraw` or
+   `POST /bot/game/{id}/draw/decline`, an `acceptDraw: false` webhook answer, and the server's
+   automatic decline for a bot without `draws`) continues into step 3 instead of the classic immediate
+   reveal; the automatic decline therefore triggers a `doubleOpportunity` delivery when the decliner is
+   eligible.
 3. If the turn owner is eligible to offer, enter a `doubleOpportunity` decision before deriving or
    revealing any dice. The turn owner chooses either roll or offer. If it is ineligible because the
    cube belongs to the opponent or is at the multiplier cap, no decision is created and the existing
-   automatic roll path continues.
+   automatic roll path continues. On the opening turn the client-seed window closes first (both seeds
+   or the seed grace); only then does the first opportunity open, the seed-grace force-start enters the
+   opportunity instead of rolling, and the turn owner's clock starts when the opportunity opens.
 4. On an offer, commit `DoubleOffered`, pause the turn owner's clock, and make the opponent the active
    decision seat. The board position does not change.
 5. On acceptance, charge the responder's decision time, commit `DoubleAccepted`, update the cube and
@@ -155,29 +166,42 @@ The seat named by `activeSeat` pays for its own decision:
 - an offerer that resigns or disconnects while waiting loses normally at the current stake. The
   unaccepted offer is not turned into a responder decline.
 
-Webhook transport failures never become an immediate financial decision. A missing, malformed,
-oversized, late, non-200, or wrong-kind response leaves the authoritative decision pending and the
-responder's clock decides. The runtime's safe default response is an explicit decline; that default is
-used only when the signed callback was successfully invoked.
+Webhook transport failures never become an immediate financial decision, and the two deliveries fail
+differently because delivery is single-attempt. For `doubleOpportunity` the only non-financial answer
+is to roll: a missing, malformed, oversized, late, non-200, or wrong-kind response is treated exactly
+like `offerDouble: false` and the roll follows, mirroring the failed-`drawDecision` precedent. For
+`doubleDecision` no transport outcome is ever read as an acceptance or a decline: the authoritative
+decision stays pending and the responder's clock decides. The runtime's explicit defaults
+(`offerDouble: false`, `acceptDouble: false`) are used only when the signed callback was successfully
+invoked.
 
 ### Idempotency, retries, and reconnect
 
-Every pre-roll decision has an opaque `decisionId`. It is persisted before publication and remains
-stable across snapshots, stream reconnects, webhook redelivery after process restart, and client retry.
-The accepted action and its outcome are retained with the snapshot.
+Every doubling episode has one opaque `decisionId`, minted when the opportunity is created and shared
+by its opportunity, offer, and response steps; `doubling.decision.kind` names the step currently
+awaiting an answer. The id is persisted before publication and remains stable across snapshots, stream
+reconnects, webhook redelivery after process restart, and client retry. Each answered step retains its
+action and outcome with the snapshot.
 
-- Repeating the same action for the same `decisionId` returns the original outcome and emits no event.
-- A different action for an already resolved id, an unknown id, a decision for another seat, or an
-  action whose kind does not match returns `409` without changing state.
-- At most one `DoubleOffered`, `DoubleAccepted`, `DoubleDeclined`, or `DiceRolled` transition can result
-  from one decision id.
+- Repeating the same action for the same `decisionId` and step returns the original outcome and emits
+  no event.
+- A different action for an already answered step, an unknown id, a decision for another seat, or an
+  action whose kind does not match the current step returns `409` without changing state. The
+  outcome's `version` is the version the action committed and is `null` when nothing was applied, as
+  on move verdicts.
+- At most one `DoubleOffered` or `DiceRolled` transition can result from the offer step of a decision
+  id, and at most one `DoubleAccepted` or `DoubleDeclined` from its response step.
 - A reconnecting client receives a `Snapshot` with the exact pending decision and acts from that state;
   it does not infer a decision from the absence of dice.
 
 ## Public state and transport contract
 
 Classic games omit `doubling` or send it as `null`; clients must treat both forms identically. Staked
-games always send the complete object. The schema fixes these fields:
+games always send the complete object. The schema describes the pre-roll shape as
+`StakedDecisionSnapshot`: the live `PublicGameState` with `doubling` present, `dicePending: false`,
+`legalMoves: null`, and nullable `clocks` (`null` on `Unlimited`, as today). Classic and post-roll
+snapshots keep the live `PublicGameState` shape, which gains the optional nullable `doubling` member.
+The schema fixes these fields:
 
 - `currency`, `initialStake`, `currentStake`;
 - `cubeValue`, nullable `cubeOwner`, and `maximumMultiplier`;
@@ -190,13 +214,23 @@ neutral command vocabulary becomes:
 
 ```json
 { "RequestRoll": { "decisionId": "double_01K4F4Y7M8R2" } }
+```
+
+```json
 { "OfferDouble": { "decisionId": "double_01K4F4Y7M8R2" } }
+```
+
+```json
 { "RespondDouble": { "decisionId": "double_01K4F4Y7M8R2", "accept": true } }
 ```
 
 The event vocabulary becomes `DoubleOpportunity`, `DoubleOffered`, `DoubleAccepted`, and
-`DoubleDeclined`. A declined event carries a machine-readable reason; `GameEnded.termination` remains
-the factual game termination. The Bot API exposes equivalent synchronous REST actions and two signed
+`DoubleDeclined`. A declined event carries a machine-readable reason. `GameEnded.termination` remains
+the factual game termination and gains one additive member, `DoubleDeclined`, used only for an explicit
+decline; timeout and disconnect keep `Timeout` and `Resign`. Adding the member is an additive change to
+the live AsyncAPI `GameEnded` enum and to the OpenAPI `GameHistory.termination` vocabulary
+(`double_declined`), delivered with the transport and persistence work; clients must already tolerate
+unknown termination values. The Bot API exposes equivalent synchronous REST actions and two signed
 webhook delivery types:
 
 - `doubleOpportunity` -> `{ "decisionId": "...", "offerDouble": false }` (false means roll);
@@ -218,8 +252,9 @@ Legacy safety is admission-time, not a financially meaningful auto-action:
 - a bot without `doubling` cannot enter a staked game;
 - capability support is snapshotted into the admitted game. Removing or deleting a webhook later does
   not rewrite the game contract; delivery stops and the ordinary clock/disconnect rules apply;
-- unknown new stream events and optional `PublicGameState.doubling` remain additive for spectators,
-  but old playing clients are never admitted to a game they did not explicitly request;
+- unknown new stream events, the optional `PublicGameState.doubling` member, and the additive
+  `DoubleDeclined` termination remain additive for spectators, but old playing clients are never
+  admitted to a game they did not explicitly request;
 - the server does not switch `doubling` to available or admit a staked game merely because schema
   components exist.
 
@@ -234,8 +269,10 @@ The terminal snapshot transaction also commits one idempotent settlement instruc
 archive/analytics outbox entries before `GameEnded` is published. Applying the instruction may be
 asynchronous, but replaying it by game id cannot transfer credits twice.
 
-The existing analytics wire vocabulary is retained, with one ambiguity resolved: for play-api,
-`initial_stake_amount` and `final_stake_amount` are one seat's exposure, matching the current
+The existing analytics wire vocabulary is retained with three additions (`stake_currency` gains the
+value `PLAY_CREDIT`, `DOUBLE_DECLINE` payloads gain `settled_stake`, and play-api starts emitting the
+`double_declined` termination the practice client already uses) and one ambiguity resolved: for
+play-api, `initial_stake_amount` and `final_stake_amount` are one seat's exposure, matching the current
 `dicechess-play` producer. They are not a two-seat pot. Existing analytics prose that calls these
 columns a pot must be corrected by the ingest follow-up. The legacy `*_money_delta` column names carry
 closed-loop play-credit changes for this source and do not imply money.
@@ -275,6 +312,11 @@ Implementation is not complete until tests pin all of these sequences:
 | forced pass | no precomputed dice; after roll the ordinary forced-pass path runs |
 | multiplier cap / wrong owner | no opportunity is created; the ordinary automatic roll path continues; an unsolicited offer is rejected |
 | game end during offer | only the factual terminal action settles; no fabricated acceptance |
+| failed `doubleOpportunity` delivery | answered as roll; no stake changes and no fabricated offer |
+| failed `doubleDecision` delivery | decision stays pending; the responder's clock decides; no fabricated decline |
+| opening turn | the client-seed window closes before the first opportunity; force-start enters the opportunity, not the roll |
+| `Unlimited` staked game | snapshots carry `clocks: null`; the anti-abandonment deadline governs both decision phases |
+| poll-only or `house` bot | cannot be admitted: no webhook registration can select `doubling` |
 | legacy bot/client | cannot be admitted to a staked game; classic behaviour is unchanged |
 
 ## Rollout and rollback

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://bots.fortemate.com/contracts/stake-doubling/v1/schema.json",
   "title": "Reserved DiceChess stake-doubling contract",
-  "description": "Machine-readable v1 contract accepted by ADR-0019. Publication does not enable the reserved capability.",
+  "description": "Machine-readable v1 contract accepted by ADR-0019. Publication does not enable the reserved capability. Request and snapshot definitions mirror the live OpenAPI/AsyncAPI shapes plus the stake extension; they are folded into those documents only when an implementation serves them.",
   "$defs": {
     "Seat": {
       "type": "string",
@@ -10,13 +10,91 @@
     },
     "DecisionId": {
       "type": "string",
-      "pattern": "^double_[A-Za-z0-9_-]+$"
+      "pattern": "^double_[A-Za-z0-9_-]+$",
+      "description": "Opaque id of one doubling episode, shared by its opportunity, offer, and response steps."
+    },
+    "Commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the server seed, lowercase hex: the dice commitment published from creation."
+    },
+    "Stake": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "One seat's exposure in whole PLAY_CREDIT units, never the combined pot."
+    },
+    "EventVersion": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "TimeControl": {
+      "description": "The live single-key time-control wrapper.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "Unlimited": { "type": "object", "additionalProperties": false } },
+          "required": ["Unlimited"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "SuddenDeath": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "initialSeconds": { "type": "integer", "minimum": 1 } },
+              "required": ["initialSeconds"]
+            }
+          },
+          "required": ["SuddenDeath"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "Fischer": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "initialSeconds": { "type": "integer", "minimum": 1 },
+                "incrementSeconds": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["initialSeconds", "incrementSeconds"]
+            }
+          },
+          "required": ["Fischer"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "PerMove": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "secondsPerMove": { "type": "integer", "minimum": 1 } },
+              "required": ["secondsPerMove"]
+            }
+          },
+          "required": ["PerMove"]
+        }
+      ]
+    },
+    "Clocks": {
+      "type": ["object", "null"],
+      "description": "Remaining milliseconds per side as of the carrying event; null on Unlimited games, exactly as today.",
+      "additionalProperties": false,
+      "properties": {
+        "white": { "type": "integer", "minimum": 0 },
+        "black": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["white", "black"]
     },
     "StakeAgreement": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "amount": { "type": "integer", "minimum": 1 },
+        "amount": { "$ref": "#/$defs/Stake" },
         "currency": { "const": "PLAY_CREDIT" },
         "maximumMultiplier": { "type": "integer", "enum": [2, 4, 8, 16, 32, 64] }
       },
@@ -24,28 +102,31 @@
     },
     "PlayBotRequest": {
       "type": "object",
+      "description": "The live POST /lobby/play-bot body plus the stake opt-in. guestId is the live anonymous fallback and is ignored when a session cookie seats the player; a staked request without a session is rejected by the server, not by this schema.",
       "additionalProperties": false,
       "properties": {
+        "guestId": { "type": "string", "minLength": 1 },
         "team": { "type": "string", "minLength": 1 },
         "name": { "type": "string", "minLength": 1 },
-        "timeControl": { "type": "object", "minProperties": 1 },
+        "timeControl": { "$ref": "#/$defs/TimeControl" },
         "preferredColor": { "$ref": "#/$defs/Seat" },
         "rated": { "const": false },
         "stake": { "$ref": "#/$defs/StakeAgreement" }
       },
-      "required": ["team", "name", "timeControl", "rated", "stake"]
+      "required": ["team", "name", "timeControl", "stake"]
     },
     "ChallengeRequest": {
       "type": "object",
+      "description": "The live POST /bot/challenge body plus the stake offer. An omitted timeControl keeps the live Unlimited default; an omitted rated keeps the live casual default.",
       "additionalProperties": false,
       "properties": {
         "team": { "type": "string", "minLength": 1 },
         "name": { "type": "string", "minLength": 1 },
-        "timeControl": { "type": "object", "minProperties": 1 },
+        "timeControl": { "$ref": "#/$defs/TimeControl" },
         "rated": { "const": false },
         "stake": { "$ref": "#/$defs/StakeAgreement" }
       },
-      "required": ["team", "name", "rated", "stake"]
+      "required": ["team", "name", "stake"]
     },
     "OfferDecision": {
       "type": "object",
@@ -54,7 +135,7 @@
         "id": { "$ref": "#/$defs/DecisionId" },
         "kind": { "const": "offer" },
         "seat": { "$ref": "#/$defs/Seat" },
-        "proposedStake": { "type": "integer", "minimum": 1 }
+        "proposedStake": { "$ref": "#/$defs/Stake" }
       },
       "required": ["id", "kind", "seat", "proposedStake"]
     },
@@ -66,12 +147,13 @@
         "kind": { "const": "response" },
         "seat": { "$ref": "#/$defs/Seat" },
         "offeredBy": { "$ref": "#/$defs/Seat" },
-        "proposedStake": { "type": "integer", "minimum": 1 }
+        "proposedStake": { "$ref": "#/$defs/Stake" }
       },
       "required": ["id", "kind", "seat", "offeredBy", "proposedStake"]
     },
     "DoublingState": {
       "type": "object",
+      "description": "The doubling member of a staked game's public state. A centered cube (cubeValue 1) is unowned; a doubled cube is owned by the seat that last accepted.",
       "additionalProperties": false,
       "allOf": [
         {
@@ -85,8 +167,8 @@
       ],
       "properties": {
         "currency": { "const": "PLAY_CREDIT" },
-        "initialStake": { "type": "integer", "minimum": 1 },
-        "currentStake": { "type": "integer", "minimum": 1 },
+        "initialStake": { "$ref": "#/$defs/Stake" },
+        "currentStake": { "$ref": "#/$defs/Stake" },
         "cubeValue": { "type": "integer", "enum": [1, 2, 4, 8, 16, 32, 64] },
         "cubeOwner": {
           "oneOf": [
@@ -117,33 +199,49 @@
         "decision"
       ]
     },
-    "PublicGameState": {
+    "StakedDecisionSnapshot": {
       "type": "object",
+      "description": "The live PublicGameState as served while a staked game waits for a pre-roll doubling decision: doubling is present with a pending decision and no dice are revealed. Classic games omit doubling or send null, and post-roll staked states keep the live PublicGameState shape, which gains an optional nullable doubling member.",
       "properties": {
-        "version": { "type": "integer", "minimum": 0 },
+        "version": { "$ref": "#/$defs/EventVersion" },
         "dfen": { "type": "string", "minLength": 1 },
         "activeSeat": { "$ref": "#/$defs/Seat" },
         "dicePending": { "const": false },
         "status": { "type": "object", "minProperties": 1 },
-        "timeControl": { "type": "object", "minProperties": 1 },
-        "clocks": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "white": { "type": "integer", "minimum": 0 },
-            "black": { "type": "integer", "minimum": 0 }
-          },
-          "required": ["white", "black"]
-        },
-        "commit": { "type": "string" },
-        "seed": {},
-        "clientSeeds": {},
-        "legalMoves": {},
-        "players": {},
+        "timeControl": { "$ref": "#/$defs/TimeControl" },
+        "clocks": { "$ref": "#/$defs/Clocks" },
+        "commit": { "$ref": "#/$defs/Commit" },
+        "seed": { "type": ["string", "null"] },
+        "clientSeeds": { "type": ["object", "null"] },
+        "legalMoves": { "type": "null" },
+        "players": { "type": ["object", "null"] },
         "rated": { "const": false },
-        "drawOffer": {},
-        "mayOfferDraw": {},
-        "doubling": { "$ref": "#/$defs/DoublingState" }
+        "drawOffer": { "type": ["object", "null"] },
+        "mayOfferDraw": { "type": ["boolean", "null"] },
+        "doubling": {
+          "type": "object",
+          "allOf": [
+            { "$ref": "#/$defs/DoublingState" },
+            {
+              "properties": { "decision": { "type": "object" } },
+              "required": ["decision"]
+            },
+            {
+              "if": {
+                "properties": {
+                  "decision": {
+                    "type": "object",
+                    "properties": { "kind": { "const": "offer" } },
+                    "required": ["kind"]
+                  }
+                },
+                "required": ["decision"]
+              },
+              "then": { "properties": { "mayOfferDouble": { "const": true } } },
+              "else": { "properties": { "mayOfferDouble": { "const": false } } }
+            }
+          ]
+        }
       },
       "required": [
         "version",
@@ -202,6 +300,7 @@
     },
     "DecisionOutcome": {
       "type": "object",
+      "description": "The synchronous verdict of a decision action. version is the version the action committed and is null when nothing was applied, as on move verdicts; a duplicate replays the original applied outcome.",
       "additionalProperties": false,
       "allOf": [
         {
@@ -209,9 +308,15 @@
             "properties": { "applied": { "const": true } },
             "required": ["applied"]
           },
-          "then": { "properties": { "reason": { "type": "null" } } },
+          "then": {
+            "properties": {
+              "version": { "$ref": "#/$defs/EventVersion" },
+              "reason": { "type": "null" }
+            }
+          },
           "else": {
             "properties": {
+              "version": { "type": "null" },
               "duplicate": { "const": false },
               "reason": { "type": "string", "minLength": 1 }
             }
@@ -220,7 +325,7 @@
       ],
       "properties": {
         "applied": { "type": "boolean" },
-        "version": { "type": "integer", "minimum": 0 },
+        "version": { "type": ["integer", "null"], "minimum": 0 },
         "decisionId": { "$ref": "#/$defs/DecisionId" },
         "duplicate": { "type": "boolean" },
         "reason": {
@@ -240,12 +345,12 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "v": { "type": "integer", "minimum": 0 },
+            "v": { "$ref": "#/$defs/EventVersion" },
             "decisionId": { "$ref": "#/$defs/DecisionId" },
             "seat": { "$ref": "#/$defs/Seat" },
             "mayOfferDouble": { "const": true },
-            "currentStake": { "type": "integer", "minimum": 1 },
-            "proposedStake": { "type": "integer", "minimum": 1 }
+            "currentStake": { "$ref": "#/$defs/Stake" },
+            "proposedStake": { "$ref": "#/$defs/Stake" }
           },
           "required": ["v", "decisionId", "seat", "mayOfferDouble", "currentStake", "proposedStake"]
         }
@@ -260,12 +365,12 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "v": { "type": "integer", "minimum": 0 },
+            "v": { "$ref": "#/$defs/EventVersion" },
             "offerId": { "$ref": "#/$defs/DecisionId" },
             "by": { "$ref": "#/$defs/Seat" },
             "to": { "$ref": "#/$defs/Seat" },
-            "currentStake": { "type": "integer", "minimum": 1 },
-            "proposedStake": { "type": "integer", "minimum": 1 }
+            "currentStake": { "$ref": "#/$defs/Stake" },
+            "proposedStake": { "$ref": "#/$defs/Stake" }
           },
           "required": ["v", "offerId", "by", "to", "currentStake", "proposedStake"]
         }
@@ -280,10 +385,10 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "v": { "type": "integer", "minimum": 0 },
+            "v": { "$ref": "#/$defs/EventVersion" },
             "offerId": { "$ref": "#/$defs/DecisionId" },
             "by": { "$ref": "#/$defs/Seat" },
-            "currentStake": { "type": "integer", "minimum": 1 },
+            "currentStake": { "$ref": "#/$defs/Stake" },
             "cubeValue": { "type": "integer", "enum": [2, 4, 8, 16, 32, 64] },
             "cubeOwner": { "$ref": "#/$defs/Seat" }
           },
@@ -300,11 +405,11 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "v": { "type": "integer", "minimum": 0 },
+            "v": { "$ref": "#/$defs/EventVersion" },
             "offerId": { "$ref": "#/$defs/DecisionId" },
             "by": { "$ref": "#/$defs/Seat" },
-            "currentStake": { "type": "integer", "minimum": 1 },
-            "proposedStake": { "type": "integer", "minimum": 1 },
+            "currentStake": { "$ref": "#/$defs/Stake" },
+            "proposedStake": { "$ref": "#/$defs/Stake" },
             "reason": { "type": "string", "enum": ["declined", "timeout", "disconnect"] }
           },
           "required": ["v", "offerId", "by", "currentStake", "proposedStake", "reason"]
@@ -319,7 +424,25 @@
         "type": { "const": "doubleOpportunity" },
         "gameId": { "type": "string", "minLength": 1 },
         "seat": { "$ref": "#/$defs/Seat" },
-        "state": { "$ref": "#/$defs/PublicGameState" }
+        "state": {
+          "type": "object",
+          "allOf": [
+            { "$ref": "#/$defs/StakedDecisionSnapshot" },
+            {
+              "properties": {
+                "doubling": {
+                  "type": "object",
+                  "properties": {
+                    "decision": {
+                      "type": "object",
+                      "properties": { "kind": { "const": "offer" } }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
       },
       "required": ["type", "gameId", "seat", "state"]
     },
@@ -339,7 +462,25 @@
         "type": { "const": "doubleDecision" },
         "gameId": { "type": "string", "minLength": 1 },
         "seat": { "$ref": "#/$defs/Seat" },
-        "state": { "$ref": "#/$defs/PublicGameState" }
+        "state": {
+          "type": "object",
+          "allOf": [
+            { "$ref": "#/$defs/StakedDecisionSnapshot" },
+            {
+              "properties": {
+                "doubling": {
+                  "type": "object",
+                  "properties": {
+                    "decision": {
+                      "type": "object",
+                      "properties": { "kind": { "const": "response" } }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
       },
       "required": ["type", "gameId", "seat", "state"]
     },
@@ -352,39 +493,36 @@
       },
       "required": ["decisionId", "acceptDouble"]
     },
-    "DoubleOfferAction": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "decisionId": { "$ref": "#/$defs/DecisionId" },
-        "offerDouble": { "type": "boolean", "default": false }
-      },
-      "required": ["decisionId", "offerDouble"]
-    },
-    "DoubleResponseAction": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "decisionId": { "$ref": "#/$defs/DecisionId" },
-        "acceptDouble": { "type": "boolean", "default": false }
-      },
-      "required": ["decisionId", "acceptDouble"]
-    },
     "CapabilityCatalog": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "capabilities": {
           "type": "array",
-          "contains": {
+          "items": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "name": { "const": "doubling" },
-              "status": { "const": "reserved" },
-              "selectable": { "const": false }
+              "name": { "type": "string", "minLength": 1 },
+              "status": { "type": "string", "enum": ["available", "reserved"] },
+              "selectable": { "type": "boolean" }
             },
-            "required": ["name", "status", "selectable"]
+            "required": ["name", "status", "selectable"],
+            "if": {
+              "properties": { "name": { "const": "doubling" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "status": { "const": "reserved" },
+                "selectable": { "const": false }
+              }
+            }
+          },
+          "contains": {
+            "type": "object",
+            "properties": { "name": { "const": "doubling" } },
+            "required": ["name"]
           }
         }
       },
@@ -392,12 +530,13 @@
     },
     "AnalyticsProjection": {
       "type": "object",
+      "description": "Projection of the ingest columns a staked game affects, not the full ingest record. Technical aborts are not ingested, so aborted is absent from the termination vocabulary here.",
       "additionalProperties": false,
       "properties": {
         "mode": { "const": "x2" },
         "stake_currency": { "const": "PLAY_CREDIT" },
-        "initial_stake_amount": { "type": "integer", "minimum": 1 },
-        "final_stake_amount": { "type": "integer", "minimum": 1 },
+        "initial_stake_amount": { "$ref": "#/$defs/Stake" },
+        "final_stake_amount": { "$ref": "#/$defs/Stake" },
         "white_money_delta": {
           "type": "integer",
           "description": "Legacy analytics column name; for PLAY_CREDIT this is a closed-loop credit change, not money."
@@ -408,7 +547,7 @@
         },
         "termination": {
           "type": "string",
-          "enum": ["king_captured", "resign", "timeout", "draw_agreement", "double_declined", "unknown"]
+          "enum": ["king_captured", "resign", "timeout", "draw_agreement", "double_declined"]
         }
       },
       "required": [

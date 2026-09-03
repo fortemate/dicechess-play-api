@@ -1,11 +1,7 @@
 {
-  "team": "house",
+  "team": "acme",
   "name": "defender",
   "timeControl": { "Fischer": { "initialSeconds": 300, "incrementSeconds": 3 } },
   "rated": false,
-  "stake": {
-    "amount": 10,
-    "currency": "PLAY_CREDIT",
-    "maximumMultiplier": 64
-  }
+  "stake": { "amount": 10, "currency": "PLAY_CREDIT", "maximumMultiplier": 64 }
 }

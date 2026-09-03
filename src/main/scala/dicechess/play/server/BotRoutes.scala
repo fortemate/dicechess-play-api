@@ -169,14 +169,15 @@ object BotRoutes:
 
   private object NameParam extends OptionalQueryParamDecoderMatcher[String]("name")
 
+  final case class MintLimiters(anon: AnonMintLimiter, register: AnonMintLimiter)
+
   def apply(
       auth: BotAuth,
       challenges: Challenges,
       events: BotEvents,
       registry: GameRegistry,
       lobby: Lobby,
-      limiter: AnonMintLimiter,
-      registerLimiter: AnonMintLimiter,
+      limiters: MintLimiters,
       // Optional because the bot API predates accounts and must keep working without them: with a session present,
       // registering while signed in records the owner in the same INSERT instead of needing a follow-up claim (#253).
       session: Option[AuthSession] = None
@@ -185,7 +186,7 @@ object BotRoutes:
       // Zero-registration self-service: mint an ephemeral, unranked anonymous bot token for testing.
       // The only un-gated route, so it carries its own per-IP rate limit.
       case req @ POST -> Root / "bot" / "anon" :? NameParam(name) =>
-        limiter
+        limiters.anon
           .attempt(clientIp(req))
           .flatMap:
             case Left(retryAfter) =>
@@ -198,7 +199,7 @@ object BotRoutes:
       // with GET /bot/games a registered bot resumes its games after a deploy instead of forfeiting them. Un-gated
       // like the anon mint, with its own (stricter) per-IP budget.
       case req @ POST -> Root / "bot" / "register" =>
-        registerLimiter
+        limiters.register
           .attempt(clientIp(req))
           .flatMap:
             case Left(retryAfter) =>

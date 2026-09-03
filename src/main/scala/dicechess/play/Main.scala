@@ -375,8 +375,7 @@ object Main extends IOApp.Simple:
             botStore,
             webhookService,
             registry,
-            wakeLimit,
-            playBotLimit,
+            CatalogRoutes.CatalogLimiters(wakeLimit, playBotLimit),
             authSession,
             guard = Some(seatGuard)
           )
@@ -480,8 +479,7 @@ object Main extends IOApp.Simple:
                     botEvents,
                     registry,
                     lobby,
-                    mintLimit,
-                    registerLimit,
+                    BotRoutes.MintLimiters(mintLimit, registerLimit),
                     session = authSession
                   )).orNotFound
               )

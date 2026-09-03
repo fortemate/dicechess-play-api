@@ -49,7 +49,14 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
       lobby           <- Lobby.create(registry)
       registerLimiter <- AnonMintLimiter.create(limit = registerLimit)
       // LobbyRoutes rides along so the human↔bot seek flows can be exercised end-to-end over HTTP.
-      routes = BotRoutes(auth, challenges, events, registry, lobby, limiter, registerLimiter) <+> LobbyRoutes(lobby)
+      routes = BotRoutes(
+        auth,
+        challenges,
+        events,
+        registry,
+        lobby,
+        BotRoutes.MintLimiters(limiter, registerLimiter)
+      ) <+> LobbyRoutes(lobby)
     yield (routes.orNotFound, registry)
 
   private def app: IO[HttpApp[IO]] = AnonMintLimiter.create(limit = 100).flatMap(appWith(_)).map(_._1)
@@ -977,8 +984,7 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
         events,
         registry,
         lobby,
-        limiter,
-        limiter,
+        BotRoutes.MintLimiters(limiter, limiter),
         session = Some(session)
       ).orNotFound
       signedIn <- routes.run(

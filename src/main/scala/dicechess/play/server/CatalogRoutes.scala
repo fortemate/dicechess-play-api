@@ -83,13 +83,14 @@ final case class PlayBot(
   */
 object CatalogRoutes:
 
+  final case class CatalogLimiters(wake: AnonMintLimiter, playBot: AnonMintLimiter)
+
   def apply(
       catalog: BotCatalogStore,
       bots: BotStore,
       webhooks: Option[Webhooks],
       registry: GameRegistry,
-      wakeLimiter: AnonMintLimiter,
-      playBotLimiter: AnonMintLimiter,
+      limiters: CatalogLimiters,
       session: Option[AuthSession] = None,
       guard: Option[SeatGuard] = None
   ): HttpRoutes[IO] =
@@ -113,7 +114,7 @@ object CatalogRoutes:
       // the in-memory game count plus one indexed read already answers the only question that matters. This runs
       // whether or not webhooks are enabled on the server: busy is a per-bot fact, independent of that feature flag.
       case req @ POST -> Root / "lobby" / "bots" / team / name / "wake" =>
-        wakeLimiter
+        limiters.wake
           .attempt(BotRoutes.clientIp(req))
           .flatMap:
             case Left(retryAfter) =>
@@ -134,7 +135,7 @@ object CatalogRoutes:
               }
 
       case req @ POST -> Root / "lobby" / "play-bot" =>
-        playBot(req, bots, registry, effectiveGuard, playBotLimiter, session)
+        playBot(req, bots, registry, effectiveGuard, limiters.playBot, session)
 
   /** Derive the catalog card from a stored listing, flagging (not hiding) a not-yet-converged rating — the same RD
     * threshold the leaderboard uses to hide provisional bots. `available` (#224) is evaluated against

@@ -80,7 +80,13 @@ class CatalogRoutesSuite extends munit.CatsEffectSuite:
       wakeLimiter.fold(AnonMintLimiter.create())(IO.pure),
       playBotLimiter.fold(AnonMintLimiter.create())(IO.pure)
     ).mapN((wake, playBot) =>
-      CatalogRoutes(stubCatalog(listings), stubBots(open, declared), webhooks, registry, wake, playBot)
+      CatalogRoutes(
+        stubCatalog(listings),
+        stubBots(open, declared),
+        webhooks,
+        registry,
+        CatalogRoutes.CatalogLimiters(wake, playBot)
+      )
     )
 
   private def freshRegistry: IO[GameRegistry] = GameRegistry.create(store = GameStore.noop)

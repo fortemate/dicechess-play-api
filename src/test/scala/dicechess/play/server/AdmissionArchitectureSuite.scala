@@ -101,8 +101,7 @@ class AdmissionArchitectureSuite extends munit.CatsEffectSuite:
           bots,
           webhooks = None,
           registry,
-          wakeLimit,
-          playBotLimit,
+          CatalogRoutes.CatalogLimiters(wakeLimit, playBotLimit),
           session = None,
           guard = Some(seatGuard)
         )

@@ -108,7 +108,19 @@ class AuthenticatedPlaySuite extends munit.CatsEffectSuite:
       token <- session.sign(user)
       wake  <- AnonMintLimiter.create()
       plays <- AnonMintLimiter.create()
-    yield (registry, CatalogRoutes(catalog, bots, None, registry, wake, plays, Some(session)).orNotFound, user, token)
+    yield (
+      registry,
+      CatalogRoutes(
+        catalog,
+        bots,
+        None,
+        registry,
+        CatalogRoutes.CatalogLimiters(wake, plays),
+        Some(session)
+      ).orNotFound,
+      user,
+      token
+    )
 
   private def createSeek(app: HttpApp[IO], token: Option[String], creator: Option[String]) =
     val base = Request[IO](Method.POST, uri"/lobby/seeks").withEntity(CreateSeek(creator))

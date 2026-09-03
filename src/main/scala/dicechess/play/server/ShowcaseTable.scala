@@ -604,6 +604,15 @@ object ShowcaseTable:
     */
   def alertToStderr(message: String): IO[Unit] = Console[IO].errorln(s"[play][showcase] ALERT: $message")
 
+  /** The table's three schedule knobs, defaulted to the production values above. Only the tests override them — they
+    * park the tick and shrink the backoff so a suite never waits on wall-clock time.
+    */
+  final case class Timings(
+      claimGrace: FiniteDuration = DefaultClaimGrace,
+      tickInterval: FiniteDuration = DefaultTickInterval,
+      clearBackoff: FiniteDuration = DefaultClearBackoff
+  )
+
   /** A `Resource` because the table owns the fibers that follow games to completion and enforce the claim grace:
     * releasing it cancels them all. The table starts `unavailable`; call [[ShowcaseTable.reconcile]] before serving it.
     *
@@ -617,9 +626,7 @@ object ShowcaseTable:
       store: Option[ShowcaseStore],
       botReady: IO[Boolean],
       alert: String => IO[Unit] = alertToStderr,
-      claimGrace: FiniteDuration = DefaultClaimGrace,
-      tickInterval: FiniteDuration = DefaultTickInterval,
-      clearBackoff: FiniteDuration = DefaultClearBackoff
+      timings: Timings = Timings()
   ): Resource[IO, ShowcaseTable] =
     Supervisor[IO](await = false).evalMap { supervisor =>
       (
@@ -638,9 +645,9 @@ object ShowcaseTable:
           mutex,
           supervisor,
           alert,
-          claimGrace,
-          tickInterval,
-          clearBackoff
+          timings.claimGrace,
+          timings.tickInterval,
+          timings.clearBackoff
         )
       }
     }

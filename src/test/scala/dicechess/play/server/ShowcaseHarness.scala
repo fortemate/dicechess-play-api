@@ -174,9 +174,11 @@ object ShowcaseHarness:
         Option.when(withStore)(store),
         botReady = ready.get,
         alert = message => alerts.update(_ :+ message),
-        claimGrace = claimGrace,
-        tickInterval = 1.hour,
-        clearBackoff = 10.millis
+        timings = ShowcaseTable.Timings(
+          claimGrace = claimGrace,
+          tickInterval = 1.hour,
+          clearBackoff = 10.millis
+        )
       )
 
     /** A simulated process restart: a fresh registry and guard over the SAME stores, with the live games resumed from

@@ -342,130 +342,136 @@ object BotStore:
       cats.effect.Ref.of[IO, Map[(String, String), (Boolean, Option[String])]](Map.empty),
       cats.effect.Ref.of[IO, Map[(String, String), Int]](Map.empty)
     ).mapN { (byHash, ratings, catalog, capacities) =>
-      new BotStore:
-        def register(team: String, name: String, tokenHash: String, owner: Option[String]): IO[Boolean] =
-          byHash
-            .modify { bots =>
-              if bots.values.exists(b => b.team == team && b.name == name) then (bots, false)
-              else (bots.updated(tokenHash, Principal.Bot(team, name)), true)
-            }
-            .flatTap { claimed =>
-              (ratings.update(_.updated((team, name), BotRating.initial.copy(ownerExternalId = owner))) *>
-                catalog.update(_.updated((team, name), (false, None))) *>
-                capacities.update(
-                  _.updated((team, name), BotSeatPolicy.DefaultMaxConcurrentGames)
-                )).whenA(claimed)
-            }
-
-        def authenticate(tokenHash: String): IO[Option[Principal.Bot]] = byHash.get.map(_.get(tokenHash))
-
-        def rotate(team: String, name: String, newTokenHash: String): IO[Boolean] =
-          byHash.modify { bots =>
-            if bots.values.exists(b => b.team == team && b.name == name) then
-              val cleared = bots.filterNot((_, b) => b.team == team && b.name == name)
-              (cleared.updated(newTokenHash, Principal.Bot(team, name)), true)
-            else (bots, false)
-          }
-
-        def ratingOf(team: String, name: String): IO[Option[BotRating]] = ratings.get.map(_.get((team, name)))
-
-        def setOnLadder(team: String, name: String, onLadder: Boolean): IO[Option[BotRating]] =
-          updateRating(team, name)(_.copy(onLadder = onLadder))
-
-        private def updateRating(team: String, name: String)(f: BotRating => BotRating): IO[Option[BotRating]] =
-          ratings.modify { current =>
-            current.get((team, name)) match
-              case Some(r) =>
-                val updated = f(r)
-                (current.updated((team, name), updated), Some(updated))
-              case None => (current, None)
-          }
-
-        def onLadderCandidates: IO[List[BotSeatPolicy]] =
-          (ratings.get, capacities.get, catalog.get).mapN { (rated, caps, cat) =>
-            rated.toList.collect { case (key, r) if r.onLadder => seatPolicy(key, caps, cat) }
-          }
-
-        def seatPolicyOf(team: String, name: String): IO[Option[BotSeatPolicy]] =
-          (capacities.get, catalog.get).mapN { (caps, cat) =>
-            Option.when(caps.contains((team, name)))(seatPolicy((team, name), caps, cat))
-          }
-
-        def setMaxConcurrentGames(team: String, name: String, limit: Int): IO[Option[BotSeatPolicy]] =
-          capacities
-            .modify { current =>
-              if current.contains((team, name)) then (current.updated((team, name), limit), true)
-              else (current, false)
-            }
-            .flatMap(declared => if declared then seatPolicyOf(team, name) else IO.pure(None))
-
-        /** Assemble a policy from the two refs that hold its parts. The capacity fallback is dead in practice —
-          * `register` seeds every key — and exists so a policy is still well-formed if a future write path forgets to.
-          */
-        private def seatPolicy(
-            key: (String, String),
-            caps: Map[(String, String), Int],
-            cat: Map[(String, String), (Boolean, Option[String])]
-        ): BotSeatPolicy =
-          BotSeatPolicy(
-            Principal.Bot(key._1, key._2),
-            caps.getOrElse(key, BotSeatPolicy.DefaultMaxConcurrentGames),
-            cat.get(key).exists(_._1)
-          )
-
-        def openToHumans(team: String, name: String, description: Option[String]): IO[Option[BotCatalogState]] =
-          catalog.modify { current =>
-            if current.contains((team, name)) then
-              val state = BotCatalogState(openToHumans = true, description)
-              (current.updated((team, name), (true, description)), Some(state))
-            else (current, None)
-          }
-
-        def closeToHumans(team: String, name: String): IO[Option[BotCatalogState]] =
-          catalog.modify { current =>
-            current.get((team, name)) match
-              case Some((_, desc)) =>
-                (current.updated((team, name), (false, desc)), Some(BotCatalogState(openToHumans = false, desc)))
-              case None => (current, None)
-          }
-
-        def claimOwner(team: String, name: String, ownerExternalId: String): IO[OwnerClaim] =
-          ratings.modify { current =>
-            current.get((team, name)) match
-              case None                                                      => (current, OwnerClaim.NotRegistered)
-              case Some(r) if r.ownerExternalId.exists(_ != ownerExternalId) => (current, OwnerClaim.ClaimedByAnother)
-              case Some(r)                                                   =>
-                (current.updated((team, name), r.copy(ownerExternalId = Some(ownerExternalId))), OwnerClaim.Claimed)
-          }
-
-        def releaseOwner(team: String, name: String, ownerExternalId: String): IO[Boolean] =
-          ratings.modify { current =>
-            current.get((team, name)) match
-              case Some(r) if r.ownerExternalId.contains(ownerExternalId) =>
-                (current.updated((team, name), r.copy(ownerExternalId = None)), true)
-              case _ => (current, false)
-          }
-
-        def botsOwnedBy(ownerExternalId: String): IO[List[OwnedBot]] =
-          (ratings.get, catalog.get).mapN { (rated, cat) =>
-            rated.toList
-              .collect {
-                case ((team, name), r) if r.ownerExternalId.contains(ownerExternalId) =>
-                  OwnedBot(
-                    team = team,
-                    name = name,
-                    rating = 1500.0,
-                    rd = 350.0,
-                    onLadder = r.onLadder,
-                    openToHumans = cat.get((team, name)).exists(_._1)
-                  )
-              }
-              .sortBy(b => (-b.rating, b.team, b.name))
-          }
-
-        def openToHumansBots: IO[List[Principal.Bot]] =
-          catalog.get.map(_.toList.collect { case ((team, name), (open, _)) if open => Principal.Bot(team, name) })
+      new InMemoryBotStore(byHash, ratings, catalog, capacities)
     }
+
+  final private class InMemoryBotStore(
+      byHash: cats.effect.Ref[IO, Map[String, Principal.Bot]],
+      ratings: cats.effect.Ref[IO, Map[(String, String), BotRating]],
+      catalog: cats.effect.Ref[IO, Map[(String, String), (Boolean, Option[String])]],
+      capacities: cats.effect.Ref[IO, Map[(String, String), Int]]
+  ) extends BotStore:
+    def register(team: String, name: String, tokenHash: String, owner: Option[String]): IO[Boolean] =
+      byHash
+        .modify { bots =>
+          if bots.values.exists(b => b.team == team && b.name == name) then (bots, false)
+          else (bots.updated(tokenHash, Principal.Bot(team, name)), true)
+        }
+        .flatTap(claimed => seedBotState(team, name, owner).whenA(claimed))
+
+    private def seedBotState(team: String, name: String, owner: Option[String]): IO[Unit] =
+      ratings.update(_.updated((team, name), BotRating.initial.copy(ownerExternalId = owner))) *>
+        catalog.update(_.updated((team, name), (false, None))) *>
+        capacities.update(_.updated((team, name), BotSeatPolicy.DefaultMaxConcurrentGames))
+
+    def authenticate(tokenHash: String): IO[Option[Principal.Bot]] = byHash.get.map(_.get(tokenHash))
+
+    def rotate(team: String, name: String, newTokenHash: String): IO[Boolean] =
+      byHash.modify { bots =>
+        if bots.values.exists(b => b.team == team && b.name == name) then
+          val cleared = bots.filterNot((_, b) => b.team == team && b.name == name)
+          (cleared.updated(newTokenHash, Principal.Bot(team, name)), true)
+        else (bots, false)
+      }
+
+    def ratingOf(team: String, name: String): IO[Option[BotRating]] = ratings.get.map(_.get((team, name)))
+
+    def setOnLadder(team: String, name: String, onLadder: Boolean): IO[Option[BotRating]] =
+      updateRating(team, name)(_.copy(onLadder = onLadder))
+
+    private def updateRating(team: String, name: String)(f: BotRating => BotRating): IO[Option[BotRating]] =
+      ratings.modify { current =>
+        current.get((team, name)) match
+          case Some(r) =>
+            val updated = f(r)
+            (current.updated((team, name), updated), Some(updated))
+          case None => (current, None)
+      }
+
+    def onLadderCandidates: IO[List[BotSeatPolicy]] =
+      (ratings.get, capacities.get, catalog.get).mapN { (rated, caps, cat) =>
+        rated.toList.collect { case (key, r) if r.onLadder => seatPolicy(key, caps, cat) }
+      }
+
+    def seatPolicyOf(team: String, name: String): IO[Option[BotSeatPolicy]] =
+      (capacities.get, catalog.get).mapN { (caps, cat) =>
+        Option.when(caps.contains((team, name)))(seatPolicy((team, name), caps, cat))
+      }
+
+    def setMaxConcurrentGames(team: String, name: String, limit: Int): IO[Option[BotSeatPolicy]] =
+      capacities
+        .modify { current =>
+          if current.contains((team, name)) then (current.updated((team, name), limit), true)
+          else (current, false)
+        }
+        .flatMap(declared => if declared then seatPolicyOf(team, name) else IO.pure(None))
+
+    /** Assemble a policy from the two refs that hold its parts. The capacity fallback is dead in practice — `register`
+      * seeds every key — and exists so a policy is still well-formed if a future write path forgets to.
+      */
+    private def seatPolicy(
+        key: (String, String),
+        caps: Map[(String, String), Int],
+        cat: Map[(String, String), (Boolean, Option[String])]
+    ): BotSeatPolicy =
+      BotSeatPolicy(
+        Principal.Bot(key._1, key._2),
+        caps.getOrElse(key, BotSeatPolicy.DefaultMaxConcurrentGames),
+        cat.get(key).exists(_._1)
+      )
+
+    def openToHumans(team: String, name: String, description: Option[String]): IO[Option[BotCatalogState]] =
+      catalog.modify { current =>
+        if current.contains((team, name)) then
+          val state = BotCatalogState(openToHumans = true, description)
+          (current.updated((team, name), (true, description)), Some(state))
+        else (current, None)
+      }
+
+    def closeToHumans(team: String, name: String): IO[Option[BotCatalogState]] =
+      catalog.modify { current =>
+        current.get((team, name)) match
+          case Some((_, desc)) =>
+            (current.updated((team, name), (false, desc)), Some(BotCatalogState(openToHumans = false, desc)))
+          case None => (current, None)
+      }
+
+    def claimOwner(team: String, name: String, ownerExternalId: String): IO[OwnerClaim] =
+      ratings.modify { current =>
+        current.get((team, name)) match
+          case None                                                      => (current, OwnerClaim.NotRegistered)
+          case Some(r) if r.ownerExternalId.exists(_ != ownerExternalId) => (current, OwnerClaim.ClaimedByAnother)
+          case Some(r)                                                   =>
+            (current.updated((team, name), r.copy(ownerExternalId = Some(ownerExternalId))), OwnerClaim.Claimed)
+      }
+
+    def releaseOwner(team: String, name: String, ownerExternalId: String): IO[Boolean] =
+      ratings.modify { current =>
+        current.get((team, name)) match
+          case Some(r) if r.ownerExternalId.contains(ownerExternalId) =>
+            (current.updated((team, name), r.copy(ownerExternalId = None)), true)
+          case _ => (current, false)
+      }
+
+    def botsOwnedBy(ownerExternalId: String): IO[List[OwnedBot]] =
+      (ratings.get, catalog.get).mapN { (rated, cat) =>
+        rated.toList
+          .collect {
+            case ((team, name), r) if r.ownerExternalId.contains(ownerExternalId) =>
+              OwnedBot(
+                team = team,
+                name = name,
+                rating = 1500.0,
+                rd = 350.0,
+                onLadder = r.onLadder,
+                openToHumans = cat.get((team, name)).exists(_._1)
+              )
+          }
+          .sortBy(b => (-b.rating, b.team, b.name))
+      }
+
+    def openToHumansBots: IO[List[Principal.Bot]] =
+      catalog.get.map(_.toList.collect { case ((team, name), (open, _)) if open => Principal.Bot(team, name) })
 
 /** A registered bot's verified webhook (F.2, #104): rows exist only after the ownership handshake succeeded, so
   * `verifiedAt` is total. `secret` is the per-bot HMAC key the server signs outbound deliveries with — readable by

@@ -25,7 +25,9 @@ import javax.crypto.spec.SecretKeySpec
   *     unspecified). Resolution happens AT SEND TIME on every delivery, never cached. [[WebhookTransport]] connects to
   *     an address from that exact validated result while retaining this URI's hostname for HTTP Host, TLS SNI, and
   *     certificate verification. That closes the policy-check/connect DNS-rebinding window instead of assuming TLS
-  *     alone closes it. Redirects are not followed, so the check cannot be laundered through a public 302.
+  *     alone closes it. Redirects are not followed, so the check cannot be laundered through a public 302. The single
+  *     concession is [[LoopbackEnvVar]], for local acceptance harnesses — fail-closed, read once at boot, and it widens
+  *     the policy to loopback and nothing else.
   */
 object WebhookSecurity:
 
@@ -80,28 +82,45 @@ object WebhookSecurity:
     * original hostname: [[WebhookTransport]] changes only the TCP destination, never the HTTP/TLS identity.
     */
   def resolvePublicHttps(url: String): IO[Either[WebhookUrlFailure, ResolvedWebhookTarget]] =
-    resolvePublicHttps(url, systemLookup)
+    resolvePublicHttps(url, systemLookup, loopbackAllowed)
 
+  /** Test-only escape hatch for local acceptance harnesses (#62). Case-insensitive `true` or `1` widens the SSRF policy
+    * exactly far enough to drive a fixture bot on this host: loopback addresses are accepted, and plaintext `http` is
+    * accepted '''only when every resolved address is loopback'''. Nothing else moves — RFC1918, link-local, CGNAT and
+    * the rest of the non-public registry stay rejected, and plaintext to a routable host stays `HttpsRequired`, so the
+    * flag can never put a signed body on a real network in the clear. Unset, the production case, is fail-closed. Never
+    * set this in a deployed environment.
+    */
   val LoopbackEnvVar = "WEBHOOK_ALLOW_LOOPBACK"
 
-  private def loopbackAllowed: Boolean =
-    sys.env.get(LoopbackEnvVar).exists(v => v.equalsIgnoreCase("true") || v == "1")
+  /** Fail-closed parse, kept pure so the accepted spellings are testable without mutating the JVM environment. */
+  private[server] def loopbackFlag(value: Option[String]): Boolean =
+    value.exists(v => v.equalsIgnoreCase("true") || v == "1")
 
-  /** Test seam for deterministic DNS answers, including mixed public/private rebinding responses. */
+  /** Read once: the environment cannot change under a running JVM, and the URL policy must not depend on ''when'' it is
+    * consulted. `Main` reads it to raise the boot alert.
+    */
+  private[play] lazy val loopbackAllowed: Boolean = loopbackFlag(sys.env.get(LoopbackEnvVar))
+
+  /** Test seam for deterministic DNS answers, including mixed public/private rebinding responses. `allowLoopback` is
+    * required rather than defaulted to an ambient read of [[LoopbackEnvVar]]: every caller states the policy it means
+    * to exercise, so exporting the hatch in the shell that runs the suite cannot quietly change what a test asserts.
+    */
   private[server] def resolvePublicHttps(
       url: String,
-      lookup: String => IO[List[InetAddress]]
+      lookup: String => IO[List[InetAddress]],
+      allowLoopback: Boolean
   ): IO[Either[WebhookUrlFailure, ResolvedWebhookTarget]] =
     Uri.fromString(url) match
       case Left(_)    => IO.pure(Left(WebhookUrlFailure.InvalidUrl))
       case Right(uri) =>
-        val allowedScheme =
-          uri.scheme.contains(Uri.Scheme.https) || (loopbackAllowed && uri.scheme.contains(Uri.Scheme.http))
+        val plaintext     = uri.scheme.contains(Uri.Scheme.http)
+        val allowedScheme = uri.scheme.contains(Uri.Scheme.https) || (allowLoopback && plaintext)
         if !allowedScheme then IO.pure(Left(WebhookUrlFailure.HttpsRequired))
         else if uri.userInfo.nonEmpty then IO.pure(Left(WebhookUrlFailure.UserInfoForbidden))
         else if uri.fragment.nonEmpty then IO.pure(Left(WebhookUrlFailure.FragmentForbidden))
         else
-          val defaultPort = if uri.scheme.contains(Uri.Scheme.http) then 80 else 443
+          val defaultPort = if plaintext then 80 else 443
           (uri.host.map(_.value), Port.fromInt(uri.port.getOrElse(defaultPort))) match
             case (None, _)                => IO.pure(Left(WebhookUrlFailure.MissingHost))
             case (_, None)                => IO.pure(Left(WebhookUrlFailure.InvalidPort))
@@ -112,10 +131,14 @@ object WebhookSecurity:
                   NonEmptyList.fromList(addresses) match
                     case None => Left(WebhookUrlFailure.HostDoesNotResolve(host))
                     case Some(resolved)
-                        if !resolved.forall(a => isPublic(a) || (loopbackAllowed && a.isLoopbackAddress)) =>
+                        if !resolved.forall(a => isPublic(a) || (allowLoopback && a.isLoopbackAddress)) =>
                       // Do not name the rejected address: a split-horizon resolver must not become an internal-DNS
                       // oracle through caller-visible policy errors.
                       Left(WebhookUrlFailure.NonPublicAddress)
+                    case Some(resolved) if plaintext && !resolved.forall(_.isLoopbackAddress) =>
+                      // The hatch concedes plaintext to a fixture on this host, never to a routable one: the HMAC and
+                      // the turn body would otherwise cross a real network readable.
+                      Left(WebhookUrlFailure.HttpsRequired)
                     case Some(resolved) =>
                       Right(
                         ResolvedWebhookTarget(
@@ -132,7 +155,8 @@ object WebhookSecurity:
   def checkPublicHttps(url: String): IO[Either[String, Uri]] =
     resolvePublicHttps(url).map(_.left.map(_.message).map(_.uri))
 
-  private def systemLookup(host: String): IO[List[InetAddress]] =
+  /** The production resolver. `private[server]` so a test can name it explicitly and pin `allowLoopback` alongside. */
+  private[server] def systemLookup(host: String): IO[List[InetAddress]] =
     IO.interruptibleMany(InetAddress.getAllByName(host).toList)
 
   /** Whether an address is routable-public. Java's `isSiteLocalAddress` covers RFC1918 for IPv4 (and the deprecated

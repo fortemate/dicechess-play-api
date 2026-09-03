@@ -347,9 +347,7 @@ object Main extends IOApp.Simple:
                 .println(
                   s"[play][webhook] ALERT: ${WebhookSecurity.LoopbackEnvVar} enabled — private loopback allowed for testing"
                 )
-                .whenA(
-                  sys.env.get(WebhookSecurity.LoopbackEnvVar).exists(v => v.equalsIgnoreCase("true") || v == "1")
-                ) *>
+                .whenA(WebhookSecurity.loopbackAllowed) *>
                 pgStore.fold(WebhookStore.inMemory)(pg => IO.pure(pg: WebhookStore))
             )
             .flatMap { webhookStore =>
@@ -448,9 +446,12 @@ object Main extends IOApp.Simple:
         val showcaseResource: Resource[IO, Option[ShowcaseTable]] =
           if !showcaseConfig.enabled then Resource.pure(None)
           else
+            // Test-harness override only. A non-positive value would turn the coordinator's `IO.sleep *> tick`
+            // loop into a busy spin, so anything but a positive integer falls back to the shipped cadence.
             val tickInterval = sys.env
               .get("SHOWCASE_TICK_SECONDS")
               .flatMap(_.toIntOption)
+              .filter(_ > 0)
               .map(_.seconds)
               .getOrElse(ShowcaseTable.DefaultTickInterval)
             ShowcaseTable
@@ -617,9 +618,12 @@ object Main extends IOApp.Simple:
   ): IO[Boolean] =
     (config.featuredBot, webhooks) match
       case (Some(bot), Some(service)) =>
+        // Test-harness override only; a non-positive deadline would fail every probe instantly and pin the table
+        // at `bot_unavailable`, so it falls back to the shipped budget.
         val probeTimeout = sys.env
           .get("SHOWCASE_PROBE_TIMEOUT_SECONDS")
           .flatMap(_.toIntOption)
+          .filter(_ > 0)
           .map(_.seconds)
           .getOrElse(ShowcaseTable.ProbeTimeout)
         bots

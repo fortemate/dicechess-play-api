@@ -449,13 +449,19 @@ object Main extends IOApp.Simple:
         val showcaseResource: Resource[IO, Option[ShowcaseTable]] =
           if !showcaseConfig.enabled then Resource.pure(None)
           else
+            val tickInterval = sys.env
+              .get("SHOWCASE_TICK_SECONDS")
+              .flatMap(_.toIntOption)
+              .map(_.seconds)
+              .getOrElse(ShowcaseTable.DefaultTickInterval)
             ShowcaseTable
               .create(
                 showcaseConfig,
                 registry,
                 admissionGuard,
                 pgStore.map(pg => pg: ShowcaseStore),
-                botReady = showcaseReadiness(showcaseConfig, botStore, webhookService)
+                botReady = showcaseReadiness(showcaseConfig, botStore, webhookService),
+                tickInterval = tickInterval
               )
               .evalTap(table =>
                 table.reconcile.flatMap(phase =>
@@ -613,11 +619,16 @@ object Main extends IOApp.Simple:
   ): IO[Boolean] =
     (config.featuredBot, webhooks) match
       case (Some(bot), Some(service)) =>
+        val probeTimeout = sys.env
+          .get("SHOWCASE_PROBE_TIMEOUT_SECONDS")
+          .flatMap(_.toIntOption)
+          .map(_.seconds)
+          .getOrElse(ShowcaseTable.ProbeTimeout)
         bots
           .seatPolicyOf(bot.team, bot.name)
           .flatMap:
             case None    => IO.pure(false)
-            case Some(_) => service.wake(bot, ShowcaseTable.ProbeTimeout).handleError(_ => false)
+            case Some(_) => service.wake(bot, probeTimeout).handleError(_ => false)
       case _ => IO.pure(false)
 
   /** The showcase table can only ever open if the featured bot's webhook can be driven, and `WEBHOOK_TIMEOUT_SECONDS`

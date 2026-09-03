@@ -32,15 +32,10 @@ final class AdmissionGuard private (
 ):
   import AdmissionGuard.*
 
-  private def untrackedInRegistry(bot: Principal.Bot, active: Map[GameId, ActiveAdmission]): IO[Int] =
+  private def registryActiveGameIds(bot: Principal.Bot): IO[Set[GameId]] =
     registry match
-      case None      => IO.pure(0)
-      case Some(reg) =>
-        reg
-          .activeGamesFor(bot)
-          .map: regActive =>
-            val trackedActive = active.values.count(_.bots.contains(bot))
-            math.max(0, regActive - trackedActive)
+      case None      => IO.pure(Set.empty)
+      case Some(reg) => reg.activeGameIdsFor(bot)
 
   /** Attempt to acquire provisional admission for `players` under `purpose`.
     *
@@ -54,17 +49,17 @@ final class AdmissionGuard private (
         if registeredBots.isEmpty then IO.pure(Right(UnboundedTicket(purpose)))
         else
           for
-            now       <- IO.monotonic
-            untracked <- registeredBots
-              .traverse { case (bot, _) =>
-                state.get.flatMap(s => untrackedInRegistry(bot, s.active).map(u => bot -> u))
-              }
+            now          <- IO.monotonic
+            regActiveMap <- registeredBots
+              .traverse { case (bot, _) => registryActiveGameIds(bot).map(ids => bot -> ids) }
               .map(_.toMap)
             res <- state.modify: current =>
               val pruned = current.pruneExpired(now)
               val check  = registeredBots.traverse { case (bot, policy) =>
+                val regActive                   = regActiveMap.getOrElse(bot, Set.empty)
+                val untracked                   = pruned.untrackedFor(bot, regActive)
                 val (inFlightGen, inFlightShow) = pruned.occupancyFor(bot, now)
-                val genOcc                      = inFlightGen + untracked.getOrElse(bot, 0)
+                val genOcc                      = inFlightGen + untracked
                 val showOcc                     = inFlightShow
                 checkCapacity(bot, policy, purpose, genOcc, showOcc)
               }
@@ -149,9 +144,10 @@ final class AdmissionGuard private (
             case None         => IO.pure(true)
             case Some(policy) =>
               for
+                regActive <- registryActiveGameIds(bot)
                 current   <- state.get
                 now       <- IO.monotonic
-                untracked <- untrackedInRegistry(bot, current.active)
+                untracked                   = current.untrackedFor(bot, regActive)
                 (inFlightGen, inFlightShow) = current.occupancyFor(bot, now)
                 genOcc                      = inFlightGen + untracked
                 showOcc                     = inFlightShow
@@ -165,15 +161,18 @@ final class AdmissionGuard private (
   /** Subset of candidate policies available for ladder pairing. */
   def availableForLadder(pool: List[BotSeatPolicy]): IO[List[Principal.Bot]] =
     for
-      current      <- state.get
-      now          <- IO.monotonic
-      untrackedMap <- pool.traverse(p => untrackedInRegistry(p.bot, current.active).map(u => p.bot -> u)).map(_.toMap)
+      current <- state.get
+      now     <- IO.monotonic
+      bots = pool.map(_.bot)
+      regActiveMap <- bots.traverse(b => registryActiveGameIds(b).map(b -> _)).map(_.toMap)
     yield pool
       .filter: policy =>
+        val bot                         = policy.bot
+        val untracked                   = current.untrackedFor(bot, regActiveMap.getOrElse(bot, Set.empty))
         val (inFlightGen, inFlightShow) = current.occupancyFor(policy.bot, now)
-        val genOcc                      = inFlightGen + untrackedMap.getOrElse(policy.bot, 0)
+        val genOcc                      = inFlightGen + untracked
         val showOcc                     = inFlightShow
-        checkCapacity(policy.bot, policy, AdmissionPurpose.Ladder, genOcc, showOcc).isRight
+        checkCapacity(bot, policy, AdmissionPurpose.Ladder, genOcc, showOcc).isRight
       .map(_.bot)
 
   /** Server-side diagnostics for `bot`, exposing allowances and occupancies without credentials. */
@@ -184,9 +183,10 @@ final class AdmissionGuard private (
         case None         => IO.pure(None)
         case Some(policy) =>
           for
+            regActive <- registryActiveGameIds(bot)
             current   <- state.get
             now       <- IO.monotonic
-            untracked <- untrackedInRegistry(bot, current.active)
+            untracked                   = current.untrackedFor(bot, regActive)
             (inFlightGen, inFlightShow) = current.occupancyFor(bot, now)
             genOcc                      = inFlightGen + untracked
             showOcc                     = inFlightShow
@@ -195,7 +195,9 @@ final class AdmissionGuard private (
             genAllowance                =
               if isFeatured then math.max(0, policy.maxConcurrentGames - reserved) else policy.maxConcurrentGames
             showAllowance    = if isFeatured then reserved else 0
-            activeGamesCount = current.active.values.count(_.bots.contains(bot)) + untracked
+            activeGamesCount = (current.active.collect { case (gid, a) if a.bots.contains(bot) => gid }.toSet ++
+              current.inFlight.values.collect { case r if r.bots.contains(bot) => r.gameId }.flatten ++
+              regActive).size
           yield Some(
             AdmissionDiagnostics(
               bot = bot,
@@ -228,12 +230,20 @@ final class AdmissionGuard private (
     resolveRegisteredBots(players).flatMap: bots =>
       if bots.isEmpty then IO.unit
       else
+        val botList = bots.map(_._1)
         state.update: current =>
           if current.active.contains(gameId) then current
           else
-            current.copy(
-              active = current.active.updated(gameId, ActiveAdmission(gameId, bots.map(_._1), origin.admissionPurpose))
-            )
+            val matchingTicket = current.inFlight.find { (_, r) =>
+              r.gameId.isEmpty && r.bots.toSet == botList.toSet && r.purpose == origin.admissionPurpose
+            }
+            matchingTicket match
+              case Some((tid, res)) =>
+                current.copy(inFlight = current.inFlight.updated(tid, res.copy(gameId = Some(gameId))))
+              case None =>
+                current.copy(
+                  active = current.active.updated(gameId, ActiveAdmission(gameId, botList, origin.admissionPurpose))
+                )
 
   /** Release committed admission when a room terminates. */
   def releaseGame(gameId: GameId): IO[Unit] =
@@ -391,7 +401,8 @@ object AdmissionGuard:
       bots: List[Principal.Bot],
       purpose: AdmissionPurpose,
       createdAt: FiniteDuration,
-      expiresAt: FiniteDuration
+      expiresAt: FiniteDuration,
+      gameId: Option[GameId] = None
   )
 
   final case class ActiveAdmission(
@@ -416,6 +427,13 @@ object AdmissionGuard:
       val gen           = validInFlight.count(_.purpose.isGeneral) + validActive.count(_.purpose.isGeneral)
       val show          = validInFlight.count(_.purpose.isShowcase) + validActive.count(_.purpose.isShowcase)
       (gen, show)
+
+    def untrackedFor(bot: Principal.Bot, registryActiveIds: Set[GameId]): Int =
+      val trackedGids = active.collect { case (gid, a) if a.bots.contains(bot) => gid }.toSet ++
+        inFlight.values.collect { case r if r.bots.contains(bot) => r.gameId }.flatten
+      val unknownRegistryGids   = (registryActiveIds -- trackedGids).size
+      val inFlightWithoutGameId = inFlight.values.count(r => r.bots.contains(bot) && r.gameId.isEmpty)
+      math.max(0, unknownRegistryGids - inFlightWithoutGameId)
 
   final case class AdmissionDiagnostics(
       bot: Principal.Bot,

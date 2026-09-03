@@ -63,8 +63,14 @@ final class GameRegistry private (
     * with an idle seat can deadlock forever (see the testing notes on idle seats). That is not a miscount, it is a real
     * stuck game, and every path that seats bots automatically imposes a clock.
     */
+  def activeGameIdsFor(principal: Principal): IO[Set[GameId]] =
+    gamesFor(principal)
+      .flatMap: list =>
+        list.filterA((_, room) => room.hasEnded.map(!_))
+      .map(_.map(_._1).toSet)
+
   def activeGamesFor(principal: Principal): IO[Int] =
-    gamesFor(principal).flatMap(_.traverse((_, room) => room.hasEnded)).map(_.count(!_))
+    activeGameIdsFor(principal).map(_.size)
 
   /** Create and start a room for two players. Dice come from a fresh commit-reveal source whose server seed is
     * committed before any client connects; each player then folds in its own post-commit seed (see GameRoom's gate).

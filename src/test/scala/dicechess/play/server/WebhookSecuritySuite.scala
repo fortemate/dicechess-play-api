@@ -49,9 +49,15 @@ class WebhookSecuritySuite extends CatsEffectSuite:
 
   // ── URL policy ───────────────────────────────────────────────────────────────
 
-  private def allRejected(urls: List[String]): IO[Unit] =
+  /** The shipped policy, with the loopback hatch pinned shut. These expectations describe the production default, so
+    * they must not flip because an acceptance harness exported `WEBHOOK_ALLOW_LOOPBACK` in the shell running `sbt
+    * test`.
+    */
+  private def allRejected(urls: List[String], allowLoopback: Boolean = false): IO[Unit] =
     urls.traverse_ : url =>
-      WebhookSecurity.checkPublicHttps(url).map(r => assert(r.isLeft, s"$url must be rejected, got $r"))
+      WebhookSecurity
+        .resolvePublicHttps(url, WebhookSecurity.systemLookup, allowLoopback)
+        .map(r => assert(r.isLeft, s"$url must be rejected, got $r"))
 
   test("non-https and malformed URLs are rejected before any resolution"):
     allRejected(
@@ -67,8 +73,12 @@ class WebhookSecuritySuite extends CatsEffectSuite:
     for
       calls <- Ref.of[IO, Int](0)
       lookup = (_: String) => calls.update(_ + 1).as(List(InetAddress.getByName("1.1.1.1")))
-      userInfo <- WebhookSecurity.resolvePublicHttps("https://user:pass@example.com/hook", lookup)
-      fragment <- WebhookSecurity.resolvePublicHttps("https://example.com/hook#private", lookup)
+      userInfo <- WebhookSecurity.resolvePublicHttps(
+        "https://user:pass@example.com/hook",
+        lookup,
+        allowLoopback = false
+      )
+      fragment <- WebhookSecurity.resolvePublicHttps("https://example.com/hook#private", lookup, allowLoopback = false)
       count    <- calls.get
     yield
       assertEquals(userInfo, Left(WebhookUrlFailure.UserInfoForbidden))
@@ -80,12 +90,24 @@ class WebhookSecuritySuite extends CatsEffectSuite:
       calls <- Ref.of[IO, Int](0)
       lookup = (_: String) => calls.update(_ + 1).as(List(InetAddress.getByName("1.1.1.1")))
       // userinfo + fragment => UserInfoForbidden (userinfo checked before fragment)
-      userInfoAndFrag <- WebhookSecurity.resolvePublicHttps("https://user:pass@example.com/hook#private", lookup)
+      userInfoAndFrag <- WebhookSecurity.resolvePublicHttps(
+        "https://user:pass@example.com/hook#private",
+        lookup,
+        allowLoopback = false
+      )
       // private IP literal + fragment => FragmentForbidden (fragment checked before DNS/address check)
-      privateIpAndFrag <- WebhookSecurity.resolvePublicHttps("https://192.168.1.1/hook#private", lookup)
+      privateIpAndFrag <- WebhookSecurity.resolvePublicHttps(
+        "https://192.168.1.1/hook#private",
+        lookup,
+        allowLoopback = false
+      )
       // non-https + userinfo => HttpsRequired (scheme checked before userinfo)
-      httpAndUserInfo <- WebhookSecurity.resolvePublicHttps("http://user:pass@example.com/hook", lookup)
-      count           <- calls.get
+      httpAndUserInfo <- WebhookSecurity.resolvePublicHttps(
+        "http://user:pass@example.com/hook",
+        lookup,
+        allowLoopback = false
+      )
+      count <- calls.get
     yield
       assertEquals(userInfoAndFrag, Left(WebhookUrlFailure.UserInfoForbidden))
       assertEquals(privateIpAndFrag, Left(WebhookUrlFailure.FragmentForbidden))
@@ -95,14 +117,14 @@ class WebhookSecuritySuite extends CatsEffectSuite:
   test("one non-public answer rejects the complete DNS result"):
     val lookup = (_: String) => IO.pure(List(InetAddress.getByName("1.1.1.1"), InetAddress.getByName("127.0.0.1")))
     WebhookSecurity
-      .resolvePublicHttps("https://bot.example/hook", lookup)
+      .resolvePublicHttps("https://bot.example/hook", lookup, allowLoopback = false)
       .map: result =>
         assertEquals(result, Left(WebhookUrlFailure.NonPublicAddress))
 
   test("resolved target retains the original URI identity and every validated IP"):
     val lookup = (_: String) => IO.pure(List(InetAddress.getByName("1.1.1.1"), InetAddress.getByName("8.8.8.8")))
     WebhookSecurity
-      .resolvePublicHttps("https://Bot.Example:8443/hook?opaque=value", lookup)
+      .resolvePublicHttps("https://Bot.Example:8443/hook?opaque=value", lookup, allowLoopback = false)
       .map:
         case Left(failure) => fail(s"public addresses rejected: $failure")
         case Right(target) =>
@@ -164,6 +186,60 @@ class WebhookSecuritySuite extends CatsEffectSuite:
       .map:
         case Right(uri) => assertEquals(uri.renderString, "https://1.1.1.1/hook")
         case Left(why)  => fail(s"public literal rejected: $why")
+
+  // ── The loopback escape hatch (#62) ───────────────────────────────────────────────
+
+  test("the hatch is fail-closed: only `true` in any case, or `1`, opens it"):
+    assert(WebhookSecurity.loopbackFlag(Some("true")))
+    assert(WebhookSecurity.loopbackFlag(Some("TRUE")))
+    assert(WebhookSecurity.loopbackFlag(Some("1")))
+    List(None, Some(""), Some(" true"), Some("false"), Some("yes"), Some("on"), Some("0"), Some("2"))
+      .foreach(value => assert(!WebhookSecurity.loopbackFlag(value), s"$value must leave the hatch shut"))
+
+  test("shut, the hatch changes nothing: loopback is refused over https and plaintext alike"):
+    for
+      secure <- WebhookSecurity.resolvePublicHttps(
+        "https://127.0.0.1/hook",
+        WebhookSecurity.systemLookup,
+        allowLoopback = false
+      )
+      plain <- WebhookSecurity.resolvePublicHttps(
+        "http://127.0.0.1/hook",
+        WebhookSecurity.systemLookup,
+        allowLoopback = false
+      )
+    yield
+      assertEquals(secure, Left(WebhookUrlFailure.NonPublicAddress))
+      assertEquals(plain, Left(WebhookUrlFailure.HttpsRequired))
+
+  test("open, the hatch reaches a loopback fixture over https and plaintext, with the scheme's default port"):
+    val loopback = (_: String) => IO.pure(List(InetAddress.getByName("127.0.0.1")))
+    for
+      secure   <- WebhookSecurity.resolvePublicHttps("https://localhost/hook", loopback, allowLoopback = true)
+      plain    <- WebhookSecurity.resolvePublicHttps("http://localhost/hook", loopback, allowLoopback = true)
+      explicit <- WebhookSecurity.resolvePublicHttps("http://localhost:9099/hook", loopback, allowLoopback = true)
+    yield
+      assertEquals(secure.map(_.port.value), Right(443))
+      assertEquals(plain.map(_.port.value), Right(80))
+      assertEquals(explicit.map(_.port.value), Right(9099))
+
+  test("open, the hatch still refuses plaintext to a routable host — a signed body never crosses a real network"):
+    val public = (_: String) => IO.pure(List(InetAddress.getByName("1.1.1.1")))
+    WebhookSecurity
+      .resolvePublicHttps("http://bot.example/hook", public, allowLoopback = true)
+      .map(result => assertEquals(result, Left(WebhookUrlFailure.HttpsRequired)))
+
+  test("open, the hatch widens the policy to loopback and nothing else"):
+    allRejected(
+      List(
+        "https://10.1.2.3/hook",        // RFC1918
+        "https://192.168.10.3/hook",    // RFC1918
+        "https://169.254.169.254/hook", // link-local — the cloud metadata endpoint
+        "https://100.64.0.1/hook",      // CGNAT
+        "https://[fc00::1]/hook"        // IPv6 ULA
+      ),
+      allowLoopback = true
+    )
 
   test("isPublic agrees with the classification of well-known literals"):
     def addr(s: String): InetAddress = InetAddress.getByName(s)

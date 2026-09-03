@@ -6,7 +6,7 @@ import com.comcast.ip4s.*
 import dicechess.engine.search.BotRegistry
 import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
-import dicechess.play.game.{BotConnection, GameRoom}
+import dicechess.play.game.{BotConnection, EngineOps, GameRoom}
 import dicechess.play.store.{BotWebhook, DeliveryOutcome, GameStore, WebhookStats, WebhookStatsStore, WebhookStore}
 import fs2.Stream
 import io.circe.Json
@@ -617,55 +617,48 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       garbage  = Client.fromHttpApp(HttpApp[IO](_ => answered.complete(()).attempt *> Ok("this is not a move")))
       noisy    = Principal.Bot("hooks", "noisy")
       opponent = Principal.Bot("acme", "driven")
-      _    <- store.put(BotWebhook("hooks", "noisy", "https://noise.example/hook", "s" * 64, Instant.EPOCH))
-      made <- registry.create(noisy, opponent, TimeControl.Unlimited)
+      _ <- store.put(BotWebhook("hooks", "noisy", "https://noise.example/hook", "s" * 64, Instant.EPOCH))
+      // This test needs exactly ONE actionable turn for the webhook seat (White), so the opening roll is scripted to
+      // pawn/knight/bishop (340 legal paths, inlined) instead of rolled at random. Random dice failed two ways: a roll
+      // with neither a pawn nor a knight is a forced pass, and (a) with an idle Black and no clock the game deadlocked
+      // there (#140, #176, once mistaken for fiber starvation), while (b) even with Black driven the runner could POST
+      // inside the pass window — `DiceRolled` is broadcast before the auto-pass commits — so `answered` fired for a
+      // roll nobody could play and the snapshot read below landed between turns with no dice pending.
+      movableDice = new DiceSource:
+        def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 2, 3)
+        def commit: String                                                       = "noise-commit"
+        def reveal: String                                                       = "noise-seed"
+      made <- registry.createWithDice(noisy, opponent, movableDice)
       (_, room) = made.toOption.get
-      // Black must be played, not idle (#176). This test needs ONE actionable turn for the webhook seat (White), but
-      // White's opening roll has no legal move whenever it contains neither a pawn nor a knight — from the start
-      // position nothing else can move — and the room then auto-passes to Black. With an idle Black and no clock
-      // (Unlimited) the game deadlocks there forever and the delivery never happens: `(4/6)^3 ≈ 30%` of runs, which
-      // is the flake #140 and this issue both mistook for fiber starvation. Driving Black keeps play moving until
-      // White does get an actionable roll. Same `BotConnection` pattern as the dead-webhook test above.
-      driver = BotConnection(opponent, Seat.Black, BotRegistry.getAlgorithm("greedy").get)
       state <- service(registry, store, garbage).use: webhooks =>
-        driver
-          .run(room)
-          .background
-          .use: _ =>
-            for
-              _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
-              _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
-              _ <- webhooks.attachSweep
-              // Bounded per house convention, and back to 30s from #140's 150s. The width was never the fix: a
-              // deadlocked game never delivers at any ceiling, which is why both recorded failures landed exactly ON
-              // the bound (30.008s here, 150.022s in CI) rather than somewhere under it. With Black driven the
-              // delivery arrives in ~2s, so 30s is ~15x headroom.
-              //
-              // If this ever fails again, read the message before touching the number: it reports whose turn the room
-              // is actually on. `activeSeat=Black` means the deadlock above is back (something stopped driving Black);
-              // `activeSeat=White` with the bound crossed would be genuine starvation, and THAT is when contention is
-              // worth investigating — not before.
-              _ <- answered.get.timeoutTo(
-                30.seconds,
-                room.snapshot.flatMap: s =>
-                  IO.raiseError(
-                    new RuntimeException(
-                      s"delivery never reached the endpoint (activeSeat=${s.activeSeat}, dicePending=${s.dicePending})"
-                    )
-                  )
+        for
+          _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+          _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+          _ <- webhooks.attachSweep
+          // Bounded per house convention. If this ever fails, read the message before touching the number: it reports
+          // whose turn the room is actually on, and `activeSeat=White` with the bound crossed would be genuine
+          // starvation — THAT is when contention is worth investigating, not before.
+          _ <- answered.get.timeoutTo(
+            30.seconds,
+            room.snapshot.flatMap: s =>
+              IO.raiseError(
+                new RuntimeException(
+                  s"delivery never reached the endpoint (activeSeat=${s.activeSeat}, dicePending=${s.dicePending})"
+                )
               )
-              state <- room.snapshot
-              // Clean up, and WAIT for it: `submit` only offers to the room's inbox (`GameRoom.submit` is
-              // `inbox.offer`, unlike `submitTurn` which awaits a verdict), so returning here without awaiting the
-              // terminal state would let both scopes close while the room is still Active — leaving its detached
-              // writer fiber and idle-deadline timer running for the rest of the JVM. In a suite whose whole problem
-              // is background work competing for CPU, leaking one live room per run is the last thing we want.
-              _ <- room.submit(Seat.White, GameCommand.Resign)
-              _ <- room.result.timeoutTo(
-                10.seconds,
-                IO.raiseError(new RuntimeException("the room never reached a terminal state after Resign"))
-              )
-            yield state
+          )
+          state <- room.snapshot
+          // Clean up, and WAIT for it: `submit` only offers to the room's inbox (`GameRoom.submit` is `inbox.offer`,
+          // unlike `submitTurn` which awaits a verdict), so returning here without awaiting the terminal state would
+          // let the scope close while the room is still Active — leaving its detached writer fiber and idle-deadline
+          // timer running for the rest of the JVM. In a suite whose whole problem is background work competing for
+          // CPU, leaking one live room per run is the last thing we want.
+          _ <- room.submit(Seat.White, GameCommand.Resign)
+          _ <- room.result.timeoutTo(
+            10.seconds,
+            IO.raiseError(new RuntimeException("the room never reached a terminal state after Resign"))
+          )
+        yield state
     yield
       assertEquals(state.status, GameStatus.Active)
       assert(state.dicePending, "an unparseable answer must leave the pending roll unanswered")
@@ -782,35 +775,67 @@ class WebhooksSuite extends munit.CatsEffectSuite:
     )
 
   test("webhook bot with 'draws' capability receives drawDecision and can accept draw"):
-    def drawAcceptingBot: HttpApp[IO] =
+    // The scripted game (die faces: 1 = pawn ... 6 = king). Turn 0, White: bishop/rook/queen cannot move from the
+    // initial position, so the room auto-passes. Turn 1, Black: three pawns — 3376 legal paths, more than the room
+    // inlines (`DefaultMaxInlineTurnPaths`), so the `yourTurn` envelope carries NO `legalMoves` tree and the bot has to
+    // fetch the uncapped tree the way a real bot fetches `GET /games/{id}/moves`. Turn 2, White: three pawns again,
+    // played with a draw offer, which gates Black's next roll behind a `drawDecision`. Before this script the dice were
+    // random and the bot answered a capped `yourTurn` with empty moves: the runner recorded `Declined`, nobody ever
+    // played Black, and the room sat on its 120 s idle timeout while the test's 10 s budget ran out.
+    val scriptedDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] =
+        if ply == 0L then List(3, 4, 5) else List(1, 1, 1)
+      def commit: String = "draw-commit"
+      def reveal: String = "draw-seed"
+
+    def drawAcceptingBot(registry: GameRegistry, envelopes: Ref[IO, List[WebhookEnvelope]]): HttpApp[IO] =
       HttpApp[IO] { req =>
         req.bodyText.compile.string.flatMap { body =>
           decode[WebhookEnvelope](body) match
-            case Right(envelope) if envelope.`type` == "drawDecision" =>
-              Ok(BotMove(moves = Nil, acceptDraw = Some(true)).asJson)
-            case Right(envelope) if envelope.`type` == "yourTurn" =>
-              val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
-                case Some(tree) => firstPath(tree)
-                case None       => Nil
-              Ok(BotMove(moves).asJson)
-            case _ => IO.pure(Response[IO](Status.BadRequest))
+            case Right(envelope) =>
+              val answer = envelope.`type` match
+                case "drawDecision" => IO.pure(Some(BotMove(moves = Nil, acceptDraw = Some(true))))
+                case "yourTurn"     =>
+                  envelope.state.legalMoves.filter(_.children.nonEmpty) match
+                    case Some(tree) => IO.pure(Some(BotMove(firstPath(tree))))
+                    case None       =>
+                      registry
+                        .get(GameId(envelope.gameId))
+                        .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
+                        .map(tree => Some(BotMove(firstPath(tree))))
+                case _ => IO.pure(None)
+              envelopes.update(_ :+ envelope) *>
+                answer.flatMap(_.fold(IO.pure(Response[IO](Status.BadRequest)))(move => Ok(move.asJson)))
+            case Left(_) => IO.pure(Response[IO](Status.BadRequest))
         }
       }
 
-    def humanPlaysLoop(room: GameRoom): IO[Unit] =
-      (room.snapshot, room.legalMoves).flatMapN { (snap, moves) =>
-        if snap.status != GameStatus.Active then IO.unit
-        else if snap.activeSeat == Seat.White && moves.legalMoves.children.nonEmpty then
-          val path = firstPath(moves.legalMoves)
-          room.submitTurn(Seat.White, path, offerDraw = true) *>
-            IO.sleep(50.millis) *>
-            humanPlaysLoop(room)
-        else IO.sleep(25.millis) *> humanPlaysLoop(room)
-      }
+    /** White, driven by the room's own event stream instead of a polling loop: every roll that lands on White's side is
+      * answered with its first legal path plus a draw offer. The tree is read uncapped from the room (a three-pawn roll
+      * is never inlined) and checked against the roll it answers — `subscribe` can show one version twice, and a forced
+      * pass announces a roll with no legal turn.
+      */
+    def whitePlays(room: GameRoom): IO[Unit] =
+      def play(version: Long): IO[Unit] =
+        room.legalMoves.flatMap { moves =>
+          val whiteToMove = EngineOps.parse(moves.dfen).exists(EngineOps.activeSeat(_) == Seat.White)
+          val ready       = moves.version == version && moves.dicePending && whiteToMove &&
+            moves.legalMoves.children.nonEmpty
+          room.submitTurn(Seat.White, firstPath(moves.legalMoves), offerDraw = true).void.whenA(ready)
+        }
+      room.subscribe
+        .evalMap {
+          case GameEvent.Snapshot(v, state, _) if state.activeSeat == Seat.White && state.dicePending => play(v)
+          case GameEvent.DiceRolled(v, Seat.White, _, _, _, _)                                        => play(v)
+          case _                                                                                      => IO.unit
+        }
+        .compile
+        .drain
 
     for
-      registry <- GameRegistry.create(store = GameStore.noop)
-      store    <- WebhookStore.inMemory
+      registry  <- GameRegistry.create(store = GameStore.noop)
+      store     <- WebhookStore.inMemory
+      envelopes <- Ref.of[IO, List[WebhookEnvelope]](Nil)
       webhookBot = Principal.Bot("hooks", "draw-accepter")
       _ <- store.put(
         BotWebhook(
@@ -823,20 +848,31 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         )
       )
       human = Principal.Guest("human-123")
-      made <- registry.create(human, webhookBot, TimeControl.Unlimited)
+      made <- registry.createWithDice(human, webhookBot, scriptedDice)
       (_, room) = made.toOption.get
       _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
       _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
-      resources = service(registry, store, Client.fromHttpApp(drawAcceptingBot))
+      resources = service(registry, store, Client.fromHttpApp(drawAcceptingBot(registry, envelopes)))
       res <- resources.use { webhooks =>
-        humanPlaysLoop(room).background.use { _ =>
+        whitePlays(room).background.use { _ =>
           webhooks.attachSweep *>
             room.result.timeoutTo(10.seconds, IO.raiseError(new RuntimeException("game never ended in draw")))
         }
       }
+      received <- envelopes.get
     yield
       assertEquals(res.result, GameResult.Draw)
       assertEquals(res.termination, Termination.Draw)
+      assertEquals(received.map(_.`type`), List("yourTurn", "drawDecision"), "one Black turn, then the decision")
+      val turn     = received.head
+      val decision = received.last
+      assert(
+        turn.state.legalMoves.isEmpty,
+        "the scripted three-pawn roll must exceed the inline cap to stay a regression test"
+      )
+      assertEquals(decision.seat, Seat.Black)
+      assert(decision.state.drawOffer.exists(_.pending), "the decision envelope must carry the pending offer")
+      assert(!decision.state.dicePending, "a capable bot decides before it sees any dice")
 
   test("webhook bot without 'draws' capability has draw auto-declined and receives yourTurn with dice"):
     def regularBot(registry: GameRegistry, receivedEvents: Ref[IO, List[String]]): HttpApp[IO] =

@@ -137,6 +137,10 @@ The singleton showcase table on the homepage (`/`) is controlled by the followin
 | `SHOWCASE_BOT_NAME` | Name of the featured bot (e.g. `hunter-book`). Required when showcase is enabled. |
 | `SHOWCASE_RESERVED_SEATS` | Dedicated capacity reserved exclusively for the showcase table. When `SHOWCASE_ENABLED=true`, this value must be set to exactly `1`. Values `0` or `> 1` are rejected during configuration validation at boot time. |
 
+A signed-in visitor can claim only when `PLAY_CORS_ORIGINS` is a real allow-list: the session path
+requires an `Origin` that matches it, and with no allow-list the claim answers `403 csrf_origin_rejected`
+(guest claims are unaffected). This is the same rule the staged webhook management surface follows.
+
 The clock is fixed at `5+3` (`ShowcaseTable.FixedTimeControl`) and is deliberately not configurable in this
 release — the homepage promises one table with one clock. The routes mount only when `SHOWCASE_ENABLED=true`;
 disabled, both paths answer a plain 404.

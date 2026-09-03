@@ -40,7 +40,8 @@ final class ShowcaseTable private (
     supervisor: Supervisor[IO],
     alert: String => IO[Unit],
     claimGrace: FiniteDuration,
-    tickInterval: FiniteDuration
+    tickInterval: FiniteDuration,
+    clearBackoff: FiniteDuration
 ):
   import ShowcaseTable.*
 
@@ -117,7 +118,10 @@ final class ShowcaseTable private (
                 case Phase.Unavailable(reason) => IO.pure(ClaimOutcome.Unavailable(reason))
                 case Phase.Live(game)          => spectate(db, actor, key, requestHash, game)
                 case Phase.Finishing(game)     => spectate(db, actor, key, requestHash, game)
-                case Phase.Open(next)          => seatHuman(db, actor, key, requestHash, clientEntropy, next)
+                case Phase.Open(next)          =>
+                  config.featuredBot match
+                    case None      => failClosed(UnavailableReason.BotNotReady)
+                    case Some(bot) => seatHuman(db, actor, key, requestHash, clientEntropy, next, bot)
 
   /** A same-key retry answers what the first request committed (ADR-005 §5). A winner is handed its credential again
     * while its game is still on; once the game is over — or was never this table's current game any more — nobody is
@@ -182,9 +186,9 @@ final class ShowcaseTable private (
       key: UUID,
       requestHash: String,
       clientEntropy: Option[String],
-      humanColor: Side
+      humanColor: Side,
+      bot: Principal.Bot
   ): IO[ClaimOutcome] =
-    val bot            = config.featuredBot.getOrElse(Principal.Bot("", ""))
     val (white, black) = humanColor match
       case Side.White => (actor, bot)
       case Side.Black => (bot, actor)
@@ -290,7 +294,9 @@ final class ShowcaseTable private (
 
   private def releaseLocked(gameId: GameId): IO[Unit] =
     store.traverse_ { db =>
-      clearWithRetry(db, gameId, attempts = ClearAttempts)
+      clearWithRetry(db, gameId, attempts = ClearAttempts).flatMap:
+        case Right(())   => IO.unit
+        case Left(error) => alert(s"could not clear current showcase game ${gameId.value}: ${error.getMessage}")
     } *>
       phase.update {
         case Phase.Live(game) if game.id == gameId      => Phase.Unavailable(UnavailableReason.Reconciling)
@@ -303,14 +309,13 @@ final class ShowcaseTable private (
     * quick retries cover a blip, and past them the stale pointer is left for [[reconcile]] to repair once the store is
     * back — the table is `unavailable` meanwhile, never `open` over a row that still names a finished game.
     */
-  private def clearWithRetry(db: ShowcaseStore, gameId: GameId, attempts: Int): IO[Unit] =
+  private def clearWithRetry(db: ShowcaseStore, gameId: GameId, attempts: Int): IO[Either[Throwable, Unit]] =
     db.clearShowcaseGame(gameId)
       .attempt
       .flatMap:
-        case Right(_)                => IO.unit
-        case Left(_) if attempts > 1 => IO.sleep(ClearBackoff) *> clearWithRetry(db, gameId, attempts - 1)
-        case Left(error)             =>
-          alert(s"could not clear current showcase game ${gameId.value}: ${error.getMessage}")
+        case Right(_)                => IO.pure(Right(()))
+        case Left(_) if attempts > 1 => IO.sleep(clearBackoff) *> clearWithRetry(db, gameId, attempts - 1)
+        case Left(error)             => IO.pure(Left(error))
 
   /** The registry releases the admission on deregistration, which follows `result` on the registry's own fiber. Waiting
     * for it keeps "the table is open" and "the reserved seat is free" from being observed in the wrong order. Bounded:
@@ -369,21 +374,24 @@ final class ShowcaseTable private (
       store match
         case None     => transition(Phase.Unavailable(UnavailableReason.PersistenceMissing))
         case Some(db) =>
-          phase.get.flatMap:
-            // A live table is governed by its game; nothing here may reopen it.
-            case Phase.Live(_) | Phase.Finishing(_) => IO.unit
-            case _                                  =>
-              db.activeShowcaseGameIds.attempt.flatMap:
-                case Left(error) =>
-                  transition(
-                    Phase.Unavailable(
-                      UnavailableReason.PersistenceFailure(s"reconciliation read failed: ${error.getMessage}")
-                    )
-                  )
-                case Right(Nil)       => reopen(db, ready)
-                case Right(id :: Nil) => adopt(db, id)
-                case Right(many)      =>
-                  transition(Phase.Unavailable(UnavailableReason.DuplicateActiveGames(many.size)))
+          config.featuredBot match
+            case None    => transition(Phase.Unavailable(UnavailableReason.BotNotReady))
+            case Some(_) =>
+              phase.get.flatMap:
+                // A live table is governed by its game; nothing here may reopen it.
+                case Phase.Live(_) | Phase.Finishing(_) => IO.unit
+                case _                                  =>
+                  db.activeShowcaseGameIds.attempt.flatMap:
+                    case Left(error) =>
+                      transition(
+                        Phase.Unavailable(
+                          UnavailableReason.PersistenceFailure(s"reconciliation read failed: ${error.getMessage}")
+                        )
+                      )
+                    case Right(Nil)       => reopen(db, ready)
+                    case Right(id :: Nil) => adopt(db, id)
+                    case Right(many)      =>
+                      transition(Phase.Unavailable(UnavailableReason.DuplicateActiveGames(many.size)))
 
   /** No live showcase game: the table may open — after repairing a current-game pointer left by a crash between the
     * terminal commit and the clear, and only if the bot answered its readiness probe.
@@ -393,12 +401,28 @@ final class ShowcaseTable private (
       case Left(error) =>
         transition(Phase.Unavailable(UnavailableReason.PersistenceFailure(s"table read failed: ${error.getMessage}")))
       case Right(record) =>
-        record.currentGameId.traverse_ { stale =>
-          db.clearShowcaseGame(stale).attempt.void *>
-            alert(s"cleared stale current game ${stale.value}: its terminal transaction had committed before a restart")
-        } *>
-          (if ready then transition(Phase.Open(record.nextHumanColor))
-           else transition(Phase.Unavailable(UnavailableReason.BotNotReady)))
+        record.currentGameId match
+          case None        => open(record.nextHumanColor, ready)
+          case Some(stale) =>
+            // The row must not name a finished game while the table advertises `open`: a claim would then create a
+            // room the fence refuses. So the clear is retried like the completion path's, and a store that stays away
+            // keeps the table closed rather than opening it over a stale pointer.
+            clearWithRetry(db, stale, attempts = ClearAttempts).flatMap:
+              case Right(()) =>
+                alert(
+                  s"cleared stale current game ${stale.value}: its terminal transaction had committed before a restart"
+                ) *> open(record.nextHumanColor, ready)
+              case Left(error) =>
+                transition(
+                  Phase.Unavailable(
+                    UnavailableReason
+                      .PersistenceFailure(s"could not clear stale current game ${stale.value}: ${error.getMessage}")
+                  )
+                )
+
+  private def open(nextHumanColor: Side, ready: Boolean): IO[Unit] =
+    if ready then transition(Phase.Open(nextHumanColor))
+    else transition(Phase.Unavailable(UnavailableReason.BotNotReady))
 
   /** Exactly one live showcase game: it must be the room the registry resumed, with a human on one side. The store row
     * is repaired to name it (and to have advanced the colour if the claim transaction never got to), and the table is
@@ -495,7 +519,9 @@ object ShowcaseTable:
   private val DeregisterPoll: FiniteDuration = 20.millis
   private val DeregisterWait: FiniteDuration = 5.seconds
   private val ClearAttempts: Int             = 5
-  private val ClearBackoff: FiniteDuration   = 1.second
+
+  /** The pause between attempts to clear the table's current-game pointer; a test shortens it. */
+  val DefaultClearBackoff: FiniteDuration = 1.second
 
   final case class LiveGame(id: GameId, room: GameRoom, humanColor: Side)
 
@@ -592,7 +618,8 @@ object ShowcaseTable:
       botReady: IO[Boolean],
       alert: String => IO[Unit] = alertToStderr,
       claimGrace: FiniteDuration = DefaultClaimGrace,
-      tickInterval: FiniteDuration = DefaultTickInterval
+      tickInterval: FiniteDuration = DefaultTickInterval,
+      clearBackoff: FiniteDuration = DefaultClearBackoff
   ): Resource[IO, ShowcaseTable] =
     Supervisor[IO](await = false).evalMap { supervisor =>
       (
@@ -612,7 +639,8 @@ object ShowcaseTable:
           supervisor,
           alert,
           claimGrace,
-          tickInterval
+          tickInterval,
+          clearBackoff
         )
       }
     }

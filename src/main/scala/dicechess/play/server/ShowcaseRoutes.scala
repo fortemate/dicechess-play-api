@@ -106,6 +106,11 @@ object ShowcaseRoutes:
   /** How long a `503` asks the caller to wait before asking again. */
   val UnavailableRetryAfterSeconds: Long = 5L
 
+  /** The most a claim body may weigh: two optional short fields. Ember buffers no limit of its own, and this endpoint
+    * is public, so the body is capped before it is buffered.
+    */
+  val MaxClaimBodyBytes: Int = 4096
+
   private val ProblemType = `Content-Type`(MediaType.unsafeParse("application/problem+json"))
   private val NoStore     = `Cache-Control`(NonEmptyList.one(CacheDirective.`no-store`))
 
@@ -153,6 +158,12 @@ object ShowcaseRoutes:
     "JSON required",
     "Content-Type must be application/json."
   )
+  private val requestTooLarge = Failure(
+    Status.PayloadTooLarge,
+    "request_too_large",
+    "Request body too large",
+    s"A claim body may not exceed $MaxClaimBodyBytes bytes."
+  )
   private val malformedRequest = Failure(
     Status.BadRequest,
     "malformed_request",
@@ -175,7 +186,8 @@ object ShowcaseRoutes:
     Status.Forbidden,
     "csrf_origin_rejected",
     "Request origin rejected",
-    "A session-authenticated claim must come from an allowed Origin and carry X-DiceChess-CSRF: 1."
+    "A session-authenticated claim must carry X-DiceChess-CSRF: 1 and come from an Origin listed in " +
+      "PLAY_CORS_ORIGINS; without an allow-list, claim as a guest."
   )
   private val idempotencyConflict = Failure(
     Status.Conflict,
@@ -293,19 +305,29 @@ object ShowcaseRoutes:
       case Some(_)         => Left(invalidIdempotencyKey)
 
   /** An absent or empty body is a valid claim (a signed-in caller has nothing to add); a present body must be JSON of
-    * the request shape.
+    * the request shape, and no larger than [[MaxClaimBodyBytes]] — read with a cap, never buffered whole first.
     */
   private def decodeBody(req: Request[IO]): IO[Either[Failure, ShowcaseClaimRequest]] =
-    // `bodyText`, not `as[String]`: with the circe entity codecs in scope, `as[String]` resolves to the JSON decoder
-    // for a JSON *string* and refuses both an object and an empty body.
-    req.bodyText.compile.string.map: text =>
-      if text.trim.isEmpty then Right(ShowcaseClaimRequest())
-      else if !req.contentType.exists(_.mediaType == MediaType.application.json) then Left(unsupportedMediaType)
-      else decode[ShowcaseClaimRequest](text).left.map(_ => malformedRequest)
+    // `body`/`bodyText`, not `as[String]`: with the circe entity codecs in scope, `as[String]` resolves to the JSON
+    // decoder for a JSON *string* and refuses both an object and an empty body.
+    req.body
+      .take(MaxClaimBodyBytes.toLong + 1)
+      .compile
+      .to(Array)
+      .map: bytes =>
+        if bytes.length > MaxClaimBodyBytes then Left(requestTooLarge)
+        else
+          val text = new String(bytes, StandardCharsets.UTF_8)
+          if text.trim.isEmpty then Right(ShowcaseClaimRequest())
+          else if !req.contentType.exists(_.mediaType == MediaType.application.json) then Left(unsupportedMediaType)
+          else decode[ShowcaseClaimRequest](text).left.map(_ => malformedRequest)
 
   /** The session wins; the body's guest id is only the anonymous fallback (#235). A session-authenticated claim is a
     * cookie-authenticated state change that hands out a credential, so it needs the CSRF proof the staged webhook API
-    * already requires: `X-DiceChess-CSRF: 1`, plus an allowed `Origin` when the deployment has an allow-list.
+    * already requires: `X-DiceChess-CSRF: 1` AND an `Origin` on the deployment's allow-list. Without an allow-list
+    * there is no trusted origin to compare against — `Cors.AllowedOrigins` documents that the empty configuration means
+    * public credential-less CORS, never "trust every origin for a cookie-authenticated mutation" — so the session path
+    * is refused and the visitor claims as a guest instead.
     */
   private def resolveActor(
       req: Request[IO],
@@ -324,12 +346,7 @@ object ShowcaseRoutes:
 
   private def csrfAccepted(req: Request[IO], allowedOrigins: Cors.AllowedOrigins): Boolean =
     val header = req.headers.get(CsrfHeader).exists(_.toList.map(_.value.trim) == List("1"))
-    val origin =
-      if !allowedOrigins.isExplicitlyConfigured then true
-      else
-        req.headers.get[Origin] match
-          case Some(origin) => allowedOrigins.allows(origin)
-          case None         => false
+    val origin = allowedOrigins.isExplicitlyConfigured && req.headers.get[Origin].exists(allowedOrigins.allows)
     header && origin
 
   /** The fingerprint an `Idempotency-Key` is bound to: the actor and the body fields that could change the claim. A

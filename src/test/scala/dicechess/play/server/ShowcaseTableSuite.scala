@@ -367,6 +367,46 @@ class ShowcaseTableSuite extends munit.CatsEffectSuite:
       }
     }
 
+  test("a stale pointer that cannot be cleared keeps the table closed instead of opening over it"):
+    fixture.flatMap { f =>
+      f.table().use { t =>
+        for
+          _ <- f.store.table.set(ShowcaseTableRecord(Side.Black, Some(GameId("00000000-0000-0000-0000-00000000dead"))))
+          _ <- f.store.failClear(true)
+          phase   <- t.reconcile
+          record  <- f.store.table.get
+          k       <- key
+          refused <- t.claim(guest1, k, "h", None)
+          _       <- f.store.failClear(false)
+          healed  <- t.reconcile
+          cleared <- f.store.table.get
+        yield
+          phase match
+            case Phase.Unavailable(UnavailableReason.PersistenceFailure(detail)) =>
+              assert(detail.contains("stale current game"), detail)
+            case other => fail(s"expected a fail-closed table, got $other")
+          assertEquals(record.currentGameId.map(_.value), Some("00000000-0000-0000-0000-00000000dead"))
+          assert(refused.isInstanceOf[ClaimOutcome.Unavailable], refused.toString)
+          assertEquals(healed, Phase.Open(Side.Black))
+          assertEquals(cleared, ShowcaseTableRecord(Side.Black, None))
+      }
+    }
+
+  test("an enabled configuration without a featured bot fails closed as bot_unavailable and seats nobody"):
+    fixture.flatMap { f =>
+      f.table(config = ShowcaseConfig(enabled = true, featuredBot = None, reservedSeats = 1)).use { t =>
+        for
+          phase   <- t.reconcile
+          k       <- key
+          refused <- t.claim(guest1, k, "h", None)
+          rooms   <- f.registry.list
+        yield
+          assertEquals(phase, Phase.Unavailable(UnavailableReason.BotNotReady))
+          assertEquals(refused, ClaimOutcome.Unavailable(UnavailableReason.BotNotReady))
+          assert(rooms.isEmpty)
+      }
+    }
+
   test("two active showcase games in the store fail closed as unavailable with an operator signal"):
     fixture.flatMap { f =>
       f.table().use { t =>

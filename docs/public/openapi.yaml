@@ -705,8 +705,9 @@ paths:
       summary: Claim the open table (public)
       description: >
         The atomic first claim. The caller is the session account (cookie; then X-DiceChess-CSRF: 1
-        is required, plus an allowed Origin when the server has an allow-list) or a stable guest id in
-        the body. Idempotency-Key (a UUID) is mandatory: exactly one concurrent claimant wins and
+        and an Origin on the server's PLAY_CORS_ORIGINS allow-list are both required — a server
+        without an allow-list refuses the session path, so claim as a guest there) or a stable guest
+        id in the body. The body is capped at 4096 bytes. Idempotency-Key (a UUID) is mandatory: exactly one concurrent claimant wins and
         receives the human seat's token; every other caller, concurrent or later, receives the
         spectator outcome and no credential. A same-key retry replays the committed outcome for 24
         hours — the winner is handed the same token while its game is on, and nobody is handed one
@@ -752,13 +753,20 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/ShowcaseProblem' }
         '403':
-          description: csrf_origin_rejected — a session claim without the CSRF header or from a disallowed Origin.
+          description: >
+            csrf_origin_rejected — a session claim without the CSRF header, without an Origin on the
+            allow-list, or on a server that has no allow-list configured.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/ShowcaseProblem' }
         '404': { description: The showcase is not enabled on this server. }
         '409':
           description: idempotency_conflict — the Idempotency-Key was already used for a different request.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
+        '413':
+          description: request_too_large — the body exceeds 4096 bytes.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/ShowcaseProblem' }
@@ -1688,6 +1696,7 @@ components:
             - guest_required
             - invalid_guest_id
             - malformed_request
+            - request_too_large
             - csrf_origin_rejected
             - idempotency_conflict
             - rate_limited

@@ -86,6 +86,15 @@ class ShowcaseRoutesSuite extends munit.CatsEffectSuite:
 
   private def code(resp: Response[IO]): IO[String] = resp.as[Json].map(_.hcursor.get[String]("code").toOption.get)
 
+  /** A cookie-authenticated claim with a fresh Idempotency-Key and the given extra headers. */
+  private def sessionPost(a: HttpApp[IO], cookie: RequestCookie, headers: Seq[Header.ToRaw]): IO[Response[IO]] =
+    a.run(
+      Request[IO](Method.POST, uri"/showcase/claim")
+        .addCookie(cookie)
+        .putHeaders(Header.Raw(ci"Idempotency-Key", UUID.randomUUID().toString))
+        .putHeaders(headers*)
+    )
+
   private def openTable(t: ShowcaseTable): IO[Unit] =
     t.reconcile.map(phase => assertEquals(phase, ShowcaseTable.Phase.Open(Side.White)))
 
@@ -309,9 +318,12 @@ class ShowcaseRoutesSuite extends munit.CatsEffectSuite:
       }
     }
 
-  test("a session-authenticated claim needs the CSRF header (and an allowed Origin when one is configured)"):
+  test("a session-authenticated claim needs the CSRF header AND an Origin on a configured allow-list"):
     fixture.flatMap { f =>
       f.table().use { t =>
+        val csrf       = Header.Raw(ci"X-DiceChess-CSRF", "1")
+        val goodOrigin = Header.Raw(ci"Origin", "https://fortemate.com")
+        val evilOrigin = Header.Raw(ci"Origin", "https://evil.example")
         for
           _     <- openTable(t)
           users <- Ref.of[IO, Map[String, UserAccount]](Map.empty).map(StubUsers(_))
@@ -319,38 +331,24 @@ class ShowcaseRoutesSuite extends munit.CatsEffectSuite:
           user  <- users.upsertOnLogin("google", "sub-showcase", None, IO.pure("ShowNick"))
           token <- session.sign(user)
           cookie = RequestCookie(AuthSession.SessionCookieName, token)
-          open   <- app(t, Some(session))
-          pinned <- app(t, Some(session), Cors.allowedOrigins("https://fortemate.com"))
-          noCsrf <- open.run(
-            Request[IO](Method.POST, uri"/showcase/claim")
-              .addCookie(cookie)
-              .putHeaders(Header.Raw(ci"Idempotency-Key", UUID.randomUUID().toString))
-          )
+          unpinned    <- app(t, Some(session))
+          pinned      <- app(t, Some(session), Cors.allowedOrigins("https://fortemate.com"))
+          noCsrf      <- sessionPost(pinned, cookie, Seq(goodOrigin))
           noCsrfCode  <- code(noCsrf)
-          wrongOrigin <- pinned.run(
-            Request[IO](Method.POST, uri"/showcase/claim")
-              .addCookie(cookie)
-              .putHeaders(
-                Header.Raw(ci"Idempotency-Key", UUID.randomUUID().toString),
-                Header.Raw(ci"X-DiceChess-CSRF", "1"),
-                Header.Raw(ci"Origin", "https://evil.example")
-              )
-          )
-          won <- pinned.run(
-            Request[IO](Method.POST, uri"/showcase/claim")
-              .addCookie(cookie)
-              .putHeaders(
-                Header.Raw(ci"Idempotency-Key", UUID.randomUUID().toString),
-                Header.Raw(ci"X-DiceChess-CSRF", "1"),
-                Header.Raw(ci"Origin", "https://fortemate.com")
-              )
-          )
-          wonBody <- won.as[Json]
+          wrongOrigin <- sessionPost(pinned, cookie, Seq(csrf, evilOrigin))
+          noOrigin    <- sessionPost(pinned, cookie, Seq(csrf))
+          // No allow-list configured: there is no trusted origin to compare against, so the session path is refused
+          // even with the header — the visitor claims as a guest instead.
+          noAllowList <- sessionPost(unpinned, cookie, Seq(csrf, goodOrigin))
+          won         <- sessionPost(pinned, cookie, Seq(csrf, goodOrigin))
+          wonBody     <- won.as[Json]
           seating <- f.registry.get(GameId(wonBody.hcursor.get[String]("gameId").toOption.get)).flatMap(_.get.seating)
         yield
           assertEquals(noCsrf.status, Status.Forbidden)
           assertEquals(noCsrfCode, "csrf_origin_rejected")
           assertEquals(wrongOrigin.status, Status.Forbidden)
+          assertEquals(noOrigin.status, Status.Forbidden)
+          assertEquals(noAllowList.status, Status.Forbidden)
           assertEquals(won.status, Status.Ok)
           assertEquals(seating(Seat.White), Principal.User(user.id), "the session wins; no body was even needed")
       }
@@ -365,13 +363,14 @@ class ShowcaseRoutesSuite extends munit.CatsEffectSuite:
           session = AuthSession(users, Secret)
           user  <- users.upsertOnLogin("google", "sub-showcase-2", None, IO.pure("OtherNick"))
           token <- session.sign(user)
-          a     <- app(t, Some(session))
+          a     <- app(t, Some(session), Cors.allowedOrigins("https://fortemate.com"))
           won   <- a.run(
             Request[IO](Method.POST, uri"/showcase/claim")
               .addCookie(RequestCookie(AuthSession.SessionCookieName, token))
               .putHeaders(
                 Header.Raw(ci"Idempotency-Key", UUID.randomUUID().toString),
-                Header.Raw(ci"X-DiceChess-CSRF", "1")
+                Header.Raw(ci"X-DiceChess-CSRF", "1"),
+                Header.Raw(ci"Origin", "https://fortemate.com")
               )
               .withEntity(guestBody(Guest1))
           )
@@ -380,5 +379,25 @@ class ShowcaseRoutesSuite extends munit.CatsEffectSuite:
         yield
           assertEquals(won.status, Status.Ok)
           assertEquals(seating(Seat.White), Principal.User(user.id))
+      }
+    }
+
+  test("an oversized claim body is refused with 413 before it is buffered or parsed"):
+    fixture.flatMap { f =>
+      f.table().use { t =>
+        for
+          _ <- openTable(t)
+          a <- app(t)
+          big = Json.obj(
+            "guestId"       -> Guest1.asJson,
+            "clientEntropy" -> "e".repeat(ShowcaseRoutes.MaxClaimBodyBytes).asJson
+          )
+          resp  <- claim(a, Some(UUID.randomUUID().toString), Some(big))
+          c     <- code(resp)
+          phase <- t.currentPhase
+        yield
+          assertEquals(resp.status, Status.PayloadTooLarge)
+          assertEquals(c, "request_too_large")
+          assertEquals(phase, ShowcaseTable.Phase.Open(Side.White))
       }
     }

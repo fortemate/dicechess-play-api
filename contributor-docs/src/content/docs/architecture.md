@@ -82,15 +82,16 @@ Routes are grouped by audience rather than by resource:
     authentication, and **never carries a seat token, a webhook detail, a private identity or
     infrastructure state**. Colours use the existing `Side` wire form (`White` / `Black`).
   - `POST /showcase/claim` is the atomic first claim. The actor is the session account (then
-    `X-DiceChess-CSRF: 1` is required, plus an allowed `Origin` when `PLAY_CORS_ORIGINS` is set) or a
-    stable `guestId` in the body. `Idempotency-Key` (a UUID) is mandatory; `clientEntropy` is an optional
+    `X-DiceChess-CSRF: 1` and an `Origin` on the `PLAY_CORS_ORIGINS` allow-list are both required; a
+    deployment without an allow-list refuses the session path, so visitors claim as guests there) or a
+    stable `guestId` in the body. The body is capped at 4 KiB. `Idempotency-Key` (a UUID) is mandatory; `clientEntropy` is an optional
     dice seed. The winner gets `200` with `outcome: "claimed"`, `seat`, `seatToken` and a relative
     `wsUrl`, under `Cache-Control: no-store, private`; every other caller gets `200` with
     `outcome: "spectating"`, a `reason` (`already_claimed` / `game_ended`), the `gameId` and a
     `spectatorWsUrl` — and **no credential**. Problems are RFC 7807 (`application/problem+json`) with a
     `code`: `400` `missing_idempotency_key` / `invalid_idempotency_key` / `guest_required` /
     `invalid_guest_id` / `malformed_request`, `403` `csrf_origin_rejected`, `409`
-    `idempotency_conflict` (same key, different body), `415` `malformed_request`, `429` `rate_limited`
+    `idempotency_conflict` (same key, different body), `413` `request_too_large`, `415` `malformed_request`, `429` `rate_limited`
     (per IP and per actor, `Retry-After`), `503` `showcase_unavailable` (`Retry-After`). WebSocket URLs
     are relative references against the API origin; the server does not guess its public hostname.
     The authoritative contract is ADR-005 (#44); the machine-readable one is `openapi.yaml`.
@@ -181,7 +182,8 @@ idempotency records live in PostgreSQL behind `store/ShowcaseStore` (tables `sho
 `showcase_claims`, V6), and `ShowcaseTable.reconcile` rebuilds the phase from them **before the port
 opens** (`Main` runs it inside the resource that mounts the routes). Reconciliation reads
 `PgGameStore.activeShowcaseGameIds`: none → the table may open (after repairing a stale current-game
-pointer left by a crash between the terminal commit and the clear); exactly one → the resumed room is
+pointer left by a crash between the terminal commit and the clear — and only once that repair has
+committed; a store that will not take it keeps the table `unavailable`); exactly one → the resumed room is
 adopted as `live` (and the colour advanced if the claim transaction never got to); several → split-brain,
 `unavailable` with an operator alert. A live showcase game the registry failed to resume, a store that is
 not PostgreSQL, or a bot that fails its readiness probe all fail closed the same way.

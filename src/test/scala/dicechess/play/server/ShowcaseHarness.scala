@@ -44,8 +44,17 @@ final class InMemoryShowcaseStore(
     val claims: Ref[IO, Map[(String, UUID), ShowcaseClaimRecord]],
     active: IO[List[GameId]],
     failCommits: Ref[IO, Boolean],
-    failReads: Ref[IO, Boolean]
+    failReads: Ref[IO, Boolean],
+    failClears: Ref[IO, Boolean]
 ) extends ShowcaseStore:
+
+  /** The PostgreSQL write's `ON CONFLICT … DO UPDATE … WHERE expires_at <= now()`: a live record is kept, an expired
+    * one is replaced by the fresh outcome.
+    */
+  private def replaceIfExpired(now: java.time.Instant, fresh: Option[ShowcaseClaimRecord])(
+      existing: Option[ShowcaseClaimRecord]
+  ): Option[ShowcaseClaimRecord] =
+    existing.filter(_.expiresAt.isAfter(now)).orElse(fresh)
 
   private def guardReads[A](io: IO[A]): IO[A] =
     failReads.get.flatMap(fail => if fail then IO.raiseError(RuntimeException("database unavailable")) else io)
@@ -54,6 +63,7 @@ final class InMemoryShowcaseStore(
   def activeShowcaseGameIds: IO[List[GameId]]                                        = guardReads(active)
   def failCommit(on: Boolean): IO[Unit]                                              = failCommits.set(on)
   def failEveryRead(on: Boolean): IO[Unit]                                           = failReads.set(on)
+  def failClear(on: Boolean): IO[Unit]                                               = failClears.set(on)
   def findShowcaseClaim(actorId: String, key: UUID): IO[Option[ShowcaseClaimRecord]] =
     guardReads(claims.get.map(_.get((actorId, key))))
 
@@ -78,7 +88,8 @@ final class InMemoryShowcaseStore(
               claims
                 .update(
                   _.updatedWith((actorId, key))(
-                    _.orElse(
+                    replaceIfExpired(
+                      now,
                       Some(
                         ShowcaseClaimRecord(
                           actorId,
@@ -100,7 +111,8 @@ final class InMemoryShowcaseStore(
     IO.realTimeInstant.flatMap: now =>
       claims.update(
         _.updatedWith((actorId, key))(
-          _.orElse(
+          replaceIfExpired(
+            now,
             Some(
               ShowcaseClaimRecord(
                 actorId,
@@ -123,8 +135,12 @@ final class InMemoryShowcaseStore(
       ShowcaseTableRecord(if advance then humanColor.opponent else current.nextHumanColor, Some(gameId))
 
   def clearShowcaseGame(gameId: GameId): IO[Boolean] =
-    table.modify: current =>
-      if current.currentGameId.contains(gameId) then (current.copy(currentGameId = None), true) else (current, false)
+    failClears.get.flatMap: fail =>
+      if fail then IO.raiseError(RuntimeException("database unavailable"))
+      else
+        table.modify: current =>
+          if current.currentGameId.contains(gameId) then (current.copy(currentGameId = None), true)
+          else (current, false)
 
 /** The wiring every showcase suite shares: a registered featured bot with capacity 3, a durable recording game store,
   * an in-memory showcase store derived from it, and a registry with the admission guard attached — the same shape
@@ -159,7 +175,8 @@ object ShowcaseHarness:
         botReady = ready.get,
         alert = message => alerts.update(_ :+ message),
         claimGrace = claimGrace,
-        tickInterval = 1.hour
+        tickInterval = 1.hour,
+        clearBackoff = 10.millis
       )
 
     /** A simulated process restart: a fresh registry and guard over the SAME stores, with the live games resumed from
@@ -185,7 +202,8 @@ object ShowcaseHarness:
       claims      <- Ref.of[IO, Map[(String, UUID), ShowcaseClaimRecord]](Map.empty)
       failCommits <- Ref.of[IO, Boolean](false)
       failReads   <- Ref.of[IO, Boolean](false)
-      store = InMemoryShowcaseStore(tableRef, claims, games.activeShowcaseGameIds, failCommits, failReads)
+      failClears  <- Ref.of[IO, Boolean](false)
+      store = InMemoryShowcaseStore(tableRef, claims, games.activeShowcaseGameIds, failCommits, failReads, failClears)
       registry <- GameRegistry.create(store = games)
       guard    <- AdmissionGuard.create(bots, Config, registry = Some(registry))
       _        <- registry.attachAdmissionGuard(guard)

@@ -2296,12 +2296,28 @@ final class PgGameStore private (xa: Transactor[IO])
       sql"""UPDATE play.showcase_table
             SET next_human_color = $advanced, current_game_id = ${gameId.value}::uuid, updated_at = now()
             WHERE id = 1 AND next_human_color = $expected AND current_game_id IS NULL""".update.run
+    // An expired row under the same key may have survived the bounded prune; it is replaced, so the replay window
+    // restarts with this claim. A live row under the same key cannot be here — the coordinator replays it instead of
+    // claiming — so a write that lands on nothing means the transaction must not commit the fence either.
     val record =
       sql"""INSERT INTO play.showcase_claims (actor_id, idempotency_key, request_hash, outcome, game_id, human_color)
             VALUES ($actorId, $key, $requestHash, 'claimed', ${gameId.value}::uuid, $human)
-            ON CONFLICT (actor_id, idempotency_key) DO NOTHING""".update.run
+            ON CONFLICT (actor_id, idempotency_key) DO UPDATE
+            SET request_hash = EXCLUDED.request_hash, outcome = EXCLUDED.outcome, game_id = EXCLUDED.game_id,
+                human_color = EXCLUDED.human_color, created_at = now(), expires_at = now() + interval '24 hours'
+            WHERE play.showcase_claims.expires_at <= now()""".update.run
     (pruneExpiredClaims *> fence)
-      .flatMap(moved => if moved == 1 then record.as(true) else false.pure[ConnectionIO])
+      .flatMap: moved =>
+        if moved != 1 then false.pure[ConnectionIO]
+        else
+          record.flatMap: written =>
+            if written == 1 then true.pure[ConnectionIO]
+            else
+              FC.raiseError(
+                new IllegalStateException(
+                  s"showcase claim record for game ${gameId.value} conflicts with a live record under the same key"
+                )
+              )
       .transact(xa)
       .timeout(SaveTimeout)
 
@@ -2310,7 +2326,10 @@ final class PgGameStore private (xa: Transactor[IO])
     (pruneExpiredClaims *>
       sql"""INSERT INTO play.showcase_claims (actor_id, idempotency_key, request_hash, outcome, game_id)
             VALUES ($actorId, $key, $requestHash, 'spectating', $game::uuid)
-            ON CONFLICT (actor_id, idempotency_key) DO NOTHING""".update.run).void
+            ON CONFLICT (actor_id, idempotency_key) DO UPDATE
+            SET request_hash = EXCLUDED.request_hash, outcome = EXCLUDED.outcome, game_id = EXCLUDED.game_id,
+                human_color = NULL, created_at = now(), expires_at = now() + interval '24 hours'
+            WHERE play.showcase_claims.expires_at <= now()""".update.run).void
       .transact(xa)
       .timeout(SaveTimeout)
 

@@ -69,7 +69,12 @@ for a different request into `409 idempotency_conflict`; `outcome` is `claimed` 
 a claimed row must carry `game_id` and `human_color` (a check constraint). Rows expire 24 hours after
 creation (`expires_at`, defaulted from the database clock), an expired row is invisible to the lookup
 and reads as a fresh claim, and the claim path prunes at most 128 expired rows per write by primary
-key — so the table needs no sweeper and never blocks a live claim for long. No foreign key to
+key — so the table needs no sweeper and never blocks a live claim for long. Because that prune is
+bounded, an expired row under a reused key may still be present when the fresh outcome is written:
+both writes are `ON CONFLICT … DO UPDATE … WHERE expires_at <= now()`, replacing an expired row and
+restarting its window while leaving a live one untouched (the coordinator never writes over a live
+record — it replays it). A winning write that lands on nothing rolls the whole transaction back,
+colour advance included. No foreign key to
 `games` for the same reason `game_results` has none: the record must outlive the snapshot
 retention prunes.
 

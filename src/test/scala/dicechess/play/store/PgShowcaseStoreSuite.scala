@@ -149,9 +149,15 @@ class PgShowcaseStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  test("spectating records are idempotent, expired records are invisible, and the next write prunes them"):
+  test(
+    "claim records are idempotent while live, invisible once expired, and an expired key is replaced by a fresh one"
+  ):
     withContainers { pg =>
       storeAndXa(pg).use { (db, xa) =>
+        val age =
+          sql"""UPDATE play.showcase_claims
+                SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day'
+                WHERE actor_id = ${guest.externalId}""".update.run.transact(xa)
         for
           _     <- reset(xa)
           id    <- GameId.random
@@ -160,20 +166,53 @@ class PgShowcaseStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _     <- db.recordSpectatingClaim(guest.externalId, key, "other-hash-ignored", None)
           found <- db.findShowcaseClaim(guest.externalId, key)
           // Age the row past its window; both stamps move so the `expires_at > created_at` constraint still holds.
-          _ <- sql"""UPDATE play.showcase_claims
-                     SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day'
-                     WHERE idempotency_key = $key""".update.run.transact(xa)
+          _    <- age
           gone <- db.findShowcaseClaim(guest.externalId, key)
-          k2   <- IO(UUID.randomUUID())
-          _    <- db.recordSpectatingClaim(guest.externalId, k2, "hash", None)
-          rows <- sql"SELECT count(*) FROM play.showcase_claims".query[Int].unique.transact(xa)
+          // The bounded prune may leave an expired row under a reused key: the fresh outcome must replace it, not
+          // bounce off it — otherwise a winner's retry would find no record to replay.
+          won      <- GameId.random
+          claimed  <- db.commitShowcaseClaim(guest.externalId, key, "fresh-hash", won, Side.White, Side.White)
+          replaced <- db.findShowcaseClaim(guest.externalId, key)
+          table    <- db.showcaseTable
+          // And the same for a spectating outcome over an expired row.
+          _     <- age
+          _     <- db.recordSpectatingClaim(guest.externalId, key, "spectating-hash", Some(won))
+          again <- db.findShowcaseClaim(guest.externalId, key)
+          rows  <- sql"SELECT count(*) FROM play.showcase_claims".query[Int].unique.transact(xa)
         yield
           assertEquals(
             found.map(r => (r.outcome, r.gameId, r.requestHash)),
             Some((ShowcaseClaimOutcome.Spectating, Some(id), "hash"))
           )
           assertEquals(gone, None)
-          assertEquals(rows, 1, "the expired record was pruned by the following write")
+          assert(claimed)
+          assertEquals(
+            replaced.map(r => (r.outcome, r.gameId, r.humanColor, r.requestHash)),
+            Some((ShowcaseClaimOutcome.Claimed, Some(won), Some(Side.White), "fresh-hash"))
+          )
+          assertEquals(table, ShowcaseTableRecord(Side.Black, Some(won)))
+          assertEquals(
+            again.map(r => (r.outcome, r.gameId, r.humanColor, r.requestHash)),
+            Some((ShowcaseClaimOutcome.Spectating, Some(won), None, "spectating-hash"))
+          )
+          assertEquals(rows, 1, "one key, one row, however many outcomes replaced each other")
+      }
+    }
+
+  test("the bounded prune removes expired rows on the next write"):
+    withContainers { pg =>
+      storeAndXa(pg).use { (db, xa) =>
+        for
+          _   <- reset(xa)
+          key <- IO(UUID.randomUUID())
+          _   <- db.recordSpectatingClaim(guest.externalId, key, "hash", None)
+          _   <- sql"""UPDATE play.showcase_claims
+                     SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day'
+                     WHERE idempotency_key = $key""".update.run.transact(xa)
+          k2   <- IO(UUID.randomUUID())
+          _    <- db.recordSpectatingClaim(guest.externalId, k2, "hash", None)
+          rows <- sql"SELECT count(*) FROM play.showcase_claims".query[Int].unique.transact(xa)
+        yield assertEquals(rows, 1, "the expired record was pruned by the following write")
       }
     }
 

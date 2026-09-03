@@ -231,7 +231,7 @@ object PlayRoutes:
   private[server] def clientFrames(room: GameRoom, keepAlive: FiniteDuration): Stream[IO, WebSocketFrame] =
     val events     = room.subscribe.map(event => WebSocketFrame.Text(event.asJson.noSpaces))
     val keepAlives = Stream.awakeEvery[IO](keepAlive).as(WebSocketFrame.Ping())
-    events.mergeHaltL(keepAlives) ++ Stream.emit(WebSocketFrame.Close())
+    events.mergeHaltL(keepAlives) ++ Stream.emit(WebSocketFrame.Close(1000))
 
   private def fromClient(room: GameRoom, seat: Seat): Pipe[IO, WebSocketFrame, Unit] =
     in =>

@@ -350,8 +350,8 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
         assert(frames.nonEmpty, "frames must not be empty")
         assertEquals(
           frames.last,
-          WebSocketFrame.Close(),
-          "the final frame in clientFrames must be WebSocketFrame.Close"
+          WebSocketFrame.Close(1000),
+          "the final frame in clientFrames must be WebSocketFrame.Close(1000)"
         )
 
   private def tokenOf(created: CreatedGame, seat: Seat): String =

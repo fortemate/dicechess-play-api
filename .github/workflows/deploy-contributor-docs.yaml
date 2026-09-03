@@ -8,21 +8,22 @@ on:
       - "src/main/resources/db/migration/**"
       - "scripts/generate-schema-docs.sh"
       - ".github/workflows/deploy-contributor-docs.yaml"
+      - "mise.toml"
   pull_request:
     paths:
       - "contributor-docs/**"
       - "src/main/resources/db/migration/**"
       - "scripts/generate-schema-docs.sh"
       - ".github/workflows/deploy-contributor-docs.yaml"
+      - "mise.toml"
   workflow_dispatch:
-
-concurrency:
-  group: pages
-  cancel-in-progress: true
 
 jobs:
   build:
     name: Build Contributor Docs
+    concurrency:
+      group: contrib-docs-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -57,6 +58,9 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     needs: build
     permissions:
       pages: write

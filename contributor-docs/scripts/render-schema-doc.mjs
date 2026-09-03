@@ -23,6 +23,114 @@ const byName = (a, b) => a.name.localeCompare(b.name);
 const bare = (name) => name.replace(/^public\./, '');
 
 const tables = schema.tables.filter(isApplicationTable).sort(byName);
+const applicationTableNames = new Set(tables.map((t) => bare(t.name)));
+
+/**
+ * Hand-written rationales for tables that carry no foreign key.
+ *
+ * Every table without a foreign key MUST have an entry here. If a migration adds an
+ * FK-free table without a rationale, rendering will fail loudly so the prose is never
+ * left quietly stale.
+ */
+const FK_FREE_RATIONALES = {
+	admin_actions:
+		'is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone',
+	bots: 'is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly',
+	client_reports:
+		'holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design)',
+	game_archive: 'must outlive the snapshots they describe',
+	game_results: 'must outlive the snapshots they describe',
+	games: 'holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives',
+	nickname_history:
+		'must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished',
+	released_nicknames:
+		'must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished',
+	showcase_claims:
+		'holds short-lived rate-limiting claims that outlive or precede individual games',
+	showcase_table:
+		'is a singleton table tracking showcase table state without external entity references',
+	users: 'is the root of the account graph the other user tables reference',
+	webhook_admin_authority_generations:
+		'tracks global authority heartbeat logs independent of individual bot rows',
+	webhook_verification_budgets:
+		'tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles',
+};
+
+function hasForeignKey(table) {
+	const tableName = bare(table.name);
+	const inRelations = (schema.relations ?? []).some(
+		(r) => bare(r.table) === tableName && applicationTableNames.has(bare(r.parent_table)),
+	);
+	const inConstraints = (table.constraints ?? []).some((c) => c.type === 'FOREIGN KEY');
+	return inRelations || inConstraints;
+}
+
+function renderFkFreeNarrative() {
+	const fkFreeTables = tables.filter((t) => !hasForeignKey(t)).sort(byName);
+
+	const missing = fkFreeTables.filter((t) => !FK_FREE_RATIONALES[bare(t.name)]);
+	if (missing.length > 0) {
+		console.error(
+			`Error: Missing rationale in FK_FREE_RATIONALES for FK-free table(s): ${missing.map((t) => bare(t.name)).join(', ')}`,
+		);
+		process.exit(1);
+	}
+
+	// Group consecutive tables that share identical rationales.
+	const groups = [];
+	for (const table of fkFreeTables) {
+		const name = bare(table.name);
+		const rationale = FK_FREE_RATIONALES[name];
+		const last = groups[groups.length - 1];
+		if (last && last.rationale === rationale) {
+			last.names.push(name);
+		} else {
+			groups.push({ names: [name], rationale });
+		}
+	}
+
+	const numberWords = [
+		'Zero',
+		'One',
+		'Two',
+		'Three',
+		'Four',
+		'Five',
+		'Six',
+		'Seven',
+		'Eight',
+		'Nine',
+		'Ten',
+		'Eleven',
+		'Twelve',
+		'Thirteen',
+		'Fourteen',
+		'Fifteen',
+		'Sixteen',
+		'Seventeen',
+		'Eighteen',
+		'Nineteen',
+		'Twenty',
+	];
+	const countStr = numberWords[fkFreeTables.length] ?? String(fkFreeTables.length);
+
+	const formattedGroups = groups.map((g) => {
+		const tableList =
+			g.names.length === 1
+				? `\`${g.names[0]}\``
+				: g.names.length === 2
+					? `\`${g.names[0]}\` and \`${g.names[1]}\``
+					: g.names.map((n) => `\`${n}\``).join(', ');
+		return `${tableList} ${g.rationale}`;
+	});
+
+	const joinedList =
+		formattedGroups.length > 1
+			? formattedGroups.slice(0, -1).join(', ') + ' — and ' + formattedGroups[formattedGroups.length - 1]
+			: formattedGroups[0];
+
+	return `Only foreign keys appear as edges. ${countStr} tables carry no foreign key on purpose — ${joinedList}.`;
+}
 
 /**
  * Cardinality of a foreign key, derived rather than assumed: if the child's FK columns are
@@ -143,17 +251,7 @@ Regenerate with \`mise run contrib-docs:schema\` after adding a migration.
 
 ${erDiagram()}
 
-Only foreign keys appear as edges. Seven tables carry no foreign key on purpose —
-\`game_results\` and \`game_archive\` must outlive the snapshots they describe,
-\`client_reports\` holds browser-submitted reports for games that never had a
-\`games\` row on this server (kept separate from authoritative game data by design),
-\`users\` is the root of the account graph the other two user tables reference,
-\`nickname_history\`/\`released_nicknames\` must outlive the account a rename
-describes just as readily as the one it never touched — a foreign key to \`users\`
-would cascade away the audit trail and the hold on exactly the accounts whose
-history or vacated name matters most, an account that renamed and then vanished —
-and \`admin_actions\` is an audit of the same kind: it must keep naming an
-admin who has since deleted their account, on a bot whose row may be long gone.
+${renderFkFreeNarrative()}
 
 ## Tables
 

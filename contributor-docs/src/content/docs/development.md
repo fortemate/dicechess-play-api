@@ -14,7 +14,7 @@ public packages**; `build.sbt` reads the token via `gh auth token`. If you skip 
 failure looks like a broken build rather than a missing credential:
 
 ```text
-unresolved dependency: lv.id.jc#dicechess-engine-scala...
+unresolved dependency: com.fortemate#dicechess-engine...
 ```
 
 That signature always means auth, never a broken build.
@@ -28,7 +28,7 @@ jq. Install everything and register the Git hooks with:
 mise run setup
 ```
 
-Docker is needed only by the four Postgres suites. On Rancher Desktop, export
+Docker is needed by the five Postgres suites and by `mise run contrib-docs:schema`. On Rancher Desktop, export
 `DOCKER_HOST=unix://$HOME/.rd/docker.sock` and `TESTCONTAINERS_RYUK_DISABLED=true` first —
 without them the test run hangs at container startup rather than failing.
 
@@ -37,15 +37,19 @@ without them the test run hangs at container startup rather than failing.
 | Command | What it does |
 | --- | --- |
 | `mise run compile` | `sbt compile Test/compile` |
-| `mise run test` | `sbt "testOnly *"` (full suite, needs Docker for four suites) |
+| `mise run test` | `sbt "testOnly *"` (full suite, needs Docker for five suites) |
 | `mise run check` | **The CI mirror**: shutdown, disposable cache, scalafmtCheckAll, clean, coverage, testOnly *, coverageReport |
 | `mise run format` | `sbt scalafmtAll` |
 | `mise run run` | Start the server on `:8080` |
-| `mise run contrib-docs:dev` | This site, locally |
+| `mise run contrib-docs:install` | Install dependencies for this site (`npm install`) |
+| `mise run contrib-docs:dev` | This site, locally (`npm run dev`) |
+| `mise run contrib-docs:build` | Build static output for this site (`npm run build`) |
 | `mise run contrib-docs:schema` | Regenerate the schema reference from the migrations |
-| `mise run docs:dev` | The Bot API site, locally |
+| `mise run docs:install` | Install dependencies for the Bot API site (`npm install`) |
+| `mise run docs:dev` | The Bot API site, locally (`npm run dev`) |
+| `mise run docs:build` | Build static output for the Bot API site (`npm run build`) |
 
-For a targeted, Docker-free run: `sbt "testOnly dicechess.play.server.*"`.
+For a targeted, Docker-free run: `sbt "testOnly dicechess.play.game.*"`.
 
 ## Code conventions
 
@@ -60,10 +64,14 @@ For a targeted, Docker-free run: `sbt "testOnly dicechess.play.server.*"`.
 ## Quality gates
 
 - `mise run check` passes locally. It mirrors CI exactly.
-- Backend CI is **path-filtered** to `src/**`, `build.sbt`, `project/**`, `.scalafmt.conf`, and
-  its own workflow file. A documentation-only pull request gets **zero checks** — that is
-  normal, not a stuck pipeline. A pull request touching only other workflow files likewise gets
-  no run; validate those with `gh workflow run`.
+- Backend CI is **path-filtered** to `src/**`, `build.sbt`, `project/**`, `.scalafmt.conf`, `Dockerfile`,
+  `mise.toml`, `sonar-project.properties`, and `.github/workflows/ci.yaml`.
+- All pull requests run `CI: PR Policy` and `CI: CLA` regardless of modified paths. Pull requests modifying
+  `contributor-docs/**`, Flyway migrations, or related scripts trigger `CD: Deploy Contributor Docs`, which
+  runs the schema-drift gate (`mise run contrib-docs:schema` + git diff check) and an Astro build. A pull request
+  touching only other workflow files gets no backend CI run; validate those with `gh workflow run`.
+- Automated code review by CodeRabbit is enabled but does not start automatically on PR creation.
+  To request a review, comment `@coderabbitai review` on your pull request.
 - SonarCloud imports the scoverage report. No coverage minimum is enforced — which is not a
   licence to skip tests.
 - Branch naming and `Closes #n` linking are validated automatically; external contributors must

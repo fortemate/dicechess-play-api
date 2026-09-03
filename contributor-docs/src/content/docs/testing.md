@@ -11,9 +11,9 @@ test names are full sentences describing behaviour:
 test("the game-end event reveals the server seed")
 ```
 
-Six suites need Docker, because they run against a real Postgres via Testcontainers:
-`PgGameStoreSuite`, `PgQueryCheckSuite`, `PgShowcaseStoreSuite`, `IngestDelivererSuite`,
-`RatingBatchSuite`, `HistoryRoutesSuite`. Everything else is Docker-free — including the showcase
+Five suites need Docker, because they run against a real Postgres via Testcontainers:
+`PgGameStoreSuite`, `PgQueryCheckSuite`, `IngestDelivererSuite`, `RatingBatchSuite`,
+`HistoryRoutesSuite`. Everything else is Docker-free — including the showcase
 coordinator's own suites (`ShowcaseTableSuite`, `ShowcaseRoutesSuite`), which run over the in-memory
 harness in `ShowcaseHarness`.
 

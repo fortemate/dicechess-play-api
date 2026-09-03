@@ -30,7 +30,7 @@ flowchart TD
     C["Client<br/>(browser or bot)"] -->|"intent: move / challenge / seek"| R["server/ routes<br/>PlayRoutes · BotRoutes · LobbyRoutes"]
     R --> REG["GameRegistry"]
     REG --> ROOM["game/GameRoom<br/>single writer fiber"]
-    ROOM -->|"validate"| ENG["game/EngineOps<br/>→ dicechess-engine-scala"]
+    ROOM -->|"validate"| ENG["game/EngineOps<br/>→ dicechess-engine"]
     ROOM -->|"roll"| DICE["dice/DiceSource<br/>CSPRNG + commit-reveal"]
     ROOM -->|"tryOffer, non-blocking"| SUB["Per-subscriber queues<br/>WebSocket · ndjson · webhook"]
     ROOM -->|"snapshot"| STORE["store/PgGameStore<br/>jsonb snapshot"]
@@ -50,7 +50,7 @@ consumer block play. That rule is spelled out in
 `play-api` sits in the middle of four contracts. Changing either side of one without the other
 is the most common way to break the platform.
 
-- **Consumes** `lv.id.jc:dicechess-engine-scala`, a JVM artifact from GitHub Packages with the
+- **Consumes** `com.fortemate:dicechess-engine`, a JVM artifact from GitHub Packages with the
   version pinned in `build.sbt`. It is the single source of truth for the rules — legality is
   never reimplemented here. Legal moves ship on the wire as a prefix tree of UCI micro-moves.
 - **Publishes** the client wire protocol in `wire/Codecs.scala`, consumed by the

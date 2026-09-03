@@ -136,17 +136,37 @@ The singleton showcase table on the homepage (`/`) is controlled by the followin
 | `SHOWCASE_BOT_TEAM` | Team identifier of the featured bot (e.g. `rpi3`). Required when showcase is enabled. |
 | `SHOWCASE_BOT_NAME` | Name of the featured bot (e.g. `hunter-book`). Required when showcase is enabled. |
 | `SHOWCASE_RESERVED_SEATS` | Dedicated capacity reserved exclusively for the showcase table. When `SHOWCASE_ENABLED=true`, this value must be set to exactly `1`. Values `0` or `> 1` are rejected during configuration validation at boot time. |
-| `SHOWCASE_TIME_CONTROL` | Optional, fixed default `5+3`. The time control used for showcase games. |
+
+A signed-in visitor can claim only when `PLAY_CORS_ORIGINS` is a real allow-list: the session path
+requires an `Origin` that matches it, and with no allow-list the claim answers `403 csrf_origin_rejected`
+(guest claims are unaffected). This is the same rule the staged webhook management surface follows.
+
+The clock is fixed at `5+3` (`ShowcaseTable.FixedTimeControl`) and is deliberately not configurable in this
+release — the homepage promises one table with one clock. The routes mount only when `SHOWCASE_ENABLED=true`;
+disabled, both paths answer a plain 404.
+
+The table can only ever be `open` while the featured bot passes its readiness probe: it must be a **registered**
+bot (so the reserved admission class applies), `WEBHOOK_TIMEOUT_SECONDS` must be set (delivery is what drives the
+bot), and its registered webhook must answer the unsigned verification echo within 5 seconds. The probe reruns
+every 15 seconds while the table is not live. `SHOWCASE_ENABLED=true` without `WEBHOOK_TIMEOUT_SECONDS` logs a
+`[play][showcase]` warning at boot and the table stays `unavailable` (`reason: "bot_unavailable"`).
 
 :::danger[Showcase requires PostgreSQL persistence]
 The showcase table enforces fail-closed durability: if `PLAY_DB_URL` is unset, the showcase table
-remains `unavailable` and rejects claims. Falling back to an in-memory store is strictly prohibited
-for showcase games. Concretely (#47): `GameRegistry` refuses to create a showcase room over a
-store that does not claim durability, and `SHOWCASE_ENABLED=true` without `PLAY_DB_URL` logs a
-`[play][showcase]` warning at boot — the seat reservation still applies (a silent fallback to
-unreserved capacity is what ADR-005 forbids), so fix the configuration rather than expecting the
-table to open.
+remains `unavailable` (`reason: "maintenance"`) and answers every claim `503 showcase_unavailable`. Falling
+back to an in-memory store is strictly prohibited for showcase games. Concretely (#47, #46): `GameRegistry`
+refuses to create a showcase room over a store that does not claim durability, the coordinator is built
+without a `ShowcaseStore` and never leaves `unavailable`, and `SHOWCASE_ENABLED=true` without `PLAY_DB_URL`
+logs a `[play][showcase]` warning at boot — the seat reservation still applies (a silent fallback to
+unreserved capacity is what ADR-005 forbids), so fix the configuration rather than expecting the table to
+open.
 :::
+
+Operator signals: every phase change is one `[play][showcase] table -> …` line on stdout, and every
+fail-closed reason that needs a human (no persistence, a persistence failure, a bot that fails the probe,
+irreconcilable state, more than one active showcase game) is one `[play][showcase] ALERT: …` line on stderr,
+raised on the transition rather than on every tick. None of them ever carries a seat token, a webhook secret
+or an address.
 
 ## Staged webhook rollout runbook
 

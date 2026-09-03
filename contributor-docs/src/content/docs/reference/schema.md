@@ -38,6 +38,8 @@ erDiagram
     nickname_history
     outbox
     released_nicknames
+    showcase_claims
+    showcase_table
     user_guest_links
     user_identities
     user_ratings
@@ -374,6 +376,49 @@ Indexes:
 Indexes:
 
 - `released_nicknames_lookup_idx` — `CREATE INDEX released_nicknames_lookup_idx ON public.released_nicknames USING btree (nickname_lower, expires_at)`
+
+### `showcase_claims`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `actor_id` | `text` | no | — | PK |
+| `idempotency_key` | `uuid` | no | — | PK |
+| `request_hash` | `text` | no | — | — |
+| `outcome` | `text` | no | — | — |
+| `game_id` | `uuid` | yes | — | — |
+| `human_color` | `text` | yes | — | — |
+| `created_at` | `timestamp with time zone` | no | `now()` | — |
+| `expires_at` | `timestamp with time zone` | no | `(now() + '24:00:00'::interval)` | — |
+
+Check constraints:
+
+- `CHECK (((outcome <> 'claimed'::text) OR ((game_id IS NOT NULL) AND (human_color IS NOT NULL))))`
+- `CHECK ((expires_at > created_at))`
+- `CHECK (((human_color IS NULL) OR (human_color = ANY (ARRAY['white'::text, 'black'::text]))))`
+- `CHECK ((outcome = ANY (ARRAY['claimed'::text, 'spectating'::text])))`
+
+Indexes:
+
+- `showcase_claims_expires_idx` — `CREATE INDEX showcase_claims_expires_idx ON public.showcase_claims USING btree (expires_at)`
+- `showcase_claims_pkey` — `CREATE UNIQUE INDEX showcase_claims_pkey ON public.showcase_claims USING btree (actor_id, idempotency_key)`
+
+### `showcase_table`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `id` | `smallint` | no | `1` | PK |
+| `next_human_color` | `text` | no | `'white'::text` | — |
+| `current_game_id` | `uuid` | yes | — | — |
+| `updated_at` | `timestamp with time zone` | no | `now()` | — |
+
+Check constraints:
+
+- `CHECK ((next_human_color = ANY (ARRAY['white'::text, 'black'::text])))`
+- `CHECK ((id = 1))`
+
+Indexes:
+
+- `showcase_table_pkey` — `CREATE UNIQUE INDEX showcase_table_pkey ON public.showcase_table USING btree (id)`
 
 ### `user_guest_links`
 

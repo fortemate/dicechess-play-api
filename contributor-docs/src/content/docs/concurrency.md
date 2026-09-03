@@ -83,23 +83,29 @@ The singleton showcase table introduces three strict concurrency invariants:
 ### 1. First-claim linearizability ("first visitor wins") and durable idempotency
 
 When the table is `open`, multiple visitors may submit `POST /showcase/claim` simultaneously:
-- Exactly one claim commits atomically. The server generates player credentials (`playerToken`) returned only to the
-  winner in a `Cache-Control: no-store` response.
-- Concurrent losers and subsequent callers receive a spectator outcome with the active game ID and WebSocket URL.
-  Losers **never** receive player credentials.
-- Next human color strictly alternates (White $\leftrightarrow$ Black) upon successful durable room creation. Failed
-  creation does not consume the next color.
+- Every claim runs under the coordinator's single mutex (`ShowcaseTable.claim`), so the order of arrival at the
+  lock decides. Exactly one claim finds the table `open`, takes the reserved seat through
+  `AdmissionGuard.admitAndCreate`, and commits; it alone receives the human seat's credential (`seatToken`) in
+  a `Cache-Control: no-store, private` response.
+- Concurrent losers and subsequent callers receive the spectator outcome with the active game id and spectator
+  WebSocket URL. Losers **never** receive a credential.
+- Next human colour strictly alternates (White $\leftrightarrow$ Black) upon successful durable room creation:
+  the advance is part of the same store transaction as the claim record and the `current_game_id` pointer
+  (`ShowcaseStore.commitShowcaseClaim`), fenced on the colour the human was seated on and on no game being
+  current. A failed creation or a failed commit does not consume the colour.
 
 Idempotency is durable and enforced across process restarts:
-- The `Idempotency-Key` request header (UUIDv4) is mandatory. Requests missing the header fail immediately with
-  `400 Bad Request` (`missing_idempotency_key`).
-- Idempotency records are keyed by `(actor_id, idempotency_key)` in PostgreSQL, where `actor_id` is the verified account
-  (`user:<uuid>`) or stable guest identifier (`guest:<uuid>`).
-- If a subsequent request reuses the key with a conflicting payload (such as different `clientEntropy`), it is rejected
-  with `409 Conflict` (`idempotency_conflict`).
-- While the record is retained (24-hour retention window), identical retries replay the original committed response:
-  re-emitting player credentials (`playerToken`) if the game is still active, or returning the spectator view once the
-  game has ended. After the retention window expires, pruned keys are treated as fresh claims.
+- The `Idempotency-Key` request header (a UUID) is mandatory. Requests missing it fail immediately with
+  `400 Bad Request` (`missing_idempotency_key`); a malformed one is `invalid_idempotency_key`.
+- Idempotency records are keyed by `(actor_id, idempotency_key)` in PostgreSQL (`showcase_claims`), where
+  `actor_id` is the verified account (`user:<uuid>`) or stable guest identifier (`guest:<uuid>`). The record
+  carries a fingerprint of the request (actor, `guestId`, `clientEntropy`).
+- If a subsequent request reuses the key with a different fingerprint, it is rejected with `409 Conflict`
+  (`idempotency_conflict`).
+- While the record is retained (24-hour window), identical retries replay the original committed outcome:
+  re-emitting the winner's `seatToken` while the game is still active, or the spectator outcome (`reason:
+  "game_ended"`, no credential) once it has ended. Expired records are pruned opportunistically by the claim
+  path itself and then read as fresh claims.
 
 ### 2. Dedicated capacity reservation, admission cleanup, and no-borrowing rule (#45)
 

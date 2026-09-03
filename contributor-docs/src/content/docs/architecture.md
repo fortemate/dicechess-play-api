@@ -72,19 +72,29 @@ Routes are grouped by audience rather than by resource:
   from the session or a `?guest=` uuid.
 - **Public discovery** — `GET /games`, `GET /leaderboard`, `GET /bots/{team}/{name}`, plus the
   history and strength endpoints.
-- **Showcase table** — `GET /showcase` and `POST /showcase/claim`. Exposes the homepage singleton table:
-  - `GET /showcase` returns the public table view: state (`unavailable`, `open`, `live`, `finishing`), featured bot
-    summary, time control (`5+3`), next human color when `open`, current game FEN and clocks when `live`/`finishing`,
-    and the public spectator WebSocket URL. It enforces `Cache-Control: no-cache, no-store, must-revalidate` for active
-    states (max-age 1s when `open`), requires no authentication, and **never exposes player credentials or internal tokens**.
-  - `POST /showcase/claim` is the atomic first-claim endpoint. Authentication accepts either a valid session cookie
-    (`user:<uuid>`) or a stable `guestId` (`guest:<uuid>`). It requires an `Idempotency-Key` header (UUIDv4) and accepts
-    optional `clientEntropy`. The atomic winner receives `200 OK` with `outcome: "playing"`, assigned color, and
-    `playerToken` in a `Cache-Control: no-store` body; concurrent losers and subsequent callers receive `200 OK` with
-    `outcome: "spectating"` and the spectator URL, with **no player credentials**. Errors use RFC 7807 problem details:
-    `400 Bad Request` (`missing_idempotency_key`), `409 Conflict` (`idempotency_conflict` on reused key with different
-    payload), `429 Too Many Requests` (per-IP and per-actor claim rate limits), or `503 Service Unavailable`
-    (`showcase_unavailable`). There is no queue and no rematch. The authoritative contract is ADR-005 (#44).
+- **Showcase table** — `GET /showcase` and `POST /showcase/claim` (ADR-005, #46), mounted only with
+  `SHOWCASE_ENABLED=true`. The homepage's singleton table:
+  - `GET /showcase` is the public read: `status` (`unavailable`, `open`, `live`, `finishing`), the
+    featured bot, the fixed `5+3`, `nextHumanColor` when open (and, while a game is on, the colour offered
+    next), `currentGame` and a spectator `wsUrl` when live or finishing, and a coarse `reason`
+    (`disabled`, `maintenance`, `bot_unavailable`) when unavailable. It is `Cache-Control: no-store,
+    no-cache, must-revalidate` with a weak `ETag` (`If-None-Match` answers `304`), needs no
+    authentication, and **never carries a seat token, a webhook detail, a private identity or
+    infrastructure state**. Colours use the existing `Side` wire form (`White` / `Black`).
+  - `POST /showcase/claim` is the atomic first claim. The actor is the session account (then
+    `X-DiceChess-CSRF: 1` and an `Origin` on the `PLAY_CORS_ORIGINS` allow-list are both required; a
+    deployment without an allow-list refuses the session path, so visitors claim as guests there) or a
+    stable `guestId` in the body. The body is capped at 4 KiB. `Idempotency-Key` (a UUID) is mandatory; `clientEntropy` is an optional
+    dice seed. The winner gets `200` with `outcome: "claimed"`, `seat`, `seatToken` and a relative
+    `wsUrl`, under `Cache-Control: no-store, private`; every other caller gets `200` with
+    `outcome: "spectating"`, a `reason` (`already_claimed` / `game_ended`), the `gameId` and a
+    `spectatorWsUrl` — and **no credential**. Problems are RFC 7807 (`application/problem+json`) with a
+    `code`: `400` `missing_idempotency_key` / `invalid_idempotency_key` / `guest_required` /
+    `invalid_guest_id` / `malformed_request`, `403` `csrf_origin_rejected`, `409`
+    `idempotency_conflict` (same key, different body), `413` `request_too_large`, `415` `malformed_request`, `429` `rate_limited`
+    (per IP and per actor, `Retry-After`), `503` `showcase_unavailable` (`Retry-After`). WebSocket URLs
+    are relative references against the API origin; the server does not guess its public hostname.
+    The authoritative contract is ADR-005 (#44); the machine-readable one is `openapi.yaml`.
 - **Bot API** — everything under `/bot/…`: identity, challenges, seeks, gameplay, streams,
   webhooks, ladder.
 - **Account control** — `/me/…` uses the live `access_token` session and current ownership;
@@ -154,12 +164,48 @@ stateDiagram-v2
    the featured bot's webhook is unresponsive, or startup reconciliation detects ambiguous state.
 2. `open`: The table is idle, advertising the configured featured bot, `5+3`, and the server-assigned
    next human color. Exactly 1 bot capacity slot is reserved.
-3. `live`: One active game against the featured bot is in progress. The winning claimant holds player
-   credentials (`playerToken`), which appears **only** in the winning `POST /showcase/claim` response body under
-   `Cache-Control: no-store`; spectators observe via WebSocket. `GET /showcase` and spectator outcomes
-   (`outcome: "spectating"`) never include player credentials.
-4. `finishing`: The game has ended in memory; terminal persistence is executing atomically. The table
-   remains closed to new claims until the transaction commits.
+3. `live`: One active game against the featured bot is in progress. The winning claimant holds the human
+   seat's credential (`seatToken`), which appears **only** in the winning `POST /showcase/claim` response body
+   under `Cache-Control: no-store, private`; spectators observe via the ordinary spectator WebSocket.
+   `GET /showcase` and spectator outcomes (`outcome: "spectating"`) never include a credential.
+4. `finishing`: The game has ended but the table has not yet been released — the window between the room's
+   committed terminal transaction and the coordinator clearing the table's current game. A claim in this
+   window spectates. The table cannot be `open` before the archive row exists (`GameRoom.result` fires only
+   after the terminal commit) and the reserved seat has been released.
+
+### The coordinator (#46)
+
+`server/ShowcaseTable` is the table: one process-local actor holding the phase and a mutex every claim
+runs under, so "first visitor wins" is decided by lock order — exactly one claimant can find the table
+`open`. It remembers nothing across a restart; the next human colour, the current game and the claim
+idempotency records live in PostgreSQL behind `store/ShowcaseStore` (tables `showcase_table` and
+`showcase_claims`, V6), and `ShowcaseTable.reconcile` rebuilds the phase from them **before the port
+opens** (`Main` runs it inside the resource that mounts the routes). Reconciliation reads
+`PgGameStore.activeShowcaseGameIds`: none → the table may open (after repairing a stale current-game
+pointer left by a crash between the terminal commit and the clear — and only once that repair has
+committed; a store that will not take it keeps the table `unavailable`); exactly one → the resumed room is
+adopted as `live` (and the colour advanced if the claim transaction never got to); several → split-brain,
+`unavailable` with an operator alert. A live showcase game the registry failed to resume, a store that is
+not PostgreSQL, or a bot that fails its readiness probe all fail closed the same way.
+
+A winning claim does, in order: `AdmissionGuard.admitAndCreate` under the `showcase` purpose (the reserved
+seat; the room's creation snapshot commits fail-closed inside it), then one store transaction that advances
+the colour, points `showcase_table.current_game_id` at the room and writes the claim record — fenced on the
+colour the human was seated on and on no game being current — and only then the `live` phase and the
+credential. A failed creation advances nothing. A failed commit aborts the room it just created (a
+technical abort, archived as such) and fails the table closed rather than guess which side is right. The
+winner's `clientEntropy`, when given, is submitted to the room as its dice seed.
+
+Completion is inherited from the room: `GameRoom.result` completes only once the terminal transaction is
+durable, the coordinator then waits for the registry to deregister the game (which releases the reserved
+seat), clears `current_game_id`, and reconciles again — a bot probe, then `open` or `unavailable`. A
+duplicate completion finds nothing to clear and reconciles to the same phase. A winner that never opens its
+socket within the claim grace (30 s) is resigned by the coordinator, through the same command a dropped
+connection already uses. While the table is not live, a readiness loop (every 15 s) re-runs reconciliation
+so a bot that stops answering closes the table before anyone claims a dead one, and a bot or database that
+recovers reopens it without a restart. `Main.showcaseReadiness` is the probe: the featured bot must be a
+registered identity, webhook delivery must be enabled, and its webhook must answer the unsigned
+verification echo within 5 s.
 
 ### Fail-closed persistence and recovery rules (#47)
 

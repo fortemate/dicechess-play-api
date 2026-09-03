@@ -33,6 +33,8 @@ import dicechess.play.server.{
   SeatGuard,
   SessionWebhookRoutes,
   ShowcaseConfig,
+  ShowcaseRoutes,
+  ShowcaseTable,
   StrengthRoutes,
   ManagedWebhookVerifier,
   WebhookManagement,
@@ -47,6 +49,7 @@ import dicechess.play.store.{
   GameStore,
   PgGameStore,
   Retention,
+  ShowcaseStore,
   WebhookManagementStore,
   WebhookRequestContext,
   WebhookStatsStore,
@@ -219,6 +222,7 @@ object Main extends IOApp.Simple:
       _ <- warnDeprecatedRatedForHumans
       _ <- warnDeprecatedOpenToHumans
       _ <- warnInertShowcase(enabled = showcaseConfig.enabled, persistenceOn = pgStore.isDefined)
+      _ <- warnShowcaseWithoutWebhooks(enabled = showcaseConfig.enabled, webhooksOn = Webhooks.configFromEnv.isDefined)
       _ <- warnInertAdmins(sessionOn = authSession.isDefined, persistenceOn = pgStore.isDefined)
       _ <- warnInertWebhookManagement(
         enabled = managedWebhookConfig.isDefined,
@@ -312,6 +316,10 @@ object Main extends IOApp.Simple:
       // Browser game reports (#212) arrive in bursts when a returning visitor's IndexedDB outbox flushes, so this
       // budget is per-minute, not per-hour — the gateway's 60/min, carried over.
       ingestLimit <- AnonMintLimiter.create(limit = IngestLimitPerMinute, window = 1.minute)
+      // Showcase claims (ADR-005 §10, #46) are budgeted per minute on two axes: the caller's IP, like every other open
+      // endpoint here, and the acting identity, so one guest id cannot spend the table's whole budget from many hosts.
+      showcaseIpLimit    <- AnonMintLimiter.create(limit = ShowcaseRoutes.ClaimsPerIpPerMinute, window = 1.minute)
+      showcaseActorLimit <- AnonMintLimiter.create(limit = ShowcaseRoutes.ClaimsPerActorPerMinute, window = 1.minute)
       // Webhook push (F.2, #104) is opt-in the same way (WEBHOOK_TIMEOUT_SECONDS). Unlike the rating batch it does
       // NOT require the database: in-memory mode registers webhooks for the process's lifetime, matching how
       // registered-bot identities behave there. The service is a Resource because it owns its per-game runner
@@ -427,47 +435,74 @@ object Main extends IOApp.Simple:
           }
           .getOrElse(org.http4s.HttpRoutes.empty[IO])
 
-        EmberServerBuilder
-          .default[IO]
-          .withHost(host)
-          .withPort(port)
-          .withHttpWebSocketApp(wsb =>
-            cors(
-              (HealthRoutes(version) <+> PlayRoutes(registry, wsb, authSession) <+> LobbyRoutes(
-                lobby,
-                authSession
-              ) <+>
-                leaderboard <+>
-                catalog <+> playerGames <+> strength <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
-                ownerBots <+> adminBots <+> managedWebhooks <+>
-                WebhookRoutes(botAuth, webhookService, webhookLimit, pgStore) <+>
-                BotRoutes(
-                  botAuth,
-                  challenges,
-                  botEvents,
-                  registry,
-                  lobby,
-                  mintLimit,
-                  registerLimit,
-                  session = authSession
-                )).orNotFound
-            )
+        // The singleton showcase table (ADR-005, #46). Created only when enabled; reconciled from durable state BEFORE
+        // the port opens, so no visitor can ever see `open` ahead of the boot-time check. Without PostgreSQL the table
+        // exists but is permanently unavailable and says so (`warnInertShowcase` above is loud about why).
+        val showcaseResource: Resource[IO, Option[ShowcaseTable]] =
+          if !showcaseConfig.enabled then Resource.pure(None)
+          else
+            ShowcaseTable
+              .create(
+                showcaseConfig,
+                registry,
+                admissionGuard,
+                pgStore.map(pg => pg: ShowcaseStore),
+                botReady = showcaseReadiness(showcaseConfig, botStore, webhookService)
+              )
+              .evalTap(table =>
+                table.reconcile.flatMap(phase =>
+                  IO.println(s"[play][showcase] table reconciled at boot: ${ShowcaseTable.describe(phase)}")
+                )
+              )
+              .map(Some(_))
+
+        showcaseResource.use { showcase =>
+          val showcaseRoutes = showcase.fold(org.http4s.HttpRoutes.empty[IO])(table =>
+            ShowcaseRoutes(table, authSession, allowedOrigins, showcaseIpLimit, showcaseActorLimit)
           )
-          .build
-          .use { _ =>
-            (
-              deliverer,
-              lobby.sweeper(),
-              challenges.sweeper(),
-              ladderLoop,
-              ratingLoop,
-              retentionLoop,
-              webhookService.fold(IO.unit)(_.loop.void),
-              webhookService.fold(IO.unit)(_.statsLoop.void),
-              adminAuthorityLoop,
-              IO.never
-            ).parTupled.void
-          }
+          EmberServerBuilder
+            .default[IO]
+            .withHost(host)
+            .withPort(port)
+            .withHttpWebSocketApp(wsb =>
+              cors(
+                (HealthRoutes(version) <+> PlayRoutes(registry, wsb, authSession) <+> LobbyRoutes(
+                  lobby,
+                  authSession
+                ) <+>
+                  leaderboard <+>
+                  catalog <+> playerGames <+> strength <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
+                  ownerBots <+> adminBots <+> managedWebhooks <+> showcaseRoutes <+>
+                  WebhookRoutes(botAuth, webhookService, webhookLimit, pgStore) <+>
+                  BotRoutes(
+                    botAuth,
+                    challenges,
+                    botEvents,
+                    registry,
+                    lobby,
+                    mintLimit,
+                    registerLimit,
+                    session = authSession
+                  )).orNotFound
+              )
+            )
+            .build
+            .use { _ =>
+              (
+                deliverer,
+                lobby.sweeper(),
+                challenges.sweeper(),
+                ladderLoop,
+                ratingLoop,
+                retentionLoop,
+                webhookService.fold(IO.unit)(_.loop.void),
+                webhookService.fold(IO.unit)(_.statsLoop.void),
+                adminAuthorityLoop,
+                showcase.fold(IO.unit)(_.supervise.void),
+                IO.never
+              ).parTupled.void
+            }
+        }
       }
     yield ()
 
@@ -557,6 +592,38 @@ object Main extends IOApp.Simple:
           "persistence and every showcase room creation will be refused. Configure PLAY_DB_URL or disable the showcase."
       )
       .whenA(enabled && !persistenceOn)
+
+  /** Whether the featured bot can be advertised as claimable (ADR-005 §9, #46): it must be a registered identity (so
+    * the reserved admission class applies to it), webhook delivery must be enabled on this server, and its registered
+    * webhook must answer the verification echo — the same unsigned probe the catalog's wake uses, under the short
+    * showcase deadline. Anything less is `false`, and the coordinator fails the table closed as `bot_unavailable`.
+    */
+  private[play] def showcaseReadiness(
+      config: ShowcaseConfig,
+      bots: BotStore,
+      webhooks: Option[Webhooks]
+  ): IO[Boolean] =
+    (config.featuredBot, webhooks) match
+      case (Some(bot), Some(service)) =>
+        bots
+          .seatPolicyOf(bot.team, bot.name)
+          .flatMap:
+            case None    => IO.pure(false)
+            case Some(_) => service.wake(bot, ShowcaseTable.ProbeTimeout).handleError(_ => false)
+      case _ => IO.pure(false)
+
+  /** The showcase table can only ever open if the featured bot's webhook can be driven, and `WEBHOOK_TIMEOUT_SECONDS`
+    * is what enables delivery — so `SHOWCASE_ENABLED=true` without it is a table that will sit `unavailable` forever.
+    * Loud at boot, like its siblings.
+    */
+  private def warnShowcaseWithoutWebhooks(enabled: Boolean, webhooksOn: Boolean): IO[Unit] =
+    cats.effect.std
+      .Console[IO]
+      .errorln(
+        "[play][showcase] SHOWCASE_ENABLED is true but WEBHOOK_TIMEOUT_SECONDS is unset — the featured bot cannot be " +
+          "driven, so the table will stay unavailable. Set WEBHOOK_TIMEOUT_SECONDS or disable the showcase."
+      )
+      .whenA(enabled && !webhooksOn)
 
   /** ADR-004's feature flag must never produce a half-mounted cookie mutation surface. In particular, the historical
     * empty CORS setting means public credential-less reads; it is not an origin policy suitable for session writes.

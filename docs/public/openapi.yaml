@@ -49,6 +49,12 @@ tags:
       Public design summary: https://github.com/fortemate/dicechess-play-api/issues/10.
   - name: Admin
     description: Break-glass operator controls and complete inventory. Gated by user session in PLAY_ADMINS.
+  - name: Showcase
+    description: >
+      The homepage's singleton showcase table (ADR-005): one public read and one atomic first-claim
+      against the configured featured bot at casual 5+3. Mounted only when SHOWCASE_ENABLED=true;
+      while it is off both paths answer a plain 404. The public read never carries a credential;
+      the claim's winning response is the only place a seat token ever appears, and it is no-store.
 paths:
   /bot/anon:
     post:
@@ -669,6 +675,120 @@ paths:
         '404': { description: No such name in the catalog. }
         '409': { description: The guest already has an unfinished catalog game, or the bot is at its concurrent-game limit. }
         '429': { description: Rate limit exceeded. }
+  /showcase:
+    get:
+      tags: [Showcase]
+      summary: The showcase table (public)
+      description: >
+        The singleton table's public state: unavailable, open, live or finishing. When open it names
+        the featured bot, the fixed 5+3 clock and the colour the next human will play; when live or
+        finishing it names the one current game for spectating. Uncacheable (no-store, no-cache,
+        must-revalidate) with a weak ETag so a poller holding the same state gets 304. Never contains a
+        seat token, a webhook detail, a private identity, or infrastructure state; the unavailable
+        reason is one of a few coarse words.
+      security: []
+      responses:
+        '200':
+          description: The table.
+          headers:
+            ETag:
+              description: Weak tag over the rendered state; send it back in If-None-Match.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShowcaseView' }
+        '304': { description: The state has not changed since the If-None-Match tag. }
+        '404': { description: The showcase is not enabled on this server. }
+  /showcase/claim:
+    post:
+      tags: [Showcase]
+      summary: Claim the open table (public)
+      description: >
+        The atomic first claim. The caller is the session account (cookie; then X-DiceChess-CSRF: 1
+        and an Origin on the server's PLAY_CORS_ORIGINS allow-list are both required — a server
+        without an allow-list refuses the session path, so claim as a guest there) or a stable guest
+        id in the body. The body is capped at 4096 bytes. Idempotency-Key (a UUID) is mandatory: exactly one concurrent claimant wins and
+        receives the human seat's token; every other caller, concurrent or later, receives the
+        spectator outcome and no credential. A same-key retry replays the committed outcome for 24
+        hours — the winner is handed the same token while its game is on, and nobody is handed one
+        after the game — without creating another room or moving the colour; the same key with a
+        different body is refused. The human colour alternates White/Black across committed games.
+        Rate-limited per IP and per actor. Errors are RFC 7807 problem details.
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - name: X-DiceChess-CSRF
+          in: header
+          required: false
+          schema: { type: string, enum: ['1'] }
+          description: Required whenever the request carries the access_token session cookie.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShowcaseClaimRequest' }
+      responses:
+        '200':
+          description: >
+            Either the winning claim (outcome claimed, with the seat token — sent Cache-Control:
+            no-store, private) or the spectator outcome (outcome spectating, no credential).
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: '#/components/schemas/ShowcaseClaimed' }
+                  - { $ref: '#/components/schemas/ShowcaseSpectating' }
+                discriminator:
+                  propertyName: outcome
+                  mapping:
+                    claimed: '#/components/schemas/ShowcaseClaimed'
+                    spectating: '#/components/schemas/ShowcaseSpectating'
+        '400':
+          description: >
+            missing_idempotency_key, invalid_idempotency_key, guest_required, invalid_guest_id, or
+            malformed_request.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
+        '403':
+          description: >
+            csrf_origin_rejected — a session claim without the CSRF header, without an Origin on the
+            allow-list, or on a server that has no allow-list configured.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
+        '404': { description: The showcase is not enabled on this server. }
+        '409':
+          description: idempotency_conflict — the Idempotency-Key was already used for a different request.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
+        '413':
+          description: request_too_large — the body exceeds 4096 bytes.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
+        '415':
+          description: malformed_request — a body was sent with a Content-Type other than application/json.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
+        '429':
+          description: rate_limited — per-IP or per-actor claim budget spent; check Retry-After.
+          headers:
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
+        '503':
+          description: showcase_unavailable — the table is unavailable (no persistence, bot not ready, or fail-closed state).
+          headers:
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ShowcaseProblem' }
   /bot/webhook:
     post:
       tags: [Webhooks]
@@ -1237,6 +1357,14 @@ components:
         type: string
         pattern: '^whs_[A-Za-z0-9_-]+$'
       description: Opaque setup id returned by the create response or redacted slot.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+      description: >
+        Mandatory on POST /showcase/claim. Generate one UUID per claim attempt and reuse it for
+        every retry of that attempt; retries replay the committed outcome for 24 hours.
     ManagedWebhookOrigin:
       name: Origin
       in: header
@@ -1451,6 +1579,132 @@ components:
             Optional, defaults to false. Any registered bot can be played rated — there is no curated roster.
             A guest player (no account session) always plays casual regardless of this field.
       required: [team, name, timeControl]
+    ShowcaseBot:
+      type: object
+      description: The configured featured bot. displayName is the same face every board renders for a bot.
+      properties:
+        team: { type: string }
+        name: { type: string }
+        displayName: { type: string }
+      required: [team, name, displayName]
+    ShowcaseTimeControl:
+      type: object
+      description: The table's fixed clock, spelled out for display.
+      properties:
+        initialSeconds: { type: integer, example: 300 }
+        incrementSeconds: { type: integer, example: 3 }
+        display: { type: string, example: '5+3' }
+      required: [initialSeconds, incrementSeconds, display]
+    ShowcaseGame:
+      type: object
+      description: The current game, for spectating — the /games listing's public fields plus which seat the human holds.
+      properties:
+        gameId: { type: string }
+        players:
+          anyOf: [{ $ref: '#/components/schemas/Players' }, { type: 'null' }]
+        humanSeat: { $ref: '#/components/schemas/Seat' }
+        activeSeat: { $ref: '#/components/schemas/Seat' }
+        dicePending: { type: boolean }
+        clocks:
+          anyOf: [{ $ref: '#/components/schemas/Clocks' }, { type: 'null' }]
+        version: { type: integer }
+        dfen: { type: string }
+        status: { type: object, description: 'Single-key status, e.g. {"Active":{}} or {"Ended":{...}}.' }
+      required: [gameId, humanSeat, activeSeat, dicePending, version, dfen, status]
+    ShowcaseSpectator:
+      type: object
+      properties:
+        wsUrl:
+          type: string
+          description: Relative reference against the API origin — /games/{id}/ws — for a spectator socket.
+      required: [wsUrl]
+    ShowcaseView:
+      type: object
+      description: GET /showcase.
+      properties:
+        status:
+          type: string
+          enum: [unavailable, open, live, finishing]
+        featuredBot:
+          anyOf: [{ $ref: '#/components/schemas/ShowcaseBot' }, { type: 'null' }]
+          description: The configured bot; null only when the showcase is disabled.
+        timeControl: { $ref: '#/components/schemas/ShowcaseTimeControl' }
+        nextHumanColor:
+          anyOf: [{ $ref: '#/components/schemas/Side' }, { type: 'null' }]
+          description: The colour the next human plays — present when open, and while a game is on as the colour offered next.
+        currentGame:
+          anyOf: [{ $ref: '#/components/schemas/ShowcaseGame' }, { type: 'null' }]
+          description: The one current game when live or finishing; null otherwise.
+        spectator:
+          anyOf: [{ $ref: '#/components/schemas/ShowcaseSpectator' }, { type: 'null' }]
+        reason:
+          type: [string, 'null']
+          enum: [disabled, maintenance, bot_unavailable, null]
+          description: Present only when unavailable. Coarse on purpose.
+      required: [status, timeControl]
+    ShowcaseClaimRequest:
+      type: object
+      description: >
+        The claim body. A signed-in caller may send an empty object or no body at all; without a
+        session, guestId is required.
+      properties:
+        guestId:
+          type: string
+          format: uuid
+          description: The browser's stable guest id — the anonymous fallback identity, ignored when a session cookie is present.
+        clientEntropy:
+          type: string
+          minLength: 16
+          maxLength: 128
+          description: Optional dice seed for the human seat, folded in exactly as a SubmitSeed over the socket would be.
+    ShowcaseClaimed:
+      type: object
+      description: The winning claim — the only response on this surface that carries a credential.
+      properties:
+        outcome: { type: string, enum: [claimed] }
+        gameId: { type: string }
+        seat: { $ref: '#/components/schemas/Seat' }
+        seatToken: { type: string, description: The human seat's capability token. Treat as a secret. }
+        wsUrl:
+          type: string
+          description: Relative reference against the API origin — /games/{id}/ws?token=… — opening the human seat.
+      required: [outcome, gameId, seat, seatToken, wsUrl]
+    ShowcaseSpectating:
+      type: object
+      description: Every non-winning answer. Never carries a credential.
+      properties:
+        outcome: { type: string, enum: [spectating] }
+        reason:
+          type: string
+          enum: [already_claimed, game_ended]
+          description: already_claimed while the named game is on; game_ended when a retry names a finished game.
+        gameId: { type: [string, 'null'] }
+        spectatorWsUrl:
+          type: [string, 'null']
+          description: /games/{id}/ws while the game still has a room; null once it is gone.
+      required: [outcome, reason]
+    ShowcaseProblem:
+      type: object
+      description: RFC 7807 problem details for the showcase surface.
+      properties:
+        status: { type: integer }
+        code:
+          type: string
+          enum:
+            - missing_idempotency_key
+            - invalid_idempotency_key
+            - guest_required
+            - invalid_guest_id
+            - malformed_request
+            - request_too_large
+            - csrf_origin_rejected
+            - idempotency_conflict
+            - rate_limited
+            - showcase_unavailable
+        title: { type: string }
+        detail: { type: string }
+        instance: { type: string }
+      required: [status, code, title, detail, instance]
     PlayBotMatch:
       type: object
       properties:

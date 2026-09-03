@@ -73,6 +73,16 @@
     "DoublingState": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "cubeValue": { "const": 1 } },
+            "required": ["cubeValue"]
+          },
+          "then": { "properties": { "cubeOwner": { "type": "null" } } },
+          "else": { "properties": { "cubeOwner": { "$ref": "#/$defs/Seat" } } }
+        }
+      ],
       "properties": {
         "currency": { "const": "PLAY_CREDIT" },
         "initialStake": { "type": "integer", "minimum": 1 },
@@ -193,6 +203,21 @@
     "DecisionOutcome": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "applied": { "const": true } },
+            "required": ["applied"]
+          },
+          "then": { "properties": { "reason": { "type": "null" } } },
+          "else": {
+            "properties": {
+              "duplicate": { "const": false },
+              "reason": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ],
       "properties": {
         "applied": { "type": "boolean" },
         "version": { "type": "integer", "minimum": 0 },

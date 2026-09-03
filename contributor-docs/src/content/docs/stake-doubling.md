@@ -37,7 +37,7 @@ a separate product, security, and compliance decision and is outside this ADR.
 `stake` always means one seat's exposure, not the combined pot. At game creation both seats authorize
 and reserve their maximum possible exposure:
 
-```
+```text
 maximum exposure per seat = initialStake * maximumMultiplier
 ```
 

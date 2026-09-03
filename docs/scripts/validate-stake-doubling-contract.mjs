@@ -35,10 +35,12 @@ for (const fixture of manifest.fixtures) {
   fixtures.set(fixture.path, value);
 }
 
+/** Throw a readable contract-validation failure when an invariant does not hold. */
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+/** Validate semantic relationships that JSON Schema cannot express as arithmetic or cross-field equality. */
 function validateDecisionState(state, source) {
   const doubling = state.doubling;
   const decision = doubling.decision;
@@ -129,6 +131,8 @@ assert(
 );
 
 const validatePlayBot = ajv.getSchema(`${schema.$id}#/$defs/PlayBotRequest`);
+const validateDoublingState = ajv.getSchema(`${schema.$id}#/$defs/DoublingState`);
+const validateDecisionOutcome = ajv.getSchema(`${schema.$id}#/$defs/DecisionOutcome`);
 const validRequest = structuredClone(fixtures.get("examples/create-play-bot.json"));
 for (const [name, mutate] of [
   ["rated stake", (request) => (request.rated = true)],
@@ -139,5 +143,22 @@ for (const [name, mutate] of [
   mutate(invalidRequest);
   assert(!validatePlayBot(invalidRequest), `schema accepted forbidden ${name}`);
 }
+
+const centeredCubeWithOwner = structuredClone(fixtures.get("examples/state-opportunity.json").doubling);
+centeredCubeWithOwner.cubeOwner = "White";
+assert(!validateDoublingState(centeredCubeWithOwner), "schema accepted an owned centered cube");
+
+const doubledCubeWithoutOwner = structuredClone(fixtures.get("examples/state-opportunity.json").doubling);
+doubledCubeWithoutOwner.cubeValue = 2;
+doubledCubeWithoutOwner.currentStake = 20;
+assert(!validateDoublingState(doubledCubeWithoutOwner), "schema accepted an unowned doubled cube");
+
+const appliedWithReason = structuredClone(appliedOutcome);
+appliedWithReason.reason = "unexpected";
+assert(!validateDecisionOutcome(appliedWithReason), "schema accepted an applied outcome with an error reason");
+
+const rejectedDuplicate = structuredClone(conflictOutcome);
+rejectedDuplicate.duplicate = true;
+assert(!validateDecisionOutcome(rejectedDuplicate), "schema accepted a rejected outcome as a duplicate replay");
 
 console.log(`Validated ${fixtures.size} stake-doubling contract fixtures and semantic invariants.`);

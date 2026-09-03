@@ -133,7 +133,7 @@ object Cors:
     Set(Method.GET, Method.POST, Method.PUT, Method.PATCH, Method.DELETE, Method.OPTIONS)
 
   private val CredentialedHeaders: Set[CIString] =
-    Set(ci"content-type", ci"authorization", ci"if-match", ci"x-dicechess-csrf", ci"idempotency-key")
+    Set(ci"content-type", ci"authorization", ci"if-match", ci"if-none-match", ci"x-dicechess-csrf", ci"idempotency-key")
 
   /** Response headers the browser client must be able to read. `etag` carries the `If-Match` revision the staged
     * webhook API requires on every mutation, `retry-after` the verification budget's reset, and `location` the

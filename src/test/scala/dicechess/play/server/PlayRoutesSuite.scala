@@ -19,6 +19,7 @@ import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.implicits.*
 import org.http4s.jdkhttpclient.{JdkHttpClient, JdkWSClient}
 import org.http4s.websocket.WebSocketFrame
+import scodec.bits.ByteVector
 
 import scala.concurrent.duration.*
 
@@ -350,7 +351,7 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
         assert(frames.nonEmpty, "frames must not be empty")
         assertEquals(
           frames.last,
-          WebSocketFrame.Close(1000),
+          WebSocketFrame.Close(ByteVector.fromShort(1000.toShort)),
           "the final frame in clientFrames must be WebSocketFrame.Close(1000)"
         )
 

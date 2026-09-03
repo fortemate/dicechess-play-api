@@ -15,6 +15,7 @@ import org.http4s.dsl.io.*
 import org.http4s.server.websocket.WebSocketBuilder2
 import org.http4s.websocket.WebSocketFrame
 import org.http4s.{HttpRoutes, Request}
+import scodec.bits.ByteVector
 
 import scala.concurrent.duration.*
 
@@ -231,7 +232,7 @@ object PlayRoutes:
   private[server] def clientFrames(room: GameRoom, keepAlive: FiniteDuration): Stream[IO, WebSocketFrame] =
     val events     = room.subscribe.map(event => WebSocketFrame.Text(event.asJson.noSpaces))
     val keepAlives = Stream.awakeEvery[IO](keepAlive).as(WebSocketFrame.Ping())
-    events.mergeHaltL(keepAlives) ++ Stream.emit(WebSocketFrame.Close(1000))
+    events.mergeHaltL(keepAlives) ++ Stream.emit(WebSocketFrame.Close(ByteVector.fromShort(1000.toShort)))
 
   private def fromClient(room: GameRoom, seat: Seat): Pipe[IO, WebSocketFrame, Unit] =
     in =>

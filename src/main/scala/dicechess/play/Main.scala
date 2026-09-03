@@ -460,7 +460,7 @@ object Main extends IOApp.Simple:
                 admissionGuard,
                 pgStore.map(pg => pg: ShowcaseStore),
                 botReady = showcaseReadiness(showcaseConfig, botStore, webhookService),
-                tickInterval = tickInterval
+                timings = ShowcaseTable.Timings(tickInterval = tickInterval)
               )
               .evalTap(table =>
                 table.reconcile.flatMap(phase =>

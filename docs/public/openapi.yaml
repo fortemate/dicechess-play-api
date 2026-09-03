@@ -707,13 +707,15 @@ paths:
         The atomic first claim. The caller is the session account (cookie; then X-DiceChess-CSRF: 1
         and an Origin on the server's PLAY_CORS_ORIGINS allow-list are both required — a server
         without an allow-list refuses the session path, so claim as a guest there) or a stable guest
-        id in the body. The body is capped at 4096 bytes. Idempotency-Key (a UUID) is mandatory: exactly one concurrent claimant wins and
-        receives the human seat's token; every other caller, concurrent or later, receives the
-        spectator outcome and no credential. A same-key retry replays the committed outcome for 24
-        hours — the winner is handed the same token while its game is on, and nobody is handed one
-        after the game — without creating another room or moving the colour; the same key with a
-        different body is refused. The human colour alternates White/Black across committed games.
-        Rate-limited per IP and per actor. Errors are RFC 7807 problem details.
+        id in the body. The body is capped at 4096 bytes. Idempotency-Key (a UUID) is mandatory and is
+        scoped to the calling actor (the session account or the guest id). Exactly one concurrent claimant
+        wins and receives the human seat's token; every other caller, concurrent or later, receives the
+        spectator outcome and no credential. A same-key retry from the same actor replays its committed outcome
+        for 24 hours — the winner is handed the same token while its game is on, and nobody is handed one after
+        the game — without creating another room or moving the colour; the same actor reusing its key with a
+        different body is refused with 409 idempotency_conflict. The same key arriving from a different actor is
+        not a conflict and is evaluated fresh as that actor's own claim attempt. The human colour alternates
+        White/Black across committed games. Rate-limited per IP and per actor. Errors are RFC 7807 problem details.
       security: []
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -761,7 +763,8 @@ paths:
               schema: { $ref: '#/components/schemas/ShowcaseProblem' }
         '404': { description: The showcase is not enabled on this server. }
         '409':
-          description: idempotency_conflict — the Idempotency-Key was already used for a different request.
+          description: >
+            idempotency_conflict — the calling actor already used this Idempotency-Key for a different request body.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/ShowcaseProblem' }
@@ -1363,8 +1366,9 @@ components:
       required: true
       schema: { type: string, format: uuid }
       description: >
-        Mandatory on POST /showcase/claim. Generate one UUID per claim attempt and reuse it for
-        every retry of that attempt; retries replay the committed outcome for 24 hours.
+        Mandatory on POST /showcase/claim, scoped per calling actor (session account or guest id). Generate
+        one UUID per claim attempt and reuse it for every retry of that attempt; retries replay the committed
+        outcome for 24 hours.
     ManagedWebhookOrigin:
       name: Origin
       in: header

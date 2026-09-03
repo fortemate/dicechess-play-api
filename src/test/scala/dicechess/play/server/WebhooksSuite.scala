@@ -617,55 +617,48 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       garbage  = Client.fromHttpApp(HttpApp[IO](_ => answered.complete(()).attempt *> Ok("this is not a move")))
       noisy    = Principal.Bot("hooks", "noisy")
       opponent = Principal.Bot("acme", "driven")
-      _    <- store.put(BotWebhook("hooks", "noisy", "https://noise.example/hook", "s" * 64, Instant.EPOCH))
-      made <- registry.create(noisy, opponent, TimeControl.Unlimited)
+      _ <- store.put(BotWebhook("hooks", "noisy", "https://noise.example/hook", "s" * 64, Instant.EPOCH))
+      // This test needs exactly ONE actionable turn for the webhook seat (White), so the opening roll is scripted to
+      // pawn/knight/bishop (340 legal paths, inlined) instead of rolled at random. Random dice failed two ways: a roll
+      // with neither a pawn nor a knight is a forced pass, and (a) with an idle Black and no clock the game deadlocked
+      // there (#140, #176, once mistaken for fiber starvation), while (b) even with Black driven the runner could POST
+      // inside the pass window — `DiceRolled` is broadcast before the auto-pass commits — so `answered` fired for a
+      // roll nobody could play and the snapshot read below landed between turns with no dice pending.
+      movableDice = new DiceSource:
+        def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 2, 3)
+        def commit: String                                                       = "noise-commit"
+        def reveal: String                                                       = "noise-seed"
+      made <- registry.createWithDice(noisy, opponent, movableDice)
       (_, room) = made.toOption.get
-      // Black must be played, not idle (#176). This test needs ONE actionable turn for the webhook seat (White), but
-      // White's opening roll has no legal move whenever it contains neither a pawn nor a knight — from the start
-      // position nothing else can move — and the room then auto-passes to Black. With an idle Black and no clock
-      // (Unlimited) the game deadlocks there forever and the delivery never happens: `(4/6)^3 ≈ 30%` of runs, which
-      // is the flake #140 and this issue both mistook for fiber starvation. Driving Black keeps play moving until
-      // White does get an actionable roll. Same `BotConnection` pattern as the dead-webhook test above.
-      driver = BotConnection(opponent, Seat.Black, BotRegistry.getAlgorithm("greedy").get)
       state <- service(registry, store, garbage).use: webhooks =>
-        driver
-          .run(room)
-          .background
-          .use: _ =>
-            for
-              _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
-              _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
-              _ <- webhooks.attachSweep
-              // Bounded per house convention, and back to 30s from #140's 150s. The width was never the fix: a
-              // deadlocked game never delivers at any ceiling, which is why both recorded failures landed exactly ON
-              // the bound (30.008s here, 150.022s in CI) rather than somewhere under it. With Black driven the
-              // delivery arrives in ~2s, so 30s is ~15x headroom.
-              //
-              // If this ever fails again, read the message before touching the number: it reports whose turn the room
-              // is actually on. `activeSeat=Black` means the deadlock above is back (something stopped driving Black);
-              // `activeSeat=White` with the bound crossed would be genuine starvation, and THAT is when contention is
-              // worth investigating — not before.
-              _ <- answered.get.timeoutTo(
-                30.seconds,
-                room.snapshot.flatMap: s =>
-                  IO.raiseError(
-                    new RuntimeException(
-                      s"delivery never reached the endpoint (activeSeat=${s.activeSeat}, dicePending=${s.dicePending})"
-                    )
-                  )
+        for
+          _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+          _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+          _ <- webhooks.attachSweep
+          // Bounded per house convention. If this ever fails, read the message before touching the number: it reports
+          // whose turn the room is actually on, and `activeSeat=White` with the bound crossed would be genuine
+          // starvation — THAT is when contention is worth investigating, not before.
+          _ <- answered.get.timeoutTo(
+            30.seconds,
+            room.snapshot.flatMap: s =>
+              IO.raiseError(
+                new RuntimeException(
+                  s"delivery never reached the endpoint (activeSeat=${s.activeSeat}, dicePending=${s.dicePending})"
+                )
               )
-              state <- room.snapshot
-              // Clean up, and WAIT for it: `submit` only offers to the room's inbox (`GameRoom.submit` is
-              // `inbox.offer`, unlike `submitTurn` which awaits a verdict), so returning here without awaiting the
-              // terminal state would let both scopes close while the room is still Active — leaving its detached
-              // writer fiber and idle-deadline timer running for the rest of the JVM. In a suite whose whole problem
-              // is background work competing for CPU, leaking one live room per run is the last thing we want.
-              _ <- room.submit(Seat.White, GameCommand.Resign)
-              _ <- room.result.timeoutTo(
-                10.seconds,
-                IO.raiseError(new RuntimeException("the room never reached a terminal state after Resign"))
-              )
-            yield state
+          )
+          state <- room.snapshot
+          // Clean up, and WAIT for it: `submit` only offers to the room's inbox (`GameRoom.submit` is `inbox.offer`,
+          // unlike `submitTurn` which awaits a verdict), so returning here without awaiting the terminal state would
+          // let the scope close while the room is still Active — leaving its detached writer fiber and idle-deadline
+          // timer running for the rest of the JVM. In a suite whose whole problem is background work competing for
+          // CPU, leaking one live room per run is the last thing we want.
+          _ <- room.submit(Seat.White, GameCommand.Resign)
+          _ <- room.result.timeoutTo(
+            10.seconds,
+            IO.raiseError(new RuntimeException("the room never reached a terminal state after Resign"))
+          )
+        yield state
     yield
       assertEquals(state.status, GameStatus.Active)
       assert(state.dicePending, "an unparseable answer must leave the pending roll unanswered")

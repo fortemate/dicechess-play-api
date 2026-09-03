@@ -69,7 +69,17 @@ in their queues undelivered. Boot warns on stderr, and nothing else complains.
 | `PLAY_OPEN_TO_HUMANS` | Deprecated since #310; ignored if set. Catalog availability is managed via `/admin/bots/{team}/{name}/open-to-humans`. Boot logs a warning if present. |
 | `PLAY_ADMINS` | Comma-separated **account uuids** granted the admin bot surface (#273): `/admin/bots/{team}/{name}/…` drives any registered bot without its token — ladder, catalog, description, capacity, token rotation — every write audited in `admin_actions`. Uuids, not nicknames: nicknames rename and release. Needs `PLAY_SESSION_SECRET` **and** persistence; boot warns loudly when set without them. Malformed entries are skipped and reported by **position only** — never by value, since one of them may be a secret pasted into the wrong variable. When staged webhook management is enabled, the parsed, sorted allow-list is also hashed into the instance's admin-authority generation; the raw ids are not copied to the generation table. |
 | `PLAY_CORS_ORIGINS` | Exact comma-separated browser origins, each one lower-case `scheme://host[:port]` with no path, no wildcard, and no explicitly written default port. Unset or blank allows any origin only in credential-less CORS mode. A non-empty list enables credentialed CORS and is mandatory for staged webhook session mutations, whose server-side guard also requires an exact `Origin` match and `X-DiceChess-CSRF: 1`. Unusable entries are reported on stderr and ignored; a non-empty value with **no** usable entry **fails startup** rather than silently degrading to allow-all — see the warning below. |
+| `WEBHOOK_ALLOW_LOOPBACK` | **Test-only.** Case-insensitive `true` or `1` widens the outbound webhook URL policy to reach a fixture bot on the same host: loopback addresses are accepted, and plaintext `http` is accepted *only when every resolved address is loopback*. Nothing else moves — RFC1918, link-local, CGNAT and the rest of the non-public registry stay rejected, and plaintext to a routable host is still refused. Unset is fail-closed and is the only correct production value; when it is set, boot prints one `[play][webhook] ALERT:` line. |
+| `PORT` | Optional, default `8080`. The port the server binds. Exists so several instances can run side by side under a local acceptance harness; an unparseable value falls back to `8080`. |
 | `APP_VERSION` | Surfaced at `GET /version`. Set by the CD workflow from the git tag. |
+
+:::danger[`WEBHOOK_ALLOW_LOOPBACK` is an SSRF control, not a convenience]
+Outbound webhook delivery resolves the owner-supplied URL at send time and refuses every non-public answer —
+that check is what keeps a bot owner from pointing play-api at `169.254.169.254` or at a neighbour on the
+deployment's private network. `WEBHOOK_ALLOW_LOOPBACK` exists so a local acceptance harness can run a fixture
+bot on `127.0.0.1`, and it belongs in a test runner's environment and nowhere else. Set it in a deployment and
+any registered bot can aim a signed, authenticated turn at a service listening on that host's loopback.
+:::
 
 ## Player accounts (Google sign-in)
 
@@ -138,6 +148,8 @@ The singleton showcase table on the homepage (`/`) is controlled by the followin
 | `SHOWCASE_BOT_TEAM` | Team identifier of the featured bot (e.g. `rpi3`). Required when showcase is enabled. |
 | `SHOWCASE_BOT_NAME` | Name of the featured bot (e.g. `hunter-book`). Required when showcase is enabled. |
 | `SHOWCASE_RESERVED_SEATS` | Dedicated capacity reserved exclusively for the showcase table. When `SHOWCASE_ENABLED=true`, this value must be set to exactly `1`. Values `0` or `> 1` are rejected during configuration validation at boot time. |
+| `SHOWCASE_TICK_SECONDS` | **Test-only**, default `15`. The coordinator's reconcile cadence while the table is not live. Only a positive integer is honoured; anything else — including `0`, which would turn the loop into a busy spin — falls back to the default. |
+| `SHOWCASE_PROBE_TIMEOUT_SECONDS` | **Test-only**, default `5`. The deadline on the featured bot's readiness echo. Only a positive integer is honoured; a non-positive value would fail every probe instantly and pin the table at `bot_unavailable`, so it falls back to the default. |
 
 A signed-in visitor can claim only when `PLAY_CORS_ORIGINS` is a real allow-list: the session path
 requires an `Origin` that matches it, and with no allow-list the claim answers `403 csrf_origin_rejected`
@@ -150,7 +162,8 @@ disabled, both paths answer a plain 404.
 The table can only ever be `open` while the featured bot passes its readiness probe: it must be a **registered**
 bot (so the reserved admission class applies), `WEBHOOK_TIMEOUT_SECONDS` must be set (delivery is what drives the
 bot), and its registered webhook must answer the unsigned verification echo within 5 seconds. The probe reruns
-every 15 seconds while the table is not live. `SHOWCASE_ENABLED=true` without `WEBHOOK_TIMEOUT_SECONDS` logs a
+every 15 seconds while the table is not live — both are defaults an acceptance harness may shorten, and
+neither is meant to be tuned in a deployment. `SHOWCASE_ENABLED=true` without `WEBHOOK_TIMEOUT_SECONDS` logs a
 `[play][showcase]` warning at boot and the table stays `unavailable` (`reason: "bot_unavailable"`).
 
 :::danger[Showcase requires PostgreSQL persistence]

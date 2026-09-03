@@ -113,6 +113,19 @@ object BradleyTerry:
       */
     def fit(selection: Array[Int]): Map[String, Double] =
       val total   = players.length
+      val present = markPresentPlayers(selection, total)
+      val localOf = new Array[Int](total)
+      val n       = assignLocalIndices(present, localOf, total)
+
+      if n < 2 then (0 until total).filter(present(_)).map(i => players(i) -> 0.0).toMap
+      else
+        val points    = buildPointsMatrix(selection, localOf, n)
+        val strengths = BradleyTerry.mm(points, n)
+        val elos      = strengths.map(strength => 400.0 * math.log10(strength))
+        val mean      = elos.sum / n
+        buildRankedMap(present, localOf, elos, mean, total)
+
+    private def markPresentPlayers(selection: Array[Int], total: Int): Array[Boolean] =
       val present = new Array[Boolean](total)
       var s       = 0
       while s < selection.length do
@@ -123,53 +136,56 @@ object BradleyTerry:
           present(playerB(t)) = true
           t += 1
         s += 1
+      present
 
-      // Local (fit-sized) index per present player, assigned in ascending global order so the fit sees exactly the
-      // sorted subset the name-based implementation used to build.
-      val localOf = new Array[Int](total)
-      var n       = 0
-      var p       = 0
+    private def assignLocalIndices(present: Array[Boolean], localOf: Array[Int], total: Int): Int =
+      var n = 0
+      var p = 0
       while p < total do
         if present(p) then
           localOf(p) = n
           n += 1
         else localOf(p) = -1
         p += 1
+      n
 
-      if n < 2 then (0 until total).filter(present(_)).map(i => players(i) -> 0.0).toMap
-      else
-        // points(i)(j) = points i scored against j; the virtual draw spreads Smoothing/2 each way per pair.
-        val points = Array.ofDim[Double](n, n)
-        var i      = 0
-        while i < n do
-          var j = 0
-          while j < n do
-            if i != j then points(i)(j) = Smoothing / 2.0
-            j += 1
-          i += 1
+    private def buildPointsMatrix(selection: Array[Int], localOf: Array[Int], n: Int): Array[Array[Double]] =
+      val points = Array.ofDim[Double](n, n)
+      var i      = 0
+      while i < n do
+        var j = 0
+        while j < n do
+          if i != j then points(i)(j) = Smoothing / 2.0
+          j += 1
+        i += 1
 
-        s = 0
-        while s < selection.length do
-          var t        = groupStart(selection(s))
-          val groupEnd = groupStart(selection(s) + 1)
-          while t < groupEnd do
-            val a     = localOf(playerA(t))
-            val b     = localOf(playerB(t))
-            val score = scoreA(t)
-            points(a)(b) += score
-            points(b)(a) += 1.0 - score
-            t += 1
-          s += 1
+      var s = 0
+      while s < selection.length do
+        var t        = groupStart(selection(s))
+        val groupEnd = groupStart(selection(s) + 1)
+        while t < groupEnd do
+          val a     = localOf(playerA(t))
+          val b     = localOf(playerB(t))
+          val score = scoreA(t)
+          points(a)(b) += score
+          points(b)(a) += 1.0 - score
+          t += 1
+        s += 1
+      points
 
-        val strengths = BradleyTerry.mm(points, n)
-        val elos      = strengths.map(strength => 400.0 * math.log10(strength))
-        val mean      = elos.sum / n
-        val ranked    = Map.newBuilder[String, Double]
-        p = 0
-        while p < total do
-          if present(p) then ranked += players(p) -> (elos(localOf(p)) - mean)
-          p += 1
-        ranked.result()
+    private def buildRankedMap(
+        present: Array[Boolean],
+        localOf: Array[Int],
+        elos: Array[Double],
+        mean: Double,
+        total: Int
+    ): Map[String, Double] =
+      val ranked = Map.newBuilder[String, Double]
+      var p      = 0
+      while p < total do
+        if present(p) then ranked += players(p) -> (elos(localOf(p)) - mean)
+        p += 1
+      ranked.result()
 
   private object Corpus:
 
@@ -210,35 +226,50 @@ object BradleyTerry:
     var iteration = 0
     var moved     = Double.MaxValue
     while iteration < MaxIterations && moved > Tolerance do
-      val next = new Array[Double](n)
-      var i    = 0
-      while i < n do
-        var denominator = 0.0
-        var j           = 0
-        while j < n do
-          if j != i then denominator += gamesBetween(i)(j) / (strengths(i) + strengths(j))
-          j += 1
-        next(i) = if denominator == 0.0 then strengths(i) else totalPoints(i) / denominator
-        i += 1
-
-      // Renormalise to geometric mean 1 so the iteration can't drift off to infinity as a family.
-      var logSum = 0.0
-      i = 0
-      while i < n do
-        logSum += math.log(next(i))
-        i += 1
-      val scale = math.exp(logSum / n)
-
-      moved = 0.0
-      i = 0
-      while i < n do
-        val scaled = next(i) / scale
-        val delta  = math.abs(scaled - strengths(i))
-        if delta > moved then moved = delta
-        next(i) = scaled
-        i += 1
-
-      strengths = next
+      val unscaled = computeNextStrengths(gamesBetween, totalPoints, strengths, n)
+      moved = normalizeAndMeasureDelta(unscaled, strengths, n)
+      strengths = unscaled
       iteration += 1
 
     strengths
+
+  private def computeNextStrengths(
+      gamesBetween: Array[Array[Double]],
+      totalPoints: Array[Double],
+      strengths: Array[Double],
+      n: Int
+  ): Array[Double] =
+    val next = new Array[Double](n)
+    var i    = 0
+    while i < n do
+      var denominator = 0.0
+      var j           = 0
+      while j < n do
+        if j != i then denominator += gamesBetween(i)(j) / (strengths(i) + strengths(j))
+        j += 1
+      next(i) = if denominator == 0.0 then strengths(i) else totalPoints(i) / denominator
+      i += 1
+    next
+
+  private def normalizeAndMeasureDelta(
+      next: Array[Double],
+      strengths: Array[Double],
+      n: Int
+  ): Double =
+    // Renormalise to geometric mean 1 so the iteration can't drift off to infinity as a family.
+    var logSum = 0.0
+    var i      = 0
+    while i < n do
+      logSum += math.log(next(i))
+      i += 1
+    val scale = math.exp(logSum / n)
+
+    var maxMoved = 0.0
+    i = 0
+    while i < n do
+      val scaled = next(i) / scale
+      val delta  = math.abs(scaled - strengths(i))
+      if delta > maxMoved then maxMoved = delta
+      next(i) = scaled
+      i += 1
+    maxMoved

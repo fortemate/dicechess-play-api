@@ -89,6 +89,27 @@ class BradleyTerrySuite extends munit.FunSuite:
       row.losVsNext.zip(los).foreach((got, want) => assertEqualsDouble(got, want, 1e-9, s"$player losVsNext"))
     }
 
+  test("lopsided multi-player corpus with undefeated/winless players and unplayed pairs - regression test"):
+    val lopsidedGames: Seq[BradleyTerry.Game] = Seq(
+      ("alpha", "beta", 1.0),
+      ("alpha", "beta", 1.0),
+      ("beta", "gamma", 1.0),
+      ("beta", "gamma", 0.5),
+      ("gamma", "delta", 1.0),
+      ("gamma", "delta", 1.0)
+    )
+    val expected = Map(
+      "alpha" -> 206.36668287373766,
+      "beta"  -> 3.180168593266478,
+      "gamma" -> -3.1801685864093105,
+      "delta" -> -206.36668288059482
+    )
+    val elos = BradleyTerry.ratings(lopsidedGames)
+    assertEquals(elos.keySet, expected.keySet)
+    expected.foreach { (player, wantElo) =>
+      assertEqualsDouble(elos(player), wantElo, 1e-9, s"$player elo drift")
+    }
+
   test("empty and single-player inputs degrade gracefully"):
     assertEquals(BradleyTerry.ratings(Nil), Map.empty[String, Double])
     assertEquals(BradleyTerry.rankedWithBootstrap(Nil, iterations = 10, seed = 1L), Nil)

@@ -96,7 +96,7 @@ final class Webhooks private (
             // Only failures from the remote verification attempt carry the historical "verification failed" prefix.
             case PostOutcome.PolicyRejected(reason) => IO.pure(Left(reason))
             case PostOutcome.OversizedBody          =>
-              IO.pure(Left("verification failed: endpoint answered with an oversized body"))
+              IO.pure(Left(s"verification failed: $OversizedBodyMessage"))
             case PostOutcome.HttpStatus(code) =>
               IO.pure(Left(s"verification failed: endpoint answered HTTP $code"))
             case PostOutcome.TimedOut | PostOutcome.Unreachable =>
@@ -339,7 +339,7 @@ final class Webhooks private (
             decision(accept = false)
       case PostOutcome.OversizedBody =>
         declineThen(
-          "endpoint answered with an oversized body",
+          OversizedBodyMessage,
           DeliveryOutcome.OversizedBody
         )
       case PostOutcome.HttpStatus(code) =>
@@ -397,7 +397,7 @@ final class Webhooks private (
           case Right(botMove) =>
             submit(botMove)
       case PostOutcome.OversizedBody =>
-        ifCurrent(failed("endpoint answered with an oversized body", DeliveryOutcome.OversizedBody))
+        ifCurrent(failed(OversizedBodyMessage, DeliveryOutcome.OversizedBody))
       case PostOutcome.HttpStatus(code) =>
         ifCurrent(failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code)))
       case PostOutcome.TimedOut    => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut))
@@ -520,6 +520,7 @@ object Webhooks:
 
   /** Stable caller-visible text shared by timeout and transport failures to avoid exposing a connectivity oracle. */
   private val CouldNotReachEndpointMessage = "could not reach the endpoint"
+  private val OversizedBodyMessage         = "endpoint answered with an oversized body"
 
   /** Response-read cap: a `{"moves":[...]}` answer is bytes, not megabytes — the cap bounds what a hostile endpoint can
     * make the server buffer. A truncated body simply fails JSON decoding and is treated as garbage.
@@ -545,7 +546,7 @@ object Webhooks:
         */
       def legacy: Either[String, String] = outcome match
         case Ok(body)               => Right(body)
-        case OversizedBody          => Left("endpoint answered with an oversized body")
+        case OversizedBody          => Left(OversizedBodyMessage)
         case HttpStatus(code)       => Left(s"endpoint answered HTTP $code")
         case TimedOut               => Left(CouldNotReachEndpointMessage)
         case Unreachable            => Left(CouldNotReachEndpointMessage)

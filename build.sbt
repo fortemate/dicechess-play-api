@@ -43,17 +43,17 @@ ThisBuild / credentials ++= (for {
   user = sys.env.get("GITHUB_ACTOR").filter(_.nonEmpty).getOrElse("git")
 } yield Credentials("GitHub Package Registry", "maven.pkg.github.com", user, token)).toSeq
 
-val DiceChessEngineVersion    = "0.7.2"
+val DiceChessEngineVersion    = "0.8.0"
 val CatsEffectVersion         = "3.7.1"
 val Fs2Version                = "3.13.0"
 val Http4sVersion             = "0.23.30"
 val CirceVersion              = "0.14.10"
 val LogbackVersion            = "1.6.3"
 val Http4sJdkClientVersion    = "0.10.0"
-val MunitVersion              = "1.3.5"
+val MunitVersion              = "1.3.6"
 val MunitCatsEffectVersion    = "2.2.0"
 val DoobieVersion             = "1.0.0-RC9"
-val FlywayVersion             = "13.4.0"
+val FlywayVersion             = "13.5.0"
 val JavaJwtVersion            = "4.6.0"
 val JwksRsaVersion            = "0.24.1"
 val PostgresDriverVersion     = "42.7.13"

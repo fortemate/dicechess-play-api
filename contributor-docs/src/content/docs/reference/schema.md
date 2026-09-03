@@ -56,17 +56,7 @@ erDiagram
     users ||--o{ user_ratings : ""
 ```
 
-Only foreign keys appear as edges. Seven tables carry no foreign key on purpose —
-`game_results` and `game_archive` must outlive the snapshots they describe,
-`client_reports` holds browser-submitted reports for games that never had a
-`games` row on this server (kept separate from authoritative game data by design),
-`users` is the root of the account graph the other two user tables reference,
-`nickname_history`/`released_nicknames` must outlive the account a rename
-describes just as readily as the one it never touched — a foreign key to `users`
-would cascade away the audit trail and the hold on exactly the accounts whose
-history or vacated name matters most, an account that renamed and then vanished —
-and `admin_actions` is an audit of the same kind: it must keep naming an
-admin who has since deleted their account, on a bot whose row may be long gone.
+Only foreign keys appear as edges. Thirteen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `nickname_history` and `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
 
 ## Tables
 

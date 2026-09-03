@@ -4,14 +4,14 @@ import starlight from '@astrojs/starlight';
 import mermaid from 'astro-mermaid';
 
 // Contributor documentation: the GitHub Pages project site, on the ADR-0012 host/base pattern
-// (jc.id.lv/<repo>) that the engine and analytics docs also use. The *product* docs for
-// third-party bot developers moved to their own domain, https://bots.jc.id.lv (#203) — this
+// (fortemate.github.io/<repo>) that the engine and analytics docs also use. The *product* docs for
+// third-party bot developers moved to their own domain, https://bots.fortemate.com (#203) — this
 // slot used to serve them, hence the redirects below.
 //
 // Everything here is public: GitHub Pages has no private mode. Nothing may be documented that
 // is not already derivable from this public repository — no host topology, no env values.
 export default defineConfig({
-	site: 'https://fortemate.com',
+	site: 'https://fortemate.github.io',
 	base: '/dicechess-play-api',
 	// The bot-docs slugs this site inherited. Astro emits a meta-refresh page for each in a
 	// static build, so search results and stale bookmarks land on the moved page rather than on

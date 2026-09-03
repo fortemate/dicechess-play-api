@@ -800,7 +800,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
     def humanPlaysLoop(room: GameRoom): IO[Unit] =
       (room.snapshot, room.legalMoves).flatMapN { (snap, moves) =>
         if snap.status != GameStatus.Active then IO.unit
-        else if snap.activeSeat == Seat.White && moves.dicePending && moves.legalMoves.children.nonEmpty then
+        else if snap.activeSeat == Seat.White && moves.legalMoves.children.nonEmpty then
           val path = firstPath(moves.legalMoves)
           room.submitTurn(Seat.White, path, offerDraw = true) *>
             IO.sleep(50.millis) *>

@@ -113,7 +113,7 @@ seek creation, and the anti-farming guarantee moved into the rating batch itself
 (`RatingBatch.applyGame`: a guest seat is never rated; an account vs a bot it **owns** never
 counts). `Main.warnDeprecatedRatedForHumans` tells an operator who still has the old variable set.
 
-`max_concurrent_games` (V12) is the bot's own declaration of how many games it will hold at once
+`max_concurrent_games` is the bot's own declaration of how many games it will hold at once
 — the counterpart of the per-turn window the server publishes. Its default of **1** is the whole
 point rather than an incidental choice: absence has to select the conservative policy, because
 the authors who most need the limit are the ones who never read about it, and because the
@@ -140,7 +140,7 @@ succeeded (`verified_at`). Note the asymmetry with `bots`: the per-bot HMAC `sec
 in plaintext because the server must read it back to sign requests, whereas the bearer token is
 only ever compared as a hash. Deleting the bot cascades to its webhook.
 
-`last_failure_at`/`last_failure_reason` (V13, #225) are the one delivery a histogram alone can't
+`last_failure_at`/`last_failure_reason` (#225) are the one delivery a histogram alone can't
 answer: not "how often does my bot fail", but "is it still failing, and since when". Both
 nullable — a bot with a clean history, or no deliveries yet, has neither. Written only by a
 genuine fault (`DeliveryOutcome.isFailure`); a usable move or a clean decline never overwrites
@@ -252,24 +252,24 @@ has `result = NULL` and `termination = 'aborted'`, which `GameResultRow.sporting
 into the one boolean a reader needs. The V5 backfill took `origin` from the still-existing
 snapshot where there was one and from the `ladder` flag otherwise.
 
-The four `*_rating_before` / `*_rating_after` columns (V17, #296) record what the game did to
+The four `*_rating_before` / `*_rating_after` columns (#296) record what the game did to
 each seat, written by the rating batch in the same transaction as the `rating_applied_at` stamp
 and the Glicko write — `before` is only knowable there, since the instant that transaction
 commits the participant's own row carries `after`. They are what `GET /games/{id}/rating` serves.
-Nullable and deliberately never backfilled: for games applied before V17 the pre-game states are
+Nullable and deliberately never backfilled: for games applied before rating tracking landed the pre-game states are
 gone, and NULLs are also the honest record for a game the batch skipped (a guest seat, an
 unregistered bot, self-play, a deleted account), which is stamped applied with no rating write at
 all. Together with the stamp they make a `game_results` row write-**twice** rather than
 write-once: one bookkeeping UPDATE, by a single writer, never revisited.
 
-`category` (V22, #335) is a **STORED generated column**, `rating_category(time_control)` computed
+`category` (#335) is a **STORED generated column**, `rating_category(time_control)` computed
 once at insert — the schema reference above cannot show that, so it reads as an ordinary nullable
 `text`. It exists because the readers used to call that function inside their `WHERE` clauses, and
 the function is not inlinable: its body ends in a sub-SELECT, and PostgreSQL only inlines a SQL
 function whose body is a single expression. So it ran once per scanned row. The leaderboard reads
 this table twice (one UNION half per seat), which on the production corpus meant ~338k calls and
 turned a 123 ms aggregate into 28 s — past the 5 s query timeout, and `GET /leaderboard` answered
-500 until V22 landed.
+500 until the generated category column landed.
 
 Two fixes that look plausible and are not: rewriting the function to be inlinable still costs
 17 s, because the regexes themselves are the expense; and an index on the expression buys nothing,
@@ -342,8 +342,7 @@ public response reads them, and per-category rating is the only rating system. T
 `glicko_*` columns on `bots` and `users` and the batch's dual-write were dropped in migration `V2` (#9).
 
 The tables are **sparse**: a row exists only for a `(participant, category)` pair that has
-actually been rated, and an absent row *is* the fresh state 1500 / 350 / 0.06 — the same seeds
-V4 and V15 gave the columns they will replace. "Provisional in a category I have never played"
+actually been rated, and an absent row *is* the fresh state 1500 / 350 / 0.06. "Provisional in a category I have never played"
 is therefore expressed by the absence itself rather than by a copied number nobody measured, and
 the leaderboard needs no special case: an unplayed category sits at RD 350, above
 `Glicko2.ProvisionalDeviationThreshold`, so the existing visibility rule already hides it.
@@ -364,9 +363,7 @@ control, 5+3), and no other. A participant whose history spans several categorie
 single answer, since its stored number is a blend, so the modal category wins; one with no
 categorised rated history gets no row at all. The alternative on the table — copy the number into
 all three with RD reset — was passed over: it would publish a Bullet and a Rapid rating derived
-entirely from Blitz evidence. Because the backfill can only ever run against history the suite's
-own database does not have, `PgGameStoreSuite` stages the real migration chain into a scratch
-schema, plants a history at V20, and applies V21 to it.
+entirely from Blitz evidence. For tests that exercise incremental migration behaviors against historical states, `PgGameStoreSuite` stages migrations into a scratch schema and asserts their effects.
 
 ### `admin_actions` — durable bot-control audit (#273, ADR-004)
 
@@ -401,11 +398,9 @@ continues to identify the actor.
 an oversight: both must outlive the snapshot. Retention prunes ended snapshots, and a foreign
 key would either block that or cascade away the very history these tables exist to keep.
 
-**V10 drops nothing, despite its name.** The migration is called `drop_crn_pairing`, but
-`pairing_id` and its partial index remain — historical CRN-paired rows must stay interpretable
-by the strength report. What V10 actually does is *add* the `ladder` boolean that now marks
-ladder-origin games, taking over the role `pairing_id` used to imply. New rows leave
-`pairing_id` null. Across V1–V11, no column is ever dropped.
+**Historical `pairing_id` remains in `game_results`.** Historical CRN-paired rows stay interpretable
+by the strength report, while the `ladder` boolean marks ladder-origin games and new rows leave
+`pairing_id` null. Migration `V2` dropped six single-scale `glicko_*` columns on `bots` and `users` (#9) after per-category ratings landed.
 
 ## Changing the schema
 

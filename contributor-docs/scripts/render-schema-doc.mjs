@@ -152,7 +152,7 @@ Only foreign keys appear as edges. Seven tables carry no foreign key on purpose 
 describes just as readily as the one it never touched — a foreign key to \`users\`
 would cascade away the audit trail and the hold on exactly the accounts whose
 history or vacated name matters most, an account that renamed and then vanished —
-and \`admin_actions\` (V19) is an audit of the same kind: it must keep naming an
+and \`admin_actions\` is an audit of the same kind: it must keep naming an
 admin who has since deleted their account, on a bot whose row may be long gone.
 
 ## Tables

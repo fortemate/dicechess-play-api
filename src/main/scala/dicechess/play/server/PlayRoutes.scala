@@ -15,6 +15,7 @@ import org.http4s.dsl.io.*
 import org.http4s.server.websocket.WebSocketBuilder2
 import org.http4s.websocket.WebSocketFrame
 import org.http4s.{HttpRoutes, Request}
+import scodec.bits.ByteVector
 
 import scala.concurrent.duration.*
 
@@ -185,11 +186,6 @@ object PlayRoutes:
                       }
                   }
 
-  /** Frames pushed to a client: the room's event feed merged with periodic WebSocket pings. The browser auto-replies
-    * with a pong, and that inbound frame resets the server's read-idle timeout — so a quiet but live game (a player
-    * thinking, or the opening dice auto-passing) is not dropped at the 60s idle deadline. Halts with the event feed
-    * (which completes on the terminal event), so the socket still closes when the game ends.
-    */
   /** Who is redeeming a join token, for the seat-claim in #285: the account session if there is one, otherwise the
     * `guest` query param — the same "session wins, the anonymous id is only a fallback" order #235 established for the
     * game-start bodies. `None` means nobody identifiable, so nothing is claimed and the socket opens exactly as before.
@@ -227,10 +223,16 @@ object PlayRoutes:
       .handleErrorWith: e =>
         Console[IO].errorln(s"[play][claim] game ${id.value} seat $seat not attributed: $e")
 
+  /** Frames pushed to a client: the room's event feed merged with periodic WebSocket pings. The browser auto-replies
+    * with a pong, and that inbound frame resets the server's read-idle timeout — so a quiet but live game (a player
+    * thinking, or the opening dice auto-passing) is not dropped at the 60s idle deadline. Halts with the event feed
+    * (which completes on the terminal event), appending an explicit WebSocket Close frame so the socket closes cleanly
+    * when the game ends rather than idling out.
+    */
   private[server] def clientFrames(room: GameRoom, keepAlive: FiniteDuration): Stream[IO, WebSocketFrame] =
     val events     = room.subscribe.map(event => WebSocketFrame.Text(event.asJson.noSpaces))
     val keepAlives = Stream.awakeEvery[IO](keepAlive).as(WebSocketFrame.Ping())
-    events.mergeHaltL(keepAlives)
+    events.mergeHaltL(keepAlives) ++ Stream.emit(WebSocketFrame.Close(ByteVector.fromShort(1000.toShort)))
 
   private def fromClient(room: GameRoom, seat: Seat): Pipe[IO, WebSocketFrame, Unit] =
     in =>

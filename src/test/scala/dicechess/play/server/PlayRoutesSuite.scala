@@ -19,6 +19,7 @@ import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.implicits.*
 import org.http4s.jdkhttpclient.{JdkHttpClient, JdkWSClient}
 import org.http4s.websocket.WebSocketFrame
+import scodec.bits.ByteVector
 
 import scala.concurrent.duration.*
 
@@ -327,6 +328,32 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
       }
       .map: frames =>
         assert(frames.exists(_.isInstanceOf[WebSocketFrame.Ping]), s"expected a ping among $frames")
+
+  test("clientFrames terminates with a Close frame when the game ends"):
+    val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
+    GameRoom
+      .create(Map(Seat.White -> Principal.Guest("white"), Seat.Black -> Principal.Guest("black")), dice)
+      .flatMap {
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          val streamFrames = PlayRoutes
+            .clientFrames(room, keepAlive = 1.second)
+            .compile
+            .toList
+
+          val playAndFinish = room.submit(Seat.White, GameCommand.Resign)
+
+          (streamFrames, playAndFinish)
+            .parMapN((frames, _) => frames)
+            .timeoutTo(5.seconds, IO.raiseError(RuntimeException("clientFrames did not complete")))
+      }
+      .map: frames =>
+        assert(frames.nonEmpty, "frames must not be empty")
+        assertEquals(
+          frames.last,
+          WebSocketFrame.Close(ByteVector.fromShort(1000.toShort)),
+          "the final frame in clientFrames must be WebSocketFrame.Close(1000)"
+        )
 
   private def tokenOf(created: CreatedGame, seat: Seat): String =
     created.tokens.find(_.seat == seat).map(_.token).getOrElse(sys.error(s"no join token for $seat"))

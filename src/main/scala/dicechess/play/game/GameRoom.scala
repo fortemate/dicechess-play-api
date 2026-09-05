@@ -141,6 +141,18 @@ final class GameRoom private (
         (Deferred[IO, TurnVerdict], IO.monotonic).flatMapN: (reply, receivedAt) =>
           inbox.offer(Msg.Command(seat, GameCommand.RespondDraw(accept), receivedAt, Some(reply))).as(reply.get)
 
+  /** Resign the game and await the writer's verdict. */
+  def resign(seat: Seat): IO[TurnVerdict] =
+    enqueueResign(seat).flatten
+
+  /** The resignation equivalent of [[enqueueTurn]]; see that method for the database-fence rationale. */
+  def enqueueResign(seat: Seat): IO[IO[TurnVerdict]] =
+    stateRef.get.flatMap: s =>
+      if s.ended then IO.pure(IO.pure(TurnVerdict.Refused(GameOverReason)))
+      else
+        (Deferred[IO, TurnVerdict], IO.monotonic).flatMapN: (reply, receivedAt) =>
+          inbox.offer(Msg.Command(seat, GameCommand.Resign, receivedAt, Some(reply))).as(reply.get)
+
   /** Begin the game (roll the first turn). Call after subscribers have attached. */
   def start: IO[Unit] = inbox.offer(Msg.Begin)
 
@@ -675,8 +687,12 @@ final class GameRoom private (
         command match
           case GameCommand.Resign =>
             seat.side match
-              case Some(loser) => endGame(s, GameOver(GameResult.Win(loser.opponent), Termination.Resign))
-              case None        => emit(s, v => GameEvent.Rejected(v, seat, "spectator cannot resign"))
+              case Some(loser) =>
+                endGame(s, GameOver(GameResult.Win(loser.opponent), Termination.Resign))
+                  .flatTap(s1 => answer(reply, TurnVerdict.Applied(s1.version)))
+              case None =>
+                emit(s, v => GameEvent.Rejected(v, seat, "spectator cannot resign"))
+                  .flatTap(_ => answer(reply, TurnVerdict.Refused("spectator cannot resign")))
 
           case GameCommand.SubmitSeed(seed) =>
             seat.side match

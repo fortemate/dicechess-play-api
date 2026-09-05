@@ -424,9 +424,39 @@ paths:
     post:
       tags: [Gameplay]
       summary: Resign a game
+      description: >
+        Concede the game. Returns synchronous verdict on whether the resignation was applied.
       parameters: [{ $ref: '#/components/parameters/GameId' }]
       responses:
-        '202': { description: Accepted. }
+        '200':
+          description: Resignation applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+        '202': { description: No verdict within timeout; observe stream. }
+        '404': { description: Game not found or caller not seated. }
+        '409':
+          description: Refused (e.g. game is over).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+  /bot/games/resign-all:
+    post:
+      tags: [Gameplay]
+      summary: Resign all active games
+      description: >
+        Concede every active game the caller is seated in and optionally pause seating on the ladder and catalog.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResignAllRequest' }
+      responses:
+        '200':
+          description: Resignation outcome summary for all active games.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResignAllResponse' }
   /bot/games:
     get:
       tags: [Gameplay]
@@ -1760,7 +1790,7 @@ components:
     MoveRequest:
       type: object
       description: >
-        Submit a turn of moves (optionally piggybacking a draw offer), or accept a pending draw offer.
+        Submit a turn of moves (optionally piggybacking a draw offer), accept a pending draw offer, or resign.
       properties:
         moves:
           type: array
@@ -1774,6 +1804,36 @@ components:
           type: boolean
           default: false
           description: Accept a pending draw offer instead of submitting moves (moves array may be omitted or empty).
+        resign:
+          type: boolean
+          default: false
+          description: Resign the game (takes precedence over acceptDraw, moves, and offerDraw).
+    ResignAllRequest:
+      type: object
+      properties:
+        pauseSeating:
+          type: boolean
+          default: false
+          description: Option to leave rating ladder and catalog opt-in after resigning all games.
+    ResignAllResponse:
+      type: object
+      properties:
+        resigned:
+          type: array
+          items: { type: string }
+          description: Game IDs successfully resigned in this call.
+        alreadyOver:
+          type: array
+          items: { type: string }
+          description: Game IDs that were already over.
+        pending:
+          type: array
+          items: { type: string }
+          description: Game IDs that timed out waiting for verdict.
+        pausedSeating:
+          type: boolean
+          description: Whether pauseSeating was requested and applied.
+      required: [resigned, alreadyOver, pending, pausedSeating]
     MoveVerdict:
       type: object
       properties:

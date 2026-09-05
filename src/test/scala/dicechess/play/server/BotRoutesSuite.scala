@@ -693,12 +693,98 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           )
           .map(r => assertEquals(r.status, Status.Accepted))
 
-  test("a seated bot can resign"):
+  test("a seated bot can resign with synchronous verdict"):
     app.flatMap: service =>
       seatedGame(service).flatMap: gameId =>
         service
           .run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
-          .map(r => assertEquals(r.status, Status.Accepted))
+          .flatMap: resp =>
+            assertEquals(resp.status, Status.Ok)
+            resp.as[MoveOutcome].map: outcome =>
+              assertEquals(outcome.applied, true)
+              assert(outcome.version.exists(_ > 0L))
+
+  test("resigning an ended game returns 409 game is over"):
+    app.flatMap: service =>
+      seatedGame(service).flatMap: gameId =>
+        for
+          first  <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
+          _       = assertEquals(first.status, Status.Ok)
+          second <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
+          _       = assertEquals(second.status, Status.Conflict)
+          body   <- second.as[MoveOutcome]
+        yield assertEquals(body, MoveOutcome(applied = false, reason = Some("game is over")))
+
+  test("resigning a non-seated or unknown game is 404"):
+    app.flatMap: service =>
+      seatedGame(service).flatMap: gameId =>
+        for
+          unseated <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-carol")))
+          unknown  <- service.run(request(Method.POST, uri"/bot/game" / "nope" / "resign", Some("tok-bob")))
+        yield
+          assertEquals(unseated.status, Status.NotFound)
+          assertEquals(unknown.status, Status.NotFound)
+
+  test("BotMove with resign = true takes precedence over moves, offerDraw, and acceptDraw"):
+    AnonMintLimiter
+      .create(limit = 100)
+      .flatMap(appWith(_, diceSource = () => IO.pure(movableDice)))
+      .flatMap: (service, registry) =>
+        for
+          gameId <- seatedGame(service)
+          _      <- service.run(request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-alice")).withEntity(BotSeed("alice-client-seed-0001")))
+          _      <- service.run(request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-bob")).withEntity(BotSeed("bob-client-seed-00001")))
+          resp   <- service.run(
+            request(Method.POST, uri"/bot/game" / gameId / "move", Some("tok-alice"))
+              .withEntity(BotMove(moves = List("e2e4"), offerDraw = true, acceptDraw = Some(true), resign = true))
+          )
+          _       = assertEquals(resp.status, Status.Ok)
+          body   <- resp.as[MoveOutcome]
+          room   <- registry.get(GameId(gameId)).map(_.get)
+          result <- room.result
+        yield
+          assertEquals(body.applied, true)
+          assertEquals(result.termination, Termination.Resign)
+          assertEquals(result.result, GameResult.Win(dicechess.play.core.Side.Black))
+
+  test("POST /bot/games/resign-all resigns all active games, supports pauseSeating, and is idempotent"):
+    AnonMintLimiter
+      .create(limit = 100)
+      .flatMap(appWith(_))
+      .flatMap: (service, registry) =>
+        for
+          g1 <- seatedGame(service)
+          g2 <- seatedGame(service)
+          g3 <- seatedGame(service)
+          // Resign g1 first so it's already over
+          _       <- service.run(request(Method.POST, uri"/bot/game" / g1 / "resign", Some("tok-bob")))
+          // Alice calls resign-all with pauseSeating = true
+          resp1   <- service.run(
+            request(Method.POST, uri"/bot/games" / "resign-all", Some("tok-alice"))
+              .withEntity(ResignAllRequest(pauseSeating = true))
+          )
+          _        = assertEquals(resp1.status, Status.Ok)
+          body1   <- resp1.as[ResignAllResponse]
+          // Repeat call
+          resp2   <- service.run(
+            request(Method.POST, uri"/bot/games" / "resign-all", Some("tok-alice"))
+              .withEntity(ResignAllRequest(pauseSeating = false))
+          )
+          _        = assertEquals(resp2.status, Status.Ok)
+          body2   <- resp2.as[ResignAllResponse]
+        yield
+          assert(body1.resigned.contains(g2))
+          assert(body1.resigned.contains(g3))
+          assert(body1.alreadyOver.contains(g1))
+          assertEquals(body1.pending, Nil)
+          assertEquals(body1.pausedSeating, true)
+
+          assertEquals(body2.resigned, Nil)
+          assert(body2.alreadyOver.contains(g1))
+          assert(body2.alreadyOver.contains(g2))
+          assert(body2.alreadyOver.contains(g3))
+          assertEquals(body2.pending, Nil)
+          assertEquals(body2.pausedSeating, false)
 
   test("move on an unknown game is 404"):
     app

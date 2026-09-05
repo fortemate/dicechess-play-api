@@ -447,6 +447,31 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       }
       .timeoutTo(10.seconds, IO.raiseError(RuntimeException("the ended-game verdict did not arrive")))
 
+  test("Race a resignation against a king-capturing turn and a timeout through the real room inbox: exactly one terminal event"):
+    val kingCaptureDfen = "4k3/4Q3/4K3/8/8/8/8/8 w - - 0 1"
+    val dice            = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
+    GameRoom
+      .create(seats, dice, initialDfen = kingCaptureDfen, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .flatMap {
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            eventsFiber <- room.subscribe.compile.toList.start
+            roll        <- firstMovableRoll(room)
+            turnIO      <- room.enqueueTurn(roll.seat, List("e7e8"))
+            resignIO    <- room.enqueueResign(roll.seat)
+            _           <- (
+              resignIO,
+              turnIO,
+              room.submit(roll.seat, GameCommand.Resign)
+            ).parTupled.attempt
+            _           <- room.result
+            events      <- eventsFiber.joinWithNever
+            endedEvents = events.collect { case e: GameEvent.GameEnded => e }
+          yield assertEquals(endedEvents.size, 1)
+      }
+      .timeoutTo(15.seconds, IO.raiseError(RuntimeException("race test timed out")))
+
   private def testSession(
       timeControl: TimeControl,
       remaining: Map[Seat, FiniteDuration],

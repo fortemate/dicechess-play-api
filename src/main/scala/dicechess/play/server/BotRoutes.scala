@@ -38,8 +38,20 @@ final case class BotGame(gameId: String) derives Codec.AsObject
 final case class BotMove(
     moves: List[String] = Nil,
     offerDraw: Boolean = false,
-    acceptDraw: Option[Boolean] = None
+    acceptDraw: Option[Boolean] = None,
+    resign: Boolean = false
 ) derives ConfiguredCodec
+
+/** `POST /bot/games/resign-all` request body (optional). */
+final case class ResignAllRequest(pauseSeating: Boolean = false) derives ConfiguredCodec
+
+/** `POST /bot/games/resign-all` response. */
+final case class ResignAllResponse(
+    resigned: List[String],
+    alreadyOver: List[String],
+    pending: List[String],
+    pausedSeating: Boolean
+) derives Codec.AsObject
 final case class BotSeed(seed: String) derives Codec.AsObject
 
 /** Credentials returned by `POST /bot/anon`: the Bearer token plus the minted anonymous identity. */
@@ -330,6 +342,36 @@ object BotRoutes:
             })
             .flatMap(games => Ok(BotGames(games.flatten)))
 
+      // Bulk resignation for bot shutdown / maintenance. Optional body {"pauseSeating": true} leaves the ladder and catalog.
+      case req @ POST -> Root / "bot" / "games" / "resign-all" =>
+        withBot(auth, req): bot =>
+          parseResignAllRequest(req).flatMap:
+            case Left(failure) => BadRequest(failure)
+            case Right(body)   =>
+              registry
+                .gamesFor(bot)
+                .flatMap: games =>
+                  games.parTraverse { (id, room) =>
+                    seatOf(room, bot).flatMap:
+                      case None => IO.pure(ResignAllResult.AlreadyOver(id.value))
+                      case Some(seat) =>
+                        room
+                          .resign(seat)
+                          .map:
+                            case GameRoom.TurnVerdict.Applied(_) => ResignAllResult.Resigned(id.value)
+                            case GameRoom.TurnVerdict.Refused(_) => ResignAllResult.AlreadyOver(id.value)
+                          .timeoutTo(VerdictTimeout, IO.pure(ResignAllResult.Pending(id.value)))
+                  }
+                .flatMap: results =>
+                  val resigned    = results.collect { case ResignAllResult.Resigned(id) => id }.sorted
+                  val alreadyOver = results.collect { case ResignAllResult.AlreadyOver(id) => id }.sorted
+                  val pending     = results.collect { case ResignAllResult.Pending(id) => id }.sorted
+                  val pauseIO     =
+                    if body.pauseSeating then
+                      auth.setOnLadder(bot, onLadder = false) *> auth.closeToHumans(bot).void
+                    else IO.unit
+                  pauseIO *> Ok(ResignAllResponse(resigned, alreadyOver, pending, body.pauseSeating))
+
       // How bots meet humans (#72): post a standing public offer in the SAME lobby guests use. Hold it by polling the
       // capability-gated GET /lobby/seeks/{id}?secret= (bot seeks get a lazier TTL, sized for a poll-only bot); once
       // matched, the game also shows up in GET /bot/games — no seat token needed, bots are seated by principal.
@@ -421,9 +463,12 @@ object BotRoutes:
                 // 200 applied with the TurnPlayed version, 409 refused with the stream Rejected's reason. The stream
                 // events are unchanged; a wedged writer degrades to the old fire-and-forget 202 instead of hanging.
                 seated(registry, id, bot)((room, seat) =>
-                  val action = move.acceptDraw match
-                    case Some(accept) => room.respondDraw(seat, accept)
-                    case None         => room.submitTurn(seat, move.moves, offerDraw = move.offerDraw)
+                  val action =
+                    if move.resign then room.resign(seat)
+                    else
+                      move.acceptDraw match
+                        case Some(accept) => room.respondDraw(seat, accept)
+                        case None         => room.submitTurn(seat, move.moves, offerDraw = move.offerDraw)
                   action
                     .flatMap:
                       case GameRoom.TurnVerdict.Applied(version) =>
@@ -461,7 +506,16 @@ object BotRoutes:
 
       case req @ POST -> Root / "bot" / "game" / id / "resign" =>
         withBot(auth, req): bot =>
-          seated(registry, id, bot)((room, seat) => room.submit(seat, GameCommand.Resign) *> Accepted())
+          seated(registry, id, bot)((room, seat) =>
+            room
+              .resign(seat)
+              .flatMap:
+                case GameRoom.TurnVerdict.Applied(version) =>
+                  Ok(MoveOutcome(applied = true, version = Some(version)))
+                case GameRoom.TurnVerdict.Refused(reason) =>
+                  Conflict(MoveOutcome(applied = false, reason = Some(reason)))
+              .timeoutTo(VerdictTimeout, Accepted())
+          )
 
   /** Run `action` against the room and the caller's seat in it; 404 if no such game or the bot isn't seated there. */
   private def seated(registry: GameRegistry, id: String, bot: Principal.Bot)(
@@ -501,6 +555,17 @@ object BotRoutes:
     * body means "no description" (and clears any previous one); anything else is parsed and length-validated, `Left`
     * being the 400 message. One parser so the doors cannot drift on what a description is allowed to be.
     */
+  private enum ResignAllResult:
+    case Resigned(id: String)
+    case AlreadyOver(id: String)
+    case Pending(id: String)
+
+  private def parseResignAllRequest(req: Request[IO]): IO[Either[String, ResignAllRequest]] =
+    req.bodyText.compile.string.map: raw =>
+      if raw.isBlank then Right(ResignAllRequest())
+      else
+        io.circe.parser.decode[ResignAllRequest](raw).leftMap(_ => "invalid JSON body")
+
   private[server] def catalogDescription(req: Request[IO]): IO[Either[String, Option[String]]] =
     req.bodyText.compile.string.map: raw =>
       if raw.isBlank then Right(None)

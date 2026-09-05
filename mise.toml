@@ -2,6 +2,7 @@
 # Local-development tool set. CI installs the JVM toolchain via setup-java/setup-sbt and
 # runs sbt directly (see .github/workflows/ci.yaml), so keep this lean.
 java = "temurin-25"   # Primary runtime, aligned with CI (Java 25)
+sbt = "2.0.8" # sbt runner; MUST match sbt.version in project/build.properties (also provisions the Jules VM)
 
 # Git hooks & formatting
 lefthook = "latest"   # Git hooks manager (pre-commit / pre-push)
@@ -19,11 +20,7 @@ tbls = "1.95.0"       # schema introspection for the generated contributor-docs 
 
 [tasks.setup]
 description = "📦 Install tooling and register Git hooks locally"
-depends = ["setup:tools", "hook:install"]
-
-[tasks."setup:tools"]
-description = "🛠️  Install the SBT build tool"
-run = "brew install sbt"
+depends = ["hook:install"]
 
 [tasks.compile]
 description = "🔨 Incremental compilation of main and test sources"

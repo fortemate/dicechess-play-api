@@ -424,9 +424,44 @@ paths:
     post:
       tags: [Gameplay]
       summary: Resign a game
+      description: >
+        Concede the game. Returns synchronous verdict on whether the resignation was applied.
       parameters: [{ $ref: '#/components/parameters/GameId' }]
       responses:
-        '202': { description: Accepted. }
+        '200':
+          description: Resignation applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+        '202': { description: No verdict within timeout; observe stream. }
+        '404': { description: Game not found or caller not seated. }
+        '409':
+          description: Refused (e.g. game is over).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MoveVerdict' }
+  /bot/games/resign-all:
+    post:
+      tags: [Gameplay]
+      summary: Resign all active games
+      description: >
+        Concede every active game the caller is seated in — the one-signal shutdown path for a bot. With
+        `pauseSeating: true` the bot first leaves the rating ladder and the human catalog (the same writes as
+        `POST /bot/ladder/leave` and `POST /bot/open-to-humans/leave`), so the scheduler cannot seat it into a
+        fresh game while it is conceding. Games that have already ended are skipped, so a repeated call answers
+        with empty lists. After the response the bot may disconnect at once.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResignAllRequest' }
+      responses:
+        '200':
+          description: Per-game outcome of the bulk resignation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResignAllResponse' }
+        '400': { description: The body is present but is not the JSON object described by ResignAllRequest. }
   /bot/games:
     get:
       tags: [Gameplay]
@@ -1760,7 +1795,7 @@ components:
     MoveRequest:
       type: object
       description: >
-        Submit a turn of moves (optionally piggybacking a draw offer), or accept a pending draw offer.
+        Submit a turn of moves (optionally piggybacking a draw offer), accept a pending draw offer, or resign.
       properties:
         moves:
           type: array
@@ -1774,6 +1809,44 @@ components:
           type: boolean
           default: false
           description: Accept a pending draw offer instead of submitting moves (moves array may be omitted or empty).
+        resign:
+          type: boolean
+          default: false
+          description: Resign the game (takes precedence over acceptDraw, moves, and offerDraw).
+    ResignAllRequest:
+      type: object
+      properties:
+        pauseSeating:
+          type: boolean
+          default: false
+          description: >
+            Leave the rating ladder and the human catalog before resigning, so no new game is seated while the bot
+            shuts down. A no-op for anonymous and static identities, which have nothing to pause.
+    ResignAllResponse:
+      type: object
+      properties:
+        resigned:
+          type: array
+          items: { type: string }
+          description: Games this call resigned, sorted by id.
+        alreadyOver:
+          type: array
+          items: { type: string }
+          description: >
+            Games that ended between the listing and the room's verdict (a race with a king capture, a timeout or the
+            opponent's resignation). Games already over before the call are not listed at all.
+        pending:
+          type: array
+          items: { type: string }
+          description: >
+            Games whose verdict did not arrive within the server's verdict timeout. The resignation is queued and the
+            game will still end; confirm through GET /bot/games.
+        pausedSeating:
+          type: boolean
+          description: >
+            True when pauseSeating was requested and the caller is a registered identity whose ladder and catalog
+            flags were cleared; false when it was not requested or the caller has nothing to pause.
+      required: [resigned, alreadyOver, pending, pausedSeating]
     MoveVerdict:
       type: object
       properties:

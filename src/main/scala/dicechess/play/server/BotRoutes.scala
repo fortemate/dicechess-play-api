@@ -38,8 +38,20 @@ final case class BotGame(gameId: String) derives Codec.AsObject
 final case class BotMove(
     moves: List[String] = Nil,
     offerDraw: Boolean = false,
-    acceptDraw: Option[Boolean] = None
+    acceptDraw: Option[Boolean] = None,
+    resign: Boolean = false
 ) derives ConfiguredCodec
+
+/** `POST /bot/games/resign-all` request body (optional). */
+final case class ResignAllRequest(pauseSeating: Boolean = false) derives ConfiguredCodec
+
+/** `POST /bot/games/resign-all` response. */
+final case class ResignAllResponse(
+    resigned: List[String],
+    alreadyOver: List[String],
+    pending: List[String],
+    pausedSeating: Boolean
+) derives Codec.AsObject
 final case class BotSeed(seed: String) derives Codec.AsObject
 
 /** Credentials returned by `POST /bot/anon`: the Bearer token plus the minted anonymous identity. */
@@ -330,6 +342,33 @@ object BotRoutes:
             })
             .flatMap(games => Ok(BotGames(games.flatten)))
 
+      // Bulk resignation for a bot shutdown (ADR 006 §3.5): concede every ACTIVE game the caller is seated in. With
+      // {"pauseSeating": true} the bot leaves the ladder and the human catalog FIRST, so the scheduler cannot seat the
+      // departing bot into a fresh game between the listing and the resignations. Rooms that have already ended but
+      // still linger in the registry are skipped (the same `hasEnded` filter `GET /bot/games` applies), so a repeated
+      // call answers with empty lists and `alreadyOver` only names a game that ended between the listing and the
+      // room's verdict. `pending` is a game whose verdict did not arrive within `VerdictTimeout`: the command is queued
+      // and the game will still end; confirm through `GET /bot/games`.
+      case req @ POST -> Root / "bot" / "games" / "resign-all" =>
+        withBot(auth, req): bot =>
+          parseResignAllRequest(req).flatMap:
+            case Left(failure) => BadRequest(failure)
+            case Right(body)   =>
+              for
+                paused  <- if body.pauseSeating then pauseSeating(auth, bot) else IO.pure(false)
+                active  <- registry.gamesFor(bot).flatMap(_.filterA((_, room) => room.hasEnded.map(!_)))
+                results <- active.parTraverse((id, room) => resignOne(room, id, bot))
+                outcome = results.flatten
+                response <- Ok(
+                  ResignAllResponse(
+                    resigned = outcome.collect { case ResignAllResult.Resigned(id) => id }.sorted,
+                    alreadyOver = outcome.collect { case ResignAllResult.AlreadyOver(id) => id }.sorted,
+                    pending = outcome.collect { case ResignAllResult.Pending(id) => id }.sorted,
+                    pausedSeating = paused
+                  )
+                )
+              yield response
+
       // How bots meet humans (#72): post a standing public offer in the SAME lobby guests use. Hold it by polling the
       // capability-gated GET /lobby/seeks/{id}?secret= (bot seeks get a lazier TTL, sized for a poll-only bot); once
       // matched, the game also shows up in GET /bot/games — no seat token needed, bots are seated by principal.
@@ -421,9 +460,12 @@ object BotRoutes:
                 // 200 applied with the TurnPlayed version, 409 refused with the stream Rejected's reason. The stream
                 // events are unchanged; a wedged writer degrades to the old fire-and-forget 202 instead of hanging.
                 seated(registry, id, bot)((room, seat) =>
-                  val action = move.acceptDraw match
-                    case Some(accept) => room.respondDraw(seat, accept)
-                    case None         => room.submitTurn(seat, move.moves, offerDraw = move.offerDraw)
+                  val action =
+                    if move.resign then room.resign(seat)
+                    else
+                      move.acceptDraw match
+                        case Some(accept) => room.respondDraw(seat, accept)
+                        case None         => room.submitTurn(seat, move.moves, offerDraw = move.offerDraw)
                   action
                     .flatMap:
                       case GameRoom.TurnVerdict.Applied(version) =>
@@ -461,7 +503,16 @@ object BotRoutes:
 
       case req @ POST -> Root / "bot" / "game" / id / "resign" =>
         withBot(auth, req): bot =>
-          seated(registry, id, bot)((room, seat) => room.submit(seat, GameCommand.Resign) *> Accepted())
+          seated(registry, id, bot)((room, seat) =>
+            room
+              .resign(seat)
+              .flatMap:
+                case GameRoom.TurnVerdict.Applied(version) =>
+                  Ok(MoveOutcome(applied = true, version = Some(version)))
+                case GameRoom.TurnVerdict.Refused(reason) =>
+                  Conflict(MoveOutcome(applied = false, reason = Some(reason)))
+              .timeoutTo(VerdictTimeout, Accepted())
+          )
 
   /** Run `action` against the room and the caller's seat in it; 404 if no such game or the bot isn't seated there. */
   private def seated(registry: GameRegistry, id: String, bot: Principal.Bot)(
@@ -496,6 +547,44 @@ object BotRoutes:
     catalogDescription(req).flatMap:
       case Left(message)      => BadRequest(message)
       case Right(description) => respondCatalog(auth.openToHumans(bot, description))
+
+  /** One game's share of `POST /bot/games/resign-all`. `None` when the caller turns out not to hold a seat in the room
+    * (the per-player index only lists rooms it is seated in, so this is a guard, not an expected path). A refusal can
+    * only be `game is over` for a seated caller, hence `AlreadyOver`.
+    */
+  private def resignOne(room: GameRoom, id: GameId, bot: Principal.Bot): IO[Option[ResignAllResult]] =
+    seatOf(room, bot).flatMap:
+      case None       => IO.pure(None)
+      case Some(seat) =>
+        room
+          .resign(seat)
+          .map:
+            case GameRoom.TurnVerdict.Applied(_) => ResignAllResult.Resigned(id.value)
+            case GameRoom.TurnVerdict.Refused(_) => ResignAllResult.AlreadyOver(id.value)
+          .timeoutTo(VerdictTimeout, IO.pure(ResignAllResult.Pending(id.value)))
+          .map(Some(_))
+
+  /** Leave the ladder and the human catalog in one go, the same writes `POST /bot/ladder/leave` and
+    * `POST /bot/open-to-humans/leave` perform. `true` when the caller is a registered identity, the only kind with a
+    * row to flag; a static or anonymous bot has nothing to pause, so the request is honoured as a no-op and reported as
+    * `pausedSeating: false` rather than refused — a shutdown must not fail on a flag.
+    */
+  private def pauseSeating(auth: BotAuth, bot: Principal.Bot): IO[Boolean] =
+    (auth.setOnLadder(bot, onLadder = false), auth.closeToHumans(bot)).mapN((ladder, catalog) =>
+      ladder.isDefined || catalog.isDefined
+    )
+
+  private enum ResignAllResult:
+    case Resigned(id: String)
+    case AlreadyOver(id: String)
+    case Pending(id: String)
+
+  /** The optional `POST /bot/games/resign-all` body: blank means the defaults, anything else must be the JSON object.
+    */
+  private def parseResignAllRequest(req: Request[IO]): IO[Either[String, ResignAllRequest]] =
+    req.bodyText.compile.string.map: raw =>
+      if raw.isBlank then Right(ResignAllRequest())
+      else io.circe.parser.decode[ResignAllRequest](raw).leftMap(_ => "invalid JSON body")
 
   /** The optional catalog-description body, shared by every door that writes one (bot, owner, admin — #273): a blank
     * body means "no description" (and clears any previous one); anything else is parsed and length-validated, `Left`

@@ -467,8 +467,8 @@ class GameRoomSuite extends munit.CatsEffectSuite:
               turnIO,
               room.submit(roll.seat, GameCommand.Resign)
             ).parTupled.attempt
-            _           <- room.result
-            events      <- eventsFiber.joinWithNever
+            _      <- room.result
+            events <- eventsFiber.joinWithNever
             endedEvents = events.collect { case e: GameEvent.GameEnded => e }
           yield assertEquals(endedEvents.size, 1)
       }

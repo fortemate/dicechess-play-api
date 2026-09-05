@@ -368,8 +368,7 @@ object BotRoutes:
                   val alreadyOver = results.collect { case ResignAllResult.AlreadyOver(id) => id }.sorted
                   val pending     = results.collect { case ResignAllResult.Pending(id) => id }.sorted
                   val pauseIO     =
-                    if body.pauseSeating then
-                      auth.setOnLadder(bot, onLadder = false) *> auth.closeToHumans(bot).void
+                    if body.pauseSeating then auth.setOnLadder(bot, onLadder = false) *> auth.closeToHumans(bot).void
                     else IO.unit
                   pauseIO *> Ok(ResignAllResponse(resigned, alreadyOver, pending, body.pauseSeating))
 

@@ -700,19 +700,21 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           .run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
           .flatMap: resp =>
             assertEquals(resp.status, Status.Ok)
-            resp.as[MoveOutcome].map: outcome =>
-              assertEquals(outcome.applied, true)
-              assert(outcome.version.exists(_ > 0L))
+            resp
+              .as[MoveOutcome]
+              .map: outcome =>
+                assertEquals(outcome.applied, true)
+                assert(outcome.version.exists(_ > 0L))
 
   test("resigning an ended game returns 409 game is over"):
     app.flatMap: service =>
       seatedGame(service).flatMap: gameId =>
         for
-          first  <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
-          _       = assertEquals(first.status, Status.Ok)
+          first <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
+          _ = assertEquals(first.status, Status.Ok)
           second <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
-          _       = assertEquals(second.status, Status.Conflict)
-          body   <- second.as[MoveOutcome]
+          _ = assertEquals(second.status, Status.Conflict)
+          body <- second.as[MoveOutcome]
         yield assertEquals(body, MoveOutcome(applied = false, reason = Some("game is over")))
 
   test("resigning a non-seated or unknown game is 404"):
@@ -736,15 +738,15 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
             request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-alice"))
               .withEntity(BotSeed("alice-client-seed-0001"))
           )
-          _      <- service.run(
+          _ <- service.run(
             request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-bob"))
               .withEntity(BotSeed("bob-client-seed-00001"))
           )
-          resp   <- service.run(
+          resp <- service.run(
             request(Method.POST, uri"/bot/game" / gameId / "move", Some("tok-alice"))
               .withEntity(BotMove(moves = List("e2e4"), offerDraw = true, acceptDraw = Some(true), resign = true))
           )
-          _       = assertEquals(resp.status, Status.Ok)
+          _ = assertEquals(resp.status, Status.Ok)
           body   <- resp.as[MoveOutcome]
           room   <- registry.get(GameId(gameId)).map(_.get)
           result <- room.result
@@ -763,21 +765,21 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           g2 <- seatedGame(service)
           g3 <- seatedGame(service)
           // Resign g1 first so it's already over
-          _       <- service.run(request(Method.POST, uri"/bot/game" / g1 / "resign", Some("tok-bob")))
+          _ <- service.run(request(Method.POST, uri"/bot/game" / g1 / "resign", Some("tok-bob")))
           // Alice calls resign-all with pauseSeating = true
-          resp1   <- service.run(
+          resp1 <- service.run(
             request(Method.POST, uri"/bot/games" / "resign-all", Some("tok-alice"))
               .withEntity(ResignAllRequest(pauseSeating = true))
           )
-          _        = assertEquals(resp1.status, Status.Ok)
-          body1   <- resp1.as[ResignAllResponse]
+          _ = assertEquals(resp1.status, Status.Ok)
+          body1 <- resp1.as[ResignAllResponse]
           // Repeat call
-          resp2   <- service.run(
+          resp2 <- service.run(
             request(Method.POST, uri"/bot/games" / "resign-all", Some("tok-alice"))
               .withEntity(ResignAllRequest(pauseSeating = false))
           )
-          _        = assertEquals(resp2.status, Status.Ok)
-          body2   <- resp2.as[ResignAllResponse]
+          _ = assertEquals(resp2.status, Status.Ok)
+          body2 <- resp2.as[ResignAllResponse]
         yield
           assert(body1.resigned.contains(g2))
           assert(body1.resigned.contains(g3))

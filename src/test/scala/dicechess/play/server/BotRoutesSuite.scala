@@ -732,8 +732,14 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
       .flatMap: (service, registry) =>
         for
           gameId <- seatedGame(service)
-          _      <- service.run(request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-alice")).withEntity(BotSeed("alice-client-seed-0001")))
-          _      <- service.run(request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-bob")).withEntity(BotSeed("bob-client-seed-00001")))
+          _      <- service.run(
+            request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-alice"))
+              .withEntity(BotSeed("alice-client-seed-0001"))
+          )
+          _      <- service.run(
+            request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-bob"))
+              .withEntity(BotSeed("bob-client-seed-00001"))
+          )
           resp   <- service.run(
             request(Method.POST, uri"/bot/game" / gameId / "move", Some("tok-alice"))
               .withEntity(BotMove(moves = List("e2e4"), offerDraw = true, acceptDraw = Some(true), resign = true))

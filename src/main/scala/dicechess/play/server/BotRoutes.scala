@@ -342,7 +342,8 @@ object BotRoutes:
             })
             .flatMap(games => Ok(BotGames(games.flatten)))
 
-      // Bulk resignation for bot shutdown / maintenance. Optional body {"pauseSeating": true} leaves the ladder and catalog.
+      // Bulk resignation for bot shutdown / maintenance. Optional body {"pauseSeating": true} leaves the ladder and
+      // catalog.
       case req @ POST -> Root / "bot" / "games" / "resign-all" =>
         withBot(auth, req): bot =>
           parseResignAllRequest(req).flatMap:
@@ -353,7 +354,7 @@ object BotRoutes:
                 .flatMap: games =>
                   games.parTraverse { (id, room) =>
                     seatOf(room, bot).flatMap:
-                      case None => IO.pure(ResignAllResult.AlreadyOver(id.value))
+                      case None       => IO.pure(ResignAllResult.AlreadyOver(id.value))
                       case Some(seat) =>
                         room
                           .resign(seat)
@@ -563,8 +564,7 @@ object BotRoutes:
   private def parseResignAllRequest(req: Request[IO]): IO[Either[String, ResignAllRequest]] =
     req.bodyText.compile.string.map: raw =>
       if raw.isBlank then Right(ResignAllRequest())
-      else
-        io.circe.parser.decode[ResignAllRequest](raw).leftMap(_ => "invalid JSON body")
+      else io.circe.parser.decode[ResignAllRequest](raw).leftMap(_ => "invalid JSON body")
 
   private[server] def catalogDescription(req: Request[IO]): IO[Either[String, Option[String]]] =
     req.bodyText.compile.string.map: raw =>

@@ -447,7 +447,9 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       }
       .timeoutTo(10.seconds, IO.raiseError(RuntimeException("the ended-game verdict did not arrive")))
 
-  test("Race a resignation against a king-capturing turn and a timeout through the real room inbox: exactly one terminal event"):
+  test(
+    "Race a resignation against a king-capturing turn and a timeout through the real room inbox: exactly one terminal event"
+  ):
     val kingCaptureDfen = "4k3/4Q3/4K3/8/8/8/8/8 w - - 0 1"
     val dice            = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom

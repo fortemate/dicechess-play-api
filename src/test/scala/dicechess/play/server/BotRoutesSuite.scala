@@ -466,7 +466,7 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
     AnonMintLimiter
       .create(limit = 100)
       .flatMap(appWith(_))
-      .flatMap: (service, registry) =>
+      .flatMap: (service, _) =>
         for
           created <- service
             .run(request(Method.POST, uri"/bot/seeks", Some("tok-alice")).withEntity(BotCreateSeek()))
@@ -759,7 +759,7 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
     AnonMintLimiter
       .create(limit = 100)
       .flatMap(appWith(_))
-      .flatMap: (service, registry) =>
+      .flatMap: (service, _) =>
         for
           g1 <- seatedGame(service)
           g2 <- seatedGame(service)

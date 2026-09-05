@@ -466,7 +466,7 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
     AnonMintLimiter
       .create(limit = 100)
       .flatMap(appWith(_))
-      .flatMap: (service, _) =>
+      .flatMap: (service, registry) =>
         for
           created <- service
             .run(request(Method.POST, uri"/bot/seeks", Some("tok-alice")).withEntity(BotCreateSeek()))
@@ -706,16 +706,24 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
                 assertEquals(outcome.applied, true)
                 assert(outcome.version.exists(_ > 0L))
 
-  test("resigning an ended game returns 409 game is over"):
+  test("resigning an ended game is refused: 409 game is over while the room lingers, 404 once the registry evicted it"):
     app.flatMap: service =>
       seatedGame(service).flatMap: gameId =>
         for
           first <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
           _ = assertEquals(first.status, Status.Ok)
+          // The registry deregisters a room on its result from a background fiber, so the second call races that
+          // eviction: both answers are refusals, and the room-level `game is over` verdict is pinned in GameRoomSuite.
           second <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-bob")))
-          _ = assertEquals(second.status, Status.Conflict)
-          body <- second.as[MoveOutcome]
-        yield assertEquals(body, MoveOutcome(applied = false, reason = Some("game is over")))
+          body   <-
+            if second.status == Status.Conflict then second.as[MoveOutcome].map(Some(_))
+            else IO.pure(None)
+        yield
+          assert(
+            second.status == Status.Conflict || second.status == Status.NotFound,
+            s"expected 409 or 404, got ${second.status}"
+          )
+          body.foreach(b => assertEquals(b, MoveOutcome(applied = false, reason = Some("game is over"))))
 
   test("resigning a non-seated or unknown game is 404"):
     app.flatMap: service =>
@@ -742,57 +750,84 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
             request(Method.POST, uri"/bot/game" / gameId / "seed", Some("tok-bob"))
               .withEntity(BotSeed("bob-client-seed-00001"))
           )
+          // Take the room before the game ends: the registry evicts a finished room from a background fiber.
+          room <- registry.get(GameId(gameId)).map(_.get)
           resp <- service.run(
             request(Method.POST, uri"/bot/game" / gameId / "move", Some("tok-alice"))
               .withEntity(BotMove(moves = List("e2e4"), offerDraw = true, acceptDraw = Some(true), resign = true))
           )
           _ = assertEquals(resp.status, Status.Ok)
           body   <- resp.as[MoveOutcome]
-          room   <- registry.get(GameId(gameId)).map(_.get)
           result <- room.result
         yield
           assertEquals(body.applied, true)
           assertEquals(result.termination, Termination.Resign)
           assertEquals(result.result, GameResult.Win(dicechess.play.core.Side.Black))
 
-  test("POST /bot/games/resign-all resigns all active games, supports pauseSeating, and is idempotent"):
+  test("POST /bot/games/resign-all resigns every active game once; ended games are skipped; a repeat is empty"):
     AnonMintLimiter
       .create(limit = 100)
       .flatMap(appWith(_))
-      .flatMap: (service, _) =>
+      .flatMap: (service, registry) =>
         for
           g1 <- seatedGame(service)
           g2 <- seatedGame(service)
           g3 <- seatedGame(service)
-          // Resign g1 first so it's already over
+          // Rooms are taken before anything ends: the registry evicts a finished room from a background fiber.
+          room2 <- registry.get(GameId(g2)).map(_.get)
+          room3 <- registry.get(GameId(g3)).map(_.get)
+          // g1 is already over before the bulk call: it must neither be resigned again nor be reported.
           _ <- service.run(request(Method.POST, uri"/bot/game" / g1 / "resign", Some("tok-bob")))
-          // Alice calls resign-all with pauseSeating = true
-          resp1 <- service.run(
+          // Alice is a static identity: pauseSeating has nothing to flag and is reported as not applied.
+          first <- service.run(
             request(Method.POST, uri"/bot/games" / "resign-all", Some("tok-alice"))
               .withEntity(ResignAllRequest(pauseSeating = true))
           )
-          _ = assertEquals(resp1.status, Status.Ok)
-          body1 <- resp1.as[ResignAllResponse]
-          // Repeat call
-          resp2 <- service.run(
+          _ = assertEquals(first.status, Status.Ok)
+          body1  <- first.as[ResignAllResponse]
+          over2  <- room2.result
+          over3  <- room3.result
+          second <- service.run(request(Method.POST, uri"/bot/games" / "resign-all", Some("tok-alice")))
+          _ = assertEquals(second.status, Status.Ok)
+          body2 <- second.as[ResignAllResponse]
+          bad   <- service.run(
             request(Method.POST, uri"/bot/games" / "resign-all", Some("tok-alice"))
-              .withEntity(ResignAllRequest(pauseSeating = false))
+              .withEntity("not json")(using org.http4s.EntityEncoder.stringEncoder[IO])
           )
-          _ = assertEquals(resp2.status, Status.Ok)
-          body2 <- resp2.as[ResignAllResponse]
         yield
-          assert(body1.resigned.contains(g2))
-          assert(body1.resigned.contains(g3))
-          assert(body1.alreadyOver.contains(g1))
-          assertEquals(body1.pending, Nil)
-          assertEquals(body1.pausedSeating, true)
+          assertEquals(body1, ResignAllResponse(List(g2, g3).sorted, Nil, Nil, pausedSeating = false))
+          assertEquals(over2.termination, Termination.Resign)
+          assertEquals(over3.termination, Termination.Resign)
+          // Alice sat White in every seatedGame, so both games are Black's wins.
+          assertEquals(over2.result, GameResult.Win(dicechess.play.core.Side.Black))
+          assertEquals(body2, ResignAllResponse(Nil, Nil, Nil, pausedSeating = false))
+          assertEquals(bad.status, Status.BadRequest)
 
-          assertEquals(body2.resigned, Nil)
-          assert(body2.alreadyOver.contains(g1))
-          assert(body2.alreadyOver.contains(g2))
-          assert(body2.alreadyOver.contains(g3))
-          assertEquals(body2.pending, Nil)
-          assertEquals(body2.pausedSeating, false)
+  test("POST /bot/games/resign-all with pauseSeating leaves the ladder and the catalog for a registered bot"):
+    app.flatMap: service =>
+      for
+        created <- service
+          .run(Request[IO](Method.POST, uri"/bot/register").withEntity(RegisterBot("dragons", "smaug")))
+          .flatMap(_.as[BotRegistered])
+        joined <- service.run(request(Method.POST, uri"/bot/ladder/join", Some(created.token)))
+        _ = assertEquals(joined.status, Status.Ok)
+        opened <- service.run(request(Method.POST, uri"/bot/open-to-humans", Some(created.token)))
+        _ = assertEquals(opened.status, Status.Ok)
+        resp <- service.run(
+          request(Method.POST, uri"/bot/games" / "resign-all", Some(created.token))
+            .withEntity(ResignAllRequest(pauseSeating = true))
+        )
+        _ = assertEquals(resp.status, Status.Ok)
+        body <- resp.as[ResignAllResponse]
+        // The same writes the leave routes perform: both now report the bot as off the ladder and out of the catalog.
+        ladder <- service
+          .run(request(Method.POST, uri"/bot/ladder/leave", Some(created.token)))
+          .flatMap(_.as[LadderStatus])
+        catalog <- service.run(request(Method.POST, uri"/bot/open-to-humans/leave", Some(created.token)))
+      yield
+        assertEquals(body, ResignAllResponse(Nil, Nil, Nil, pausedSeating = true))
+        assertEquals(ladder.onLadder, false)
+        assertEquals(catalog.status, Status.Ok)
 
   test("move on an unknown game is 404"):
     app

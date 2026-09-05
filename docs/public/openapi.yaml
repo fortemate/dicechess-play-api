@@ -445,7 +445,11 @@ paths:
       tags: [Gameplay]
       summary: Resign all active games
       description: >
-        Concede every active game the caller is seated in and optionally pause seating on the ladder and catalog.
+        Concede every active game the caller is seated in — the one-signal shutdown path for a bot. With
+        `pauseSeating: true` the bot first leaves the rating ladder and the human catalog (the same writes as
+        `POST /bot/ladder/leave` and `POST /bot/open-to-humans/leave`), so the scheduler cannot seat it into a
+        fresh game while it is conceding. Games that have already ended are skipped, so a repeated call answers
+        with empty lists. After the response the bot may disconnect at once.
       requestBody:
         required: false
         content:
@@ -453,10 +457,11 @@ paths:
             schema: { $ref: '#/components/schemas/ResignAllRequest' }
       responses:
         '200':
-          description: Resignation outcome summary for all active games.
+          description: Per-game outcome of the bulk resignation.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ResignAllResponse' }
+        '400': { description: The body is present but is not the JSON object described by ResignAllRequest. }
   /bot/games:
     get:
       tags: [Gameplay]
@@ -1814,25 +1819,33 @@ components:
         pauseSeating:
           type: boolean
           default: false
-          description: Option to leave rating ladder and catalog opt-in after resigning all games.
+          description: >
+            Leave the rating ladder and the human catalog before resigning, so no new game is seated while the bot
+            shuts down. A no-op for anonymous and static identities, which have nothing to pause.
     ResignAllResponse:
       type: object
       properties:
         resigned:
           type: array
           items: { type: string }
-          description: Game IDs successfully resigned in this call.
+          description: Games this call resigned, sorted by id.
         alreadyOver:
           type: array
           items: { type: string }
-          description: Game IDs that were already over.
+          description: >
+            Games that ended between the listing and the room's verdict (a race with a king capture, a timeout or the
+            opponent's resignation). Games already over before the call are not listed at all.
         pending:
           type: array
           items: { type: string }
-          description: Game IDs that timed out waiting for verdict.
+          description: >
+            Games whose verdict did not arrive within the server's verdict timeout. The resignation is queued and the
+            game will still end; confirm through GET /bot/games.
         pausedSeating:
           type: boolean
-          description: Whether pauseSeating was requested and applied.
+          description: >
+            True when pauseSeating was requested and the caller is a registered identity whose ladder and catalog
+            flags were cleared; false when it was not requested or the caller has nothing to pause.
       required: [resigned, alreadyOver, pending, pausedSeating]
     MoveVerdict:
       type: object

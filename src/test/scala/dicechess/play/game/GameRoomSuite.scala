@@ -432,6 +432,25 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       }
       .timeoutTo(15.seconds, IO.raiseError(RuntimeException("verdicts did not arrive")))
 
+  test("resign on a finished game answers 'game is over' instead of hanging"):
+    val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
+    GameRoom
+      .create(seats, dice, seedGrace = 10.seconds)
+      .flatMap {
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            first  <- room.resign(Seat.White)
+            _      <- room.result
+            second <- room.resign(Seat.Black)
+            replay <- room.resign(Seat.White)
+          yield
+            assert(first.isInstanceOf[GameRoom.TurnVerdict.Applied], s"expected Applied, got $first")
+            assertEquals(second, GameRoom.TurnVerdict.Refused("game is over"))
+            assertEquals(replay, GameRoom.TurnVerdict.Refused("game is over"))
+      }
+      .timeoutTo(10.seconds, IO.raiseError(RuntimeException("the ended-game verdict did not arrive")))
+
   test("submitTurn on a finished game answers 'game is over' instead of hanging"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
@@ -448,29 +467,44 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       .timeoutTo(10.seconds, IO.raiseError(RuntimeException("the ended-game verdict did not arrive")))
 
   test(
-    "Race a resignation against a king-capturing turn and a timeout through the real room inbox: exactly one terminal event"
+    "Race a legal turn against resignations from both seats through the real room inbox: one terminal event, every verdict answered"
   ):
-    val kingCaptureDfen = "4k3/4Q3/4K3/8/8/8/8/8 w - - 0 1"
-    val dice            = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
+    val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, initialDfen = kingCaptureDfen, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, dice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
           for
-            eventsFiber <- room.subscribe.compile.toList.start
-            roll        <- firstMovableRoll(room)
-            turnIO      <- room.enqueueTurn(roll.seat, List("e7e8"))
-            resignIO    <- room.enqueueResign(roll.seat)
-            _           <- (
-              resignIO,
-              turnIO,
-              room.submit(roll.seat, GameCommand.Resign)
-            ).parTupled.attempt
-            _      <- room.result
+            // `subscribe` never terminates on its own; stop collecting shortly after the game has ended.
+            eventsFiber <- room.subscribe
+              .interruptWhen(room.result.void.delayBy(300.millis).attempt)
+              .compile
+              .toList
+              .start
+            roll <- firstMovableRoll(room)
+            other = if roll.seat == Seat.White then Seat.Black else Seat.White
+            // Three commands submitted concurrently, so the inbox order is whatever the scheduler makes it.
+            verdicts <- (
+              room.submitTurn(roll.seat, leafPath(roll.legalMoves.get)),
+              room.resign(roll.seat),
+              room.resign(other)
+            ).parTupled
+            over   <- room.result
             events <- eventsFiber.joinWithNever
-            endedEvents = events.collect { case e: GameEvent.GameEnded => e }
-          yield assertEquals(endedEvents.size, 1)
+          yield
+            val (turn, resign, otherResign) = verdicts
+            val gameOver                    = GameRoom.TurnVerdict.Refused("game is over")
+            assertEquals(events.count(_.isInstanceOf[GameEvent.GameEnded]), 1)
+            // A first-turn move from the start position never captures a king, so only a resignation can end the game...
+            assertEquals(over.termination, Termination.Resign)
+            // ...exactly one of the two resignations does, and the other is refused as game over, never left hanging.
+            assertEquals(List(resign, otherResign).count(_ == gameOver), 1)
+            assertEquals(List(resign, otherResign).count(_.isInstanceOf[GameRoom.TurnVerdict.Applied]), 1)
+            // The turn was applied if it ran first, or refused as game over if a resignation beat it.
+            turn match
+              case GameRoom.TurnVerdict.Applied(_)      => ()
+              case GameRoom.TurnVerdict.Refused(reason) => assertEquals(reason, "game is over")
       }
       .timeoutTo(15.seconds, IO.raiseError(RuntimeException("race test timed out")))
 

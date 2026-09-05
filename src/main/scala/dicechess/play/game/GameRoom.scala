@@ -121,7 +121,8 @@ final class GameRoom private (
   def enqueueTurn(seat: Seat, moves: List[String], offerDraw: Boolean = false): IO[IO[TurnVerdict]] =
     stateRef.get.flatMap: s =>
       // The writer fiber stops once the game ends, so an ended room would never drain the inbox — answer eagerly.
-      // (A game ending in the gap between this check and the offer is caught by the caller's verdict timeout.)
+      // (A game ending in the gap between this check and the offer is answered by the writer's post-end drain, or —
+      // if the offer lands after that drain — caught by the caller's verdict timeout.)
       if s.ended then IO.pure(IO.pure(TurnVerdict.Refused(GameOverReason)))
       else
         (Deferred[IO, TurnVerdict], IO.monotonic).flatMapN: (reply, receivedAt) =>
@@ -479,7 +480,19 @@ final class GameRoom private (
     IO.monotonic.map(now => s.copy(turnStartedAt = Some(now)))
 
   private def continue: IO[Unit] =
-    stateRef.get.flatMap(s => if s.ended then IO.unit else consume)
+    stateRef.get.flatMap(s => if s.ended then drainRefusing else consume)
+
+  /** The writer stops once the game has ended, but a command that was queued in the gap between its caller's `ended`
+    * pre-check and the terminal transition would otherwise never be dequeued, and its caller would wait out its verdict
+    * timeout for nothing. Answer everything already queued with the game-over refusal, then stop. A command offered
+    * after this drain still relies on the caller's timeout; that window is the offer itself, not a whole turn.
+    */
+  private def drainRefusing: IO[Unit] =
+    inbox.tryTake.flatMap:
+      case Some(Msg.Command(_, _, _, reply))      => answer(reply, TurnVerdict.Refused(GameOverReason)) *> drainRefusing
+      case Some(Msg.ClaimSeat(_, _, _, _, reply)) => reply.complete(false).attempt.void *> drainRefusing
+      case Some(_)                                => drainRefusing
+      case None                                   => IO.unit
 
   /** Advance the session, commit it (write the Ref and persist, in the order the room's durability dictates — see
     * [[commit]]), THEN broadcast — so the Ref always reflects the latest published event, and anything a player has

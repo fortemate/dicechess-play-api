@@ -76,17 +76,27 @@ The tree appears in three places:
 
 A complete random bot is therefore: read the tree, walk root→leaf picking a random child at each node, and `POST` the path — no engine, no DFEN parsing. That is exactly what [`examples/random_bot.py`](https://github.com/rabestro/dicechess-play-api/blob/main/docs/examples/random_bot.py) does, end to end, in ~100 lines.
 
+## Resignation
+
+Resigning concedes the game immediately.
+
+- **Concede at once**: Resigning terminates the game at once with result `Win` for the opponent and `termination: Resign`.
+- **Legal in any phase**: A player may resign at any moment during an active game — whether it is their turn or the opponent's turn, and regardless of whether dice are pending or rolled.
+- **Stalled opponents**: A player facing a stalled or disconnected opponent should wait for the opponent's clock to run out (`Timeout`) rather than resigning.
+
 ## Draw offers
 
 Dice Chess supports turn-anchored draw offers via a pre-roll gate:
 
 - **Governing rule**: A draw offer lives from the completion of the offerer's turn until the reveal of the responder's dice; revealing the dice constitutes a decline.
-- **Turn-anchored offer**: A player offers a draw by piggybacking the offer onto their completed turn (`offerDraw: true` in `POST /bot/game/{id}/move` or webhook response).
+- **Standing flag**: A player may arm a standing draw-offer flag at any moment during an active game (via REST `POST /bot/game/{id}/draw/offer` or WebSocket `ArmDrawOffer`). Arming is private to the seat and is **never broadcast** to the opponent or spectators. The room consumes the flag at that seat's next turn completion — including a forced pass, which is what allows a bare-king endgame or forced pass to carry a draw offer. The flag can be disarmed prior to turn completion via `DELETE /bot/game/{id}/draw/offer` or WebSocket `ArmDrawOffer(false)`.
+- **Turn-anchored delivery**: A player may also offer a draw by piggybacking `offerDraw: true` onto their completed move submission (`POST /bot/game/{id}/move` or webhook response).
 - **Pre-roll gate**: When an offer is pending for the active player, **auto-roll is suspended**. The board state displays the position after the offerer's move (with no dice revealed). The responder's clock ticks down while they decide.
 - **Acceptance**: The receiver may accept the draw offer via `acceptDraw: true` in their move submission or by calling `POST /bot/game/{id}/draw/accept`. This immediately terminates the game with `GameEnded(result = Draw, termination = Draw)` before any dice are revealed.
 - **Decline and dice reveal**: Calling `POST /bot/game/{id}/draw/decline` (or responding `acceptDraw: false`) explicitly declines the offer, which emits a `DrawDeclined` event, rolls and reveals the dice, and opens the move phase. In a reserved staked game the decline instead continues into the pre-roll double opportunity described under [Stake Doubling](../stake-doubling/).
 - **Anti-goals resolved**:
-  - *No mid-turn distraction attacks*: Draw offers cannot be made mid-turn; they are strictly bound to completed turn submissions.
+  - *No mid-turn distraction attacks*: Draw offers cannot interrupt an active turn; they are strictly delivered at turn completion.
   - *No free dice option*: A player is never allowed to view their dice before deciding on an opponent's draw offer.
-- **Alternation anti-spam**: Once a player's offer is declined or expires, only the opponent is permitted to make the next offer (`mayOfferDraw` on `PublicGameState` indicates whether the active player may offer a draw).
-- **Bot API & Webhook capabilities**: Bots without the exact `"draws"` capability have draw offers automatically declined by the server, immediately revealing dice and dispatching the standard `yourTurn` payload. Bots that declare `"draws"` receive a `drawDecision` webhook envelope (without dice) to accept or decline. The canonical [webhook capability catalog](../reference/webhooks/#discover-capabilities) lists `"draws"` as available and `"doubling"` as a reserved, unselectable name with no runtime behavior. The accepted future contract is documented separately under [Stake Doubling](../stake-doubling/); documentation does not enable it.
+- **Passing right and configurable return**: The right to offer a draw is a passing right. It starts centered and available to both seats (`mayOfferDrawBy: { "white": true, "black": true }`). A delivered offer hands the right exclusively to the opponent — only the holder may offer next. Whether the right also returns to a seat after $N$ of that seat's own completed turns is determined by the operator setting `PLAY_DRAW_REOFFER_TURNS`, which defaults to non-positive (never returning on its own). When returning is disabled, an offer attempt when not permitted is refused with `"opponent must offer next"` and no `availableAfterTurns` value. Only a deployment that explicitly enables a return (`PLAY_DRAW_REOFFER_TURNS > 0`) produces draw offer cooldown with `availableAfterTurns`.
+- **`mayOfferDrawBy` & `mayOfferDraw`**: `mayOfferDrawBy` on `Snapshot.state` indicates for each seat (`white` and `black`) whether that seat currently holds the right to offer a draw. `mayOfferDraw` indicates whether the active player may offer a draw on the current turn.
+- **Bot API & Webhook capabilities**: Bots without the exact `"draws"` capability have draw offers automatically declined by the server, immediately revealing dice and dispatching the standard `yourTurn` payload. Bots that declare `"draws"` receive a `drawDecision` webhook envelope (without dice) to accept or decline. Note that there is no `armDrawOffer` member on any webhook answer; standing flags are armed via REST or WebSocket. The canonical [webhook capability catalog](../reference/webhooks/#discover-capabilities) lists `"draws"` as available and `"doubling"` as a reserved, unselectable name with no runtime behavior. The accepted future contract is documented separately under [Stake Doubling](../stake-doubling/); documentation does not enable it.

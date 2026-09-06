@@ -124,19 +124,34 @@ Responds `202` (fire-and-forget). A duplicate, too-late, or malformed seed is ig
 
 `POST /bot/game/{id}/move`
 
-The turn's micro-moves in UCI, one per rolled die. Can optionally piggyback a draw offer (`offerDraw: true`) or accept a pending draw offer (`acceptDraw: true`).
+The turn's micro-moves in UCI, one per rolled die. Can optionally piggyback a draw offer (`offerDraw: true`), accept a pending draw offer (`acceptDraw: true`), or resign (`resign: true`). Note that `resign: true` takes precedence over `acceptDraw`, `moves`, and `offerDraw`.
 
 ```json
-{ "moves": ["e2e4", "g8f6"], "offerDraw": false, "acceptDraw": false }
+{ "moves": ["e2e4", "g8f6"], "offerDraw": false, "acceptDraw": false, "resign": false }
 ```
 
 The verdict is **synchronous**:
 
-- `200 { "applied": true, "version": 17, "reason": null }` — applied; `version` is the resulting `TurnPlayed`'s `v` (or game-ending event version).
-- `409 { "applied": false, "version": null, "reason": "illegal turn" }` — refused, same reason the stream's `Rejected` carries (`"not your turn"`, `"illegal turn"`, `"no draw offer pending"`, `"game is over"`).
+- `200 { "applied": true, "version": 17, "reason": null, "drawOffered": false }` — applied; `version` is the resulting `TurnPlayed`'s `v` (or game-ending event version). `drawOffered` indicates whether a draw offer was delivered with this turn (`true`) or dropped/not requested (`false`).
+- `409 { "applied": false, "version": null, "reason": "illegal turn", "drawOffered": null }` — refused, same reason the stream's `Rejected` carries (`"not your turn"`, `"illegal turn"`, `"no draw offer pending"`, `"game is over"`).
 - `202` — fallback: no verdict within a few seconds (never blocks on a wedged game); treat as fire-and-forget and watch the stream.
 
 A `TurnPlayed`/`Rejected`/`GameEnded` still broadcasts on the game stream regardless, so fire-and-forget bots can ignore the body.
+
+### Standing draw offers
+
+- **Arm standing draw offer**: `POST /bot/game/{id}/draw/offer`
+  Arms the standing draw-offer flag for the caller's seat. The offer is delivered at the completion of the caller's next turn (including forced pass). Idempotent (noop if already armed). Responds `200` with `DrawOfferResult`:
+  ```json
+  { "armed": true, "outcome": "armed", "reason": null, "availableAfterTurns": null }
+  ```
+  Refused `409` returns `DrawOfferResult` with `armed: false`, `outcome: null`, and `reason` (e.g. `"opponent must offer next"`, `"draw offer cooldown"`, `"draw offer already delivered"`, `"respond to the pending draw offer first"`, `"game is over"`, or `"too many draw toggles"`). `availableAfterTurns` is present only when refused due to cooldown under `PLAY_DRAW_REOFFER_TURNS > 0`.
+- **Disarm standing draw offer**: `DELETE /bot/game/{id}/draw/offer`
+  Disarms a previously armed standing draw-offer flag before delivery. Idempotent (noop if not armed). A delivered offer cannot be disarmed. Responds `200` with `DrawDisarmResult`:
+  ```json
+  { "armed": false, "outcome": "disarmed", "reason": null }
+  ```
+  Refused `409` returns `DrawDisarmResult` with `armed: false`, `outcome: null`, and `reason` (`"draw offer already delivered"`, `"respond to the pending draw offer first"`, `"game is over"`, `"too many draw toggles"`).
 
 ### Accept / decline a draw offer
 
@@ -145,7 +160,25 @@ A `TurnPlayed`/`Rejected`/`GameEnded` still broadcasts on the game stream regard
 
 ### Resign
 
-`POST /bot/game/{id}/resign` → `202`.
+- **Resign one game**: `POST /bot/game/{id}/resign`
+  Concede the game. Returns synchronous verdict on whether the resignation was applied:
+  - `200 { "applied": true, "version": 18, "reason": null }` — applied; terminates the game immediately in opponent `Win` with `termination: Resign`.
+  - `409 { "applied": false, "version": null, "reason": "game is over" }` — refused.
+  - `202` — fallback when verdict processing lags.
+- **Resign all games**: `POST /bot/games/resign-all`
+  Concede every active game the caller is seated in — the one-signal shutdown path for a bot. Accepts an optional body:
+  ```json
+  { "pauseSeating": true }
+  ```
+  With `pauseSeating: true`, the bot first leaves the rating ladder and human catalog (same writes as `POST /bot/ladder/leave` and `POST /bot/open-to-humans/leave`), preventing fresh games from seating during shutdown.
+  Responds `200`:
+  ```json
+  { "resigned": ["game-1", "game-2"], "alreadyOver": [], "pending": [], "pausedSeating": true }
+  ```
+  - `resigned`: games resigned by this call, sorted by id.
+  - `alreadyOver`: games that ended concurrently (king capture, timeout, opponent resignation).
+  - `pending`: games whose verdict timed out (resignation is queued and will settle).
+  - `pausedSeating`: true when `pauseSeating` was requested and ladder/catalog seating was paused.
 
 ### List my games
 
@@ -154,8 +187,25 @@ A `TurnPlayed`/`Rejected`/`GameEnded` still broadcasts on the game stream regard
 Every live game you are seated in — the polling counterpart of `GameStart` and the **post-restart recovery path**.
 
 ```json
-{ "games": [{ "gameId": "game-uuid", "seat": "White", "activeSeat": "White", "dicePending": true, "timeControl": { "Unlimited": {} }, "clocks": null, "version": 17 }] }
+{
+  "games": [{
+    "gameId": "game-uuid",
+    "seat": "White",
+    "activeSeat": "White",
+    "dicePending": true,
+    "timeControl": { "Unlimited": {} },
+    "clocks": null,
+    "version": 17,
+    "decision": null,
+    "mayOfferDraw": true,
+    "drawOfferArmed": false
+  }]
+}
 ```
+
+- **`decision`**: pending decision requiring caller's action before dice can be rolled (e.g. `{"kind": "drawResponse"}`), or `null`.
+- **`mayOfferDraw`**: whether the caller is eligible to arm or offer a draw this turn.
+- **`drawOfferArmed`**: whether the caller currently has a standing draw-offer flag armed.
 
 ## Public discovery
 

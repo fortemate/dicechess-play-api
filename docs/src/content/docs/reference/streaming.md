@@ -63,6 +63,7 @@ Sent immediately on connect — the current state.
       "clientSeeds": null,
       "drawOffer": null,
       "mayOfferDraw": true,
+      "mayOfferDrawBy": { "white": true, "black": true },
       "legalMoves": null,
       "players": { "white": { "kind": "Bot", "name": "house greedy", "rating": 1642.0 }, "black": { "kind": "Human", "name": null, "rating": null } },
       "rated": false
@@ -75,7 +76,7 @@ Sent immediately on connect — the current state.
 }
 ```
 
-`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero).
+`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `mayOfferDrawBy` indicates for each seat (`white` and `black`) whether that seat holds the right to offer a draw. `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero).
 
 `rated` says whether the game counts toward the [leaderboard](../rest/#leaderboard). Treat absence as "the server does not say", never as "casual". No rating delta is sent on `GameEnded`: ratings are applied by an asynchronous batch after the game, so refetch the profile or leaderboard for the post-game numbers.
 
@@ -139,4 +140,30 @@ Broadcast when a player explicitly declines a pending draw offer via `/draw/decl
 
 ```json
 { "Rejected": { "v": 2, "seat": "White", "reason": "Move e2e4 is illegal for dice pool" } }
+```
+
+## Socket Commands & Seat-Private Frames
+
+When playing or spectating over WebSocket, client commands and seat-private frames ride on the socket alongside the public game stream.
+
+### ArmDrawOffer (Client Command)
+
+A seated player may send `ArmDrawOffer` to arm or disarm their standing draw-offer flag:
+
+```json
+{ "ArmDrawOffer": { "armed": true } }
+```
+
+### DrawOfferArmed (Seat-Private Frame)
+
+The server responds with a seat-private `DrawOfferArmed` frame to confirm the flag status or report a refusal reason. **This frame is also sent once automatically when a seated socket connects**, reflecting the current standing flag state:
+
+```json
+{ "DrawOfferArmed": { "armed": true, "reason": null, "availableAfterTurns": null } }
+```
+
+When refused (e.g. when a spectator attempts to arm a draw offer, or when refused due to cooldown/alternation):
+
+```json
+{ "DrawOfferArmed": { "armed": false, "reason": "spectator cannot arm draw offer", "availableAfterTurns": null } }
 ```

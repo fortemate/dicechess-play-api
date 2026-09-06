@@ -130,6 +130,28 @@ final class GameRoom private (
             .offer(Msg.Command(seat, GameCommand.SubmitTurn(moves, offerDraw), receivedAt, Some(reply)))
             .as(reply.get)
 
+  /** Arm or disarm a standing draw offer flag for `seat`. Refusals are private. */
+  def armDrawOffer(seat: Seat, armed: Boolean): IO[DrawOfferArmed] =
+    stateRef.get.flatMap { s =>
+      if s.ended then IO.pure(DrawOfferArmed(armed = false, reason = Some(GameOverReason)))
+      else
+        Deferred[IO, DrawOfferArmed].flatMap { reply =>
+          inbox.offer(Msg.ArmDrawOfferMsg(seat, armed, reply)) *>
+            IO.race(reply.get, done.get).map {
+              case Left(res) => res
+              case Right(_)  => DrawOfferArmed(armed = false, reason = Some(GameOverReason))
+            }
+        }
+    }
+
+  /** Current armed status for `seat` (for initial frame after Snapshot on connect). */
+  def drawOfferArmedStatus(seat: Seat): IO[DrawOfferArmed] =
+    stateRef.get.map { s =>
+      if seat.side.isEmpty then DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer"))
+      else if s.ended then DrawOfferArmed(armed = false, reason = Some(GameOverReason))
+      else DrawOfferArmed(armed = s.armedDrawOffer.getOrElse(seat, false))
+    }
+
   /** Respond to a pending draw offer (accept or decline explicitly) and await the writer's verdict. */
   def respondDraw(seat: Seat, accept: Boolean): IO[TurnVerdict] =
     enqueueDrawResponse(seat, accept).flatten
@@ -381,6 +403,11 @@ final class GameRoom private (
               inFlightReply.set(reply) *>
                 stateRef.get.flatMap(s => process(s, seat, command, receivedAt, reply)).flatMap(stateRef.set) *>
                 inFlightReply.set(None) *> continue
+            case Msg.ArmDrawOfferMsg(seat, armed, reply) =>
+              stateRef.get.flatMap { s =>
+                val (sNext, response) = s.armDrawOffer(seat, armed)
+                stateRef.set(sNext) *> reportDrawArmRefusal(seat, response) *> reply.complete(response).void
+              } *> continue
             case Msg.Timeout =>
               stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
             case Msg.Abort =>
@@ -490,6 +517,8 @@ final class GameRoom private (
   private def drainRefusing: IO[Unit] =
     inbox.tryTake.flatMap:
       case Some(Msg.Command(_, _, _, reply))      => answer(reply, TurnVerdict.Refused(GameOverReason)) *> drainRefusing
+      case Some(Msg.ArmDrawOfferMsg(_, _, reply)) =>
+        reply.complete(DrawOfferArmed(armed = false, reason = Some(GameOverReason))).attempt.void *> drainRefusing
       case Some(Msg.ClaimSeat(_, _, _, _, reply)) => reply.complete(false).attempt.void *> drainRefusing
       case Some(_)                                => drainRefusing
       case None                                   => IO.unit
@@ -645,11 +674,35 @@ final class GameRoom private (
       else
         val passed   = rolled.endTurn()
         val passDfen = EngineOps.serialize(passed)
-        val s3       = s2.copy(
+
+        val canOffer   = s2.mayOffer(seat)
+        val armedOffer = s2.armedDrawOffer.getOrElse(seat, false)
+        val offer      = armedOffer && canOffer
+
+        val nextArmed = s2.armedDrawOffer.updated(seat, false)
+        // A turn boundary starts a fresh turn for BOTH seats: the waiting side may have spent its budget toggling
+        // while this turn was played, and must not carry that spend into a turn it is about to own.
+        val nextToggles = Map.empty[Seat, Int]
+
+        val (newPendingOffer, newLastOfferer, nextTurnsSinceLastOffer) =
+          if offer then (Some(seat), Some(seat), s2.turnsSinceLastOffer.updated(seat, 0))
+          else
+            (
+              None,
+              s2.lastDrawOfferer,
+              s2.turnsSinceLastOffer.updated(seat, s2.turnsSinceLastOffer.getOrElse(seat, 0) + 1)
+            )
+
+        val s3 = s2.copy(
           state = passed,
           pending = false,
           legalTurns = Map.empty,
           legalTree = MoveTree.empty,
+          armedDrawOffer = nextArmed,
+          drawTogglesThisTurn = nextToggles,
+          pendingDrawOffer = newPendingOffer,
+          lastDrawOfferer = newLastOfferer,
+          turnsSinceLastOffer = nextTurnsSinceLastOffer,
           turns = s2.turns :+ TurnRecord(s2.ply, colorLetter(seat), dice, Nil, passDfen, Some(0L))
         )
         emit(s3, v => GameEvent.TurnPlayed(v, seat, Nil, passDfen))
@@ -722,6 +775,14 @@ final class GameRoom private (
                   if seeded.started && seeded.hasAllSeeds then commit(seeded).flatMap(beginTurn)
                   else commit(seeded)
 
+          case GameCommand.ArmDrawOffer(armed) =>
+            // The socket routes this command through `armDrawOffer`, which owns the private reply the client needs, so
+            // this fire-and-forget path is not how a player arms. It is kept, rather than dropped, so that any caller
+            // holding a decoded `GameCommand` still applies the same transition through the same pure function — only
+            // the answer is unavailable here, which is exactly why the socket does not use it.
+            val (sNext, _) = s.armDrawOffer(seat, armed)
+            IO.pure(sNext)
+
           case GameCommand.RespondDraw(accept) =>
             seat.side match
               case None =>
@@ -739,7 +800,10 @@ final class GameRoom private (
                   endGame(s.copy(pendingDrawOffer = None), GameOver(GameResult.Draw, Termination.Draw))
                     .flatTap(s1 => answer(reply, TurnVerdict.Applied(s1.version)))
                 else
-                  val s1 = s.copy(pendingDrawOffer = None)
+                  val s1 = s.copy(
+                    pendingDrawOffer = None,
+                    armedDrawOffer = s.armedDrawOffer.updated(seat, false)
+                  )
                   emit(s1, v => GameEvent.DrawDeclined(v, seat))
                     .flatMap(revealDiceAndBegin)
                     .flatTap(s2 => answer(reply, TurnVerdict.Applied(s2.version)))
@@ -766,13 +830,25 @@ final class GameRoom private (
                   val nextDfen       = EngineOps.serialize(next)
                   // Stop the mover's clock at the receive time (not now, after validation) and apply the control's bonus
                   // before the next turn rolls and resets the clock for the other side.
-                  val (sd, elapsedMs)                   = debit(s, seat, receivedAt)
-                  val (newPendingOffer, newLastOfferer) =
-                    if offerDraw then
-                      if s.lastDrawOfferer.contains(seat) then
-                        (None, s.lastDrawOfferer) // Disallowed by alternation: ignored
-                      else (Some(seat), Some(seat))
-                    else (None, s.lastDrawOfferer) // No new offer
+                  val (sd, elapsedMs) = debit(s, seat, receivedAt)
+
+                  val canOffer   = sd.mayOffer(seat)
+                  val riderOffer = offerDraw
+                  val armedOffer = sd.armedDrawOffer.getOrElse(seat, false)
+                  val offer      = (riderOffer || armedOffer) && canOffer
+
+                  val nextArmed   = sd.armedDrawOffer.updated(seat, false)
+                  val nextToggles = Map.empty[Seat, Int]
+
+                  val (newPendingOffer, newLastOfferer, nextTurnsSinceLastOffer) =
+                    if winner.isDefined then (None, sd.lastDrawOfferer, sd.turnsSinceLastOffer)
+                    else if offer then (Some(seat), Some(seat), sd.turnsSinceLastOffer.updated(seat, 0))
+                    else
+                      (
+                        None,
+                        sd.lastDrawOfferer,
+                        sd.turnsSinceLastOffer.updated(seat, sd.turnsSinceLastOffer.getOrElse(seat, 0) + 1)
+                      )
 
                   emit(
                     sd.copy(
@@ -780,8 +856,11 @@ final class GameRoom private (
                       pending = false,
                       legalTurns = Map.empty,
                       legalTree = MoveTree.empty,
+                      armedDrawOffer = nextArmed,
+                      drawTogglesThisTurn = nextToggles,
                       pendingDrawOffer = newPendingOffer,
                       lastDrawOfferer = newLastOfferer,
+                      turnsSinceLastOffer = nextTurnsSinceLastOffer,
                       turns =
                         sd.turns :+ TurnRecord(sd.ply, colorLetter(seat), sd.lastRoll, uci, nextDfen, Some(elapsedMs))
                     ),
@@ -794,6 +873,20 @@ final class GameRoom private (
                       ).flatTap(_ => answer(reply, TurnVerdict.Applied(s1.version)))
 
   /** Complete a synchronous reply channel, if the command carried one. */
+  /** One line per refusal a player could not have predicted, so the open question in ADR 006 decision 1 — whether the
+    * right to offer a draw should return on its own, and after how many turns — is eventually answered from how often
+    * players actually hit the wall, rather than from competing intuitions. Deliberately not an error: being told the
+    * opponent holds the right is the rule working, not a fault.
+    */
+  private def reportDrawArmRefusal(seat: Seat, response: DrawOfferArmed): IO[Unit] =
+    response.reason match
+      case Some(reason) if reason == OpponentMustOfferReason || reason == DrawCooldownReason =>
+        Console[IO].println(
+          s"[play][draw] $seat wanted to offer a draw and could not: $reason" +
+            response.availableAfterTurns.fold("")(turns => s" (returns after $turns own turns)")
+        )
+      case _ => IO.unit
+
   private def answer(reply: Option[Deferred[IO, TurnVerdict]], verdict: TurnVerdict): IO[Unit] =
     reply.traverse_(_.complete(verdict).void)
 
@@ -858,6 +951,36 @@ object GameRoom:
     */
   val DefaultMaxInlineTurnPaths: Int = 1000
 
+  /** `drawReofferTurns` value meaning the right to offer a draw never returns on its own: once a seat's offer has been
+    * delivered, only the opponent may offer next, until they offer in turn. This is the model ADR 006 calls a passing
+    * right, the same shape as the doubling cube's ownership, and it is what shipped before #105.
+    */
+  val DrawRightNeverReturns: Int = 0
+
+  /** How many of its own turns a seat must complete before its right to offer a draw returns on its own.
+    *
+    * The rule is deliberately a setting rather than a constant: no external authority defines it for Dice Chess yet,
+    * and reasonable people disagree (ADR 006 decision 1). `PLAY_DRAW_REOFFER_TURNS` is read once in `Main` and passed
+    * down; the default keeps the pre-#105 behaviour, so enabling a return is an explicit operator choice measured
+    * against the refusal telemetry rather than a silent loosening of a live rule.
+    */
+  val DefaultDrawReofferTurns: Int = DrawRightNeverReturns
+
+  /** Refusal reasons for `ArmDrawOffer`, named once because the socket edge answers a spectator with the same wording
+    * the room would have used (see `PlayRoutes.fromClient`).
+    */
+  private[play] val SpectatorCannotArmReason = "spectator cannot arm draw offer"
+  private[play] val OpponentMustOfferReason  = "opponent must offer next"
+  private[play] val DrawCooldownReason       = "draw offer cooldown"
+  private[play] val OfferAlreadyDelivered    = "draw offer already delivered"
+  private[play] val RespondToOfferFirst      = "respond to the pending draw offer first"
+  private[play] val TooManyDrawToggles       = "too many draw toggles"
+
+  /** Changes of the standing flag one seat may make within a single turn. A no-op change does not count, so this is a
+    * budget for genuine indecision, not for the client's own re-sends.
+    */
+  private[play] val MaxDrawTogglesPerTurn: Int = 10
+
   /** The per-roll turn cache, built once when the dice land: the UCI→engine-path index `SubmitTurn` validates against
     * (a lookup per submit, never a re-enumeration or re-mapping), and the prebuilt wire tree every snapshot and
     * `GET /games/{id}/moves` read serves as-is.
@@ -882,6 +1005,11 @@ object GameRoom:
         command: GameCommand,
         receivedAt: FiniteDuration,
         reply: Option[Deferred[IO, TurnVerdict]]
+    )
+    case ArmDrawOfferMsg(
+        seat: Seat,
+        armed: Boolean,
+        reply: Deferred[IO, DrawOfferArmed]
     )
     case Timeout
     // #285: bind a seat to whoever redeemed its join token. Goes through the inbox like every other write — the
@@ -942,11 +1070,70 @@ object GameRoom:
       // Whether a draw offer from the opponent is currently live on this turn (#327). `None` when no offer is pending.
       pendingDrawOffer: Option[Seat] = None,
       // The seat that last offered a draw, enforcing the Option A alternation anti-spam rule (#327).
-      lastDrawOfferer: Option[Seat] = None
+      lastDrawOfferer: Option[Seat] = None,
+      // Transient standing draw offer flags per seat.
+      armedDrawOffer: Map[Seat, Boolean] = Map.empty,
+      // Count of own completed turns since last delivered offer per seat.
+      turnsSinceLastOffer: Map[Seat, Int] = Map.empty,
+      // Toggle count per seat per turn.
+      drawTogglesThisTurn: Map[Seat, Int] = Map.empty,
+      // Configured cooldown turns before re-offering.
+      drawReofferTurns: Int = DefaultDrawReofferTurns
   ):
     def ended: Boolean = status match
       case GameStatus.Ended(_) => true
       case GameStatus.Active   => false
+
+    /** Whether `s` is permitted to offer a draw under the re-offer rule: the right is held by whoever did not offer
+      * last, and comes back to `s` on its own only when the deployment configured it to (see `drawReofferTurns`).
+      */
+    def mayOffer(s: Seat): Boolean =
+      s.side.isDefined &&
+        status == GameStatus.Active &&
+        pendingDrawOffer.isEmpty &&
+        (!lastDrawOfferer.contains(s) || drawRightReturned(s))
+
+    /** Whether `s`'s own right to offer has come back without the opponent offering. Never when the deployment leaves
+      * `drawReofferTurns` at [[DrawRightNeverReturns]].
+      */
+    private def drawRightReturned(s: Seat): Boolean =
+      drawReofferTurns > 0 && turnsSinceLastOffer.getOrElse(s, 0) >= drawReofferTurns
+
+    /** How many more of `s`'s own turns must be completed before the right returns; `None` when it never does, so a
+      * client is never told to wait out a number that will not arrive.
+      */
+    private def availableAfterTurns(s: Seat): Option[Int] =
+      Option.when(drawReofferTurns > 0)(drawReofferTurns - turnsSinceLastOffer.getOrElse(s, 0))
+
+    /** Arm or disarm the standing draw offer for `seat`, answering privately. The state-based refusals come first, so a
+      * player is told what the game forbids rather than that they toggled too often; a change to the value the seat
+      * already holds is a no-op and costs nothing, since a client re-sending its state must not spend the budget.
+      */
+    def armDrawOffer(seat: Seat, requestedArmed: Boolean): (Session, DrawOfferArmed) =
+      val currentArmed                                               = armedDrawOffer.getOrElse(seat, false)
+      def refuse(reason: String, availableAfter: Option[Int] = None) =
+        (this, DrawOfferArmed(armed = false, reason = Some(reason), availableAfterTurns = availableAfter))
+
+      if seat.side.isEmpty then refuse(SpectatorCannotArmReason)
+      else if ended then refuse(GameOverReason)
+      else if pendingDrawOffer.contains(seat) then refuse(OfferAlreadyDelivered)
+      else if pendingDrawOffer.isDefined then refuse(RespondToOfferFirst)
+      else if requestedArmed == currentArmed then (this, DrawOfferArmed(armed = currentArmed))
+      else if requestedArmed && !mayOffer(seat) then
+        // The right is the opponent's. Name that, and only quote a number of turns when one will actually arrive.
+        availableAfterTurns(seat) match
+          case Some(turnsLeft) => refuse(DrawCooldownReason, Some(turnsLeft))
+          case None            => refuse(OpponentMustOfferReason)
+      else if drawTogglesThisTurn.getOrElse(seat, 0) >= MaxDrawTogglesPerTurn then
+        (this, DrawOfferArmed(armed = currentArmed, reason = Some(TooManyDrawToggles)))
+      else
+        (
+          copy(
+            armedDrawOffer = armedDrawOffer.updated(seat, requestedArmed),
+            drawTogglesThisTurn = drawTogglesThisTurn.updated(seat, drawTogglesThisTurn.getOrElse(seat, 0) + 1)
+          ),
+          DrawOfferArmed(armed = requestedArmed)
+        )
 
     /** Every seated player has submitted a client seed. */
     def hasAllSeeds: Boolean = players.keySet.forall(clientSeeds.contains)
@@ -989,7 +1176,10 @@ object GameRoom:
           ),
         Some(rated),
         Option.when(isDrawPending)(DrawOffer(pending = true)),
-        Option.when(dicePending)(!lastDrawOfferer.contains(activeSt))
+        Option.when(dicePending)(mayOffer(activeSt)),
+        Option.when(status == GameStatus.Active)(
+          MayOfferDrawBy(white = mayOffer(Seat.White), black = mayOffer(Seat.Black))
+        )
       )
 
     /** The pair of client seeds actually folded into the dice, for the end-of-game reveal. */
@@ -1018,6 +1208,7 @@ object GameRoom:
       origin: GameOrigin = GameOrigin.Legacy,
       seedGrace: FiniteDuration = DefaultSeedGrace,
       maxInlinePaths: Int = DefaultMaxInlineTurnPaths,
+      drawReofferTurns: Int = DefaultDrawReofferTurns,
       persist: GameSnapshot => IO[Unit] = _ => IO.unit,
       // How writes after the creation snapshot are treated (ADR-005 §7) — the registry passes `Required` for a
       // showcase game; everything else keeps the availability-first default.
@@ -1044,7 +1235,8 @@ object GameRoom:
               ladder = ladder,
               origin = origin,
               remaining = initialRemaining(timeControl, players.keys),
-              createdAtEpochMs = Some(createdAt.toMillis)
+              createdAtEpochMs = Some(createdAt.toMillis),
+              drawReofferTurns = drawReofferTurns
             )
             seatTokens <- mintTokens(players.keys)
             room       <- build(
@@ -1085,6 +1277,7 @@ object GameRoom:
       disconnectGrace: FiniteDuration = DefaultDisconnectGrace,
       seedGrace: FiniteDuration = DefaultSeedGrace,
       maxInlinePaths: Int = DefaultMaxInlineTurnPaths,
+      drawReofferTurns: Int = DefaultDrawReofferTurns,
       persist: GameSnapshot => IO[Unit] = _ => IO.unit,
       durability: Durability = Durability.BestEffort
   ): IO[Either[String, GameRoom]] =
@@ -1127,7 +1320,8 @@ object GameRoom:
             legalTurns = turns,
             legalTree = tree,
             pendingDrawOffer = snapshot.pendingDrawOffer,
-            lastDrawOfferer = snapshot.lastDrawOfferer
+            lastDrawOfferer = snapshot.lastDrawOfferer,
+            drawReofferTurns = drawReofferTurns
           )
           build(
             session0,

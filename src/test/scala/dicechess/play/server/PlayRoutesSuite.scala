@@ -329,6 +329,57 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
       .map: frames =>
         assert(frames.exists(_.isInstanceOf[WebSocketFrame.Ping]), s"expected a ping among $frames")
 
+  test("human WebSocket handles ArmDrawOffer, sends DrawOfferArmed private frame, and refuses spectator privately"):
+    val resources =
+      for
+        port <- server
+        http <- JdkHttpClient.simple[IO]
+        ws   <- JdkWSClient.simple[IO]
+      yield (port, http, ws)
+
+    resources.use: (port, http, ws) =>
+      val httpBase = Uri.unsafeFromString(s"http://127.0.0.1:$port")
+      val wsBase   = Uri.unsafeFromString(s"ws://127.0.0.1:$port")
+      for
+        created <- http.expect[CreatedGame](POST(CreateGame(Some(WhiteId), Some(BlackId)), httpBase / "games"))
+        whiteUri = wsBase / "games" / created.gameId / "ws" +? ("token" -> tokenOf(created, Seat.White))
+        specUri  = wsBase / "games" / created.gameId / "ws"
+        _ <- ws.connectHighLevel(WSRequest(whiteUri)).use { whiteConn =>
+          // Seated White receives Snapshot then initial DrawOfferArmed frame
+          for
+            // Send ArmDrawOffer over WS
+            _ <- whiteConn.send(WSFrame.Text((GameCommand.ArmDrawOffer(armed = true): GameCommand).asJson.noSpaces))
+            // Read until DrawOfferArmed response frame
+            armedFrame <- whiteConn.receiveStream
+              .collect { case WSFrame.Text(txt, _) => txt }
+              .map(txt => decode[DrawOfferArmedFrame](txt).toOption)
+              .unNone
+              .collect { case DrawOfferArmedFrame(da) => da }
+              .take(2) // Initial status after Snapshot, then response to ArmDrawOffer
+              .compile
+              .toList
+              .timeoutTo(5.seconds, IO.raiseError(RuntimeException("no DrawOfferArmed frame")))
+          yield assertEquals(armedFrame.last, DrawOfferArmed(armed = true))
+        }
+        _ <- ws.connectHighLevel(WSRequest(specUri)).use { specConn =>
+          for
+            _ <- specConn.send(WSFrame.Text((GameCommand.ArmDrawOffer(armed = true): GameCommand).asJson.noSpaces))
+            refusedFrame <- specConn.receiveStream
+              .collect { case WSFrame.Text(txt, _) => txt }
+              .map(txt => decode[DrawOfferArmedFrame](txt).toOption)
+              .unNone
+              .collect { case DrawOfferArmedFrame(da) => da }
+              .take(1)
+              .compile
+              .lastOrError
+              .timeoutTo(5.seconds, IO.raiseError(RuntimeException("spectator refusal not received")))
+          yield assertEquals(
+            refusedFrame,
+            DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer"))
+          )
+        }
+      yield ()
+
   test("clientFrames terminates with a Close frame when the game ends"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom

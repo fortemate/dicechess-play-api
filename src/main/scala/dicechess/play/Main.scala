@@ -4,6 +4,7 @@ import cats.effect.{IO, IOApp, Resource}
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import dicechess.play.core.{Principal, RatingCategory}
+import dicechess.play.game.GameRoom
 import dicechess.play.server.{
   AdminBotRoutes,
   AdmissionGuard,
@@ -139,6 +140,14 @@ object Main extends IOApp.Simple:
     */
   private[play] def registryFor(store: GameStore, pgStore: Option[PgGameStore]): IO[GameRegistry] =
     GameRegistry.create(
+      // ADR 006 decision 1 leaves one number open: after how many of its own turns a seat's right to offer a draw
+      // returns without the opponent offering. No governing body defines it for Dice Chess, so it is an operator
+      // setting; anything but a positive integer keeps the shipped rule, where the right only ever passes.
+      drawReofferTurns = sys.env
+        .get("PLAY_DRAW_REOFFER_TURNS")
+        .flatMap(_.toIntOption)
+        .filter(_ > 0)
+        .getOrElse(GameRoom.DefaultDrawReofferTurns),
       store = store,
       resolveNicknames =
         pgStore.fold[List[String] => IO[Map[String, String]]](_ => IO.pure(Map.empty))(_.nicknamesByExternalId),

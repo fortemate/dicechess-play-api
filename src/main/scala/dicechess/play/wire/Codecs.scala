@@ -62,20 +62,23 @@ object Codecs:
     Encoder.instance(encodeMoveTree)
   )
 
-  given Codec[GameResult]      = deriveCodec
-  given Codec[GameOver]        = deriveCodec
-  given Codec[GameStatus]      = deriveCodec
-  given Codec[TimeControl]     = deriveCodec
-  given Codec[Seek]            = deriveCodec
-  given Codec[Clocks]          = deriveCodec
-  given Codec[ClientSeeds]     = deriveCodec
-  given Codec[Principal]       = deriveCodec
-  given Codec[DrawOffer]       = deriveCodec
-  given Codec[PublicPlayer]    = deriveCodec
-  given Codec[Players]         = deriveCodec
-  given Codec[PublicGameState] = deriveCodec
-  given Codec[GameMoves]       = deriveCodec
-  given Codec[SnapshotTurn]    = deriveCodec
+  given Codec[GameResult]          = deriveCodec
+  given Codec[GameOver]            = deriveCodec
+  given Codec[GameStatus]          = deriveCodec
+  given Codec[TimeControl]         = deriveCodec
+  given Codec[Seek]                = deriveCodec
+  given Codec[Clocks]              = deriveCodec
+  given Codec[ClientSeeds]         = deriveCodec
+  given Codec[Principal]           = deriveCodec
+  given Codec[DrawOffer]           = deriveCodec
+  given Codec[MayOfferDrawBy]      = deriveCodec
+  given Codec[PublicPlayer]        = deriveCodec
+  given Codec[Players]             = deriveCodec
+  given Codec[PublicGameState]     = deriveCodec
+  given Codec[GameMoves]           = deriveCodec
+  given Codec[SnapshotTurn]        = deriveCodec
+  given Codec[DrawOfferArmed]      = deriveCodec
+  given Codec[DrawOfferArmedFrame] = deriveCodec
   // ConfiguredCodec, not deriveCodec: `SubmitTurn.offerDraw` (#327) is a defaulted non-Option field.
   given Codec[GameCommand] = ConfiguredCodec.derived
   given Codec[GameEvent]   = deriveCodec

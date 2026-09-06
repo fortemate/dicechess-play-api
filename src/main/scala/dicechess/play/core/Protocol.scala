@@ -176,6 +176,9 @@ final case class Players(white: PublicPlayer, black: PublicPlayer)
 /** Whether a draw offer from the opponent is currently pending for the side on move (#327). */
 final case class DrawOffer(pending: Boolean = true)
 
+/** Whether each seat is permitted to offer a draw on its turn under the re-offer rule. */
+final case class MayOfferDrawBy(white: Boolean, black: Boolean)
+
 /** A wire-safe snapshot of a game, sufficient for a (re)joining client or bot to act. */
 final case class PublicGameState(
     version: Long,
@@ -209,7 +212,9 @@ final case class PublicGameState(
     // Whether a draw offer from the opponent is currently pending for the side on move (#327).
     drawOffer: Option[DrawOffer] = None,
     // Whether the side to move is permitted to offer a draw on this turn under the alternation rule (#327).
-    mayOfferDraw: Option[Boolean] = None
+    mayOfferDraw: Option[Boolean] = None,
+    // Whether each seat is permitted to offer a draw on its turn.
+    mayOfferDrawBy: Option[MayOfferDrawBy] = None
 )
 
 /** The full legal-move tree for a game's pending roll, served by `GET /games/{id}/moves` — never capped, unlike the
@@ -239,6 +244,17 @@ enum GameCommand:
   case SubmitSeed(seed: String)
   case Resign
   case RespondDraw(accept: Boolean)
+  case ArmDrawOffer(armed: Boolean)
+
+/** Private WebSocket response for standing draw offer status. */
+final case class DrawOfferArmed(
+    armed: Boolean,
+    reason: Option[String] = None,
+    availableAfterTurns: Option[Int] = None
+)
+
+/** Top-level envelope for private DrawOfferArmed responses on WebSocket. */
+final case class DrawOfferArmedFrame(DrawOfferArmed: DrawOfferArmed)
 
 /** Transport-neutral events the room broadcasts. Each carries a monotonic version `v` so clients can order,
   * de-duplicate, and resync.

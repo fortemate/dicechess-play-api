@@ -19,6 +19,7 @@ final class GameRegistry private (
     rooms: Ref[IO, Map[GameId, GameRoom]],
     byPlayer: Ref[IO, Map[Principal, Set[GameId]]],
     disconnectGrace: FiniteDuration,
+    drawReofferTurns: Int,
     store: GameStore,
     resolveNicknames: List[String] => IO[Map[String, String]],
     resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]],
@@ -193,6 +194,7 @@ final class GameRegistry private (
           displayNames = names,
           ratings = ratings,
           disconnectGrace = disconnectGrace,
+          drawReofferTurns = drawReofferTurns,
           timeControl = timeControl,
           rated = rated,
           ladder = ladder,
@@ -248,6 +250,7 @@ final class GameRegistry private (
                 displayNames = names,
                 ratings = RatingCategory.of(snapshot.timeControl).flatMap(byCategory.get).getOrElse(Map.empty),
                 disconnectGrace = disconnectGrace,
+                drawReofferTurns = drawReofferTurns,
                 persist = store.save(id, _),
                 // A resumed showcase game is as fail-closed as it was before the restart: the origin travels in the
                 // snapshot precisely so the discipline can be re-derived from it.
@@ -402,6 +405,7 @@ object GameRegistry:
     */
   def create(
       disconnectGrace: FiniteDuration = GameRoom.DefaultDisconnectGrace,
+      drawReofferTurns: Int = GameRoom.DefaultDrawReofferTurns,
       store: GameStore = GameStore.noop,
       resolveNicknames: List[String] => IO[Map[String, String]] = _ => IO.pure(Map.empty),
       resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]] = (_, _) => IO.pure(Map.empty),
@@ -415,6 +419,7 @@ object GameRegistry:
         rooms,
         byPlayer,
         disconnectGrace,
+        drawReofferTurns,
         store,
         resolveNicknames,
         resolveRatings,

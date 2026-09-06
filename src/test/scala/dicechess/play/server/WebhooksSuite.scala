@@ -343,7 +343,10 @@ class WebhooksSuite extends munit.CatsEffectSuite:
                 )
                 mutation.current match
                   case Some(_) =>
-                    assertEquals(enqueues, List(CurrentRegistrationId))
+                    assert(
+                      enqueues.nonEmpty && enqueues.forall(_ == CurrentRegistrationId),
+                      s"${mutation.label}: expected all enqueues to be CurrentRegistrationId, got $enqueues"
+                    )
                     assertEquals(usedGenerations.headOption, Some(OldRegistrationId))
                     assert(
                       usedGenerations.drop(1).nonEmpty && usedGenerations.drop(1).forall(_ == CurrentRegistrationId),

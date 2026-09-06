@@ -451,7 +451,8 @@
       "additionalProperties": false,
       "properties": {
         "decisionId": { "$ref": "#/$defs/DecisionId" },
-        "offerDouble": { "type": "boolean" }
+        "offerDouble": { "type": "boolean" },
+        "resign": { "type": "boolean" }
       },
       "required": ["decisionId", "offerDouble"]
     },
@@ -489,7 +490,8 @@
       "additionalProperties": false,
       "properties": {
         "decisionId": { "$ref": "#/$defs/DecisionId" },
-        "acceptDouble": { "type": "boolean" }
+        "acceptDouble": { "type": "boolean" },
+        "resign": { "type": "boolean" }
       },
       "required": ["decisionId", "acceptDouble"]
     },

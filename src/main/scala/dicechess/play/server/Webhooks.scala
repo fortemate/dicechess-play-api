@@ -332,6 +332,8 @@ final class Webhooks private (
               "unparseable drawDecision response",
               DeliveryOutcome.Garbled
             )
+          case Right(botMove) if botMove.resign =>
+            enqueueResign(seat, room, hook, failed)
           case Right(botMove) if botMove.acceptDraw.contains(true) =>
             decision(accept = true)
           case Right(_) =>
@@ -387,7 +389,9 @@ final class Webhooks private (
     attempt match
       case PostOutcome.Ok(answer) =>
         decode[BotMove](answer) match
-          case Left(_) => ifCurrent(failed("unparseable response", DeliveryOutcome.Garbled))
+          case Left(_)                          => ifCurrent(failed("unparseable response", DeliveryOutcome.Garbled))
+          case Right(botMove) if botMove.resign =>
+            enqueueResign(seat, room, hook, failed)
           case Right(botMove) if botMove.moves.isEmpty =>
             ifCurrent(
               Console[IO]
@@ -403,6 +407,28 @@ final class Webhooks private (
       case PostOutcome.TimedOut    => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut))
       case PostOutcome.Unreachable => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable))
       case PostOutcome.PolicyRejected(reason) => ifCurrent(failed(reason, DeliveryOutcome.Unreachable))
+
+  /** The one resignation path every delivery answer shares (ADR 006 §3.3): `resign: true` wins over every other member
+    * of the body, is applied even when the answer's `version` or `decisionId` is stale (resignation is not a decision
+    * step), and is recorded as its own `Resigned` outcome so operators can tell a deliberate concession from a fault.
+    * The reserved doubling deliveries (`doubleOpportunity`, `doubleDecision`; play-api #61/#62) must route a
+    * `resign: true` answer here before reading `offerDouble` or `acceptDouble`, exactly as `classifyTurn` and
+    * `classifyDrawDecision` do before reading `moves` and `acceptDraw`.
+    */
+  private def enqueueResign(
+      seat: Seat,
+      room: GameRoom,
+      hook: BotWebhook,
+      failed: (String, DeliveryOutcome) => IO[DeliveryOutcome]
+  ): IO[DeliveryOutcome] =
+    store
+      .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(room.enqueueResign(seat))
+      .flatMap:
+        case None        => IO.pure(DeliveryOutcome.StaleRegistration)
+        case Some(await) =>
+          await.flatMap:
+            case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
+            case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
   /** Fire-and-forget into the drain queue (#225) — `tryOffer` never blocks a turn on a slow or backed-up stats writer.
     * Overflow (the queue is bounded, matching this class's own "delivery rate is structurally bounded" doctrine) drops

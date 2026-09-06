@@ -162,29 +162,41 @@ object PlayRoutes:
           .flatMap:
             case None       => NotFound()
             case Some(room) =>
-              token match
-                case Some(t) =>
-                  room.seatFor(t) match
-                    case None       => Forbidden()
-                    case Some(seat) =>
-                      // #285: redeeming a join token is the only moment the second player of a friend-by-link game is
-                      // ever identifiable, so bind the seat to them before the socket opens. `claimSeat` is a no-op for
-                      // every game that already has two distinct players, so this costs one seating read otherwise.
-                      // The session wins over `guest` (the #235 idiom); a game whose seats already differ ignores both.
-                      claimSeatQuietly(registry, session, req, GameId(id), seat, guest) *>
-                        wsb.build(clientFrames(room, keepAlive), fromClient(room, seat))
-                case None =>
-                  AuthSession.principalFor(session, req).flatMap {
-                    case None       => wsb.build(clientFrames(room, keepAlive), fromClient(room, Seat.Spectator))
-                    case Some(user) =>
-                      room.seating.flatMap { seats =>
-                        val owned = seats.collect { case (seat, p) if p == user => seat }.toList
-                        val seat  = owned match
-                          case only :: Nil => only
-                          case _           => Seat.Spectator
-                        wsb.build(clientFrames(room, keepAlive), fromClient(room, seat))
-                      }
-                  }
+              cats.effect.std.Queue.unbounded[IO, WebSocketFrame].flatMap { privateQueue =>
+                token match
+                  case Some(t) =>
+                    room.seatFor(t) match
+                      case None       => Forbidden()
+                      case Some(seat) =>
+                        // #285: redeeming a join token is the only moment the second player of a friend-by-link game is
+                        // ever identifiable, so bind the seat to them before the socket opens. `claimSeat` is a no-op for
+                        // every game that already has two distinct players, so this costs one seating read otherwise.
+                        // The session wins over `guest` (the #235 idiom); a game whose seats already differ ignores both.
+                        claimSeatQuietly(registry, session, req, GameId(id), seat, guest) *>
+                          wsb.build(
+                            clientFrames(room, keepAlive, seat, Some(privateQueue)),
+                            fromClient(room, seat, Some(privateQueue))
+                          )
+                  case None =>
+                    AuthSession.principalFor(session, req).flatMap {
+                      case None =>
+                        wsb.build(
+                          clientFrames(room, keepAlive, Seat.Spectator, Some(privateQueue)),
+                          fromClient(room, Seat.Spectator, Some(privateQueue))
+                        )
+                      case Some(user) =>
+                        room.seating.flatMap { seats =>
+                          val owned = seats.collect { case (seat, p) if p == user => seat }.toList
+                          val seat  = owned match
+                            case only :: Nil => only
+                            case _           => Seat.Spectator
+                          wsb.build(
+                            clientFrames(room, keepAlive, seat, Some(privateQueue)),
+                            fromClient(room, seat, Some(privateQueue))
+                          )
+                        }
+                    }
+              }
 
   /** Who is redeeming a join token, for the seat-claim in #285: the account session if there is one, otherwise the
     * `guest` query param — the same "session wins, the anonymous id is only a fallback" order #235 established for the
@@ -229,17 +241,49 @@ object PlayRoutes:
     * (which completes on the terminal event), appending an explicit WebSocket Close frame so the socket closes cleanly
     * when the game ends rather than idling out.
     */
-  private[server] def clientFrames(room: GameRoom, keepAlive: FiniteDuration): Stream[IO, WebSocketFrame] =
-    val events     = room.subscribe.map(event => WebSocketFrame.Text(event.asJson.noSpaces))
+  private[server] def clientFrames(
+      room: GameRoom,
+      keepAlive: FiniteDuration,
+      seat: Seat = Seat.Spectator,
+      privateQueue: Option[cats.effect.std.Queue[IO, WebSocketFrame]] = None
+  ): Stream[IO, WebSocketFrame] =
+    val events = room.subscribe.flatMap { event =>
+      val frame = Stream.emit(WebSocketFrame.Text(event.asJson.noSpaces))
+      event match
+        case GameEvent.Snapshot(_, _, _) if seat.side.isDefined =>
+          val initialArmedFrame = Stream.eval(
+            room
+              .drawOfferArmedStatus(seat)
+              .map(da => WebSocketFrame.Text(DrawOfferArmedFrame(da).asJson.noSpaces))
+          )
+          frame ++ initialArmedFrame
+        case _ => frame
+    }
     val keepAlives = Stream.awakeEvery[IO](keepAlive).as(WebSocketFrame.Ping())
-    events.mergeHaltL(keepAlives) ++ Stream.emit(WebSocketFrame.Close(ByteVector.fromShort(1000.toShort)))
+    val privates   = privateQueue.fold(Stream.empty: Stream[IO, WebSocketFrame])(q => Stream.fromQueueUnterminated(q))
+    events.mergeHaltL(keepAlives).mergeHaltL(privates) ++ Stream.emit(
+      WebSocketFrame.Close(ByteVector.fromShort(1000.toShort))
+    )
 
-  private def fromClient(room: GameRoom, seat: Seat): Pipe[IO, WebSocketFrame, Unit] =
+  private[server] def fromClient(
+      room: GameRoom,
+      seat: Seat,
+      privateQueue: Option[cats.effect.std.Queue[IO, WebSocketFrame]] = None
+  ): Pipe[IO, WebSocketFrame, Unit] =
     in =>
       val commands = in.evalMap {
-        // Spectators receive events but cannot submit commands.
-        case WebSocketFrame.Text(txt, _) if seat.side.isDefined =>
-          decode[GameCommand](txt).fold(_ => IO.unit, room.submit(seat, _))
+        case WebSocketFrame.Text(txt, _) =>
+          decode[GameCommand](txt) match
+            case Right(GameCommand.ArmDrawOffer(armed)) =>
+              privateQueue match
+                case Some(q) =>
+                  room.armDrawOffer(seat, armed).flatMap { response =>
+                    q.offer(WebSocketFrame.Text(DrawOfferArmedFrame(response).asJson.noSpaces)).void
+                  }
+                case None => IO.unit
+            case Right(cmd) if seat.side.isDefined =>
+              room.submit(seat, cmd)
+            case _ => IO.unit
         case _ => IO.unit
       }
       // Hold the seat's presence for the life of the socket. When it drops, the room starts the reconnect grace

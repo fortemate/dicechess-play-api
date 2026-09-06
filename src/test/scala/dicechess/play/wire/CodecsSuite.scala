@@ -18,6 +18,29 @@ class CodecsSuite extends munit.FunSuite:
     roundtrip[GameCommand](GameCommand.RespondDraw(accept = false))
     roundtrip[GameCommand](GameCommand.SubmitSeed("a1b2c3d4e5f60718"))
     roundtrip[GameCommand](GameCommand.Resign)
+    roundtrip[GameCommand](GameCommand.ArmDrawOffer(armed = true))
+    roundtrip[GameCommand](GameCommand.ArmDrawOffer(armed = false))
+
+  test("DrawOfferArmedFrame and MayOfferDrawBy round-trip and pin wire shapes"):
+    val frame1 = DrawOfferArmedFrame(DrawOfferArmed(armed = true))
+    roundtrip[DrawOfferArmedFrame](frame1)
+    assertEquals(
+      frame1.asJson.noSpaces,
+      """{"DrawOfferArmed":{"armed":true,"reason":null,"availableAfterTurns":null}}"""
+    )
+
+    val frame2 = DrawOfferArmedFrame(
+      DrawOfferArmed(armed = false, reason = Some("draw offer cooldown"), availableAfterTurns = Some(5))
+    )
+    roundtrip[DrawOfferArmedFrame](frame2)
+    assertEquals(
+      frame2.asJson.noSpaces,
+      """{"DrawOfferArmed":{"armed":false,"reason":"draw offer cooldown","availableAfterTurns":5}}"""
+    )
+
+    val mayOfferBy = MayOfferDrawBy(white = true, black = false)
+    roundtrip[MayOfferDrawBy](mayOfferBy)
+    assertEquals(mayOfferBy.asJson.noSpaces, """{"white":true,"black":false}""")
 
   test("GameEvent round-trips"):
     val ps =
@@ -203,7 +226,7 @@ class CodecsSuite extends munit.FunSuite:
     )
     assertEquals(
       (GameEvent.Snapshot(9L, terminal, Nil): GameEvent).asJson.noSpaces,
-      """{"Snapshot":{"v":9,"state":{"version":9,"dfen":"fen","activeSeat":"White","dicePending":false,"status":{"Ended":{"over":{"result":{"Win":{"side":"White"}},"termination":"KingCaptured"}}},"timeControl":{"Unlimited":{}},"clocks":null,"commit":"c0ffee","seed":"ab12","clientSeeds":{"white":"w","black":"b"},"legalMoves":null,"players":null,"rated":null,"drawOffer":null,"mayOfferDraw":null},"history":[]}}"""
+      """{"Snapshot":{"v":9,"state":{"version":9,"dfen":"fen","activeSeat":"White","dicePending":false,"status":{"Ended":{"over":{"result":{"Win":{"side":"White"}},"termination":"KingCaptured"}}},"timeControl":{"Unlimited":{}},"clocks":null,"commit":"c0ffee","seed":"ab12","clientSeeds":{"white":"w","black":"b"},"legalMoves":null,"players":null,"rated":null,"drawOffer":null,"mayOfferDraw":null,"mayOfferDrawBy":null},"history":[]}}"""
     )
 
   test("Seek and Players pin their wire shapes (who a lobby row / board is looking at)"):

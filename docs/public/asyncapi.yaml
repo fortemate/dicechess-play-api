@@ -286,6 +286,12 @@ components:
         mayOfferDraw:
           type: [boolean, 'null']
           description: Whether the active player is allowed to offer a draw this turn under anti-spam alternation.
+        mayOfferDrawBy:
+          type: [object, 'null']
+          description: Whether each seat (white and black) currently holds the right to offer a draw.
+          properties:
+            white: { type: boolean }
+            black: { type: boolean }
         legalMoves:
           oneOf: [{ $ref: '#/components/schemas/MoveTree' }, { type: 'null' }]
         players:

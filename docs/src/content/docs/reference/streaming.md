@@ -63,6 +63,7 @@ Sent immediately on connect — the current state.
       "clientSeeds": null,
       "drawOffer": null,
       "mayOfferDraw": true,
+      "mayOfferDrawBy": { "white": true, "black": true },
       "legalMoves": null,
       "players": { "white": { "kind": "Bot", "name": "house greedy", "rating": 1642.0 }, "black": { "kind": "Human", "name": null, "rating": null } },
       "rated": false
@@ -75,7 +76,7 @@ Sent immediately on connect — the current state.
 }
 ```
 
-`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero).
+`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `mayOfferDrawBy` indicates for each seat (`white` and `black`) whether that seat holds the right to offer a draw. `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero).
 
 `rated` says whether the game counts toward the [leaderboard](../rest/#leaderboard). Treat absence as "the server does not say", never as "casual". No rating delta is sent on `GameEnded`: ratings are applied by an asynchronous batch after the game, so refetch the profile or leaderboard for the post-game numbers.
 
@@ -140,3 +141,15 @@ Broadcast when a player explicitly declines a pending draw offer via `/draw/decl
 ```json
 { "Rejected": { "v": 2, "seat": "White", "reason": "Move e2e4 is illegal for dice pool" } }
 ```
+
+## Not on these streams: the website's game socket
+
+The website plays over a WebSocket of its own, and two of its frames are easy to go looking for here by mistake. They
+are named for completeness, not as something a bot can use:
+
+- `{"ArmDrawOffer": {"armed": true}}` is a command the website sends to arm or disarm a standing draw offer;
+- `{"DrawOfferArmed": {"armed": true, "reason": null, "availableAfterTurns": null}}` is the seat-private answer, also
+  sent once when a seated socket connects.
+
+Neither appears on the ndjson streams above, and neither can be sent to them: both are read-only. A bot arms the same
+flag over REST, with [`POST` / `DELETE /bot/game/{id}/draw/offer`](../rest/#standing-draw-offers).

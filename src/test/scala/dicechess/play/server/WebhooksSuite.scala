@@ -1178,6 +1178,99 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       assertEquals(over.termination, Termination.Resign)
       assertEquals(over.result, GameResult.Win(Side.Black))
 
+  test("classifyDoubleOpportunity classifies non-resign, garbled, and transport outcomes"):
+    for
+      registry        <- GameRegistry.create(store = GameStore.noop)
+      store           <- WebhookStore.inMemory
+      (_, statsStore) <- capturingStats
+      webhookBot: Principal.Bot = Principal.Bot("hooks", "double-opp-bot2")
+      hook <- store.put(
+        BotWebhook("hooks", "double-opp-bot2", "https://bot.example/hook", "secret" * 8, Instant.EPOCH)
+      ) *> store.get("hooks", "double-opp-bot2").map(_.get)
+      opponent = Principal.Bot("acme", "opponent")
+      made <- registry.create(webhookBot, opponent, TimeControl.Unlimited)
+      (_, room)        = made.toOption.get
+      webhooksResource = Webhooks.create(
+        registry,
+        store,
+        Client.fromHttpApp(HttpApp[IO](_ => Ok(""))),
+        config,
+        allowAll,
+        statsStore
+      )
+      outcomes <- webhooksResource.use { webhooks =>
+        List(
+          webhooks.classifyDoubleOpportunity(
+            GameId("g1"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.Ok("""{"decisionId":"double_123","offerDouble":true,"resign":false}""")
+          ),
+          webhooks.classifyDoubleOpportunity(
+            GameId("g1"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.Ok("""not json""")
+          ),
+          webhooks.classifyDoubleOpportunity(
+            GameId("g1"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.OversizedBody
+          ),
+          webhooks.classifyDoubleOpportunity(
+            GameId("g1"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.HttpStatus(500)
+          ),
+          webhooks.classifyDoubleOpportunity(
+            GameId("g1"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.TimedOut
+          ),
+          webhooks.classifyDoubleOpportunity(
+            GameId("g1"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.Unreachable
+          ),
+          webhooks.classifyDoubleOpportunity(
+            GameId("g1"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.PolicyRejected("blocked")
+          )
+        ).sequence
+      }
+    yield assertEquals(
+      outcomes,
+      List(
+        DeliveryOutcome.Declined,
+        DeliveryOutcome.Garbled,
+        DeliveryOutcome.OversizedBody,
+        DeliveryOutcome.HttpStatus(500),
+        DeliveryOutcome.TimedOut,
+        DeliveryOutcome.Unreachable,
+        DeliveryOutcome.Unreachable
+      )
+    )
+
   test("classifyDoubleDecision parses resign: true, applies GameCommand.Resign and ignores other fields"):
     for
       registry        <- GameRegistry.create(store = GameStore.noop)
@@ -1215,3 +1308,96 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       assertEquals(outcome, DeliveryOutcome.Resigned)
       assertEquals(over.termination, Termination.Resign)
       assertEquals(over.result, GameResult.Win(Side.Black))
+
+  test("classifyDoubleDecision classifies non-resign, garbled, and transport outcomes"):
+    for
+      registry        <- GameRegistry.create(store = GameStore.noop)
+      store           <- WebhookStore.inMemory
+      (_, statsStore) <- capturingStats
+      webhookBot: Principal.Bot = Principal.Bot("hooks", "double-dec-bot2")
+      hook <- store.put(
+        BotWebhook("hooks", "double-dec-bot2", "https://bot.example/hook", "secret" * 8, Instant.EPOCH)
+      ) *> store.get("hooks", "double-dec-bot2").map(_.get)
+      opponent = Principal.Bot("acme", "opponent")
+      made <- registry.create(webhookBot, opponent, TimeControl.Unlimited)
+      (_, room)        = made.toOption.get
+      webhooksResource = Webhooks.create(
+        registry,
+        store,
+        Client.fromHttpApp(HttpApp[IO](_ => Ok(""))),
+        config,
+        allowAll,
+        statsStore
+      )
+      outcomes <- webhooksResource.use { webhooks =>
+        List(
+          webhooks.classifyDoubleDecision(
+            GameId("g2"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.Ok("""{"decisionId":"double_123","acceptDouble":true,"resign":false}""")
+          ),
+          webhooks.classifyDoubleDecision(
+            GameId("g2"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.Ok("""not json""")
+          ),
+          webhooks.classifyDoubleDecision(
+            GameId("g2"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.OversizedBody
+          ),
+          webhooks.classifyDoubleDecision(
+            GameId("g2"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.HttpStatus(500)
+          ),
+          webhooks.classifyDoubleDecision(
+            GameId("g2"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.TimedOut
+          ),
+          webhooks.classifyDoubleDecision(
+            GameId("g2"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.Unreachable
+          ),
+          webhooks.classifyDoubleDecision(
+            GameId("g2"),
+            Seat.White,
+            room,
+            webhookBot,
+            hook,
+            Webhooks.PostOutcome.PolicyRejected("blocked")
+          )
+        ).sequence
+      }
+    yield assertEquals(
+      outcomes,
+      List(
+        DeliveryOutcome.Declined,
+        DeliveryOutcome.Garbled,
+        DeliveryOutcome.OversizedBody,
+        DeliveryOutcome.HttpStatus(500),
+        DeliveryOutcome.TimedOut,
+        DeliveryOutcome.Unreachable,
+        DeliveryOutcome.Unreachable
+      )
+    )

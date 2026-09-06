@@ -436,6 +436,23 @@ final class Webhooks private (
             case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
             case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
+  private def classifyTransportOutcome(
+      id: GameId,
+      bot: Principal.Bot,
+      attempt: PostOutcome,
+      onOk: String => IO[DeliveryOutcome]
+  ): IO[DeliveryOutcome] =
+    def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
+      Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
+
+    attempt match
+      case PostOutcome.Ok(answer)       => onOk(answer)
+      case PostOutcome.OversizedBody    => failed(OversizedBodyMessage, DeliveryOutcome.OversizedBody)
+      case PostOutcome.HttpStatus(code) => failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code))
+      case PostOutcome.TimedOut         => failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
+      case PostOutcome.Unreachable      => failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
+      case PostOutcome.PolicyRejected(reason) => failed(reason, DeliveryOutcome.Unreachable)
+
   private[server] def classifyDoubleOpportunity(
       id: GameId,
       seat: Seat,
@@ -447,25 +464,16 @@ final class Webhooks private (
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
       Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
 
-    attempt match
-      case PostOutcome.Ok(answer) =>
+    classifyTransportOutcome(
+      id,
+      bot,
+      attempt,
+      answer =>
         decode[DoubleOpportunityResponse](answer) match
-          case Right(resp) if resp.resign =>
-            enqueueResign(seat, room, hook, failed)
-          case Right(_) =>
-            IO.pure(DeliveryOutcome.Declined)
-          case Left(_) =>
-            failed("unparseable doubleOpportunity response", DeliveryOutcome.Garbled)
-      case PostOutcome.OversizedBody =>
-        failed(OversizedBodyMessage, DeliveryOutcome.OversizedBody)
-      case PostOutcome.HttpStatus(code) =>
-        failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code))
-      case PostOutcome.TimedOut =>
-        failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
-      case PostOutcome.Unreachable =>
-        failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
-      case PostOutcome.PolicyRejected(reason) =>
-        failed(reason, DeliveryOutcome.Unreachable)
+          case Right(resp) if resp.resign => enqueueResign(seat, room, hook, failed)
+          case Right(_)                   => IO.pure(DeliveryOutcome.Declined)
+          case Left(_)                    => failed("unparseable doubleOpportunity response", DeliveryOutcome.Garbled)
+    )
 
   private[server] def classifyDoubleDecision(
       id: GameId,
@@ -478,25 +486,16 @@ final class Webhooks private (
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
       Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
 
-    attempt match
-      case PostOutcome.Ok(answer) =>
+    classifyTransportOutcome(
+      id,
+      bot,
+      attempt,
+      answer =>
         decode[DoubleDecisionResponse](answer) match
-          case Right(resp) if resp.resign =>
-            enqueueResign(seat, room, hook, failed)
-          case Right(_) =>
-            IO.pure(DeliveryOutcome.Declined)
-          case Left(_) =>
-            failed("unparseable doubleDecision response", DeliveryOutcome.Garbled)
-      case PostOutcome.OversizedBody =>
-        failed(OversizedBodyMessage, DeliveryOutcome.OversizedBody)
-      case PostOutcome.HttpStatus(code) =>
-        failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code))
-      case PostOutcome.TimedOut =>
-        failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
-      case PostOutcome.Unreachable =>
-        failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
-      case PostOutcome.PolicyRejected(reason) =>
-        failed(reason, DeliveryOutcome.Unreachable)
+          case Right(resp) if resp.resign => enqueueResign(seat, room, hook, failed)
+          case Right(_)                   => IO.pure(DeliveryOutcome.Declined)
+          case Left(_)                    => failed("unparseable doubleDecision response", DeliveryOutcome.Garbled)
+    )
 
   /** Fire-and-forget into the drain queue (#225) — `tryOffer` never blocks a turn on a slow or backed-up stats writer.
     * Overflow (the queue is bounded, matching this class's own "delivery rate is structurally bounded" doctrine) drops

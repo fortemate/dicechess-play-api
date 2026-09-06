@@ -57,6 +57,15 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       case None                => Nil
       case Some((move, child)) => move :: firstPath(child)
 
+  private def resolveMoves(registry: GameRegistry, envelope: WebhookEnvelope): IO[List[String]] =
+    envelope.state.legalMoves.filter(_.children.nonEmpty) match
+      case Some(tree) => IO.pure(firstPath(tree))
+      case None       =>
+        registry
+          .get(GameId(envelope.gameId))
+          .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
+          .map(firstPath)
+
   /** A deterministic store-side pause immediately before the registration fence. Reaching `fenceReached` proves the old
     * endpoint response has already arrived and decoded; the test then changes the registration before allowing the
     * current-generation check to continue. A second gate pauses the stale retry before its fresh `get`, making the
@@ -184,14 +193,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
                 decode[WebhookEnvelope](body) match
                   case Left(_)         => IO.pure(Response[IO](Status.BadRequest))
                   case Right(envelope) =>
-                    val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
-                      case Some(tree) => IO.pure(firstPath(tree))
-                      case None       =>
-                        registry
-                          .get(GameId(envelope.gameId))
-                          .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
-                          .map(firstPath)
-                    delivered.update(_ + 1) *> moves.flatMap(m => Ok(BotMove(m).asJson))
+                    delivered.update(_ + 1) *> resolveMoves(registry, envelope).flatMap(m => Ok(BotMove(m).asJson))
             }
       }
     }
@@ -227,14 +229,9 @@ class WebhooksSuite extends munit.CatsEffectSuite:
 
         (generation, decode[WebhookEnvelope](body)) match
           case (Some(registrationId), Right(envelope)) =>
-            val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
-              case Some(tree) => IO.pure(firstPath(tree))
-              case None       =>
-                registry
-                  .get(GameId(envelope.gameId))
-                  .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
-                  .map(firstPath)
-            generations.update(_ :+ registrationId) *> moves.flatMap(path => Ok(BotMove(path).asJson))
+            generations.update(_ :+ registrationId) *> resolveMoves(registry, envelope).flatMap(path =>
+              Ok(BotMove(path).asJson)
+            )
           case _ =>
             IO.pure(Response[IO](Status.Unauthorized))
       }
@@ -819,15 +816,8 @@ class WebhooksSuite extends munit.CatsEffectSuite:
             case Right(envelope) =>
               val answer = envelope.`type` match
                 case "drawDecision" => IO.pure(Some(BotMove(moves = Nil, acceptDraw = Some(true))))
-                case "yourTurn"     =>
-                  envelope.state.legalMoves.filter(_.children.nonEmpty) match
-                    case Some(tree) => IO.pure(Some(BotMove(firstPath(tree))))
-                    case None       =>
-                      registry
-                        .get(GameId(envelope.gameId))
-                        .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
-                        .map(tree => Some(BotMove(firstPath(tree))))
-                case _ => IO.pure(None)
+                case "yourTurn"     => resolveMoves(registry, envelope).map(m => Some(BotMove(m)))
+                case _              => IO.pure(None)
               envelopes.update(_ :+ envelope) *>
                 answer.flatMap(_.fold(IO.pure(Response[IO](Status.BadRequest)))(move => Ok(move.asJson)))
             case Left(_) => IO.pure(Response[IO](Status.BadRequest))
@@ -904,14 +894,9 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         req.bodyText.compile.string.flatMap { body =>
           decode[WebhookEnvelope](body) match
             case Right(envelope) =>
-              val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
-                case Some(tree) => IO.pure(firstPath(tree))
-                case None       =>
-                  registry
-                    .get(GameId(envelope.gameId))
-                    .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
-                    .map(firstPath)
-              receivedEvents.update(envelope.`type` :: _) *> moves.flatMap(m => Ok(BotMove(m).asJson))
+              receivedEvents.update(envelope.`type` :: _) *> resolveMoves(registry, envelope).flatMap(m =>
+                Ok(BotMove(m).asJson)
+              )
             case Left(_) => IO.pure(Response[IO](Status.BadRequest))
         }
       }
@@ -966,14 +951,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         req.bodyText.compile.string.flatMap { body =>
           decode[WebhookEnvelope](body) match
             case Right(envelope) =>
-              val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
-                case Some(tree) => IO.pure(firstPath(tree))
-                case None       =>
-                  registry
-                    .get(GameId(envelope.gameId))
-                    .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
-                    .map(firstPath)
-              moves.flatMap(m => Ok(BotMove(m, offerDraw = true).asJson))
+              resolveMoves(registry, envelope).flatMap(m => Ok(BotMove(m, offerDraw = true).asJson))
             case Left(_) => IO.pure(Response[IO](Status.BadRequest))
         }
       }
@@ -1052,14 +1030,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
             // Resign takes precedence over acceptDraw = Some(true)
             Ok(BotMove(moves = Nil, acceptDraw = Some(true), resign = true).asJson)
           case Right(envelope) =>
-            val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
-              case Some(tree) => IO.pure(firstPath(tree))
-              case None       =>
-                registry
-                  .get(GameId(envelope.gameId))
-                  .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
-                  .map(firstPath)
-            moves.flatMap(m => Ok(BotMove(m).asJson))
+            resolveMoves(registry, envelope).flatMap(m => Ok(BotMove(m).asJson))
           case Left(_) => IO.pure(Response[IO](Status.BadRequest))
       }
     }
@@ -1168,3 +1139,79 @@ class WebhooksSuite extends munit.CatsEffectSuite:
     yield
       assertEquals(over.termination, Termination.Resign)
       assert(recorded.exists(_._3 == DeliveryOutcome.Refused))
+
+  test("classifyDoubleOpportunity parses resign: true, applies GameCommand.Resign and ignores other fields"):
+    for
+      registry        <- GameRegistry.create(store = GameStore.noop)
+      store           <- WebhookStore.inMemory
+      (_, statsStore) <- capturingStats
+      webhookBot: Principal.Bot = Principal.Bot("hooks", "double-opp-bot")
+      hook <- store.put(
+        BotWebhook("hooks", "double-opp-bot", "https://bot.example/hook", "secret" * 8, Instant.EPOCH)
+      ) *> store.get("hooks", "double-opp-bot").map(_.get)
+      opponent = Principal.Bot("acme", "opponent")
+      made <- registry.create(webhookBot, opponent, TimeControl.Unlimited)
+      (_, room) = made.toOption.get
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      webhooksResource = Webhooks.create(
+        registry,
+        store,
+        Client.fromHttpApp(HttpApp[IO](_ => Ok(""))),
+        config,
+        allowAll,
+        statsStore
+      )
+      outcome <- webhooksResource.use { webhooks =>
+        webhooks.classifyDoubleOpportunity(
+          GameId("g1"),
+          Seat.White,
+          room,
+          webhookBot,
+          hook,
+          Webhooks.PostOutcome.Ok("""{"decisionId":"double_123","offerDouble":true,"resign":true}""")
+        )
+      }
+      over <- room.result
+    yield
+      assertEquals(outcome, DeliveryOutcome.Resigned)
+      assertEquals(over.termination, Termination.Resign)
+      assertEquals(over.result, GameResult.Win(Side.Black))
+
+  test("classifyDoubleDecision parses resign: true, applies GameCommand.Resign and ignores other fields"):
+    for
+      registry        <- GameRegistry.create(store = GameStore.noop)
+      store           <- WebhookStore.inMemory
+      (_, statsStore) <- capturingStats
+      webhookBot: Principal.Bot = Principal.Bot("hooks", "double-dec-bot")
+      hook <- store.put(
+        BotWebhook("hooks", "double-dec-bot", "https://bot.example/hook", "secret" * 8, Instant.EPOCH)
+      ) *> store.get("hooks", "double-dec-bot").map(_.get)
+      opponent = Principal.Bot("acme", "opponent")
+      made <- registry.create(webhookBot, opponent, TimeControl.Unlimited)
+      (_, room) = made.toOption.get
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      webhooksResource = Webhooks.create(
+        registry,
+        store,
+        Client.fromHttpApp(HttpApp[IO](_ => Ok(""))),
+        config,
+        allowAll,
+        statsStore
+      )
+      outcome <- webhooksResource.use { webhooks =>
+        webhooks.classifyDoubleDecision(
+          GameId("g2"),
+          Seat.White,
+          room,
+          webhookBot,
+          hook,
+          Webhooks.PostOutcome.Ok("""{"decisionId":"double_123","acceptDouble":true,"resign":true}""")
+        )
+      }
+      over <- room.result
+    yield
+      assertEquals(outcome, DeliveryOutcome.Resigned)
+      assertEquals(over.termination, Termination.Resign)
+      assertEquals(over.result, GameResult.Win(Side.Black))

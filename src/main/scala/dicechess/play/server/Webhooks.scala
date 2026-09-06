@@ -8,6 +8,7 @@ import dicechess.play.game.GameRoom
 import dicechess.play.store.{BotWebhook, DeliveryOutcome, WebhookStatsStore, WebhookStore}
 import dicechess.play.wire.Codecs.given
 import io.circe.Codec
+import io.circe.derivation.ConfiguredCodec
 import io.circe.parser.decode
 import io.circe.syntax.*
 import org.http4s.headers.`Content-Type`
@@ -34,6 +35,18 @@ final case class WebhookEnvelope(`type`: String, gameId: String, seat: Seat, sta
 final case class WebhookVerification(`type`: String, nonce: String) derives Codec.AsObject
 
 final private case class WebhookNonceEcho(nonce: String) derives Codec.AsObject
+
+final case class DoubleOpportunityResponse(
+    decisionId: Option[String] = None,
+    offerDouble: Option[Boolean] = None,
+    resign: Boolean = false
+) derives ConfiguredCodec
+
+final case class DoubleDecisionResponse(
+    decisionId: Option[String] = None,
+    acceptDouble: Option[Boolean] = None,
+    resign: Boolean = false
+) derives ConfiguredCodec
 
 /** Synchronous webhook delivery (F.2, #104; design: ADR-0013): when it is a registered bot's turn, the server POSTs the
   * game state to the bot's verified callback URL and applies the HTTP response body as the move — one component
@@ -323,16 +336,6 @@ final class Webhooks private (
         case Some(GameRoom.TurnVerdict.Applied(_))      => IO.pure(DeliveryOutcome.Applied)
         case Some(GameRoom.TurnVerdict.Refused(reason)) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
-    def resign: IO[DeliveryOutcome] =
-      store
-        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(room.enqueueResign(seat))
-        .flatMap:
-          case None        => IO.pure(DeliveryOutcome.StaleRegistration)
-          case Some(await) =>
-            await.flatMap:
-              case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
-              case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
-
     attempt match
       case PostOutcome.Ok(answer) =>
         decode[BotMove](answer) match
@@ -343,7 +346,7 @@ final class Webhooks private (
               DeliveryOutcome.Garbled
             )
           case Right(botMove) if botMove.resign =>
-            resign
+            enqueueResign(seat, room, hook, failed)
           case Right(botMove) if botMove.acceptDraw.contains(true) =>
             decision(accept = true)
           case Right(_) =>
@@ -396,22 +399,12 @@ final class Webhooks private (
               case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Applied)
               case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
-    def resign: IO[DeliveryOutcome] =
-      store
-        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(room.enqueueResign(seat))
-        .flatMap:
-          case None        => IO.pure(DeliveryOutcome.StaleRegistration)
-          case Some(await) =>
-            await.flatMap:
-              case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
-              case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
-
     attempt match
       case PostOutcome.Ok(answer) =>
         decode[BotMove](answer) match
           case Left(_)                          => ifCurrent(failed("unparseable response", DeliveryOutcome.Garbled))
           case Right(botMove) if botMove.resign =>
-            resign
+            enqueueResign(seat, room, hook, failed)
           case Right(botMove) if botMove.moves.isEmpty =>
             ifCurrent(
               Console[IO]
@@ -427,6 +420,83 @@ final class Webhooks private (
       case PostOutcome.TimedOut    => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut))
       case PostOutcome.Unreachable => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable))
       case PostOutcome.PolicyRejected(reason) => ifCurrent(failed(reason, DeliveryOutcome.Unreachable))
+
+  private def enqueueResign(
+      seat: Seat,
+      room: GameRoom,
+      hook: BotWebhook,
+      failed: (String, DeliveryOutcome) => IO[DeliveryOutcome]
+  ): IO[DeliveryOutcome] =
+    store
+      .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(room.enqueueResign(seat))
+      .flatMap:
+        case None        => IO.pure(DeliveryOutcome.StaleRegistration)
+        case Some(await) =>
+          await.flatMap:
+            case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
+            case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
+
+  private[server] def classifyDoubleOpportunity(
+      id: GameId,
+      seat: Seat,
+      room: GameRoom,
+      bot: Principal.Bot,
+      hook: BotWebhook,
+      attempt: PostOutcome
+  ): IO[DeliveryOutcome] =
+    def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
+      Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
+
+    attempt match
+      case PostOutcome.Ok(answer) =>
+        decode[DoubleOpportunityResponse](answer) match
+          case Right(resp) if resp.resign =>
+            enqueueResign(seat, room, hook, failed)
+          case Right(_) =>
+            IO.pure(DeliveryOutcome.Declined)
+          case Left(_) =>
+            failed("unparseable doubleOpportunity response", DeliveryOutcome.Garbled)
+      case PostOutcome.OversizedBody =>
+        failed(OversizedBodyMessage, DeliveryOutcome.OversizedBody)
+      case PostOutcome.HttpStatus(code) =>
+        failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code))
+      case PostOutcome.TimedOut =>
+        failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
+      case PostOutcome.Unreachable =>
+        failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
+      case PostOutcome.PolicyRejected(reason) =>
+        failed(reason, DeliveryOutcome.Unreachable)
+
+  private[server] def classifyDoubleDecision(
+      id: GameId,
+      seat: Seat,
+      room: GameRoom,
+      bot: Principal.Bot,
+      hook: BotWebhook,
+      attempt: PostOutcome
+  ): IO[DeliveryOutcome] =
+    def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
+      Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
+
+    attempt match
+      case PostOutcome.Ok(answer) =>
+        decode[DoubleDecisionResponse](answer) match
+          case Right(resp) if resp.resign =>
+            enqueueResign(seat, room, hook, failed)
+          case Right(_) =>
+            IO.pure(DeliveryOutcome.Declined)
+          case Left(_) =>
+            failed("unparseable doubleDecision response", DeliveryOutcome.Garbled)
+      case PostOutcome.OversizedBody =>
+        failed(OversizedBodyMessage, DeliveryOutcome.OversizedBody)
+      case PostOutcome.HttpStatus(code) =>
+        failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code))
+      case PostOutcome.TimedOut =>
+        failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
+      case PostOutcome.Unreachable =>
+        failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
+      case PostOutcome.PolicyRejected(reason) =>
+        failed(reason, DeliveryOutcome.Unreachable)
 
   /** Fire-and-forget into the drain queue (#225) — `tryOffer` never blocks a turn on a slow or backed-up stats writer.
     * Overflow (the queue is bounded, matching this class's own "delivery rate is structurally bounded" doctrine) drops
@@ -555,7 +625,7 @@ object Webhooks:
   private case object OversizedResponse extends RuntimeException with NoStackTrace
 
   /** The typed detail behind one POST attempt (#225) — see [[Webhooks.postDetailed]]. */
-  private enum PostOutcome:
+  private[server] enum PostOutcome:
     case Ok(body: String)
     case OversizedBody
     case HttpStatus(code: Int)
@@ -563,7 +633,7 @@ object Webhooks:
     case Unreachable
     case PolicyRejected(reason: String) // checkUrl's own re-check failed; `reason` is its exact, existing message
 
-  private object PostOutcome:
+  private[server] object PostOutcome:
     extension (outcome: PostOutcome)
       /** The pre-#225 shape, reproduced exactly: same cases, same strings, string-for-string. `TimedOut` and
         * `Unreachable` collapse to the identical caller-visible text on purpose — see `postDetailed`'s doc.

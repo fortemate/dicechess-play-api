@@ -14,6 +14,7 @@ import scala.concurrent.duration.FiniteDuration
   */
 enum DeliveryOutcome:
   case Applied               // 2xx, a non-empty legal move, accepted by the room
+  case Resigned              // 2xx, an explicit resign (`{"resign":true}`)
   case Declined              // 2xx, an explicit empty `{"moves":[]}` — the bot chose not to move
   case Refused               // 2xx, moves the room rejected (stale/illegal)
   case Garbled               // 2xx, a body that did not decode as `{"moves":[...]}`
@@ -31,6 +32,7 @@ object DeliveryOutcome:
     */
   def key(outcome: DeliveryOutcome): String = outcome match
     case Applied           => "applied"
+    case Resigned          => "resigned"
     case Declined          => "declined"
     case Refused           => "refused"
     case Garbled           => "garbled"
@@ -40,13 +42,13 @@ object DeliveryOutcome:
     case Unreachable       => "unreachable"
     case StaleRegistration => "stale_registration"
 
-  /** Whether this outcome should overwrite a bot's "last failure" (#225's other half of report-it-back). `Declined` is
-    * excluded deliberately: an explicit empty-moves answer is the bot behaving exactly as designed, not a fault — the
-    * same reasoning `Webhooks.deliverTurn`'s own log line already applies to it.
+  /** Whether this outcome should overwrite a bot's "last failure" (#225's other half of report-it-back). `Declined` and
+    * `Resigned` are excluded deliberately: an explicit empty-moves or resign answer is the bot behaving as designed,
+    * not a fault — the same reasoning `Webhooks.deliverTurn`'s own log line already applies to it.
     */
   def isFailure(outcome: DeliveryOutcome): Boolean = outcome match
-    case Applied | Declined | StaleRegistration => false
-    case _                                      => true
+    case Applied | Resigned | Declined | StaleRegistration => false
+    case _                                                 => true
 
   /** The human-facing sentence stored as `bot_webhooks.last_failure_reason` — written once, at record time, so the read
     * side never has to re-derive prose from the terse storage `key`. Mirrors the wording `Webhooks.deliverTurn`'s own
@@ -55,6 +57,7 @@ object DeliveryOutcome:
     */
   def describe(outcome: DeliveryOutcome): String = outcome match
     case Applied           => "delivered and applied"
+    case Resigned          => "the bot resigned"
     case Declined          => "the bot declined (empty moves)"
     case Refused           => "the room refused the moves"
     case Garbled           => "the response did not decode as a move"

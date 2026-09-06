@@ -323,6 +323,16 @@ final class Webhooks private (
         case Some(GameRoom.TurnVerdict.Applied(_))      => IO.pure(DeliveryOutcome.Applied)
         case Some(GameRoom.TurnVerdict.Refused(reason)) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
+    def resign: IO[DeliveryOutcome] =
+      store
+        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(room.enqueueResign(seat))
+        .flatMap:
+          case None        => IO.pure(DeliveryOutcome.StaleRegistration)
+          case Some(await) =>
+            await.flatMap:
+              case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
+              case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
+
     attempt match
       case PostOutcome.Ok(answer) =>
         decode[BotMove](answer) match
@@ -332,6 +342,8 @@ final class Webhooks private (
               "unparseable drawDecision response",
               DeliveryOutcome.Garbled
             )
+          case Right(botMove) if botMove.resign =>
+            resign
           case Right(botMove) if botMove.acceptDraw.contains(true) =>
             decision(accept = true)
           case Right(_) =>
@@ -384,10 +396,22 @@ final class Webhooks private (
               case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Applied)
               case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
+    def resign: IO[DeliveryOutcome] =
+      store
+        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(room.enqueueResign(seat))
+        .flatMap:
+          case None        => IO.pure(DeliveryOutcome.StaleRegistration)
+          case Some(await) =>
+            await.flatMap:
+              case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
+              case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
+
     attempt match
       case PostOutcome.Ok(answer) =>
         decode[BotMove](answer) match
-          case Left(_) => ifCurrent(failed("unparseable response", DeliveryOutcome.Garbled))
+          case Left(_)                          => ifCurrent(failed("unparseable response", DeliveryOutcome.Garbled))
+          case Right(botMove) if botMove.resign =>
+            resign
           case Right(botMove) if botMove.moves.isEmpty =>
             ifCurrent(
               Console[IO]

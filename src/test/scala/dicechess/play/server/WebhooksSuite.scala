@@ -1001,3 +1001,170 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         }
       }
     yield assertEquals(event.by, Seat.White)
+
+  test("webhook bot answering resign: true on yourTurn applies resignation and records Resigned outcome"):
+    val resigningBot: HttpApp[IO] = HttpApp[IO] { _ =>
+      Ok(BotMove(moves = List("e2e4"), offerDraw = true, resign = true).asJson)
+    }
+
+    val movableDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 2, 3)
+      def commit: String                                                       = "c0"
+      def reveal: String                                                       = "seed"
+
+    for
+      registry            <- GameRegistry.create(store = GameStore.noop)
+      store               <- WebhookStore.inMemory
+      (calls, statsStore) <- capturingStats
+      webhookBot = Principal.Bot("hooks", "resigning-bot")
+      _ <- store.put(BotWebhook("hooks", "resigning-bot", "https://bot.example/hook", "secret" * 8, Instant.EPOCH))
+      opponent = Principal.Bot("acme", "driven")
+      made <- registry.createWithDice(webhookBot, opponent, movableDice)
+      (_, room) = made.toOption.get
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      resources = Webhooks.create(registry, store, Client.fromHttpApp(resigningBot), config, allowAll, statsStore)
+      recorded <- resources.use { webhooks =>
+        webhooks.statsLoop.background.use { _ =>
+          webhooks.attachSweep *>
+            calls.get
+              .iterateUntil(_.exists(_._3 == DeliveryOutcome.Resigned))
+              .timeoutTo(10.seconds, IO.raiseError(new RuntimeException("Resigned telemetry never arrived")))
+        }
+      }
+      over <- room.result
+    yield
+      assertEquals(over.termination, Termination.Resign)
+      assertEquals(over.result, GameResult.Win(Side.Black))
+      assert(recorded.exists(_._3 == DeliveryOutcome.Resigned))
+
+  test("webhook bot answering resign: true on drawDecision takes precedence over acceptDraw: true"):
+    val scriptedDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] =
+        if ply == 0L then List(3, 4, 5) else List(1, 1, 1)
+      def commit: String = "draw-commit"
+      def reveal: String = "draw-seed"
+
+    def resigningDrawBot(registry: GameRegistry): HttpApp[IO] = HttpApp[IO] { req =>
+      req.bodyText.compile.string.flatMap { body =>
+        decode[WebhookEnvelope](body) match
+          case Right(envelope) if envelope.`type` == "drawDecision" =>
+            // Resign takes precedence over acceptDraw = Some(true)
+            Ok(BotMove(moves = Nil, acceptDraw = Some(true), resign = true).asJson)
+          case Right(envelope) =>
+            val moves = envelope.state.legalMoves.filter(_.children.nonEmpty) match
+              case Some(tree) => IO.pure(firstPath(tree))
+              case None       =>
+                registry
+                  .get(GameId(envelope.gameId))
+                  .flatMap(_.fold(IO.pure(MoveTree.empty))(_.legalMoves.map(_.legalMoves)))
+                  .map(firstPath)
+            moves.flatMap(m => Ok(BotMove(m).asJson))
+          case Left(_) => IO.pure(Response[IO](Status.BadRequest))
+      }
+    }
+
+    def whiteOffersDraw(room: GameRoom): IO[Unit] =
+      def play(version: Long): IO[Unit] =
+        room.legalMoves.flatMap { moves =>
+          val whiteToMove = EngineOps.parse(moves.dfen).exists(EngineOps.activeSeat(_) == Seat.White)
+          val ready       = moves.version == version && moves.dicePending && whiteToMove &&
+            moves.legalMoves.children.nonEmpty
+          room.submitTurn(Seat.White, firstPath(moves.legalMoves), offerDraw = true).void.whenA(ready)
+        }
+      room.subscribe
+        .evalMap {
+          case GameEvent.Snapshot(v, state, _) if state.activeSeat == Seat.White && state.dicePending => play(v)
+          case GameEvent.DiceRolled(v, Seat.White, _, _, _, _)                                        => play(v)
+          case _                                                                                      => IO.unit
+        }
+        .compile
+        .drain
+
+    for
+      registry            <- GameRegistry.create(store = GameStore.noop)
+      store               <- WebhookStore.inMemory
+      (calls, statsStore) <- capturingStats
+      webhookBot = Principal.Bot("hooks", "draw-resigner")
+      _ <- store.put(
+        BotWebhook(
+          "hooks",
+          "draw-resigner",
+          "https://bot.example/hook",
+          "secret" * 8,
+          Instant.EPOCH,
+          capabilities = List(WebhookCapability.Draws)
+        )
+      )
+      human = Principal.Guest("human-resigner")
+      made <- registry.createWithDice(human, webhookBot, scriptedDice)
+      (_, room) = made.toOption.get
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      resources = Webhooks.create(
+        registry,
+        store,
+        Client.fromHttpApp(resigningDrawBot(registry)),
+        config,
+        allowAll,
+        statsStore
+      )
+      res <- resources.use { webhooks =>
+        webhooks.statsLoop.background.use { _ =>
+          whiteOffersDraw(room).background.use { _ =>
+            webhooks.attachSweep *>
+              room.result.timeoutTo(10.seconds, IO.raiseError(new RuntimeException("game never ended in resign"))) *>
+              calls.get
+                .iterateUntil(_.exists(_._3 == DeliveryOutcome.Resigned))
+                .timeoutTo(10.seconds, IO.raiseError(new RuntimeException("Resigned telemetry never arrived"))) *>
+              room.result
+          }
+        }
+      }
+      recorded <- calls.get
+    yield
+      assertEquals(res.result, GameResult.Win(Side.White))
+      assertEquals(res.termination, Termination.Resign)
+      assert(recorded.exists(_._3 == DeliveryOutcome.Resigned))
+
+  test("a late answer arriving after the game has ended is classified as a refusal and not re-applied"):
+    val movableDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 2, 3)
+      def commit: String                                                       = "c0"
+      def reveal: String                                                       = "seed"
+
+    for
+      registry            <- GameRegistry.create(store = GameStore.noop)
+      store               <- WebhookStore.inMemory
+      (calls, statsStore) <- capturingStats
+      lateGate            <- Deferred[IO, Unit]
+      releaseLate         <- Deferred[IO, Unit]
+      slowBot: HttpApp[IO] = HttpApp[IO] { _ =>
+        lateGate.complete(()).attempt *> releaseLate.get *> Ok(BotMove(moves = List("e2e4")).asJson)
+      }
+      webhookBot = Principal.Bot("hooks", "late-bot")
+      _ <- store.put(BotWebhook("hooks", "late-bot", "https://bot.example/hook", "secret" * 8, Instant.EPOCH))
+      opponent = Principal.Bot("acme", "opponent")
+      made <- registry.createWithDice(webhookBot, opponent, movableDice)
+      (_, room) = made.toOption.get
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      resources = Webhooks.create(registry, store, Client.fromHttpApp(slowBot), config, allowAll, statsStore)
+      _ <- resources.use { webhooks =>
+        webhooks.statsLoop.background.use { _ =>
+          webhooks.attachSweep *>
+            lateGate.get *>
+            // Resign while the webhook POST response is paused
+            room.submit(Seat.White, GameCommand.Resign) *>
+            room.result *>
+            releaseLate.complete(()) *>
+            calls.get
+              .iterateUntil(_.exists(_._3 == DeliveryOutcome.Refused))
+              .timeoutTo(10.seconds, IO.raiseError(new RuntimeException("Refused telemetry never arrived")))
+        }
+      }
+      recorded <- calls.get
+      over     <- room.result
+    yield
+      assertEquals(over.termination, Termination.Resign)
+      assert(recorded.exists(_._3 == DeliveryOutcome.Refused))

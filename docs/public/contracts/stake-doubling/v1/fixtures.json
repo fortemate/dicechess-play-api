@@ -71,6 +71,10 @@
       "schemaRef": "#/$defs/DoubleOpportunityResponse"
     },
     {
+      "path": "examples/webhook-opportunity-response-resign.json",
+      "schemaRef": "#/$defs/DoubleOpportunityResponse"
+    },
+    {
       "path": "examples/webhook-decision.json",
       "schemaRef": "#/$defs/DoubleDecisionWebhook"
     },

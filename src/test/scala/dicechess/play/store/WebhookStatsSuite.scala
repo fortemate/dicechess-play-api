@@ -12,6 +12,7 @@ class WebhookStatsSuite extends munit.FunSuite:
 
   test("the storage key is stable text, independent of declaration order, and folds the status into HttpStatus"):
     assertEquals(DeliveryOutcome.key(DeliveryOutcome.Applied), "applied")
+    assertEquals(DeliveryOutcome.key(DeliveryOutcome.Resigned), "resigned")
     assertEquals(DeliveryOutcome.key(DeliveryOutcome.Declined), "declined")
     assertEquals(DeliveryOutcome.key(DeliveryOutcome.Refused), "refused")
     assertEquals(DeliveryOutcome.key(DeliveryOutcome.Garbled), "garbled")
@@ -24,6 +25,7 @@ class WebhookStatsSuite extends munit.FunSuite:
 
   test("only a genuine fault counts as a failure — a clean decline does not overwrite last-failure"):
     assert(!DeliveryOutcome.isFailure(DeliveryOutcome.Applied), "a usable move is not a failure")
+    assert(!DeliveryOutcome.isFailure(DeliveryOutcome.Resigned), "an explicit resign is the bot behaving as designed")
     assert(!DeliveryOutcome.isFailure(DeliveryOutcome.Declined), "an explicit decline is the bot behaving as designed")
     assert(
       !DeliveryOutcome.isFailure(DeliveryOutcome.StaleRegistration),
@@ -39,6 +41,7 @@ class WebhookStatsSuite extends munit.FunSuite:
   test("describe gives a human sentence distinct per outcome, including the HTTP status"):
     val described = List(
       DeliveryOutcome.Applied,
+      DeliveryOutcome.Resigned,
       DeliveryOutcome.Declined,
       DeliveryOutcome.Refused,
       DeliveryOutcome.Garbled,

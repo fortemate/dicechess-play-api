@@ -186,6 +186,31 @@ final class GameRoom private (
       val armed    = s.armedDrawOffer.getOrElse(seat, false)
       (decision, mayOffer, armed)
 
+  /** Active bot game row for `seat` (#106), derived atomically from a single Session snapshot. Returns `None` if the
+    * room has ended.
+    */
+  def activeBotGame(seat: Seat): IO[Option[BotGameRow]] =
+    IO.monotonic.flatMap: now =>
+      stateRef.get.map: s =>
+        if s.status != GameStatus.Active then None
+        else
+          val pub      = s.publicAt(now, maxInlinePaths)
+          val decision = Option.when(s.pendingDrawOffer.exists(_ != seat))("drawResponse")
+          val mayOffer = s.mayOffer(seat)
+          val armed    = s.armedDrawOffer.getOrElse(seat, false)
+          Some(
+            BotGameRow(
+              pub.activeSeat,
+              pub.dicePending,
+              pub.timeControl,
+              pub.clocks,
+              pub.version,
+              decision,
+              mayOffer,
+              armed
+            )
+          )
+
   /** Respond to a pending draw offer (accept or decline explicitly) and await the writer's verdict. */
   def respondDraw(seat: Seat, accept: Boolean): IO[TurnVerdict] =
     enqueueDrawResponse(seat, accept).flatten
@@ -918,8 +943,11 @@ final class GameRoom private (
                       (winner match
                         case Some(w) => endGame(s1, GameOver(GameResult.Win(w), Termination.KingCaptured))
                         case None    => advanceOrEnd(s1)
-                      ).flatTap(_ =>
-                        answer(reply, TurnVerdict.Applied(s1.version, drawOffered = offer && winner.isEmpty))
+                      ).flatTap(s2 =>
+                        answer(
+                          reply,
+                          TurnVerdict.Applied(s1.version, drawOffered = offer && s2.status == GameStatus.Active)
+                        )
                       )
 
   /** Complete a synchronous reply channel, if the command carried one. */
@@ -1058,6 +1086,18 @@ object GameRoom:
     case Disarmed
     case Noop
     case Refused(reason: String)
+
+  /** Atomic snapshot of an active game row for the Bot API (`GET /bot/games`, #106). */
+  final case class BotGameRow(
+      activeSeat: Seat,
+      dicePending: Boolean,
+      timeControl: TimeControl,
+      clocks: Option[Clocks],
+      version: Long,
+      decision: Option[String],
+      mayOfferDraw: Boolean,
+      drawOfferArmed: Boolean
+  )
 
   private enum Msg:
     case Begin

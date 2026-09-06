@@ -1173,6 +1173,13 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
             .run(request(Method.POST, uri"/bot/game" / gameId / "seed", Some(token)).withEntity(BotSeed(seed)))
             .map(_.status)
 
+        def waitUntilEvicted(gameId: String): IO[Unit] =
+          registry
+            .get(GameId(gameId))
+            .flatMap:
+              case None    => IO.unit
+              case Some(_) => IO.sleep(10.millis) *> waitUntilEvicted(gameId)
+
         for
           gameId                <- seatedGame(service)
           _                     <- seed(gameId, "tok-alice", "alice-client-seed-0001")
@@ -1184,11 +1191,10 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           )
           mover = if activeSeat == Seat.White then "tok-alice" else "tok-bob"
 
-          // 1. Arm standing draw offer before the move
           armedResp <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(mover)))
           _ = assertEquals(armedResp.status, Status.Ok)
 
-          // 2. Submit move WITHOUT offerDraw rider — the armed flag delivers the offer!
+          // Submitting a move without offerDraw rider delivers the offer via the pre-armed flag.
           played <- service.run(
             request(Method.POST, uri"/bot/game" / gameId / "move", Some(mover))
               .withEntity(BotMove(leafPath(tree), offerDraw = false))
@@ -1199,15 +1205,13 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           _  = assertEquals(playedBody.drawOffered, Some(true))
           v1 = playedBody.version.get
 
-          // 3. Wait for opponent's pre-roll gate
           (oppSeat, _) <- nextWithOffer(gameId, v1).timeoutTo(
             10.seconds,
             IO.raiseError(RuntimeException("no offer arrived for opponent"))
           )
           oppToken = if oppSeat == Seat.White then "tok-alice" else "tok-bob"
 
-          // 4. Check GET /bot/games during pre-roll gate:
-          // Responder sees decision: Some(BotDecision("drawResponse")), offerer sees decision: None
+          // GET /bot/games reflects drawResponse only for the recipient, not the offerer.
           oppGames   <- service.run(request(Method.GET, uri"/bot/games", Some(oppToken))).flatMap(_.as[BotGames])
           moverGames <- service.run(request(Method.GET, uri"/bot/games", Some(mover))).flatMap(_.as[BotGames])
           oppGame   = oppGames.games.find(_.gameId == gameId).get
@@ -1217,8 +1221,7 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           _         = assertEquals(moverGame.decision, None)
           _         = assertEquals(moverGame.drawOfferArmed, false)
 
-          // 5. 409 conflict checks during pending gate:
-          // Offerer cannot disarm or re-arm (already delivered)
+          // Offerer cannot disarm or re-arm after delivery; recipient cannot arm during pending decision.
           moverDisarm <- service.run(request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", Some(mover)))
           moverDisarmBody <- moverDisarm.as[DrawDisarmResult]
           moverArm        <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(mover)))
@@ -1228,19 +1231,17 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           _ = assertEquals(moverArm.status, Status.Conflict)
           _ = assertEquals(moverArmBody.reason, Some("draw offer already delivered"))
 
-          // Responder cannot arm while an offer is pending response
           oppArm     <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(oppToken)))
           oppArmBody <- oppArm.as[DrawOfferResult]
           _ = assertEquals(oppArm.status, Status.Conflict)
           _ = assertEquals(oppArmBody.reason, Some("respond to the pending draw offer first"))
 
-          // 6. Responder declines draw
           declined <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "decline", Some(oppToken)))
           declinedBody <- declined.as[MoveOutcome]
           _  = assertEquals(declined.status, Status.Ok)
           v2 = declinedBody.version.get
 
-          // 7. Responder plays move and offers draw back (allowed: alternation allows counter-offer)
+          // Alternation allows the opponent to counter-offer on their next turn.
           (mover2Seat, tree2, _) <- nextMovable(gameId, v2).timeoutTo(
             10.seconds,
             IO.raiseError(RuntimeException("no movable roll after decline"))
@@ -1255,7 +1256,6 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           _  = assertEquals(counterBody.drawOffered, Some(true))
           v3 = counterBody.version.get
 
-          // 8. Original offerer declines
           (receiverSeat, _) <- nextWithOffer(gameId, v3).timeoutTo(
             10.seconds,
             IO.raiseError(RuntimeException("no counter-offer arrived"))
@@ -1266,8 +1266,7 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           )
           _ = assertEquals(declined2.status, Status.Ok)
 
-          // 9. Now the counter-offerer (mover2Token) is the lastDrawOfferer!
-          // They cannot offer again immediately (passing right: "opponent must offer next")
+          // Counter-offerer is now the last offerer; cannot re-offer under the passing right rule.
           cooldownArm <- service.run(
             request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(mover2Token))
           )
@@ -1276,9 +1275,9 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           _ = assertEquals(cooldownBody.reason, Some("opponent must offer next"))
           _ = assertEquals(cooldownBody.availableAfterTurns, None)
 
-          // 10. Resigning ends the game; once deregistered, routes answer 404, and direct room answers "game is over"
           _        <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-alice")))
           _        <- room.result
+          _        <- waitUntilEvicted(gameId).timeoutTo(5.seconds, IO.unit)
           endedArm <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-bob")))
           endedDis <- service.run(request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-bob")))
           _ = assertEquals(endedArm.status, Status.NotFound)

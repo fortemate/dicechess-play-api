@@ -2,7 +2,7 @@ package dicechess.play.server
 
 import cats.effect.IO
 import cats.syntax.all.*
-import dicechess.play.core.{Challenge, Clocks, GameCommand, GameId, GameStatus, Principal, Seat, TimeControl}
+import dicechess.play.core.{Challenge, Clocks, GameCommand, GameId, Principal, Seat, TimeControl}
 import dicechess.play.game.GameRoom
 import dicechess.play.store.BotSeatPolicy
 import dicechess.play.wire.Codecs.given
@@ -362,26 +362,24 @@ object BotRoutes:
           registry
             .gamesFor(bot)
             .flatMap(_.traverse { (id, room) =>
-              (seatOf(room, bot), room.snapshot).tupled.flatMap: (seatOpt, s) =>
-                seatOpt.filter(_ => s.status == GameStatus.Active) match
-                  case None     => IO.pure(None)
-                  case Some(st) =>
-                    room
-                      .botDetails(st)
-                      .map: (decision, mayOffer, armed) =>
-                        Some(
-                          BotActiveGame(
-                            id.value,
-                            st,
-                            s.activeSeat,
-                            s.dicePending,
-                            s.timeControl,
-                            s.clocks,
-                            s.version,
-                            decision = decision.map(k => BotDecision(k)),
-                            mayOfferDraw = mayOffer,
-                            drawOfferArmed = armed
-                          )
+              seatOf(room, bot).flatMap:
+                case None     => IO.pure(None)
+                case Some(st) =>
+                  room
+                    .activeBotGame(st)
+                    .map:
+                      _.map: row =>
+                        BotActiveGame(
+                          id.value,
+                          st,
+                          row.activeSeat,
+                          row.dicePending,
+                          row.timeControl,
+                          row.clocks,
+                          row.version,
+                          decision = row.decision.map(k => BotDecision(k)),
+                          mayOfferDraw = row.mayOfferDraw,
+                          drawOfferArmed = row.drawOfferArmed
                         )
             })
             .flatMap(games => Ok(BotGames(games.flatten)))

@@ -1128,3 +1128,21 @@ class GameRoomSuite extends munit.CatsEffectSuite:
           yield
             assertEquals(arm, GameRoom.DrawArmVerdict.Refused("game is over", None))
             assertEquals(disarm, GameRoom.DrawDisarmVerdict.Refused("game is over"))
+
+  test("activeBotGame derives row atomically and returns None when game ends (#106)"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds)
+      .flatMap:
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            beforeEnd <- room.activeBotGame(Seat.White)
+            _ = assert(beforeEnd.isDefined)
+            _ = assertEquals(beforeEnd.get.mayOfferDraw, true)
+            _ = assertEquals(beforeEnd.get.drawOfferArmed, false)
+            _ = assertEquals(beforeEnd.get.decision, None)
+            _        <- room.submit(Seat.White, GameCommand.Resign)
+            _        <- room.result
+            afterEnd <- room.activeBotGame(Seat.White)
+            _ = assertEquals(afterEnd, None)
+          yield ()

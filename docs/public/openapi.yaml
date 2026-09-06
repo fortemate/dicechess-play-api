@@ -397,7 +397,7 @@ paths:
               schema: { $ref: '#/components/schemas/DrawOfferResult' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Refused (`draw offer cooldown`, `draw offer already delivered`, `respond to the pending draw offer first`, `game is over`).
+          description: Refused (`draw offer cooldown`, `opponent must offer next`, `draw offer already delivered`, `respond to the pending draw offer first`, `game is over`, `too many draw toggles`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DrawOfferResult' }
@@ -416,7 +416,7 @@ paths:
               schema: { $ref: '#/components/schemas/DrawDisarmResult' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Refused (`draw offer already delivered`, `game is over`).
+          description: Refused (`draw offer already delivered`, `respond to the pending draw offer first`, `game is over`, `too many draw toggles`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DrawDisarmResult' }

@@ -147,12 +147,9 @@ final class GameRoom private (
   /** Current armed status for `seat` (for initial frame after Snapshot on connect). */
   def drawOfferArmedStatus(seat: Seat): IO[DrawOfferArmed] =
     stateRef.get.map { s =>
-      if seat.side.isEmpty then
-        DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer"))
-      else if s.ended then
-        DrawOfferArmed(armed = false, reason = Some(GameOverReason))
-      else
-        DrawOfferArmed(armed = s.armedDrawOffer.getOrElse(seat, false))
+      if seat.side.isEmpty then DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer"))
+      else if s.ended then DrawOfferArmed(armed = false, reason = Some(GameOverReason))
+      else DrawOfferArmed(armed = s.armedDrawOffer.getOrElse(seat, false))
     }
 
   /** Respond to a pending draw offer (accept or decline explicitly) and await the writer's verdict. */
@@ -520,7 +517,8 @@ final class GameRoom private (
   private def drainRefusing: IO[Unit] =
     inbox.tryTake.flatMap:
       case Some(Msg.Command(_, _, _, reply))      => answer(reply, TurnVerdict.Refused(GameOverReason)) *> drainRefusing
-      case Some(Msg.ArmDrawOfferMsg(_, _, reply)) => reply.complete(DrawOfferArmed(armed = false, reason = Some(GameOverReason))).attempt.void *> drainRefusing
+      case Some(Msg.ArmDrawOfferMsg(_, _, reply)) =>
+        reply.complete(DrawOfferArmed(armed = false, reason = Some(GameOverReason))).attempt.void *> drainRefusing
       case Some(Msg.ClaimSeat(_, _, _, _, reply)) => reply.complete(false).attempt.void *> drainRefusing
       case Some(_)                                => drainRefusing
       case None                                   => IO.unit
@@ -685,10 +683,13 @@ final class GameRoom private (
         val nextToggles = s2.drawTogglesThisTurn.removed(seat)
 
         val (newPendingOffer, newLastOfferer, nextTurnsSinceLastOffer) =
-          if offer then
-            (Some(seat), Some(seat), s2.turnsSinceLastOffer.updated(seat, 0))
+          if offer then (Some(seat), Some(seat), s2.turnsSinceLastOffer.updated(seat, 0))
           else
-            (None, s2.lastDrawOfferer, s2.turnsSinceLastOffer.updated(seat, s2.turnsSinceLastOffer.getOrElse(seat, 0) + 1))
+            (
+              None,
+              s2.lastDrawOfferer,
+              s2.turnsSinceLastOffer.updated(seat, s2.turnsSinceLastOffer.getOrElse(seat, 0) + 1)
+            )
 
         val s3 = s2.copy(
           state = passed,
@@ -834,12 +835,14 @@ final class GameRoom private (
                   val nextToggles = sd.drawTogglesThisTurn.removed(seat)
 
                   val (newPendingOffer, newLastOfferer, nextTurnsSinceLastOffer) =
-                    if winner.isDefined then
-                      (None, sd.lastDrawOfferer, sd.turnsSinceLastOffer)
-                    else if offer then
-                      (Some(seat), Some(seat), sd.turnsSinceLastOffer.updated(seat, 0))
+                    if winner.isDefined then (None, sd.lastDrawOfferer, sd.turnsSinceLastOffer)
+                    else if offer then (Some(seat), Some(seat), sd.turnsSinceLastOffer.updated(seat, 0))
                     else
-                      (None, sd.lastDrawOfferer, sd.turnsSinceLastOffer.updated(seat, sd.turnsSinceLastOffer.getOrElse(seat, 0) + 1))
+                      (
+                        None,
+                        sd.lastDrawOfferer,
+                        sd.turnsSinceLastOffer.updated(seat, sd.turnsSinceLastOffer.getOrElse(seat, 0) + 1)
+                      )
 
                   emit(
                     sd.copy(
@@ -1038,16 +1041,14 @@ object GameRoom:
     /** Whether `s` is permitted to offer a draw under the re-offer rule. */
     def mayOffer(s: Seat): Boolean =
       s.side.isDefined &&
-      status == GameStatus.Active &&
-      pendingDrawOffer.isEmpty &&
-      (lastDrawOfferer != Some(s) || turnsSinceLastOffer.getOrElse(s, 0) >= drawReofferTurns)
+        status == GameStatus.Active &&
+        pendingDrawOffer.isEmpty &&
+        (lastDrawOfferer != Some(s) || turnsSinceLastOffer.getOrElse(s, 0) >= drawReofferTurns)
 
     /** Arm or disarm standing draw offer for `seat`. */
     def armDrawOffer(seat: Seat, requestedArmed: Boolean): (Session, DrawOfferArmed) =
-      if seat.side.isEmpty then
-        (this, DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer")))
-      else if ended then
-        (this, DrawOfferArmed(armed = false, reason = Some("game is over")))
+      if seat.side.isEmpty then (this, DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer")))
+      else if ended then (this, DrawOfferArmed(armed = false, reason = Some("game is over")))
       else
         val currentToggles = drawTogglesThisTurn.getOrElse(seat, 0)
         val currentArmed   = armedDrawOffer.getOrElse(seat, false)
@@ -1059,7 +1060,10 @@ object GameRoom:
           (this, DrawOfferArmed(armed = false, reason = Some("respond to the pending draw offer first")))
         else if requestedArmed && !mayOffer(seat) then
           val turnsLeft = drawReofferTurns - turnsSinceLastOffer.getOrElse(seat, 0)
-          (this, DrawOfferArmed(armed = false, reason = Some("draw offer cooldown"), availableAfterTurns = Some(turnsLeft)))
+          (
+            this,
+            DrawOfferArmed(armed = false, reason = Some("draw offer cooldown"), availableAfterTurns = Some(turnsLeft))
+          )
         else
           val nextArmed   = armedDrawOffer.updated(seat, requestedArmed)
           val nextToggles = drawTogglesThisTurn.updated(seat, currentToggles + 1)
@@ -1107,7 +1111,9 @@ object GameRoom:
         Some(rated),
         Option.when(isDrawPending)(DrawOffer(pending = true)),
         Option.when(dicePending)(mayOffer(activeSt)),
-        Option.when(status == GameStatus.Active)(MayOfferDrawBy(white = mayOffer(Seat.White), black = mayOffer(Seat.Black)))
+        Option.when(status == GameStatus.Active)(
+          MayOfferDrawBy(white = mayOffer(Seat.White), black = mayOffer(Seat.Black))
+        )
       )
 
     /** The pair of client seeds actually folded into the dice, for the end-of-game reveal. */

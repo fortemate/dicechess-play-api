@@ -341,7 +341,7 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
       val httpBase = Uri.unsafeFromString(s"http://127.0.0.1:$port")
       val wsBase   = Uri.unsafeFromString(s"ws://127.0.0.1:$port")
       for
-        created  <- http.expect[CreatedGame](POST(CreateGame(Some(WhiteId), Some(BlackId)), httpBase / "games"))
+        created <- http.expect[CreatedGame](POST(CreateGame(Some(WhiteId), Some(BlackId)), httpBase / "games"))
         whiteUri = wsBase / "games" / created.gameId / "ws" +? ("token" -> tokenOf(created, Seat.White))
         specUri  = wsBase / "games" / created.gameId / "ws"
         _ <- ws.connectHighLevel(WSRequest(whiteUri)).use { whiteConn =>
@@ -359,8 +359,7 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
               .compile
               .toList
               .timeoutTo(5.seconds, IO.raiseError(RuntimeException("no DrawOfferArmed frame")))
-          yield
-            assertEquals(armedFrame.last, DrawOfferArmed(armed = true))
+          yield assertEquals(armedFrame.last, DrawOfferArmed(armed = true))
         }
         _ <- ws.connectHighLevel(WSRequest(specUri)).use { specConn =>
           for
@@ -374,11 +373,10 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
               .compile
               .lastOrError
               .timeoutTo(5.seconds, IO.raiseError(RuntimeException("spectator refusal not received")))
-          yield
-            assertEquals(
-              refusedFrame,
-              DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer"))
-            )
+          yield assertEquals(
+            refusedFrame,
+            DrawOfferArmed(armed = false, reason = Some("spectator cannot arm draw offer"))
+          )
         }
       yield ()
 

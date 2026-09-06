@@ -33,7 +33,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         case Right(room) =>
           // Subscribe first, then resign shortly after so the terminal event is the live GameEnded (not a snapshot).
           val ended      = room.subscribe.collectFirst { case e: GameEvent.GameEnded => e }.compile.lastOrError
-          val resignSoon = IO.sleep(100.millis) *> room.submit(Seat.White, GameCommand.Resign)
+          val resignSoon = IO.sleep(250.millis) *> room.submit(Seat.White, GameCommand.Resign)
           (ended, resignSoon)
             .parMapN((event, _) => event)
             .flatMap(event => (room.diceCommit, room.snapshot).mapN((commit, snap) => (event, commit, snap)))
@@ -937,7 +937,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
               moves2 <- room.legalMoves
               _      <- room.submitTurn(other, leafPath(moves2.legalMoves), offerDraw = false)
               // other's standing offer was consumed and delivered to roll1.seat!
-              snap2  <- room.snapshot
+              snap2 <- room.snapshot
               _ = assertEquals(snap2.activeSeat, roll1.seat)
               _ = assertEquals(snap2.drawOffer, Some(DrawOffer(pending = true)))
             yield ()
@@ -954,7 +954,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             for
               _ <- room.armDrawOffer(roll1.seat, armed = true)
               // Resign or king capture ends game
-              _ <- room.submit(roll1.seat, GameCommand.Resign)
+              _    <- room.submit(roll1.seat, GameCommand.Resign)
               over <- room.result
               snap <- room.snapshot
               _ = assertEquals(over.termination, Termination.Resign)

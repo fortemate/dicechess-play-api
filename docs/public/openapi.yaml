@@ -380,6 +380,46 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MoveVerdict' }
+  /bot/game/{id}/draw/offer:
+    post:
+      tags: [Gameplay]
+      summary: Arm standing draw offer
+      description: >
+        Arm the standing draw-offer flag for the caller's seat. The offer is delivered
+        at the completion of the caller's next turn (including forced pass). Idempotent (noop
+        if already armed).
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The flag was armed or already armed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DrawOfferResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Refused (`draw offer cooldown`, `opponent must offer next`, `draw offer already delivered`, `respond to the pending draw offer first`, `game is over`, `too many draw toggles`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DrawOfferResult' }
+    delete:
+      tags: [Gameplay]
+      summary: Disarm standing draw offer
+      description: >
+        Disarm a previously armed standing draw-offer flag before it has been delivered.
+        Idempotent (noop if not armed). A delivered offer cannot be disarmed.
+      parameters: [{ $ref: '#/components/parameters/GameId' }]
+      responses:
+        '200':
+          description: The flag was disarmed or was not armed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DrawDisarmResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Refused (`draw offer already delivered`, `respond to the pending draw offer first`, `game is over`, `too many draw toggles`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DrawDisarmResult' }
   /bot/game/{id}/draw/accept:
     post:
       tags: [Gameplay]
@@ -1853,6 +1893,9 @@ components:
         applied: { type: boolean }
         version: { type: [integer, 'null'], description: The resulting TurnPlayed version, or null when refused. }
         reason: { type: [string, 'null'], description: Rejection reason when not applied. }
+        drawOffered:
+          type: [boolean, 'null']
+          description: Whether a draw offer was delivered with this turn (true), or dropped due to cooldown/alternation or not requested (false).
       required: [applied]
     MyGame:
       type: object
@@ -1864,7 +1907,58 @@ components:
         timeControl: { $ref: '#/components/schemas/TimeControl' }
         clocks: { $ref: '#/components/schemas/Clocks' }
         version: { type: integer }
+        decision:
+          anyOf: [{ $ref: '#/components/schemas/BotDecision' }, { type: 'null' }]
+          description: Pending decision requiring caller's action before dice can be rolled.
+        mayOfferDraw:
+          type: boolean
+          description: Whether the caller is eligible to arm/offer a draw this turn.
+        drawOfferArmed:
+          type: boolean
+          description: Whether the caller currently has a standing draw-offer flag armed.
       required: [gameId, seat, activeSeat, dicePending, timeControl, version]
+    BotDecision:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [drawResponse, doubleOffer, doubleResponse]
+          description: The kind of decision awaiting action.
+        id:
+          type: [string, 'null']
+          description: Episode ID for doubling decisions (ADR-0019). Omitted for drawResponse.
+      required: [kind]
+    DrawOfferResult:
+      type: object
+      properties:
+        armed:
+          type: boolean
+          description: Whether the standing draw-offer flag is armed after this call.
+        outcome:
+          type: [string, 'null']
+          enum: [armed, noop, null]
+          description: '"armed" if freshly armed, "noop" if already armed, null on conflict.'
+        reason:
+          type: [string, 'null']
+          description: Failure reason when refused.
+        availableAfterTurns:
+          type: [integer, 'null']
+          description: Turns remaining until draw offer is available again when refused due to cooldown.
+      required: [armed]
+    DrawDisarmResult:
+      type: object
+      properties:
+        armed:
+          type: boolean
+          description: Whether the standing draw-offer flag is armed after this call (false).
+        outcome:
+          type: [string, 'null']
+          enum: [disarmed, noop, null]
+          description: '"disarmed" if freshly cleared, "noop" if was not armed, null on conflict.'
+        reason:
+          type: [string, 'null']
+          description: Failure reason when refused.
+      required: [armed]
     PublicGame:
       type: object
       properties:

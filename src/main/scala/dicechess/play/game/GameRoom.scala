@@ -152,6 +152,49 @@ final class GameRoom private (
       else DrawOfferArmed(armed = s.armedDrawOffer.getOrElse(seat, false))
     }
 
+  /** Arm the standing draw-offer flag for `seat` (#106). */
+  def armDrawOffer(seat: Seat): IO[DrawArmVerdict] =
+    stateRef.get.flatMap: s =>
+      val wasArmed = s.armedDrawOffer.getOrElse(seat, false)
+      armDrawOffer(seat, armed = true).map: res =>
+        res.reason match
+          case Some(r) => DrawArmVerdict.Refused(r, res.availableAfterTurns)
+          case None    => if wasArmed then DrawArmVerdict.Noop else DrawArmVerdict.Armed
+
+  /** Disarm a previously armed draw-offer flag for `seat` (#106). */
+  def disarmDrawOffer(seat: Seat): IO[DrawDisarmVerdict] =
+    stateRef.get.flatMap: s =>
+      val wasArmed = s.armedDrawOffer.getOrElse(seat, false)
+      armDrawOffer(seat, armed = false).map: res =>
+        res.reason match
+          case Some(r) => DrawDisarmVerdict.Refused(r)
+          case None    => if !wasArmed then DrawDisarmVerdict.Noop else DrawDisarmVerdict.Disarmed
+
+  /** Active bot game row for `seat` (#106), derived atomically from a single Session snapshot. Returns `None` if the
+    * room has ended.
+    */
+  def activeBotGame(seat: Seat): IO[Option[BotGameRow]] =
+    IO.monotonic.flatMap: now =>
+      stateRef.get.map: s =>
+        if s.status != GameStatus.Active then None
+        else
+          val pub      = s.publicAt(now, maxInlinePaths)
+          val decision = Option.when(s.pendingDrawOffer.exists(_ != seat))("drawResponse")
+          val mayOffer = s.mayOffer(seat)
+          val armed    = s.armedDrawOffer.getOrElse(seat, false)
+          Some(
+            BotGameRow(
+              pub.activeSeat,
+              pub.dicePending,
+              pub.timeControl,
+              pub.clocks,
+              pub.version,
+              decision,
+              mayOffer,
+              armed
+            )
+          )
+
   /** Respond to a pending draw offer (accept or decline explicitly) and await the writer's verdict. */
   def respondDraw(seat: Seat, accept: Boolean): IO[TurnVerdict] =
     enqueueDrawResponse(seat, accept).flatten
@@ -870,7 +913,12 @@ final class GameRoom private (
                       (winner match
                         case Some(w) => endGame(s1, GameOver(GameResult.Win(w), Termination.KingCaptured))
                         case None    => advanceOrEnd(s1)
-                      ).flatTap(_ => answer(reply, TurnVerdict.Applied(s1.version)))
+                      ).flatTap(s2 =>
+                        answer(
+                          reply,
+                          TurnVerdict.Applied(s1.version, drawOffered = offer && s2.status == GameStatus.Active)
+                        )
+                      )
 
   /** Complete a synchronous reply channel, if the command carried one. */
   /** One line per refusal a player could not have predicted, so the open question in ADR 006 decision 1 — whether the
@@ -994,8 +1042,32 @@ object GameRoom:
 
   /** The writer's verdict on a synchronously-submitted turn — the request/response face of `TurnPlayed`/`Rejected`. */
   enum TurnVerdict:
-    case Applied(version: Long)
+    case Applied(version: Long, drawOffered: Boolean = false)
     case Refused(reason: String)
+
+  /** The writer's verdict on a `POST /bot/game/{id}/draw/offer` (arm the standing draw-offer flag, #106). */
+  enum DrawArmVerdict:
+    case Armed
+    case Noop
+    case Refused(reason: String, availableAfterTurns: Option[Int] = None)
+
+  /** The writer's verdict on a `DELETE /bot/game/{id}/draw/offer` (disarm the standing draw-offer flag, #106). */
+  enum DrawDisarmVerdict:
+    case Disarmed
+    case Noop
+    case Refused(reason: String)
+
+  /** Atomic snapshot of an active game row for the Bot API (`GET /bot/games`, #106). */
+  final case class BotGameRow(
+      activeSeat: Seat,
+      dicePending: Boolean,
+      timeControl: TimeControl,
+      clocks: Option[Clocks],
+      version: Long,
+      decision: Option[String],
+      mayOfferDraw: Boolean,
+      drawOfferArmed: Boolean
+  )
 
   private enum Msg:
     case Begin

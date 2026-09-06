@@ -2,7 +2,7 @@ package dicechess.play.server
 
 import cats.effect.IO
 import cats.syntax.all.*
-import dicechess.play.core.{Challenge, Clocks, GameCommand, GameId, GameStatus, Principal, Seat, TimeControl}
+import dicechess.play.core.{Challenge, Clocks, GameCommand, GameId, Principal, Seat, TimeControl}
 import dicechess.play.game.GameRoom
 import dicechess.play.store.BotSeatPolicy
 import dicechess.play.wire.Codecs.given
@@ -140,6 +140,13 @@ final case class ChallengeCreated(
 /** The caller's pending challenges: addressed to it (`in` — accept/decline by id) and created by it (`out`). */
 final case class BotChallenges(in: List[Challenge], out: List[Challenge]) derives Codec.AsObject
 
+/** A pending decision the bot must act on (#106).
+  *
+  * `kind` identifies the decision: `"drawResponse"` when responding to a pre-roll draw offer; reserved kinds
+  * `"doubleOffer"` and `"doubleResponse"` carry an episode `id` for ADR-0019 stake doubling.
+  */
+final case class BotDecision(kind: String, id: Option[String] = None) derives Codec.AsObject
+
 /** A live game the caller is seated in — enough to decide whether to act; fetch `GET /games/{id}` for the position and
   * `GET /games/{id}/moves` for the legal-move tree.
   */
@@ -150,7 +157,10 @@ final case class BotActiveGame(
     dicePending: Boolean,
     timeControl: TimeControl,
     clocks: Option[Clocks],
-    version: Long
+    version: Long,
+    decision: Option[BotDecision] = None,
+    mayOfferDraw: Boolean = false,
+    drawOfferArmed: Boolean = false
 ) derives Codec.AsObject
 
 final case class BotGames(games: List[BotActiveGame]) derives Codec.AsObject
@@ -158,8 +168,27 @@ final case class BotGames(games: List[BotActiveGame]) derives Codec.AsObject
 /** The synchronous verdict on a submitted turn: `applied` with the `TurnPlayed` version (200), or refused with the same
   * reason the stream's `Rejected` carries (409). A fire-and-forget bot simply ignores the body.
   */
-final case class MoveOutcome(applied: Boolean, version: Option[Long] = None, reason: Option[String] = None)
-    derives Codec.AsObject
+final case class MoveOutcome(
+    applied: Boolean,
+    version: Option[Long] = None,
+    reason: Option[String] = None,
+    drawOffered: Option[Boolean] = None
+) derives Codec.AsObject
+
+/** Result of `POST /bot/game/{id}/draw/offer` (#106). */
+final case class DrawOfferResult(
+    armed: Boolean,
+    outcome: Option[String] = None,
+    reason: Option[String] = None,
+    availableAfterTurns: Option[Int] = None
+) derives Codec.AsObject
+
+/** Result of `DELETE /bot/game/{id}/draw/offer` (#106). */
+final case class DrawDisarmResult(
+    armed: Boolean,
+    outcome: Option[String] = None,
+    reason: Option[String] = None
+) derives Codec.AsObject
 
 /** The third-party Bot API (Lichess-shaped): identity, the per-bot event stream, the challenge lifecycle, and the game
   * play surface (game event stream + move/resign).
@@ -333,12 +362,25 @@ object BotRoutes:
           registry
             .gamesFor(bot)
             .flatMap(_.traverse { (id, room) =>
-              (seatOf(room, bot), room.snapshot).mapN: (seat, s) =>
-                // A just-ended room can linger until the registry evicts it; a listing is for live games only.
-                seat
-                  .filter(_ => s.status == GameStatus.Active)
-                  .map: st =>
-                    BotActiveGame(id.value, st, s.activeSeat, s.dicePending, s.timeControl, s.clocks, s.version)
+              seatOf(room, bot).flatMap:
+                case None     => IO.pure(None)
+                case Some(st) =>
+                  room
+                    .activeBotGame(st)
+                    .map:
+                      _.map: row =>
+                        BotActiveGame(
+                          id.value,
+                          st,
+                          row.activeSeat,
+                          row.dicePending,
+                          row.timeControl,
+                          row.clocks,
+                          row.version,
+                          decision = row.decision.map(k => BotDecision(k)),
+                          mayOfferDraw = row.mayOfferDraw,
+                          drawOfferArmed = row.drawOfferArmed
+                        )
             })
             .flatMap(games => Ok(BotGames(games.flatten)))
 
@@ -468,12 +510,43 @@ object BotRoutes:
                         case None         => room.submitTurn(seat, move.moves, offerDraw = move.offerDraw)
                   action
                     .flatMap:
-                      case GameRoom.TurnVerdict.Applied(version) =>
-                        Ok(MoveOutcome(applied = true, version = Some(version)))
+                      case GameRoom.TurnVerdict.Applied(version, drawOffered) =>
+                        val offeredOpt = if move.acceptDraw.isDefined then None else Some(drawOffered)
+                        Ok(MoveOutcome(applied = true, version = Some(version), drawOffered = offeredOpt))
                       case GameRoom.TurnVerdict.Refused(reason) =>
                         Conflict(MoveOutcome(applied = false, reason = Some(reason)))
                     .timeoutTo(VerdictTimeout, Accepted())
                 )
+
+      case req @ POST -> Root / "bot" / "game" / id / "draw" / "offer" =>
+        withBot(auth, req): bot =>
+          seated(registry, id, bot)((room, seat) =>
+            room
+              .armDrawOffer(seat)
+              .flatMap:
+                case GameRoom.DrawArmVerdict.Armed =>
+                  Ok(DrawOfferResult(armed = true, outcome = Some("armed")))
+                case GameRoom.DrawArmVerdict.Noop =>
+                  Ok(DrawOfferResult(armed = true, outcome = Some("noop")))
+                case GameRoom.DrawArmVerdict.Refused(reason, availableAfterTurns) =>
+                  Conflict(
+                    DrawOfferResult(armed = false, reason = Some(reason), availableAfterTurns = availableAfterTurns)
+                  )
+          )
+
+      case req @ DELETE -> Root / "bot" / "game" / id / "draw" / "offer" =>
+        withBot(auth, req): bot =>
+          seated(registry, id, bot)((room, seat) =>
+            room
+              .disarmDrawOffer(seat)
+              .flatMap:
+                case GameRoom.DrawDisarmVerdict.Disarmed =>
+                  Ok(DrawDisarmResult(armed = false, outcome = Some("disarmed")))
+                case GameRoom.DrawDisarmVerdict.Noop =>
+                  Ok(DrawDisarmResult(armed = false, outcome = Some("noop")))
+                case GameRoom.DrawDisarmVerdict.Refused(reason) =>
+                  Conflict(DrawDisarmResult(armed = false, reason = Some(reason)))
+          )
 
       case req @ POST -> Root / "bot" / "game" / id / "draw" / ("accept" | "yes") =>
         withBot(auth, req): bot =>
@@ -481,7 +554,7 @@ object BotRoutes:
             room
               .respondDraw(seat, accept = true)
               .flatMap:
-                case GameRoom.TurnVerdict.Applied(version) =>
+                case GameRoom.TurnVerdict.Applied(version, _) =>
                   Ok(MoveOutcome(applied = true, version = Some(version)))
                 case GameRoom.TurnVerdict.Refused(reason) =>
                   Conflict(MoveOutcome(applied = false, reason = Some(reason)))
@@ -494,7 +567,7 @@ object BotRoutes:
             room
               .respondDraw(seat, accept = false)
               .flatMap:
-                case GameRoom.TurnVerdict.Applied(version) =>
+                case GameRoom.TurnVerdict.Applied(version, _) =>
                   Ok(MoveOutcome(applied = true, version = Some(version)))
                 case GameRoom.TurnVerdict.Refused(reason) =>
                   Conflict(MoveOutcome(applied = false, reason = Some(reason)))
@@ -507,7 +580,7 @@ object BotRoutes:
             room
               .resign(seat)
               .flatMap:
-                case GameRoom.TurnVerdict.Applied(version) =>
+                case GameRoom.TurnVerdict.Applied(version, _) =>
                   Ok(MoveOutcome(applied = true, version = Some(version)))
                 case GameRoom.TurnVerdict.Refused(reason) =>
                   Conflict(MoveOutcome(applied = false, reason = Some(reason)))
@@ -552,15 +625,15 @@ object BotRoutes:
     * (the per-player index only lists rooms it is seated in, so this is a guard, not an expected path). A refusal can
     * only be `game is over` for a seated caller, hence `AlreadyOver`.
     */
-  private def resignOne(room: GameRoom, id: GameId, bot: Principal.Bot): IO[Option[ResignAllResult]] =
+  private[server] def resignOne(room: GameRoom, id: GameId, bot: Principal.Bot): IO[Option[ResignAllResult]] =
     seatOf(room, bot).flatMap:
       case None       => IO.pure(None)
       case Some(seat) =>
         room
           .resign(seat)
           .map:
-            case GameRoom.TurnVerdict.Applied(_) => ResignAllResult.Resigned(id.value)
-            case GameRoom.TurnVerdict.Refused(_) => ResignAllResult.AlreadyOver(id.value)
+            case GameRoom.TurnVerdict.Applied(_, _) => ResignAllResult.Resigned(id.value)
+            case GameRoom.TurnVerdict.Refused(_)    => ResignAllResult.AlreadyOver(id.value)
           .timeoutTo(VerdictTimeout, IO.pure(ResignAllResult.Pending(id.value)))
           .map(Some(_))
 
@@ -574,7 +647,7 @@ object BotRoutes:
       ladder.isDefined || catalog.isDefined
     )
 
-  private enum ResignAllResult:
+  private[server] enum ResignAllResult:
     case Resigned(id: String)
     case AlreadyOver(id: String)
     case Pending(id: String)

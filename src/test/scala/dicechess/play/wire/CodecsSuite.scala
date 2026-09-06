@@ -1,7 +1,19 @@
 package dicechess.play.wire
 
 import dicechess.play.core.*
-import dicechess.play.server.{BotCreateSeek, BotMove, ChallengeTarget, CreateSeek, PlayBot, Wake}
+import dicechess.play.server.{
+  BotActiveGame,
+  BotCreateSeek,
+  BotDecision,
+  BotMove,
+  ChallengeTarget,
+  CreateSeek,
+  DrawDisarmResult,
+  DrawOfferResult,
+  MoveOutcome,
+  PlayBot,
+  Wake
+}
 import dicechess.play.wire.Codecs.given
 import io.circe.parser.decode
 import io.circe.syntax.*
@@ -411,3 +423,45 @@ class CodecsSuite extends munit.FunSuite:
       assertEquals(decode[GameOrigin](origin.asJson.noSpaces), Right(origin), s"$origin must round-trip")
     }
     assert(decode[GameOrigin]("\"arena\"").isLeft, "an unknown origin must not decode to a default")
+
+  test("BotActiveGame, DrawOfferResult, DrawDisarmResult, and MoveOutcome wire shapes (#106)"):
+    val defaultGame = BotActiveGame("g1", Seat.White, Seat.White, true, TimeControl.Unlimited, None, 1L)
+    assertEquals(defaultGame.decision, None)
+    assertEquals(defaultGame.mayOfferDraw, false)
+    assertEquals(defaultGame.drawOfferArmed, false)
+    roundtrip[BotActiveGame](defaultGame)
+
+    val fullGame = BotActiveGame(
+      "g1",
+      Seat.White,
+      Seat.White,
+      true,
+      TimeControl.Unlimited,
+      Some(Clocks(1000, 1000)),
+      1L,
+      decision = Some(BotDecision("drawResponse")),
+      mayOfferDraw = true,
+      drawOfferArmed = true
+    )
+    roundtrip[BotActiveGame](fullGame)
+
+    val defaultOffer = DrawOfferResult(armed = true)
+    assertEquals(defaultOffer.outcome, None)
+    assertEquals(defaultOffer.reason, None)
+    assertEquals(defaultOffer.availableAfterTurns, None)
+    roundtrip[DrawOfferResult](defaultOffer)
+    roundtrip[DrawOfferResult](
+      DrawOfferResult(armed = false, outcome = None, reason = Some("cooldown"), availableAfterTurns = Some(3))
+    )
+
+    val defaultDisarm = DrawDisarmResult(armed = false)
+    assertEquals(defaultDisarm.outcome, None)
+    assertEquals(defaultDisarm.reason, None)
+    roundtrip[DrawDisarmResult](defaultDisarm)
+    roundtrip[DrawDisarmResult](
+      DrawDisarmResult(armed = false, outcome = Some("disarmed"), reason = None)
+    )
+
+    roundtrip[MoveOutcome](MoveOutcome(applied = true, version = Some(1L), drawOffered = Some(true)))
+    roundtrip[MoveOutcome](MoveOutcome(applied = true, version = Some(1L), drawOffered = Some(false)))
+    roundtrip[MoveOutcome](MoveOutcome(applied = true, version = Some(1L), drawOffered = None))

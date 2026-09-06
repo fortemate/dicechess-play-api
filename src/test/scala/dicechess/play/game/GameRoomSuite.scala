@@ -424,7 +424,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
               assertEquals(offTurn, GameRoom.TurnVerdict.Refused("not your turn"))
               assertEquals(illegal, GameRoom.TurnVerdict.Refused("illegal turn"))
               applied match
-                case GameRoom.TurnVerdict.Applied(version) =>
+                case GameRoom.TurnVerdict.Applied(version, _) =>
                   assert(version > roll.v, s"the applied version ($version) must supersede the roll's (${roll.v})")
                 case other => fail(s"expected Applied, got: $other")
               assertEquals(replay, GameRoom.TurnVerdict.Refused("not your turn"))
@@ -503,7 +503,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             assertEquals(List(resign, otherResign).count(_.isInstanceOf[GameRoom.TurnVerdict.Applied]), 1)
             // The turn was applied if it ran first, or refused as game over if a resignation beat it.
             turn match
-              case GameRoom.TurnVerdict.Applied(_)      => ()
+              case GameRoom.TurnVerdict.Applied(_, _)   => ()
               case GameRoom.TurnVerdict.Refused(reason) => assertEquals(reason, "game is over")
       }
       .timeoutTo(15.seconds, IO.raiseError(RuntimeException("race test timed out")))
@@ -1113,3 +1113,57 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             yield assertEquals(renewed, DrawOfferArmed(armed = true))
           }
       }
+
+  test("armDrawOffer and disarmDrawOffer on a finished game answer 'game is over' (#106)"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds)
+      .flatMap:
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            _      <- room.submit(Seat.White, GameCommand.Resign)
+            _      <- room.result
+            arm    <- room.armDrawOffer(Seat.White)
+            disarm <- room.disarmDrawOffer(Seat.White)
+          yield
+            assertEquals(arm, GameRoom.DrawArmVerdict.Refused("game is over"))
+            assertEquals(disarm, GameRoom.DrawDisarmVerdict.Refused("game is over"))
+
+  test("armDrawOffer and disarmDrawOffer lifecycle and noop on active game (#106)"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds)
+      .flatMap:
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            arm1 <- room.armDrawOffer(Seat.White)
+            _ = assertEquals(arm1, GameRoom.DrawArmVerdict.Armed)
+            arm2 <- room.armDrawOffer(Seat.White)
+            _ = assertEquals(arm2, GameRoom.DrawArmVerdict.Noop)
+            dis1 <- room.disarmDrawOffer(Seat.White)
+            _ = assertEquals(dis1, GameRoom.DrawDisarmVerdict.Disarmed)
+            dis2 <- room.disarmDrawOffer(Seat.White)
+            _ = assertEquals(dis2, GameRoom.DrawDisarmVerdict.Noop)
+            specArm <- room.armDrawOffer(Seat.Spectator)
+            _ = assertEquals(specArm, GameRoom.DrawArmVerdict.Refused("spectator cannot arm draw offer"))
+            specDis <- room.disarmDrawOffer(Seat.Spectator)
+            _ = assertEquals(specDis, GameRoom.DrawDisarmVerdict.Refused("spectator cannot arm draw offer"))
+          yield ()
+
+  test("activeBotGame derives row atomically and returns None when game ends (#106)"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds)
+      .flatMap:
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            beforeEnd <- room.activeBotGame(Seat.White)
+            _ = assert(beforeEnd.isDefined)
+            _ = assertEquals(beforeEnd.get.mayOfferDraw, true)
+            _ = assertEquals(beforeEnd.get.drawOfferArmed, false)
+            _ = assertEquals(beforeEnd.get.decision, None)
+            _        <- room.submit(Seat.White, GameCommand.Resign)
+            _        <- room.result
+            afterEnd <- room.activeBotGame(Seat.White)
+            _ = assertEquals(afterEnd, None)
+          yield ()

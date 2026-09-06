@@ -324,7 +324,8 @@ If your webhook declared the `"draws"` capability and the opponent offered a dra
 ```
 
 - Answer `200` with `{"acceptDraw": true}` to accept the draw (game ends ½–½).
-- Answer `200` with `{"acceptDraw": false}` (or empty `{}` / timeout) to decline the draw. The server immediately reveals your dice and sends a subsequent `yourTurn` payload! (In a reserved staked game the decline continues into the pre-roll double opportunity instead; see [Stake Doubling](../../stake-doubling/).)
+- Answer `200` with `{"acceptDraw": false}` (or empty `{}` / timeout) to decline the draw. The server immediately reveals your dice and sends a subsequent `yourTurn` payload!
+- Answer `200` with `{"resign": true}` to concede instead: it wins over `acceptDraw`, and the game ends with `termination: Resign` before any dice are revealed. (In a reserved staked game the decline continues into the pre-roll double opportunity instead; see [Stake Doubling](../../stake-doubling/).)
 
 ### Verify delivery signatures
 
@@ -353,6 +354,7 @@ Answer within the timeout with the same shape [`POST /bot/game/{id}/move`](../re
 ```
 
 - `200` with a legal turn → the move is played (same engine validation as the move endpoint). Can piggyback `"offerDraw": true` to offer a draw.
+- `200` with `{"resign": true}` → you concede; `resign` takes precedence over `moves`, `offerDraw` and `acceptDraw`, is applied even if the delivery's `version` is stale, and is recorded as the `resigned` outcome below (never as a failure). The same member is accepted on every delivery type, and by [`POST /bot/game/{id}/move`](../rest/#submit-turn-moves).
 - Anything else — a timeout, a non-200, a malformed body, an illegal turn, or `{"moves": []}` without `acceptDraw` — plays nothing: **your clock keeps running**, and the game forfeits on time exactly as if a polling bot had stopped polling.
 
 Delivery is **single-attempt** by design — no retries, no redelivery. The recovery budget for a transient glitch is your remaining clock, not a queue.
@@ -414,7 +416,7 @@ GET /bot/webhook/stats
 }
 ```
 
-Two windows — 24 hours and 7 days — each with a count per outcome and three latency percentiles. Outcomes are named for what actually happened: `applied` (a usable move), `declined` (you sent `{"moves":[]}` on purpose), `refused` (the room rejected the moves — stale or illegal), `garbled` (the body didn't decode), `oversized_body`, `http_<code>` (your endpoint answered, just not `200` — this is exactly the "your own platform's request timeout" row from the table above, made visible: a `504` or `524` here means your gateway cut the turn, not this server), `timed_out` (nothing arrived within this server's own window), `unreachable` (connection refused, DNS, or similar), and `stale_registration` (the response arrived after its registration generation was replaced or deleted and was deliberately discarded). `lastFailure` is the most recent of everything except `applied`/`declined`/`stale_registration` — the answer to "is it still broken, and since when" that a table of counts alone can't give.
+Two windows — 24 hours and 7 days — each with a count per outcome and three latency percentiles. Outcomes are named for what actually happened: `applied` (a usable move), `resigned` (you answered `{"resign": true}` on purpose), `declined` (you sent `{"moves":[]}` on purpose), `refused` (the room rejected the moves — stale or illegal), `garbled` (the body didn't decode), `oversized_body`, `http_<code>` (your endpoint answered, just not `200` — this is exactly the "your own platform's request timeout" row from the table above, made visible: a `504` or `524` here means your gateway cut the turn, not this server), `timed_out` (nothing arrived within this server's own window), `unreachable` (connection refused, DNS, or similar), and `stale_registration` (the response arrived after its registration generation was replaced or deleted and was deliberately discarded). `lastFailure` is the most recent of everything except `applied`/`resigned`/`declined`/`stale_registration` — the answer to "is it still broken, and since when" that a table of counts alone can't give.
 
 Percentiles are bucket-resolution approximations (a fixed set of latency buckets, log-spaced from 50 ms to 300 s), not exact — enough to tell "my p99 moved from 2 s to 30 s" without needing millisecond precision. Recording never sits on the turn path: a delivery is classified and queued the instant it completes, and a slow or unavailable stats write only ever costs a dropped data point, never a turn.
 

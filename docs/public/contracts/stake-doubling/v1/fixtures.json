@@ -83,6 +83,10 @@
       "schemaRef": "#/$defs/DoubleDecisionResponse"
     },
     {
+      "path": "examples/webhook-decision-response-resign.json",
+      "schemaRef": "#/$defs/DoubleDecisionResponse"
+    },
+    {
       "path": "examples/capability-catalog.json",
       "schemaRef": "#/$defs/CapabilityCatalog"
     },

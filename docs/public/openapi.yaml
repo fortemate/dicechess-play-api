@@ -2476,7 +2476,7 @@ components:
         outcome:
           type: string
           description: >
-            applied, declined, refused, garbled, oversized_body, http_<code>, timed_out,
+            applied, resigned, declined, refused, garbled, oversized_body, http_<code>, timed_out,
             unreachable, or stale_registration (a response discarded after its generation lost
             the registration fence).
         count: { type: integer, format: int64 }

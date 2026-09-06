@@ -454,7 +454,7 @@
         "offerDouble": { "type": "boolean" },
         "resign": { "type": "boolean" }
       },
-      "required": ["decisionId"]
+      "required": ["decisionId", "offerDouble"]
     },
     "DoubleDecisionWebhook": {
       "type": "object",
@@ -493,7 +493,7 @@
         "acceptDouble": { "type": "boolean" },
         "resign": { "type": "boolean" }
       },
-      "required": ["decisionId"]
+      "required": ["decisionId", "acceptDouble"]
     },
     "CapabilityCatalog": {
       "type": "object",

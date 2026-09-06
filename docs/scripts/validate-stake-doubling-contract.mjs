@@ -109,6 +109,7 @@ for (const [name, id] of [
   ["webhook-opportunity-response", fixture("examples/webhook-opportunity-response.json").decisionId],
   ["webhook-opportunity-response-resign", fixture("examples/webhook-opportunity-response-resign.json").decisionId],
   ["webhook-decision-response", fixture("examples/webhook-decision-response.json").decisionId],
+  ["webhook-decision-response-resign", fixture("examples/webhook-decision-response-resign.json").decisionId],
 ]) {
   assert(id === decisionId, `${name} must carry the episode's decision id ${decisionId}`);
 }

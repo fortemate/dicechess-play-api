@@ -46,18 +46,8 @@ channels:
       turnPlayed: { $ref: '#/components/messages/TurnPlayed' }
       drawOffered: { $ref: '#/components/messages/DrawOffered' }
       drawDeclined: { $ref: '#/components/messages/DrawDeclined' }
-      drawOfferArmed: { $ref: '#/components/messages/DrawOfferArmedFrame' }
       gameEnded: { $ref: '#/components/messages/GameEnded' }
       rejected: { $ref: '#/components/messages/Rejected' }
-  gameCommands:
-    address: /bot/game/stream/{id}
-    title: Game socket client commands
-    description: Client commands sent by a seated player over WebSocket.
-    parameters:
-      id:
-        description: The game id.
-    messages:
-      armDrawOffer: { $ref: '#/components/messages/ArmDrawOffer' }
 operations:
   receiveAccountEvents:
     action: receive
@@ -70,22 +60,15 @@ operations:
   receiveGameEvents:
     action: receive
     channel: { $ref: '#/channels/gameEvents' }
-    summary: Stream one game's state transitions and seat-private frames.
+    summary: Stream one game's state transitions.
     messages:
       - { $ref: '#/channels/gameEvents/messages/snapshot' }
       - { $ref: '#/channels/gameEvents/messages/diceRolled' }
       - { $ref: '#/channels/gameEvents/messages/turnPlayed' }
       - { $ref: '#/channels/gameEvents/messages/drawOffered' }
       - { $ref: '#/channels/gameEvents/messages/drawDeclined' }
-      - { $ref: '#/channels/gameEvents/messages/drawOfferArmed' }
       - { $ref: '#/channels/gameEvents/messages/gameEnded' }
       - { $ref: '#/channels/gameEvents/messages/rejected' }
-  sendGameCommands:
-    action: send
-    channel: { $ref: '#/channels/gameCommands' }
-    summary: Send client commands over WebSocket.
-    messages:
-      - { $ref: '#/channels/gameCommands/messages/armDrawOffer' }
 components:
   securitySchemes:
     bearerAuth:
@@ -236,32 +219,6 @@ components:
               v: { type: integer }
               seat: { $ref: '#/components/schemas/Seat' }
               reason: { type: string }
-    ArmDrawOffer:
-      name: ArmDrawOffer
-      title: Client command to arm or disarm standing draw-offer flag over WebSocket.
-      payload:
-        type: object
-        required: [ArmDrawOffer]
-        properties:
-          ArmDrawOffer:
-            type: object
-            required: [armed]
-            properties:
-              armed: { type: boolean }
-    DrawOfferArmedFrame:
-      name: DrawOfferArmed
-      title: Seat-private frame confirming standing draw offer status or reporting refusal.
-      payload:
-        type: object
-        required: [DrawOfferArmed]
-        properties:
-          DrawOfferArmed:
-            type: object
-            required: [armed]
-            properties:
-              armed: { type: boolean }
-              reason: { type: [string, 'null'] }
-              availableAfterTurns: { type: [integer, 'null'] }
   schemas:
     Seat:
       type: string

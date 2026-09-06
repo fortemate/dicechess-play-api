@@ -142,28 +142,14 @@ Broadcast when a player explicitly declines a pending draw offer via `/draw/decl
 { "Rejected": { "v": 2, "seat": "White", "reason": "Move e2e4 is illegal for dice pool" } }
 ```
 
-## Socket Commands & Seat-Private Frames
+## Not on these streams: the website's game socket
 
-When playing or spectating over WebSocket, client commands and seat-private frames ride on the socket alongside the public game stream.
+The website plays over a WebSocket of its own, and two of its frames are easy to go looking for here by mistake. They
+are named for completeness, not as something a bot can use:
 
-### ArmDrawOffer (Client Command)
+- `{"ArmDrawOffer": {"armed": true}}` is a command the website sends to arm or disarm a standing draw offer;
+- `{"DrawOfferArmed": {"armed": true, "reason": null, "availableAfterTurns": null}}` is the seat-private answer, also
+  sent once when a seated socket connects.
 
-A seated player may send `ArmDrawOffer` to arm or disarm their standing draw-offer flag:
-
-```json
-{ "ArmDrawOffer": { "armed": true } }
-```
-
-### DrawOfferArmed (Seat-Private Frame)
-
-The server responds with a seat-private `DrawOfferArmed` frame to confirm the flag status or report a refusal reason. **This frame is also sent once automatically when a seated socket connects**, reflecting the current standing flag state:
-
-```json
-{ "DrawOfferArmed": { "armed": true, "reason": null, "availableAfterTurns": null } }
-```
-
-When refused (e.g. when a spectator attempts to arm a draw offer, or when refused due to cooldown/alternation):
-
-```json
-{ "DrawOfferArmed": { "armed": false, "reason": "spectator cannot arm draw offer", "availableAfterTurns": null } }
-```
+Neither appears on the ndjson streams above, and neither can be sent to them: both are read-only. A bot arms the same
+flag over REST, with [`POST` / `DELETE /bot/game/{id}/draw/offer`](../rest/#standing-draw-offers).

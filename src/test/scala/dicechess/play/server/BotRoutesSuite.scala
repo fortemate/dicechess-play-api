@@ -17,6 +17,7 @@ import dicechess.play.core.{
   TimeControl
 }
 import dicechess.play.dice.DiceSource
+import dicechess.play.game.GameRoom
 import dicechess.play.store.BotSeatPolicy
 import dicechess.play.wire.Codecs.given
 import fs2.Stream
@@ -1083,6 +1084,210 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           assertEquals(snap.drawOffer, None)
           assertEquals(snap.dicePending, true)
           assertEquals(snap.activeSeat, oppSeat)
+
+  test("POST/DELETE /bot/game/{id}/draw/offer arm/disarm and noop lifecycle (#106)"):
+    app.flatMap: service =>
+      for
+        gameId <- seatedGame(service)
+        // 1. Arm draw offer
+        arm1     <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-alice")))
+        arm1Body <- arm1.as[DrawOfferResult]
+        _ = assertEquals(arm1.status, Status.Ok)
+        _ = assertEquals(arm1Body, DrawOfferResult(armed = true, outcome = Some("armed")))
+
+        // 2. Arm again is idempotent (noop)
+        arm2     <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-alice")))
+        arm2Body <- arm2.as[DrawOfferResult]
+        _ = assertEquals(arm2.status, Status.Ok)
+        _ = assertEquals(arm2Body, DrawOfferResult(armed = true, outcome = Some("noop")))
+
+        // 3. GET /bot/games shows drawOfferArmed = true for alice, false for bob
+        gamesAlice <- service.run(request(Method.GET, uri"/bot/games", Some("tok-alice"))).flatMap(_.as[BotGames])
+        gamesBob   <- service.run(request(Method.GET, uri"/bot/games", Some("tok-bob"))).flatMap(_.as[BotGames])
+        _ = assertEquals(gamesAlice.games.find(_.gameId == gameId).map(_.drawOfferArmed), Some(true))
+        _ = assertEquals(gamesBob.games.find(_.gameId == gameId).map(_.drawOfferArmed), Some(false))
+
+        // 4. Disarm draw offer
+        dis1     <- service.run(request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-alice")))
+        dis1Body <- dis1.as[DrawDisarmResult]
+        _ = assertEquals(dis1.status, Status.Ok)
+        _ = assertEquals(dis1Body, DrawDisarmResult(armed = false, outcome = Some("disarmed")))
+
+        // 5. Disarm again is idempotent (noop)
+        dis2     <- service.run(request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-alice")))
+        dis2Body <- dis2.as[DrawDisarmResult]
+        _ = assertEquals(dis2.status, Status.Ok)
+        _ = assertEquals(dis2Body, DrawDisarmResult(armed = false, outcome = Some("noop")))
+
+        // 6. 401 without token
+        unauthArm <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", None))
+        unauthDis <- service.run(request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", None))
+        _ = assertEquals(unauthArm.status, Status.Unauthorized)
+        _ = assertEquals(unauthDis.status, Status.Unauthorized)
+
+        // 7. 404 for unseated bot or unknown game
+        unseatedArm <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-carol")))
+        unseatedDis <- service.run(
+          request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-carol"))
+        )
+        unknownArm <- service.run(request(Method.POST, uri"/bot/game" / "nope" / "draw" / "offer", Some("tok-alice")))
+        _ = assertEquals(unseatedArm.status, Status.NotFound)
+        _ = assertEquals(unseatedDis.status, Status.NotFound)
+        _ = assertEquals(unknownArm.status, Status.NotFound)
+      yield ()
+
+  test("draw offer delivery via standing flag, drawOffered verdict, and poll row decision (#106)"):
+    AnonMintLimiter
+      .create(limit = 100)
+      .flatMap(appWith(_, diceSource = () => IO.pure(movableDice)))
+      .flatMap: (service, registry) =>
+        def leafPath(tree: MoveTree): List[String] =
+          tree.children.headOption match
+            case None              => Nil
+            case Some((uci, next)) => uci :: leafPath(next)
+
+        def nextMovable(gameId: String, afterVersion: Long): IO[(Seat, MoveTree, Long)] =
+          registry
+            .get(GameId(gameId))
+            .flatMap:
+              case None       => IO.raiseError(RuntimeException("game vanished"))
+              case Some(room) =>
+                (room.snapshot, room.legalMoves).flatMapN: (snap, moves) =>
+                  if snap.version >= afterVersion && moves.dicePending && moves.legalMoves.children.nonEmpty then
+                    IO.pure((snap.activeSeat, moves.legalMoves, snap.version))
+                  else IO.sleep(25.millis) *> nextMovable(gameId, afterVersion)
+
+        def nextWithOffer(gameId: String, afterVersion: Long): IO[(Seat, Long)] =
+          registry
+            .get(GameId(gameId))
+            .flatMap:
+              case None       => IO.raiseError(RuntimeException("game vanished"))
+              case Some(room) =>
+                room.snapshot.flatMap: snap =>
+                  if snap.version >= afterVersion && snap.drawOffer.exists(_.pending)
+                  then IO.pure((snap.activeSeat, snap.version))
+                  else IO.sleep(25.millis) *> nextWithOffer(gameId, afterVersion)
+
+        def seed(gameId: String, token: String, seed: String): IO[Status] =
+          service
+            .run(request(Method.POST, uri"/bot/game" / gameId / "seed", Some(token)).withEntity(BotSeed(seed)))
+            .map(_.status)
+
+        for
+          gameId                <- seatedGame(service)
+          _                     <- seed(gameId, "tok-alice", "alice-client-seed-0001")
+          _                     <- seed(gameId, "tok-bob", "bob-client-seed-00001")
+          room                  <- registry.get(GameId(gameId)).map(_.getOrElse(fail("room vanished")))
+          (activeSeat, tree, _) <- nextMovable(gameId, 0L).timeoutTo(
+            10.seconds,
+            IO.raiseError(RuntimeException("no movable roll"))
+          )
+          mover = if activeSeat == Seat.White then "tok-alice" else "tok-bob"
+
+          // 1. Arm standing draw offer before the move
+          armedResp <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(mover)))
+          _ = assertEquals(armedResp.status, Status.Ok)
+
+          // 2. Submit move WITHOUT offerDraw rider — the armed flag delivers the offer!
+          played <- service.run(
+            request(Method.POST, uri"/bot/game" / gameId / "move", Some(mover))
+              .withEntity(BotMove(leafPath(tree), offerDraw = false))
+          )
+          playedBody <- played.as[MoveOutcome]
+          _  = assertEquals(played.status, Status.Ok)
+          _  = assertEquals(playedBody.applied, true)
+          _  = assertEquals(playedBody.drawOffered, Some(true))
+          v1 = playedBody.version.get
+
+          // 3. Wait for opponent's pre-roll gate
+          (oppSeat, _) <- nextWithOffer(gameId, v1).timeoutTo(
+            10.seconds,
+            IO.raiseError(RuntimeException("no offer arrived for opponent"))
+          )
+          oppToken = if oppSeat == Seat.White then "tok-alice" else "tok-bob"
+
+          // 4. Check GET /bot/games during pre-roll gate:
+          // Responder sees decision: Some(BotDecision("drawResponse")), offerer sees decision: None
+          oppGames   <- service.run(request(Method.GET, uri"/bot/games", Some(oppToken))).flatMap(_.as[BotGames])
+          moverGames <- service.run(request(Method.GET, uri"/bot/games", Some(mover))).flatMap(_.as[BotGames])
+          oppGame   = oppGames.games.find(_.gameId == gameId).get
+          moverGame = moverGames.games.find(_.gameId == gameId).get
+          _         = assertEquals(oppGame.decision, Some(BotDecision("drawResponse")))
+          _         = assertEquals(oppGame.drawOfferArmed, false)
+          _         = assertEquals(moverGame.decision, None)
+          _         = assertEquals(moverGame.drawOfferArmed, false)
+
+          // 5. 409 conflict checks during pending gate:
+          // Offerer cannot disarm or re-arm (already delivered)
+          moverDisarm <- service.run(request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", Some(mover)))
+          moverDisarmBody <- moverDisarm.as[DrawDisarmResult]
+          moverArm        <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(mover)))
+          moverArmBody    <- moverArm.as[DrawOfferResult]
+          _ = assertEquals(moverDisarm.status, Status.Conflict)
+          _ = assertEquals(moverDisarmBody.reason, Some("draw offer already delivered"))
+          _ = assertEquals(moverArm.status, Status.Conflict)
+          _ = assertEquals(moverArmBody.reason, Some("draw offer already delivered"))
+
+          // Responder cannot arm while an offer is pending response
+          oppArm     <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(oppToken)))
+          oppArmBody <- oppArm.as[DrawOfferResult]
+          _ = assertEquals(oppArm.status, Status.Conflict)
+          _ = assertEquals(oppArmBody.reason, Some("respond to the pending draw offer first"))
+
+          // 6. Responder declines draw
+          declined <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "decline", Some(oppToken)))
+          declinedBody <- declined.as[MoveOutcome]
+          _  = assertEquals(declined.status, Status.Ok)
+          v2 = declinedBody.version.get
+
+          // 7. Responder plays move and offers draw back (allowed: alternation allows counter-offer)
+          (mover2Seat, tree2, _) <- nextMovable(gameId, v2).timeoutTo(
+            10.seconds,
+            IO.raiseError(RuntimeException("no movable roll after decline"))
+          )
+          mover2Token = if mover2Seat == Seat.White then "tok-alice" else "tok-bob"
+          counterOffered <- service.run(
+            request(Method.POST, uri"/bot/game" / gameId / "move", Some(mover2Token))
+              .withEntity(BotMove(leafPath(tree2), offerDraw = true))
+          )
+          counterBody <- counterOffered.as[MoveOutcome]
+          _  = assertEquals(counterOffered.status, Status.Ok)
+          _  = assertEquals(counterBody.drawOffered, Some(true))
+          v3 = counterBody.version.get
+
+          // 8. Original offerer declines
+          (receiverSeat, _) <- nextWithOffer(gameId, v3).timeoutTo(
+            10.seconds,
+            IO.raiseError(RuntimeException("no counter-offer arrived"))
+          )
+          receiverToken = if receiverSeat == Seat.White then "tok-alice" else "tok-bob"
+          declined2 <- service.run(
+            request(Method.POST, uri"/bot/game" / gameId / "draw" / "decline", Some(receiverToken))
+          )
+          _ = assertEquals(declined2.status, Status.Ok)
+
+          // 9. Now the counter-offerer (mover2Token) is the lastDrawOfferer!
+          // They cannot offer again immediately (passing right: "opponent must offer next")
+          cooldownArm <- service.run(
+            request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some(mover2Token))
+          )
+          cooldownBody <- cooldownArm.as[DrawOfferResult]
+          _ = assertEquals(cooldownArm.status, Status.Conflict)
+          _ = assertEquals(cooldownBody.reason, Some("opponent must offer next"))
+          _ = assertEquals(cooldownBody.availableAfterTurns, None)
+
+          // 10. Resigning ends the game; once deregistered, routes answer 404, and direct room answers "game is over"
+          _        <- service.run(request(Method.POST, uri"/bot/game" / gameId / "resign", Some("tok-alice")))
+          _        <- room.result
+          endedArm <- service.run(request(Method.POST, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-bob")))
+          endedDis <- service.run(request(Method.DELETE, uri"/bot/game" / gameId / "draw" / "offer", Some("tok-bob")))
+          _ = assertEquals(endedArm.status, Status.NotFound)
+          _ = assertEquals(endedDis.status, Status.NotFound)
+          directArm <- room.armDrawOffer(Seat.White)
+          directDis <- room.disarmDrawOffer(Seat.White)
+          _ = assertEquals(directArm, GameRoom.DrawArmVerdict.Refused("game is over", None))
+          _ = assertEquals(directDis, GameRoom.DrawDisarmVerdict.Refused("game is over"))
+        yield ()
 
   test("resign without a token is 401"):
     app

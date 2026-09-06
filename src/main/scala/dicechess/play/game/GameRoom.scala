@@ -152,6 +152,40 @@ final class GameRoom private (
       else DrawOfferArmed(armed = s.armedDrawOffer.getOrElse(seat, false))
     }
 
+  /** Arm the standing draw-offer flag for `seat` (#106). */
+  def armDrawOffer(seat: Seat): IO[DrawArmVerdict] =
+    stateRef.get.flatMap: s =>
+      if s.ended then IO.pure(DrawArmVerdict.Refused(GameOverReason, None))
+      else
+        Deferred[IO, DrawArmVerdict].flatMap: reply =>
+          inbox.offer(Msg.ArmDraw(seat, reply)) *>
+            IO.race(reply.get, done.get)
+              .map:
+                case Left(v)  => v
+                case Right(_) => DrawArmVerdict.Refused(GameOverReason, None)
+
+  /** Disarm a previously armed draw-offer flag for `seat` (#106). */
+  def disarmDrawOffer(seat: Seat): IO[DrawDisarmVerdict] =
+    stateRef.get.flatMap: s =>
+      if s.ended then IO.pure(DrawDisarmVerdict.Refused(GameOverReason))
+      else
+        Deferred[IO, DrawDisarmVerdict].flatMap: reply =>
+          inbox.offer(Msg.DisarmDraw(seat, reply)) *>
+            IO.race(reply.get, done.get)
+              .map:
+                case Left(v)  => v
+                case Right(_) => DrawDisarmVerdict.Refused(GameOverReason)
+
+  /** Bot game poll row details for `seat` (#106): (decision, mayOfferDraw, drawOfferArmed). */
+  def botDetails(seat: Seat): IO[(Option[String], Boolean, Boolean)] =
+    stateRef.get.map: s =>
+      val decision =
+        if s.pendingDrawOffer.exists(_ != seat) then Some("drawResponse")
+        else None
+      val mayOffer = s.mayOffer(seat)
+      val armed    = s.armedDrawOffer.getOrElse(seat, false)
+      (decision, mayOffer, armed)
+
   /** Respond to a pending draw offer (accept or decline explicitly) and await the writer's verdict. */
   def respondDraw(seat: Seat, accept: Boolean): IO[TurnVerdict] =
     enqueueDrawResponse(seat, accept).flatten
@@ -408,6 +442,16 @@ final class GameRoom private (
                 val (sNext, response) = s.armDrawOffer(seat, armed)
                 stateRef.set(sNext) *> reportDrawArmRefusal(seat, response) *> reply.complete(response).void
               } *> continue
+            case Msg.ArmDraw(seat, reply) =>
+              stateRef.get.flatMap { s =>
+                val (sNext, verdict) = s.armDrawOfferVerdict(seat)
+                stateRef.set(sNext) *> reply.complete(verdict).void
+              } *> continue
+            case Msg.DisarmDraw(seat, reply) =>
+              stateRef.get.flatMap { s =>
+                val (sNext, verdict) = s.disarmDrawOfferVerdict(seat)
+                stateRef.set(sNext) *> reply.complete(verdict).void
+              } *> continue
             case Msg.Timeout =>
               stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
             case Msg.Abort =>
@@ -519,6 +563,10 @@ final class GameRoom private (
       case Some(Msg.Command(_, _, _, reply))      => answer(reply, TurnVerdict.Refused(GameOverReason)) *> drainRefusing
       case Some(Msg.ArmDrawOfferMsg(_, _, reply)) =>
         reply.complete(DrawOfferArmed(armed = false, reason = Some(GameOverReason))).attempt.void *> drainRefusing
+      case Some(Msg.ArmDraw(_, reply)) =>
+        reply.complete(DrawArmVerdict.Refused(GameOverReason, None)).attempt.void *> drainRefusing
+      case Some(Msg.DisarmDraw(_, reply)) =>
+        reply.complete(DrawDisarmVerdict.Refused(GameOverReason)).attempt.void *> drainRefusing
       case Some(Msg.ClaimSeat(_, _, _, _, reply)) => reply.complete(false).attempt.void *> drainRefusing
       case Some(_)                                => drainRefusing
       case None                                   => IO.unit
@@ -870,7 +918,9 @@ final class GameRoom private (
                       (winner match
                         case Some(w) => endGame(s1, GameOver(GameResult.Win(w), Termination.KingCaptured))
                         case None    => advanceOrEnd(s1)
-                      ).flatTap(_ => answer(reply, TurnVerdict.Applied(s1.version)))
+                      ).flatTap(_ =>
+                        answer(reply, TurnVerdict.Applied(s1.version, drawOffered = offer && winner.isEmpty))
+                      )
 
   /** Complete a synchronous reply channel, if the command carried one. */
   /** One line per refusal a player could not have predicted, so the open question in ADR 006 decision 1 — whether the
@@ -994,7 +1044,19 @@ object GameRoom:
 
   /** The writer's verdict on a synchronously-submitted turn — the request/response face of `TurnPlayed`/`Rejected`. */
   enum TurnVerdict:
-    case Applied(version: Long)
+    case Applied(version: Long, drawOffered: Boolean = false)
+    case Refused(reason: String)
+
+  /** The writer's verdict on a `POST /bot/game/{id}/draw/offer` (arm the standing draw-offer flag, #106). */
+  enum DrawArmVerdict:
+    case Armed
+    case Noop
+    case Refused(reason: String, availableAfterTurns: Option[Int] = None)
+
+  /** The writer's verdict on a `DELETE /bot/game/{id}/draw/offer` (disarm the standing draw-offer flag, #106). */
+  enum DrawDisarmVerdict:
+    case Disarmed
+    case Noop
     case Refused(reason: String)
 
   private enum Msg:
@@ -1011,6 +1073,8 @@ object GameRoom:
         armed: Boolean,
         reply: Deferred[IO, DrawOfferArmed]
     )
+    case ArmDraw(seat: Seat, reply: Deferred[IO, DrawArmVerdict])
+    case DisarmDraw(seat: Seat, reply: Deferred[IO, DrawDisarmVerdict])
     case Timeout
     // #285: bind a seat to whoever redeemed its join token. Goes through the inbox like every other write — the
     // consumer fiber is the only writer of `players`, and a route handler must never touch it directly.
@@ -1134,6 +1198,24 @@ object GameRoom:
           ),
           DrawOfferArmed(armed = requestedArmed)
         )
+
+    def armDrawOfferVerdict(seat: Seat): (Session, DrawArmVerdict) =
+      val currentArmed      = armedDrawOffer.getOrElse(seat, false)
+      val (sNext, armedRes) = armDrawOffer(seat, requestedArmed = true)
+      val verdict           = armedRes.reason match
+        case Some(r) => DrawArmVerdict.Refused(r, armedRes.availableAfterTurns)
+        case None    =>
+          if currentArmed then DrawArmVerdict.Noop else DrawArmVerdict.Armed
+      (sNext, verdict)
+
+    def disarmDrawOfferVerdict(seat: Seat): (Session, DrawDisarmVerdict) =
+      val currentArmed      = armedDrawOffer.getOrElse(seat, false)
+      val (sNext, armedRes) = armDrawOffer(seat, requestedArmed = false)
+      val verdict           = armedRes.reason match
+        case Some(r) => DrawDisarmVerdict.Refused(r)
+        case None    =>
+          if !currentArmed then DrawDisarmVerdict.Noop else DrawDisarmVerdict.Disarmed
+      (sNext, verdict)
 
     /** Every seated player has submitted a client seed. */
     def hasAllSeeds: Boolean = players.keySet.forall(clientSeeds.contains)

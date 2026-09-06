@@ -320,7 +320,7 @@ final class Webhooks private (
     def decision(accept: Boolean): IO[DeliveryOutcome] =
       respond(accept).flatMap:
         case None                                       => IO.pure(DeliveryOutcome.StaleRegistration)
-        case Some(GameRoom.TurnVerdict.Applied(_))      => IO.pure(DeliveryOutcome.Applied)
+        case Some(GameRoom.TurnVerdict.Applied(_, _))   => IO.pure(DeliveryOutcome.Applied)
         case Some(GameRoom.TurnVerdict.Refused(reason)) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
     attempt match
@@ -383,7 +383,7 @@ final class Webhooks private (
           case None        => IO.pure(DeliveryOutcome.StaleRegistration)
           case Some(await) =>
             await.flatMap:
-              case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Applied)
+              case GameRoom.TurnVerdict.Applied(_, _)   => IO.pure(DeliveryOutcome.Applied)
               case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
     attempt match
@@ -427,7 +427,7 @@ final class Webhooks private (
         case None        => IO.pure(DeliveryOutcome.StaleRegistration)
         case Some(await) =>
           await.flatMap:
-            case GameRoom.TurnVerdict.Applied(_)      => IO.pure(DeliveryOutcome.Resigned)
+            case GameRoom.TurnVerdict.Applied(_, _)   => IO.pure(DeliveryOutcome.Resigned)
             case GameRoom.TurnVerdict.Refused(reason) => failed(s"refused: $reason", DeliveryOutcome.Refused)
 
   /** Fire-and-forget into the drain queue (#225) — `tryOffer` never blocks a turn on a slow or backed-up stats writer.

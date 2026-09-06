@@ -1126,8 +1126,29 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             arm    <- room.armDrawOffer(Seat.White)
             disarm <- room.disarmDrawOffer(Seat.White)
           yield
-            assertEquals(arm, GameRoom.DrawArmVerdict.Refused("game is over", None))
+            assertEquals(arm, GameRoom.DrawArmVerdict.Refused("game is over"))
             assertEquals(disarm, GameRoom.DrawDisarmVerdict.Refused("game is over"))
+
+  test("armDrawOffer and disarmDrawOffer lifecycle and noop on active game (#106)"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds)
+      .flatMap:
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            arm1 <- room.armDrawOffer(Seat.White)
+            _ = assertEquals(arm1, GameRoom.DrawArmVerdict.Armed)
+            arm2 <- room.armDrawOffer(Seat.White)
+            _ = assertEquals(arm2, GameRoom.DrawArmVerdict.Noop)
+            dis1 <- room.disarmDrawOffer(Seat.White)
+            _ = assertEquals(dis1, GameRoom.DrawDisarmVerdict.Disarmed)
+            dis2 <- room.disarmDrawOffer(Seat.White)
+            _ = assertEquals(dis2, GameRoom.DrawDisarmVerdict.Noop)
+            specArm <- room.armDrawOffer(Seat.Spectator)
+            _ = assertEquals(specArm, GameRoom.DrawArmVerdict.Refused("spectator cannot arm draw offer"))
+            specDis <- room.disarmDrawOffer(Seat.Spectator)
+            _ = assertEquals(specDis, GameRoom.DrawDisarmVerdict.Refused("spectator cannot arm draw offer"))
+          yield ()
 
   test("activeBotGame derives row atomically and returns None when game ends (#106)"):
     GameRoom

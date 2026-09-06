@@ -804,6 +804,19 @@ class BotRoutesSuite extends munit.CatsEffectSuite:
           assertEquals(body2, ResignAllResponse(Nil, Nil, Nil, pausedSeating = false))
           assertEquals(bad.status, Status.BadRequest)
 
+  test("resignOne reports AlreadyOver when room resign is refused"):
+    AnonMintLimiter
+      .create(limit = 100)
+      .flatMap(appWith(_))
+      .flatMap: (service, registry) =>
+        for
+          gameId <- seatedGame(service)
+          room   <- registry.get(GameId(gameId)).map(_.get)
+          _      <- room.resign(Seat.White)
+          _      <- room.result
+          res    <- BotRoutes.resignOne(room, GameId(gameId), Principal.Bot("acme", "alice"))
+        yield assertEquals(res, Some(BotRoutes.ResignAllResult.AlreadyOver(gameId)))
+
   test("POST /bot/games/resign-all with pauseSeating leaves the ladder and the catalog for a registered bot"):
     app.flatMap: service =>
       for

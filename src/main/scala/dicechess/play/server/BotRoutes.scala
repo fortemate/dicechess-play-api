@@ -625,7 +625,7 @@ object BotRoutes:
     * (the per-player index only lists rooms it is seated in, so this is a guard, not an expected path). A refusal can
     * only be `game is over` for a seated caller, hence `AlreadyOver`.
     */
-  private def resignOne(room: GameRoom, id: GameId, bot: Principal.Bot): IO[Option[ResignAllResult]] =
+  private[server] def resignOne(room: GameRoom, id: GameId, bot: Principal.Bot): IO[Option[ResignAllResult]] =
     seatOf(room, bot).flatMap:
       case None       => IO.pure(None)
       case Some(seat) =>
@@ -647,7 +647,7 @@ object BotRoutes:
       ladder.isDefined || catalog.isDefined
     )
 
-  private enum ResignAllResult:
+  private[server] enum ResignAllResult:
     case Resigned(id: String)
     case AlreadyOver(id: String)
     case Pending(id: String)

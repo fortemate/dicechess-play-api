@@ -33,7 +33,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         case Right(room) =>
           // Subscribe first, then resign shortly after so the terminal event is the live GameEnded (not a snapshot).
           val ended      = room.subscribe.collectFirst { case e: GameEvent.GameEnded => e }.compile.lastOrError
-          val resignSoon = IO.sleep(250.millis) *> room.submit(Seat.White, GameCommand.Resign)
+          val resignSoon = IO.sleep(100.millis) *> room.submit(Seat.White, GameCommand.Resign)
           (ended, resignSoon)
             .parMapN((event, _) => event)
             .flatMap(event => (room.diceCommit, room.snapshot).mapN((commit, snap) => (event, commit, snap)))
@@ -1043,5 +1043,73 @@ class GameRoomSuite extends munit.CatsEffectSuite:
               statusAfter <- room.drawOfferArmedStatus(other)
               _ = assertEquals(statusAfter, DrawOfferArmed(armed = false))
             yield ()
+          }
+      }
+
+  test("draw offer standing flag: by default the right passes to the decliner and does not return on its own"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .flatMap {
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          firstMovableRoll(room).flatMap { roll1 =>
+            val offerer = roll1.seat
+            val other   = if offerer == Seat.White then Seat.Black else Seat.White
+            for
+              _ <- room.submitTurn(offerer, leafPath(roll1.legalMoves.get), offerDraw = true)
+              _ <- room.respondDraw(other, accept = false)
+              // The offerer completes several more turns; the right still belongs to the opponent.
+              _ <- List.fill(3)(()).traverse_ { _ =>
+                (room.snapshot, room.legalMoves).flatMapN { (snap, moves) =>
+                  room.submitTurn(snap.activeSeat, leafPath(moves.legalMoves)).void
+                }
+              }
+              refused <- room.armDrawOffer(offerer, armed = true)
+              snap    <- room.snapshot
+            yield
+              // No number is quoted, because no number would arrive.
+              assertEquals(
+                refused,
+                DrawOfferArmed(armed = false, reason = Some("opponent must offer next"), availableAfterTurns = None)
+              )
+              assertEquals(snap.mayOfferDrawBy.map(_.white), Some(offerer != Seat.White))
+          }
+      }
+
+  test("draw offer standing flag: re-arming the value a seat already holds is free"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .flatMap {
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          firstMovableRoll(room).flatMap { roll =>
+            for
+              // Twenty re-sends of the same value, twice the per-turn budget, all no-ops.
+              answers <- List.fill(20)(()).traverse(_ => room.armDrawOffer(roll.seat, armed = true))
+              // The budget is untouched, so a genuine change still lands.
+              changed <- room.armDrawOffer(roll.seat, armed = false)
+            yield
+              assert(answers.forall(_ == DrawOfferArmed(armed = true)), s"a re-send must be a free no-op: $answers")
+              assertEquals(changed, DrawOfferArmed(armed = false))
+          }
+      }
+
+  test("draw offer standing flag: the toggle budget is reset for the seat whose turn begins"):
+    GameRoom
+      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .flatMap {
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          firstMovableRoll(room).flatMap { roll =>
+            val waiting = if roll.seat == Seat.White then Seat.Black else Seat.White
+            for
+              // The waiting seat spends its whole budget while the other side is on move.
+              _     <- (1 to 10).toList.traverse_(i => room.armDrawOffer(waiting, armed = i % 2 == 1).void)
+              spent <- room.armDrawOffer(waiting, armed = true)
+              _ = assertEquals(spent.reason, Some("too many draw toggles"))
+              // The turn passes to it; the new turn must come with a fresh budget.
+              _       <- room.submitTurn(roll.seat, leafPath(roll.legalMoves.get))
+              renewed <- room.armDrawOffer(waiting, armed = true)
+            yield assertEquals(renewed, DrawOfferArmed(armed = true))
           }
       }

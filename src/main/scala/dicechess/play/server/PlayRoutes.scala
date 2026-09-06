@@ -14,7 +14,7 @@ import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.dsl.io.*
 import org.http4s.server.websocket.WebSocketBuilder2
 import org.http4s.websocket.WebSocketFrame
-import org.http4s.{HttpRoutes, Request}
+import org.http4s.{HttpRoutes, Request, Response}
 import scodec.bits.ByteVector
 
 import scala.concurrent.duration.*
@@ -163,6 +163,21 @@ object PlayRoutes:
             case None       => NotFound()
             case Some(room) =>
               cats.effect.std.Queue.unbounded[IO, WebSocketFrame].flatMap { privateQueue =>
+                // The seat-private channel, alongside the room's broadcast: it carries the standing draw-offer status,
+                // which belongs to one seat and must never reach the other or a spectator. Seeding it with the seat's
+                // current status BEFORE the socket opens is what makes the channel's order meaningful — the greeting
+                // can never be overtaken by the answer to a command sent the instant the socket came up, so the last
+                // `DrawOfferArmed` a client received is always its true state.
+                def open(seat: Seat): IO[Response[IO]] =
+                  room
+                    .drawOfferArmedStatus(seat)
+                    .flatMap(status => privateQueue.offer(armedFrame(status)))
+                    .whenA(seat.side.isDefined) *>
+                    wsb.build(
+                      clientFrames(room, keepAlive, Stream.fromQueueUnterminated(privateQueue)),
+                      fromClient(room, seat, Some(privateQueue))
+                    )
+
                 token match
                   case Some(t) =>
                     room.seatFor(t) match
@@ -172,28 +187,16 @@ object PlayRoutes:
                         // ever identifiable, so bind the seat to them before the socket opens. `claimSeat` is a no-op for
                         // every game that already has two distinct players, so this costs one seating read otherwise.
                         // The session wins over `guest` (the #235 idiom); a game whose seats already differ ignores both.
-                        claimSeatQuietly(registry, session, req, GameId(id), seat, guest) *>
-                          wsb.build(
-                            clientFrames(room, keepAlive, seat, Some(privateQueue)),
-                            fromClient(room, seat, Some(privateQueue))
-                          )
+                        claimSeatQuietly(registry, session, req, GameId(id), seat, guest) *> open(seat)
                   case None =>
                     AuthSession.principalFor(session, req).flatMap {
-                      case None =>
-                        wsb.build(
-                          clientFrames(room, keepAlive, Seat.Spectator, Some(privateQueue)),
-                          fromClient(room, Seat.Spectator, Some(privateQueue))
-                        )
+                      case None       => open(Seat.Spectator)
                       case Some(user) =>
                         room.seating.flatMap { seats =>
                           val owned = seats.collect { case (seat, p) if p == user => seat }.toList
-                          val seat  = owned match
+                          open(owned match
                             case only :: Nil => only
-                            case _           => Seat.Spectator
-                          wsb.build(
-                            clientFrames(room, keepAlive, seat, Some(privateQueue)),
-                            fromClient(room, seat, Some(privateQueue))
-                          )
+                            case _           => Seat.Spectator)
                         }
                     }
               }
@@ -244,26 +247,18 @@ object PlayRoutes:
   private[server] def clientFrames(
       room: GameRoom,
       keepAlive: FiniteDuration,
-      seat: Seat = Seat.Spectator,
-      privateQueue: Option[cats.effect.std.Queue[IO, WebSocketFrame]] = None
+      privates: Stream[IO, WebSocketFrame] = Stream.empty
   ): Stream[IO, WebSocketFrame] =
-    val events = room.subscribe.flatMap { event =>
-      val frame = Stream.emit(WebSocketFrame.Text(event.asJson.noSpaces))
-      event match
-        case GameEvent.Snapshot(_, _, _) if seat.side.isDefined =>
-          val initialArmedFrame = Stream.eval(
-            room
-              .drawOfferArmedStatus(seat)
-              .map(da => WebSocketFrame.Text(DrawOfferArmedFrame(da).asJson.noSpaces))
-          )
-          frame ++ initialArmedFrame
-        case _ => frame
-    }
+    val events     = room.subscribe.map(event => WebSocketFrame.Text(event.asJson.noSpaces))
     val keepAlives = Stream.awakeEvery[IO](keepAlive).as(WebSocketFrame.Ping())
-    val privates   = privateQueue.fold(Stream.empty: Stream[IO, WebSocketFrame])(q => Stream.fromQueueUnterminated(q))
+    // `privates` is seat-private and merged, not interleaved with the broadcast in any defined order: a client reads
+    // each channel's own order, which is all the standing-flag status needs.
     events.mergeHaltL(keepAlives).mergeHaltL(privates) ++ Stream.emit(
       WebSocketFrame.Close(ByteVector.fromShort(1000.toShort))
     )
+
+  private def armedFrame(response: DrawOfferArmed): WebSocketFrame =
+    WebSocketFrame.Text(DrawOfferArmedFrame(response).asJson.noSpaces)
 
   private[server] def fromClient(
       room: GameRoom,
@@ -275,12 +270,18 @@ object PlayRoutes:
         case WebSocketFrame.Text(txt, _) =>
           decode[GameCommand](txt) match
             case Right(GameCommand.ArmDrawOffer(armed)) =>
+              // Unlike every other command here, arming needs a private answer, so it awaits the room rather than
+              // being posted fire-and-forget. Two consequences are deliberate. A spectator is refused AT THIS EDGE:
+              // the room would refuse it too, but a frame anyone can send must never reach the single-writer fiber.
+              // And the await is sequential, which keeps a burst of toggles answered in the order they were sent;
+              // it can only stall behind a writer that is already stalled, in which case this seat's next move would
+              // not have been processed either.
               privateQueue match
+                case None                         => IO.unit
+                case Some(q) if seat.side.isEmpty =>
+                  q.offer(armedFrame(DrawOfferArmed(armed = false, reason = Some(GameRoom.SpectatorCannotArmReason))))
                 case Some(q) =>
-                  room.armDrawOffer(seat, armed).flatMap { response =>
-                    q.offer(WebSocketFrame.Text(DrawOfferArmedFrame(response).asJson.noSpaces)).void
-                  }
-                case None => IO.unit
+                  room.armDrawOffer(seat, armed).flatMap(response => q.offer(armedFrame(response)))
             case Right(cmd) if seat.side.isDefined =>
               room.submit(seat, cmd)
             case _ => IO.unit

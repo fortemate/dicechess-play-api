@@ -208,23 +208,38 @@ class RematchServiceSuite extends CatsEffectSuite with TestContainerForAll:
     }
   }
 
-  test("restart after atomic activation and before opening roll resumes the active game") {
+  test("restart preserves public active-rematch metadata without changing ordinary recovery or reopening joins") {
     withContainers { pg =>
       resources(pg).use { (db, reg) =>
         for
-          source   <- accepted(db, fixture)
-          game     <- reg.rematches.get.create(source).map(_.toOption.get)
-          r        <- reg.get(game.gameId).map(_.get)
-          _        <- r.connection(Seat.White).use(_ => r.connection(Seat.Black).use(_ => r.stopForRestart))
-          snapshot <- db.rematchSnapshot(game.gameId)
-          stored   <- db.rematches.successor(game.gameId).map(_.get)
-          resumed  <- GameRegistry.create(store = db)
-          _        <- (for
-            count  <- resumed.resume
-            active <- resumed.get(game.gameId)
+          source     <- accepted(db, fixture)
+          game       <- reg.rematches.get.create(source).map(_.toOption.get)
+          r          <- reg.get(game.gameId).map(_.get)
+          _          <- r.connection(Seat.White).use(_ => r.connection(Seat.Black).use(_ => r.stopForRestart))
+          snapshot   <- db.rematchSnapshot(game.gameId)
+          stored     <- db.rematches.successor(game.gameId).map(_.get)
+          ordinaryId <- GameId.random
+          _          <- db.save(
+            ordinaryId,
+            snapshot.copy(seatTokens = Map(Seat.White -> "ordinary-white", Seat.Black -> "ordinary-black"))
+          )
+          resumed <- GameRegistry.create(store = db)
+          _       <- (for
+            count    <- resumed.resume
+            active   <- resumed.get(game.gameId).map(_.get)
+            ordinary <- resumed.get(ordinaryId).map(_.get)
+            state    <- active.snapshot
+            wsState  <- active.subscribe.collect { case GameEvent.Snapshot(_, s, _) => s }.take(1).compile.lastOrError
+            gate     <- active.awaitingJoinDeadline
+            ordinaryState <- ordinary.snapshot
+            ordinaryGate  <- ordinary.awaitingJoinDeadline
           yield
-            assertEquals(count, 1)
-            assert(active.isDefined)
+            assertEquals(count, 2)
+            assertEquals(state.rematchStartup, Some(PublicRematchStartup(PublicRematchStartupPhase.Active)))
+            assertEquals(wsState.rematchStartup, state.rematchStartup)
+            assertEquals(gate, None)
+            assertEquals(ordinaryState.rematchStartup, None)
+            assertEquals(ordinaryGate, None)
           ).guarantee(resumed.list.flatMap(_.traverse_(_._2.abort)))
         yield
           assert(snapshot.started)

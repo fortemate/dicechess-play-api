@@ -1,5 +1,7 @@
 package dicechess.play.core
 
+import java.time.Instant
+
 /** Why a game ended. Maps to the analytics `game_termination_enum` at ingest time.
   *
   * `Aborted` is a server-side abort (the writer fiber failed or was cancelled, e.g. on shutdown); the game has no
@@ -179,6 +181,17 @@ final case class DrawOffer(pending: Boolean = true)
 /** Whether each seat is permitted to offer a draw on its turn under the re-offer rule. */
 final case class MayOfferDrawBy(white: Boolean, black: Boolean)
 
+/** Public rematch startup state. It intentionally carries no seat identities or join history. */
+enum PublicRematchStartupPhase(val wireName: String):
+  case AwaitingJoins extends PublicRematchStartupPhase("awaiting_joins")
+  case Active        extends PublicRematchStartupPhase("active")
+  case Aborted       extends PublicRematchStartupPhase("aborted")
+
+final case class PublicRematchStartup(
+    phase: PublicRematchStartupPhase,
+    joinDeadlineAt: Option[Instant] = None
+)
+
 /** A wire-safe snapshot of a game, sufficient for a (re)joining client or bot to act. */
 final case class PublicGameState(
     version: Long,
@@ -214,7 +227,9 @@ final case class PublicGameState(
     // Whether the side to move is permitted to offer a draw on this turn under the alternation rule (#327).
     mayOfferDraw: Option[Boolean] = None,
     // Whether each seat is permitted to offer a draw on its turn.
-    mayOfferDrawBy: Option[MayOfferDrawBy] = None
+    mayOfferDrawBy: Option[MayOfferDrawBy] = None,
+    // Present only for rematch successors; no participant identities or joined-seat details are exposed.
+    rematchStartup: Option[PublicRematchStartup] = None
 )
 
 /** The full legal-move tree for a game's pending roll, served by `GET /games/{id}/moves` — never capped, unlike the

@@ -40,7 +40,7 @@ final class RematchService private (
         records.successor(s.successorId.get).map(_.toRight("temporarily_unavailable"))
       case Some(s) if s.phase != RematchPhase.Starting || s.consents != Set(Seat.White, Seat.Black) =>
         IO.pure(Left("invalid_transition"))
-      case Some(s) if !RematchService.valid(s.source) =>
+      case Some(s) if !s.source.admissible =>
         records
           .advance(id, s.version, RematchChange.Close(RematchCloseReason.TechnicalFailure))
           .as(Left("settings_unavailable"))
@@ -199,28 +199,6 @@ final class RematchService private (
     records.closeUncommittedOnRestart.void *> page(None)
 
 object RematchService:
-  private def valid(source: RematchSource): Boolean =
-    val control = source.conditions.timeControl match
-      case TimeControl.Unlimited      => true
-      case TimeControl.SuddenDeath(s) => s > 0
-      case TimeControl.Fischer(s, i)  => s > 0 && i >= 0
-      case TimeControl.PerMove(s)     => s > 0
-    val humans = source.players.values.forall {
-      case Principal.User(id)  => scala.util.Try(java.util.UUID.fromString(id)).isSuccess
-      case Principal.Guest(id) => scala.util.Try(java.util.UUID.fromString(id)).isSuccess
-      case _                   => false
-    }
-    control && humans && source.players.keySet == Set(
-      Seat.White,
-      Seat.Black
-    ) && source.players.values.toSet.size == 2 &&
-    GameRegistry.isRated(
-      source.players(Seat.White),
-      source.players(Seat.Black),
-      source.conditions.rated,
-      source.conditions.timeControl
-    ) == source.conditions.rated
-
   private[server] def create(
       registry: GameRegistry,
       pg: PgGameStore,

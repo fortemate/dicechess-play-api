@@ -19,6 +19,17 @@ final case class RematchSource(
     players: Map[Seat, Principal],
     guestTokenHashes: Map[Seat, String]
 ):
+  /** Shared by command admission and successor creation; inherited settings are never silently normalized. */
+  def admissible: Boolean =
+    val control = conditions.timeControl match
+      case TimeControl.Unlimited      => true
+      case TimeControl.SuddenDeath(s) => s > 0
+      case TimeControl.Fischer(s, i)  => s > 0 && i >= 0
+      case TimeControl.PerMove(s)     => s > 0
+    val humans = players.values.toList.flatMap(RematchSource.identity)
+    control && players.keySet == Set(Seat.White, Seat.Black) && humans.size == 2 && humans.distinct.size == 2 &&
+    (!conditions.rated || (humans.forall(_._1 == "user") && RatingCategory.of(conditions.timeControl).isDefined))
+
   /** Capability fallback applies ONLY to final guest seats, never to an account-owned seat. */
   def guestSeat(token: String): Option[Seat] =
     val presented = RematchSource.hash(token).getBytes(StandardCharsets.UTF_8)

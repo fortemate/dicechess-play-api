@@ -16,8 +16,68 @@ import java.time.Instant
 import scala.concurrent.duration.*
 
 /** One locked source row serializes contenders across processes, not just inside a coordinator's mutex. */
-final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchStore:
+final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchStore with RematchCommands:
   import PgRematchStore.*
+
+  def pendingCreation(after: Option[GameId], limit: Int): IO[List[Either[CorruptRematchRecord, RematchSession]]] =
+    (sessionColumns ++ fr"""WHERE (phase = 'starting' OR (phase = 'matched' AND successor_id IN
+      (SELECT g.game_id FROM play.rematch_successors g WHERE g.startup_phase <> 'active'
+       AND NOT EXISTS (SELECT 1 FROM play.game_archive a WHERE a.game_id = g.game_id))))""" ++
+      after.fold(Fragment.empty)(id => fr"AND source_game_id > ${id.value}::uuid") ++
+      fr"ORDER BY source_game_id LIMIT ${limit.max(1).min(100)}")
+      .query[SessionRow]
+      .to[List]
+      .map(_.map(decodeSession))
+      .transact(xa)
+      .timeout(Timeout)
+
+  def current(sourceId: GameId): IO[RematchRead] =
+    (for
+      state <- readSession(sourceId, lock = true)
+      now   <- clock
+      fresh <- state.traverse(expire(_, now))
+    yield RematchRead(fresh, now)).transact(xa).timeout(Timeout)
+
+  def command(
+      sourceId: GameId,
+      seat: Seat,
+      requestId: java.util.UUID,
+      action: RematchAction
+  ): IO[RematchCommandResult] =
+    (for
+      state  <- readSession(sourceId, lock = true)
+      now    <- clock
+      fresh  <- state.traverse(expire(_, now))
+      result <- fresh match
+        case None => RematchCommandResult(RematchRead(None, now), Some("game_not_found")).pure[ConnectionIO]
+        case Some(s) if !s.source.players.contains(seat) =>
+          RematchCommandResult(RematchRead(Some(s), now), Some("not_participant")).pure[ConnectionIO]
+        case Some(s) =>
+          for
+            // Opportunistic per-source cleanup bounds recognition; permanent source/link records are never deleted.
+            _ <- sql"""DELETE FROM play.rematch_commands WHERE source_game_id = ${sourceId.value}::uuid
+                       AND recorded_at < ${now.minusSeconds(86400)}""".update.run
+            receipt <- sql"""SELECT action, error_code FROM play.rematch_commands
+                       WHERE source_game_id = ${sourceId.value}::uuid AND seat = ${seat.toString}
+                       AND request_id = $requestId""".query[(String, Option[String])].option
+            outcome <- receipt match
+              case Some((prior, error)) =>
+                RematchCommandResult(
+                  RematchRead(Some(s), now),
+                  if prior == action.wire then error else Some("request_id_conflict")
+                ).pure[ConnectionIO]
+              case None =>
+                val transition = RematchCommands.transition(s, seat, action, now)
+                val next       = transition.toOption.filter(_ != s).map(_.copy(version = s.version + 1)).getOrElse(s)
+                val error      = transition.left.toOption
+                for
+                  _ <- writeProgress(next).whenA(next != s)
+                  _ <-
+                    sql"""INSERT INTO play.rematch_commands (source_game_id, seat, request_id, action, error_code, recorded_at)
+                        VALUES (${sourceId.value}::uuid, ${seat.toString}, $requestId, ${action.wire}, $error, $now)""".update.run
+                yield RematchCommandResult(RematchRead(Some(next), now), error)
+          yield outcome
+    yield result).transact(xa).timeout(Timeout)
 
   def session(sourceId: GameId): IO[Option[RematchSession]] =
     readSession(sourceId, lock = false).transact(xa).timeout(Timeout)
@@ -232,6 +292,13 @@ private[store] object PgRematchStore:
       .query[SuccessorRow]
       .option
       .flatMap(_.traverse(decodeSuccessor).liftTo[ConnectionIO])
+
+  private def expire(s: RematchSession, now: Instant): ConnectionIO[RematchSession] =
+    if (s.phase == RematchPhase.Available || s.phase == RematchPhase.Offered) && !now.isBefore(s.deadlineAt) then
+      val next =
+        s.copy(phase = RematchPhase.Closed, closedReason = Some(RematchCloseReason.Expired), version = s.version + 1)
+      writeProgress(next).as(next)
+    else s.pure[ConnectionIO]
 
   private def writeProgress(s: RematchSession): ConnectionIO[Unit] =
     sql"""UPDATE play.rematch_sessions SET phase = ${s.phase.toString.toLowerCase}, version = ${s.version},

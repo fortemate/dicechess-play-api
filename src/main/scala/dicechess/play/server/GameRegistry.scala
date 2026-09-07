@@ -6,7 +6,7 @@ import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
 import dicechess.play.game.{Durability, GameRoom, PersistenceTelemetry}
-import dicechess.play.store.{GameStore, PgGameStore, RematchSuccessor}
+import dicechess.play.store.{GameStore, PgGameStore, RematchSuccessor, RematchStartupPhase, CorruptRematchRecord}
 import java.time.Instant
 
 import scala.concurrent.duration.*
@@ -288,22 +288,28 @@ final class GameRegistry private (
         )
         byCategory = ratingsByCategory.toMap
         restored <- snapshots.traverse: (id, snapshot) =>
-          DiceSource
-            .fromHexSeed(snapshot.serverSeed)
-            .flatTraverse: dice =>
-              GameRoom.restore(
-                snapshot,
-                dice,
-                displayNames = names,
-                ratings = RatingCategory.of(snapshot.timeControl).flatMap(byCategory.get).getOrElse(Map.empty),
-                disconnectGrace = disconnectGrace,
-                drawReofferTurns = drawReofferTurns,
-                persist = store.save(id, _),
-                // A resumed showcase game is as fail-closed as it was before the restart: the origin travels in the
-                // snapshot precisely so the discipline can be re-derived from it.
-                durability = durabilityFor(id, snapshot.effectiveOrigin)
-              )
-            .map(id -> _)
+          resumedRematch(id).flatMap { rematch =>
+            rematch
+              .flatTraverse { isRematch =>
+                DiceSource
+                  .fromHexSeed(snapshot.serverSeed)
+                  .flatTraverse: dice =>
+                    GameRoom.restore(
+                      snapshot,
+                      dice,
+                      displayNames = names,
+                      ratings = RatingCategory.of(snapshot.timeControl).flatMap(byCategory.get).getOrElse(Map.empty),
+                      disconnectGrace = disconnectGrace,
+                      drawReofferTurns = drawReofferTurns,
+                      persist = store.save(id, _),
+                      // A resumed showcase game is as fail-closed as it was before the restart: the origin travels in the
+                      // snapshot precisely so the discipline can be re-derived from it.
+                      durability = durabilityFor(id, snapshot.effectiveOrigin),
+                      resumedActiveRematch = isRematch
+                    )
+              }
+              .map(id -> _)
+          }
         failures  = restored.collect { case (id, Left(error)) => id -> error }
         successes = restored.collect { case (id, Right(room)) => (id, room) }
         _ <- failures.traverse_((id, error) => Console[IO].errorln(s"[play][resume] game ${id.value} skipped: $error"))
@@ -314,6 +320,21 @@ final class GameRegistry private (
         }
         _ <- IO.defer(resumeHooks.asScala.toList.traverse_(_(resumedDetails)))
       yield successes.size
+
+  /** An activated successor keeps its public identity, while using the ordinary post-restart clock/presence rules.
+    * Corrupt metadata skips that room like a corrupt snapshot; unavailable storage still prevents a partial boot.
+    */
+  private def resumedRematch(id: GameId): IO[Either[String, Boolean]] = store match
+    case pg: PgGameStore =>
+      pg.rematches
+        .successor(id)
+        .map {
+          case None                                                           => Right(false)
+          case Some(game) if game.startup.phase == RematchStartupPhase.Active => Right(true)
+          case Some(_) => Left("rematch startup was not reconciled before resume")
+        }
+        .recover { case error: CorruptRematchRecord => Left(error.getMessage) }
+    case _ => IO.pure(Right(false))
 
   /** Bind a seat to whoever redeemed its join token, and index the game under them (#285).
     *

@@ -63,6 +63,7 @@ object PlayRoutes:
   private val MaxListedGames = 50
 
   private object TokenParam extends OptionalQueryParamDecoderMatcher[String]("token")
+  private object ModeParam  extends OptionalQueryParamDecoderMatcher[String]("mode")
 
   /** The anonymous fallback for identifying whoever redeems a join token (#285): a browser with no account session has
     * only its stable per-visit guest uuid, and the WebSocket handshake carries no body to put it in. Validated as a
@@ -156,7 +157,7 @@ object PlayRoutes:
       // a signed-in player occupying EXACTLY one seat reconnects to it — the fix for "lost the ?seat= URL, demoted
       // to spectator forever". Ambiguity (friend-by-link seats the creator on both sides until the link is used)
       // means the session cannot name a seat, so the token stays required there. Anything else spectates, as before.
-      case req @ GET -> Root / "games" / id / "ws" :? TokenParam(token) +& GuestParam(guest) =>
+      case req @ GET -> Root / "games" / id / "ws" :? TokenParam(token) +& GuestParam(guest) +& ModeParam(mode) =>
         registry
           .get(GameId(id))
           .flatMap:
@@ -178,27 +179,29 @@ object PlayRoutes:
                       fromClient(room, seat, Some(privateQueue))
                     )
 
-                token match
-                  case Some(t) =>
-                    room.seatFor(t) match
-                      case None       => Forbidden()
-                      case Some(seat) =>
-                        // #285: redeeming a join token is the only moment the second player of a friend-by-link game is
-                        // ever identifiable, so bind the seat to them before the socket opens. `claimSeat` is a no-op for
-                        // every game that already has two distinct players, so this costs one seating read otherwise.
-                        // The session wins over `guest` (the #235 idiom); a game whose seats already differ ignores both.
-                        claimSeatQuietly(registry, session, req, GameId(id), seat, guest) *> open(seat)
-                  case None =>
-                    AuthSession.principalFor(session, req).flatMap {
-                      case None       => open(Seat.Spectator)
-                      case Some(user) =>
-                        room.seating.flatMap { seats =>
-                          val owned = seats.collect { case (seat, p) if p == user => seat }.toList
-                          open(owned match
-                            case only :: Nil => only
-                            case _           => Seat.Spectator)
-                        }
-                    }
+                if mode.contains("spectator") then open(Seat.Spectator)
+                else
+                  token match
+                    case Some(t) =>
+                      room.seatFor(t) match
+                        case None       => Forbidden()
+                        case Some(seat) =>
+                          // #285: redeeming a join token is the only moment the second player of a friend-by-link game is
+                          // ever identifiable, so bind the seat to them before the socket opens. `claimSeat` is a no-op for
+                          // every game that already has two distinct players, so this costs one seating read otherwise.
+                          // The session wins over `guest` (the #235 idiom); a game whose seats already differ ignores both.
+                          claimSeatQuietly(registry, session, req, GameId(id), seat, guest) *> open(seat)
+                    case None =>
+                      AuthSession.principalFor(session, req).flatMap {
+                        case None       => open(Seat.Spectator)
+                        case Some(user) =>
+                          room.seating.flatMap { seats =>
+                            val owned = seats.collect { case (seat, p) if p == user => seat }.toList
+                            open(owned match
+                              case only :: Nil => only
+                              case _           => Seat.Spectator)
+                          }
+                      }
               }
 
   /** Who is redeeming a join token, for the seat-claim in #285: the account session if there is one, otherwise the

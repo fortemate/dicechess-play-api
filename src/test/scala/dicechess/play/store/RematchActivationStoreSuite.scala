@@ -202,7 +202,11 @@ class RematchActivationStoreSuite extends CatsEffectSuite with TestContainerForA
             .attempt
           state <- rowState(successor.gameId, xa)
         yield
-          assert(attempted.isLeft)
+          attempted match
+            case Left(error: RematchTransitionRejected) =>
+              assertEquals(error.gameId, successor.gameId)
+              assert(error.deadlineExpired)
+            case other => fail(s"expected deadline rejection, got $other")
           assertEquals(state._1, "awaiting_joins")
           assertEquals(state._2, false)
           assertEquals(state._3, false)

@@ -157,10 +157,13 @@ final class RematchService private (
     }
 
   private def retryAbort(action: IO[Unit], id: GameId): IO[Unit] =
-    action.handleErrorWith(_ =>
-      Console[IO].errorln(s"[play][rematch] game ${id.value} terminal save unavailable; retrying") *>
-        IO.sleep(1.second) *> retryAbort(action, id)
-    )
+    action.handleErrorWith {
+      case error: CorruptRematchRecord      => IO.raiseError(error)
+      case error: RematchTransitionRejected => IO.raiseError(error)
+      case _                                =>
+        Console[IO].errorln(s"[play][rematch] game ${id.value} terminal save unavailable; retrying") *>
+          IO.sleep(1.second) *> retryAbort(action, id)
+    }
 
   private def technicalAbort(game: RematchSuccessor): IO[Unit] =
     pg.rematchSnapshot(game.gameId).flatMap { current =>
@@ -180,8 +183,18 @@ final class RematchService private (
 
   /** Called only at bootstrap, before ordinary registry resume and before accepting transports. */
   def recoverOnRestart: IO[Unit] =
-    def page(after: Option[GameId]): IO[Unit] = records.pendingStartup(after, 100).flatMap { pending =>
-      pending.traverse_(technicalAbort) *> pending.lastOption.traverse_(last => page(Some(last.gameId)))
+    def failed(id: GameId): IO[Unit] =
+      Console[IO].errorln(s"[play][rematch] game ${id.value} could not be recovered; skipped")
+    def page(after: Option[GameId]): IO[Unit] = records.pendingStartupRecords(after, 100).flatMap { pending =>
+      pending.traverse_ {
+        case Left(error) => failed(error.rowId)
+        case Right(game) =>
+          technicalAbort(game).handleErrorWith {
+            case _: CorruptRematchRecord      => failed(game.gameId)
+            case _: RematchTransitionRejected => failed(game.gameId)
+            case error                        => IO.raiseError(error)
+          }
+      } *> pending.lastOption.traverse_(last => page(Some(last.fold(_.rowId, _.gameId))))
     }
     records.closeUncommittedOnRestart.void *> page(None)
 

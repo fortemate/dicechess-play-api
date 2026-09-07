@@ -330,11 +330,15 @@ excludes successors that are still awaiting joins or otherwise not active, so bo
 one as an ordinary game room. Activation persists the `started` snapshot and the successor's
 `active` startup phase, join history, and activation timestamp in one transaction; retries are
 idempotent. The persisted `joined_white` / `joined_black` flags record that a seat joined during
-startup, but do not represent current connection presence.
+startup, but do not represent current connection presence. If both transports arrive in time but
+the activation write misses the database deadline, the room technically aborts without treating
+the definitive rejection as a retryable database outage.
 
 At bootstrap, pending startup rows are handled before ordinary room resume: unfinished offers are
 closed as restarts, while successors awaiting joins (or already marked aborted with an active
-snapshot) are technically aborted and saved before transports are admitted. A rematch technical
+snapshot) are technically aborted and saved before transports are admitted. Malformed records
+are logged by game ID and isolated so the remaining rows can recover; transient database errors
+still fail bootstrap instead of leaving a healthy pending successor eligible to start. A rematch technical
 abort is retained in `game_archive` with a null sporting result and no rating eligibility; the
 ordinary abort path is otherwise unchanged. Coordinator and HTTP integration remain #129; this
 is the storage and terminal-save seam, not a claim that the full rematch feature is deployed.

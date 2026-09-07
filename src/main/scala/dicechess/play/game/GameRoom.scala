@@ -6,7 +6,14 @@ import cats.syntax.all.*
 import dicechess.engine.domain.{GameState, Move}
 import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
-import dicechess.play.store.{GameSnapshot, TurnRecord, RematchStartup, RematchStartupPhase}
+import dicechess.play.store.{
+  GameSnapshot,
+  TurnRecord,
+  RematchStartup,
+  RematchStartupPhase,
+  CorruptRematchRecord,
+  RematchTransitionRejected
+}
 import java.time.Instant
 import fs2.Stream
 
@@ -289,10 +296,10 @@ final class GameRoom private (
 
   private def presenceMessage(seat: Seat, connected: Boolean): IO[Unit] =
     consumerFiber.get.flatMap {
-      case None    => IO.unit
-      case Some(_) =>
+      case None        => IO.unit
+      case Some(fiber) =>
         Deferred[IO, Unit].flatMap { reply =>
-          inbox.offer(Msg.Presence(seat, connected, reply)) *> IO.race(reply.get, done.get).void
+          inbox.offer(Msg.Presence(seat, connected, reply)) *> IO.race(reply.get, IO.race(done.get, fiber.join)).void
         }
     }
 
@@ -346,7 +353,14 @@ final class GameRoom private (
           startedAt = Some(mono),
           rematchStartup = Some(RematchStartup(RematchStartupPhase.Active, joined, Some(at)))
         )
-        commit(active).flatMap(st => if st.hasAllSeeds then beginTurn(st).flatMap(stateRef.set) else IO.unit)
+        commit(active)
+          .flatMap(st => if st.hasAllSeeds then beginTurn(st).flatMap(stateRef.set) else IO.unit)
+          .handleErrorWith {
+            case rejected: RematchTransitionRejected if rejected.deadlineExpired =>
+              // Both transports arrived in time, but storage missed the window: no player caused this failure.
+              endGame(s, GameOver(GameResult.Draw, Termination.Aborted)).flatMap(stateRef.set)
+            case error => IO.raiseError(error)
+          }
       }
     else commit(next).void
 
@@ -705,9 +719,11 @@ final class GameRoom private (
   private def confirmUncertainWrite(s: Session): IO[Boolean] = initialJoin match
     case None       => IO.pure(false)
     case Some(gate) =>
-      gate.confirms(snapshotOf(s), s.rematchStartup.get).handleErrorWith { _ =>
-        // The server cannot infer rollback while storage is unavailable. Release transports, then keep reconciling.
-        dropAllSubscribers *> IO.sleep(1.second) *> confirmUncertainWrite(s)
+      gate.confirms(snapshotOf(s), s.rematchStartup.get).handleErrorWith {
+        case error: CorruptRematchRecord => IO.raiseError(error)
+        case _                           =>
+          // The server cannot infer rollback while storage is unavailable. Release transports, then keep reconciling.
+          dropAllSubscribers *> IO.sleep(1.second) *> confirmUncertainWrite(s)
       }
 
   /** The fail-closed write: retry per the policy that applies (terminal for an ending, intermediate otherwise), report
@@ -734,7 +750,9 @@ final class GameRoom private (
               val stalledFor = now - startedAt
               stalledRef.set(false) *>
                 report(PersistenceTelemetry.SaveRecovered(s.version, failed + 1, stalledFor)).as(stalledFor)
-        case Left(error) =>
+        case Left(error: RematchTransitionRejected) => IO.raiseError(error)
+        case Left(error: CorruptRematchRecord)      => IO.raiseError(error)
+        case Left(error)                            =>
           val attempts = failed + 1
           IO.monotonic.flatMap: now =>
             val stalledFor = now - startedAt

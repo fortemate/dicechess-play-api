@@ -166,7 +166,8 @@ final class PgGameStore private (xa: Transactor[IO])
   private[play] def rematchSnapshot(id: GameId): IO[GameSnapshot] =
     sql"SELECT snapshot FROM play.games WHERE id = ${id.value}::uuid"
       .query[Json]
-      .unique
+      .option
+      .flatMap(_.toRight(CorruptRematchRecord("games", id, "missing snapshot")).liftTo[ConnectionIO])
       .flatMap(_.as[GameSnapshot].leftMap(_ => CorruptRematchRecord("games", id, "snapshot")).liftTo[ConnectionIO])
       .transact(xa)
       .timeout(SaveTimeout)
@@ -221,7 +222,10 @@ final class PgGameStore private (xa: Transactor[IO])
       _ <-
         if same then ().pure[ConnectionIO]
         else if !allowed then
-          new IllegalStateException("rematch startup transition rejected").raiseError[ConnectionIO, Unit]
+          RematchTransitionRejected(
+            id,
+            phase == "awaiting_joins" && next.phase == RematchStartupPhase.Active && !now.isBefore(deadline)
+          ).raiseError[ConnectionIO, Unit]
         else
           sql"""UPDATE play.rematch_successors SET startup_phase = ${next.phase.stored},
                 startup_version = startup_version + 1, joined_white = ${next.joined(Seat.White)},

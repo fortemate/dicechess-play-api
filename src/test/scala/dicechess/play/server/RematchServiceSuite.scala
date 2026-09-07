@@ -8,6 +8,13 @@ import dicechess.play.core.*
 import dicechess.play.game.{EngineOps, GameRoom, Durability, RetryPolicy}
 import dicechess.play.dice.DiceSource
 import dicechess.play.store.*
+import doobie.Fragment
+import doobie.hikari.HikariTransactor
+import doobie.implicits.*
+import doobie.postgres.circe.jsonb.implicits.*
+import doobie.util.ExecutionContexts
+import io.circe.Json
+import io.circe.syntax.*
 import munit.CatsEffectSuite
 import org.testcontainers.utility.DockerImageName
 
@@ -373,6 +380,62 @@ class RematchServiceSuite extends CatsEffectSuite with TestContainerForAll:
         yield
           assertEquals(terminal.status, GameStatus.Ended(GameOver(GameResult.Draw, Termination.Aborted)))
           assert(archive.isDefined)
+      }
+    }
+  }
+
+  test("startup recovery isolates corrupt initial snapshots, corrupt current snapshots and missing game rows") {
+    withContainers { pg =>
+      val raw = for
+        ec <- ExecutionContexts.fixedThreadPool[IO](2)
+        xa <- HikariTransactor
+          .newHikariTransactor[IO]("org.postgresql.Driver", pg.jdbcUrl, pg.username, pg.password, ec)
+      yield xa
+      (resources(pg), raw).tupled.use { case ((db, reg), xa) =>
+        for
+          games <- (1 to 4).toList.traverse { _ =>
+            accepted(db, fixture).flatMap(id => reg.rematches.get.create(id).map(_.toOption.get))
+          }
+          _ <- reg.list.flatMap(_.traverse_(_._2.stopForRestart))
+          badInitial = games(0)
+          badCurrent = games(1)
+          missing    = games(2)
+          healthy    = games(3)
+          _ <- (for
+            _ <-
+              sql"UPDATE play.rematch_successors SET initial_snapshot = ${Json.obj()} WHERE game_id = ${badInitial.gameId.value}::uuid".update.run
+                .transact(xa)
+            _ <-
+              sql"UPDATE play.games SET snapshot = ${Json.obj()} WHERE id = ${badCurrent.gameId.value}::uuid".update.run
+                .transact(xa)
+            _        <- sql"DELETE FROM play.games WHERE id = ${missing.gameId.value}::uuid".update.run.transact(xa)
+            records  <- db.rematches.pendingStartupRecords(None, 500)
+            _        <- IO(assert(records.exists(_.left.toOption.exists(_.rowId == badInitial.gameId))))
+            rebooted <- GameRegistry.create(store = db)
+            constraint = "rematch_recovery_failure_" + healthy.gameId.value.replace("-", "")
+            add        = Fragment.const(
+              s"ALTER TABLE play.games ADD CONSTRAINT $constraint CHECK (id <> '${healthy.gameId.value}'::uuid OR status = 'active')"
+            )
+            drop = Fragment.const(s"ALTER TABLE play.games DROP CONSTRAINT $constraint")
+            failedBoot <- (add.update.run.transact(xa) *> rebooted.resume.attempt)
+              .guarantee(drop.update.run.transact(xa).void)
+            _         <- IO(assert(failedBoot.isLeft, "unclassified storage errors must prevent transport admission"))
+            _         <- rebooted.resume.timeout(3.seconds)
+            archive   <- db.archiveFor(healthy.gameId)
+            successor <- db.rematches.successor(healthy.gameId)
+            _         <- IO {
+              assert(archive.isDefined)
+              assertEquals(successor.map(_.startup.phase), Some(RematchStartupPhase.Aborted))
+            }
+          yield ()).guarantee(
+            sql"UPDATE play.rematch_successors SET initial_snapshot = ${badInitial.initialSnapshot.asJson} WHERE game_id = ${badInitial.gameId.value}::uuid".update.run
+              .transact(xa)
+              .void *>
+              db.save(badCurrent.gameId, badCurrent.initialSnapshot) *>
+              db.save(missing.gameId, missing.initialSnapshot) *>
+              reg.rematches.get.recoverOnRestart
+          )
+        yield ()
       }
     }
   }

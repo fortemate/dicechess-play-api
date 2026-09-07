@@ -8,6 +8,7 @@ import dicechess.play.store.*
 import munit.CatsEffectSuite
 
 import java.time.Instant
+import java.util.UUID
 import scala.concurrent.duration.*
 
 class RematchJoinSuite extends CatsEffectSuite:
@@ -187,5 +188,72 @@ class RematchJoinSuite extends CatsEffectSuite:
             }
         }
         .guarantee(r.abort)
+    yield ()
+  }
+
+  test("a rejected activation is technically aborted once, from the previous durable snapshot") {
+    for
+      time           <- Ref.of[IO, Instant](epoch)
+      activeAttempts <- Ref.of[IO, Int](0)
+      terminalSaves  <- Ref.of[IO, List[(GameSnapshot, RematchStartup)]](Nil)
+      dice           <- IO.fromEither(DiceSource.fromHexSeed(initial.serverSeed).leftMap(new RuntimeException(_)))
+      made           <- GameRoom.restore(
+        initial,
+        dice,
+        durability = Durability.required(_ => IO.unit),
+        initialJoin = Some(
+          GameRoom.InitialJoinGate(
+            epoch.plusSeconds(15),
+            RematchStartup(RematchStartupPhase.AwaitingJoins, Set.empty, None),
+            (snapshot, startup) =>
+              startup.phase match
+                case RematchStartupPhase.Active =>
+                  activeAttempts.update(_ + 1) *> IO.raiseError(
+                    RematchTransitionRejected(GameId(UUID.randomUUID().toString), deadlineExpired = true)
+                  )
+                case RematchStartupPhase.Aborted       => terminalSaves.update(_ :+ (snapshot -> startup))
+                case RematchStartupPhase.AwaitingJoins => IO.unit,
+            time.get
+          )
+        )
+      )
+      r = made.toOption.get
+      result <- r
+        .connection(Seat.White)
+        .use(_ => r.connection(Seat.Black).use(_ => r.result.timeout(1.second)))
+      attempts <- activeAttempts.get
+      terminal <- terminalSaves.get
+    yield
+      assertEquals(result.termination, Termination.Aborted)
+      assertEquals(attempts, 1)
+      assertEquals(terminal.size, 1)
+      assertEquals(terminal.head._2.phase, RematchStartupPhase.Aborted)
+      assert(!terminal.head._1.started)
+  }
+
+  test("stopping a room completes a presence connection blocked in the consumer") {
+    for
+      nowStarted <- Deferred[IO, Unit]
+      releaseNow <- Deferred[IO, Unit]
+      dice       <- IO.fromEither(DiceSource.fromHexSeed(initial.serverSeed).leftMap(new RuntimeException(_)))
+      made       <- GameRoom.restore(
+        initial,
+        dice,
+        durability = Durability.required(_ => IO.unit),
+        initialJoin = Some(
+          GameRoom.InitialJoinGate(
+            epoch.plusSeconds(15),
+            RematchStartup(RematchStartupPhase.AwaitingJoins, Set.empty, None),
+            (_, _) => IO.unit,
+            nowStarted.complete(()) *> releaseNow.get *> IO.pure(epoch)
+          )
+        )
+      )
+      r = made.toOption.get
+      pending   <- r.connection(Seat.White).allocated.start
+      _         <- nowStarted.get
+      _         <- r.stopForRestart
+      allocated <- pending.joinWithNever.timeout(1.second)
+      _         <- allocated._2.timeout(1.second)
     yield ()
   }

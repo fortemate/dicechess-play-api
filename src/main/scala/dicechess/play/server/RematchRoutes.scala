@@ -31,16 +31,18 @@ object RematchRoutes:
     for
       limiter     <- Resource.eval(RematchLimiter.create(limits))
       coordinator <- pg.traverse(RematchCoordinator.resource(registry, _))
-    yield routes(pg, coordinator, session, origins, limiter)
+    yield new Handler(pg, coordinator, session, origins, limiter).routes
 
-  private def routes(
+  final private class Handler(
       pg: Option[PgGameStore],
       coordinator: Option[RematchCoordinator],
       session: Option[AuthSession],
       origins: Cors.AllowedOrigins,
       limiter: RematchLimiter
-  ): HttpRoutes[IO] =
-    def guarded(req: Request[IO], rawId: String)(f: (PgGameStore, RematchCoordinator, GameId) => IO[Response[IO]]) =
+  ):
+    private def guarded(req: Request[IO], rawId: String)(
+        f: (PgGameStore, RematchCoordinator, GameId) => IO[Response[IO]]
+    ) =
       limiter
         .attempt("ip:" + BotRoutes.clientIp(req), req.method == Method.POST)
         .flatMap {
@@ -56,7 +58,7 @@ object RematchRoutes:
         .handleErrorWith(_ => IO.pure(problem("temporarily_unavailable")))
         .map(_.putHeaders(Header.Raw(ci"Cache-Control", "no-store"), Header.Raw(ci"Pragma", "no-cache")))
 
-    def privateResponse(service: RematchCoordinator, state: RematchRead, seat: Seat, error: Option[String]) =
+    private def privateResponse(service: RematchCoordinator, state: RematchRead, seat: Seat, error: Option[String]) =
       state.session match
         case None    => IO.pure(problem("game_not_found"))
         case Some(s) =>
@@ -65,7 +67,7 @@ object RematchRoutes:
             error.fold(Response[IO](Status.Ok).withEntity(json))(problem(_, Some(json)))
           }
 
-    def participant(req: Request[IO], db: PgGameStore, id: GameId)(f: Seat => IO[Response[IO]]) =
+    private def participant(req: Request[IO], db: PgGameStore, id: GameId)(f: Seat => IO[Response[IO]]) =
       AuthSession.principalFor(session, req).flatMap { account =>
         val token = single(req, SeatHeader).filter(t => t.nonEmpty && t.length <= 512)
         if account.isEmpty && token.isEmpty then IO.pure(problem("authentication_required"))
@@ -89,7 +91,7 @@ object RematchRoutes:
           }
       }
 
-    def publicResponse(db: PgGameStore, service: RematchCoordinator, id: GameId): IO[Response[IO]] =
+    private def publicResponse(db: PgGameStore, service: RematchCoordinator, id: GameId): IO[Response[IO]] =
       def project(state: RematchRead): IO[Response[IO]] = state.session match
         case Some(s) =>
           service
@@ -113,7 +115,7 @@ object RematchRoutes:
           }
       db.rematchCommands.current(id).flatMap(project)
 
-    HttpRoutes.of[IO]:
+    val routes: HttpRoutes[IO] = HttpRoutes.of[IO]:
       case req @ GET -> Root / "games" / id / "continuation" =>
         guarded(req, id)((db, service, game) => publicResponse(db, service, game))
       case req @ GET -> Root / "games" / id / "rematch" =>

@@ -38,6 +38,7 @@ erDiagram
     nickname_history
     outbox
     released_nicknames
+    rematch_commands
     rematch_sessions
     rematch_successors
     showcase_claims
@@ -53,6 +54,7 @@ erDiagram
     bots ||--o{ bot_webhook_stats : ""
     bots ||--o| bot_webhooks : ""
     games ||--o| outbox : ""
+    rematch_sessions ||--o{ rematch_commands : ""
     rematch_sessions ||--o| rematch_successors : ""
     rematch_successors ||--o| rematch_sessions : ""
     users ||--o{ user_guest_links : ""
@@ -370,6 +372,27 @@ Indexes:
 Indexes:
 
 - `released_nicknames_lookup_idx` — `CREATE INDEX released_nicknames_lookup_idx ON public.released_nicknames USING btree (nickname_lower, expires_at)`
+
+### `rematch_commands`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `source_game_id` | `uuid` | no | — | FK → rematch_sessions(source_game_id), PK |
+| `seat` | `text` | no | — | PK |
+| `request_id` | `uuid` | no | — | PK |
+| `action` | `text` | no | — | — |
+| `error_code` | `text` | yes | — | — |
+| `recorded_at` | `timestamp with time zone` | no | `clock_timestamp()` | — |
+
+Check constraints:
+
+- `CHECK ((action = ANY (ARRAY['propose'::text, 'accept'::text, 'decline'::text, 'cancel'::text])))`
+- `CHECK ((seat = ANY (ARRAY['White'::text, 'Black'::text])))`
+
+Indexes:
+
+- `rematch_commands_pkey` — `CREATE UNIQUE INDEX rematch_commands_pkey ON public.rematch_commands USING btree (source_game_id, seat, request_id)`
+- `rematch_commands_retention_idx` — `CREATE INDEX rematch_commands_retention_idx ON public.rematch_commands USING btree (recorded_at)`
 
 ### `rematch_sessions`
 

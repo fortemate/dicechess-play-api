@@ -102,7 +102,7 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
         AND game_id > $cursor::uuid ORDER BY game_id LIMIT ${limit.max(0).min(500).toLong}""")
       .query[SuccessorRow]
       .to[List]
-      .map(_.map(decodeSuccessor))
+      .flatMap(_.traverse(decodeSuccessor).liftTo[ConnectionIO])
       .transact(xa)
       .timeout(Timeout)
 
@@ -111,7 +111,7 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
       current <- (successorColumns ++ fr"WHERE game_id = ${gameId.value}::uuid FOR UPDATE")
         .query[SuccessorRow]
         .option
-        .map(_.map(decodeSuccessor))
+        .flatMap(_.traverse(decodeSuccessor).liftTo[ConnectionIO])
       now    <- clock
       result <- current match
         case Some(g)
@@ -163,39 +163,56 @@ private[store] object PgRematchStore:
       join_deadline_at, startup_version, startup_phase, joined_white, joined_black, activated_at
       FROM play.rematch_successors"""
 
-  private def decode[A: Decoder](json: Json): A =
-    json.as[A].fold(_ => throw new IllegalStateException("invalid private rematch record"), identity)
-  private def required[A](value: Option[A]): A =
-    value.getOrElse(throw new IllegalStateException("invalid rematch enum in storage"))
+  private def decode[A: Decoder](
+      json: Json,
+      table: String,
+      id: String,
+      field: String
+  ): Either[CorruptRematchRecord, A] =
+    json.as[A].leftMap(_ => CorruptRematchRecord(table, GameId(id), field))
+  private def required[A](value: Option[A], table: String, id: String, field: String): Either[CorruptRematchRecord, A] =
+    value.toRight(CorruptRematchRecord(table, GameId(id), field))
   private def seats(white: Boolean, black: Boolean): Set[Seat] =
     Option.when(white)(Seat.White).toSet ++ Option.when(black)(Seat.Black)
 
-  private def decodeSession(row: SessionRow): RematchSession =
+  private def decodeSession(row: SessionRow): Either[CorruptRematchRecord, RematchSession] =
     val (id, root, source, ended, phase, version, white, black, offeredBy, deadline, reason, successor) = row
-    RematchSession(
+    val table = "rematch_sessions"
+    for
+      decodedSource <- decode[RematchSource](source, table, id, "source")
+      decodedPhase  <- required(RematchPhase.values.find(_.toString.toLowerCase == phase), table, id, "phase")
+      decodedOffer  <- offeredBy.traverse(s => required(Seat.values.find(_.toString == s), table, id, "offered_by"))
+      decodedReason <- reason.traverse(r =>
+        required(RematchCloseReason.values.find(_.stored == r), table, id, "closed_reason")
+      )
+    yield RematchSession(
       GameId(id),
       GameId(root),
-      decode[RematchSource](source),
+      decodedSource,
       ended,
-      required(RematchPhase.values.find(_.toString.toLowerCase == phase)),
+      decodedPhase,
       version,
       seats(white, black),
-      offeredBy.map(s => required(Seat.values.find(_.toString == s))),
+      decodedOffer,
       deadline,
-      reason.map(r => required(RematchCloseReason.values.find(_.stored == r))),
+      decodedReason,
       successor.map(GameId(_))
     )
 
-  private def decodeSuccessor(row: SuccessorRow): RematchSuccessor =
+  private def decodeSuccessor(row: SuccessorRow): Either[CorruptRematchRecord, RematchSuccessor] =
     val (id, source, snapshot, committed, deadline, version, phase, white, black, activated) = row
-    RematchSuccessor(
+    val table                                                                                = "rematch_successors"
+    for
+      decodedSnapshot <- decode[GameSnapshot](snapshot, table, id, "initial_snapshot")
+      decodedPhase    <- required(RematchStartupPhase.values.find(_.stored == phase), table, id, "startup_phase")
+    yield RematchSuccessor(
       GameId(id),
       GameId(source),
-      decode[GameSnapshot](snapshot),
+      decodedSnapshot,
       committed,
       deadline,
       version,
-      RematchStartup(required(RematchStartupPhase.values.find(_.stored == phase)), seats(white, black), activated)
+      RematchStartup(decodedPhase, seats(white, black), activated)
     )
 
   private def readSession(id: GameId, lock: Boolean): ConnectionIO[Option[RematchSession]] =
@@ -203,12 +220,12 @@ private[store] object PgRematchStore:
                                                                         else Fragment.empty))
       .query[SessionRow]
       .option
-      .map(_.map(decodeSession))
+      .flatMap(_.traverse(decodeSession).liftTo[ConnectionIO])
   private def readSuccessor(id: GameId): ConnectionIO[Option[RematchSuccessor]] =
     (successorColumns ++ fr"WHERE game_id = ${id.value}::uuid")
       .query[SuccessorRow]
       .option
-      .map(_.map(decodeSuccessor))
+      .flatMap(_.traverse(decodeSuccessor).liftTo[ConnectionIO])
 
   private def writeProgress(s: RematchSession): ConnectionIO[Unit] =
     sql"""UPDATE play.rematch_sessions SET phase = ${s.phase.toString.toLowerCase}, version = ${s.version},
@@ -224,11 +241,14 @@ private[store] object PgRematchStore:
         result <- sql"""SELECT finished_at, white_external_id, black_external_id FROM play.game_results
                          WHERE game_id = ${id.value}::uuid""".query[(Instant, String, String)].unique
         (endedAt, white, black) = result
-        root <- sql"""SELECT s.root_game_id::text, s.source FROM play.rematch_successors g
+        root <- sql"""SELECT s.source_game_id::text, s.root_game_id::text, s.source FROM play.rematch_successors g
                       JOIN play.rematch_sessions s ON s.source_game_id = g.source_game_id
-                      WHERE g.game_id = ${id.value}::uuid""".query[(String, Json)].option
-        rootId = root.fold(id.value)(_._1)
-        source = captured.copy(conditions = root.fold(captured.conditions)(r => decode[RematchSource](r._2).conditions))
+                      WHERE g.game_id = ${id.value}::uuid""".query[(String, String, Json)].option
+        rootSource <- root
+          .traverse(r => decode[RematchSource](r._3, "rematch_sessions", r._1, "source"))
+          .liftTo[ConnectionIO]
+        rootId = root.fold(id.value)(_._2)
+        source = captured.copy(conditions = rootSource.fold(captured.conditions)(_.conditions))
         // Do not attribute a later rewritten terminal snapshot to different participants than the first result.
         _ <- sql"""INSERT INTO play.rematch_sessions (source_game_id, root_game_id, source, ended_at, deadline_at)
                    VALUES (${id.value}::uuid, $rootId::uuid, ${source.asJson}, $endedAt,

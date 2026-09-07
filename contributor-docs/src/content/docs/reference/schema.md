@@ -54,7 +54,7 @@ erDiagram
     bots ||--o| bot_webhooks : ""
     games ||--o| outbox : ""
     rematch_sessions ||--o| rematch_successors : ""
-    rematch_successors ||--o{ rematch_sessions : ""
+    rematch_successors ||--o| rematch_sessions : ""
     users ||--o{ user_guest_links : ""
     users ||--o{ user_identities : ""
     users ||--o{ user_ratings : ""

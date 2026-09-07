@@ -9,6 +9,9 @@ import dicechess.play.game.{EngineOps, GameRoom}
 import dicechess.play.dice.DiceSource
 import doobie.hikari.HikariTransactor
 import doobie.implicits.*
+import doobie.postgres.circe.jsonb.implicits.*
+import io.circe.Json
+import io.circe.syntax.*
 import doobie.util.ExecutionContexts
 import doobie.Fragment
 import munit.CatsEffectSuite
@@ -485,5 +488,100 @@ class RematchStoreSuite extends CatsEffectSuite with TestContainerForAll:
               yield assertEquals(committed(result).initialSnapshot.timeControl, control)).guarantee(room.abort)
             yield ()
           }
+      }
+    }
+
+  private def assertCorrupt(action: IO[Any], table: String, id: GameId, field: String): IO[Unit] =
+    interceptIO[CorruptRematchRecord](action).map { error =>
+      assertEquals(error.table, table)
+      assertEquals(error.rowId, id)
+      assertEquals(error.field, field)
+      assertEquals(error.getMessage, s"Invalid rematch record: $table/${id.value}/$field")
+      assertEquals(error.getCause, null)
+    }
+
+  test("corrupt source reports safe row context and terminal capture rolls back until the record is repaired"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val s = fixture
+        for
+          started <- start(db, s)
+          (id, accepted) = started
+          next <- GameId.random
+          game <- db.rematches.commitSuccessor(id, accepted.version, next, initial(s)).map(committed)
+          corrupt = Json.obj("private" -> Json.fromString("must-not-appear-in-errors"))
+          _ <-
+            sql"UPDATE play.rematch_sessions SET source = $corrupt WHERE source_game_id = ${id.value}::uuid".update.run
+              .transact(xa)
+          _ <- (for
+            _ <- assertCorrupt(db.rematches.session(id), "rematch_sessions", id, "source")
+            _ <- assertCorrupt(
+              db.rematches.advance(id, 0, RematchChange.Offer(Seat.White)),
+              "rematch_sessions",
+              id,
+              "source"
+            )
+            _ <- assertCorrupt(
+              db.rematches.commitSuccessor(id, accepted.version, next, initial(s)),
+              "rematch_sessions",
+              id,
+              "source"
+            )
+            _ <- assertCorrupt(
+              db.save(next, game.initialSnapshot.copy(started = true, status = s.status)),
+              "rematch_sessions",
+              id,
+              "source"
+            )
+            resultCount <- sql"SELECT count(*) FROM play.game_results WHERE game_id = ${next.value}::uuid"
+              .query[Long]
+              .unique
+              .transact(xa)
+            status <- sql"SELECT status FROM play.games WHERE id = ${next.value}::uuid"
+              .query[String]
+              .unique
+              .transact(xa)
+          yield
+            assertEquals(resultCount, 0L)
+            assertEquals(status, "active")
+          ).guarantee(
+            sql"UPDATE play.rematch_sessions SET source = ${accepted.source.asJson} WHERE source_game_id = ${id.value}::uuid".update.run
+              .transact(xa)
+              .void
+          )
+          _        <- db.save(next, game.initialSnapshot.copy(started = true, status = s.status))
+          restored <- db.rematches.session(next).map(_.get)
+        yield assertEquals(restored.source.conditions, accepted.source.conditions)
+      }
+    }
+
+  test("corrupt successor fails reads, recovery, startup writes and commit retries with safe typed context"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val s = fixture
+        for
+          started <- start(db, s)
+          (id, accepted) = started
+          next <- GameId.random
+          game <- db.rematches.commitSuccessor(id, accepted.version, next, initial(s)).map(committed)
+          corrupt = game.initialSnapshot.asJson.mapObject(
+            _.add("version", Json.fromString("must-not-appear-in-errors"))
+          )
+          _ <-
+            sql"UPDATE play.rematch_successors SET initial_snapshot = $corrupt WHERE game_id = ${next.value}::uuid".update.run
+              .transact(xa)
+          _ <- List(
+            db.rematches.successor(next),
+            db.rematches.pendingStartup(None, 500),
+            db.rematches.updateStartup(next, 0, RematchStartup(RematchStartupPhase.Aborted, Set.empty, None)),
+            db.rematches.commitSuccessor(id, accepted.version, next, initial(s))
+          ).traverse_(action => assertCorrupt(action, "rematch_successors", next, "initial_snapshot"))
+            .guarantee(
+              sql"UPDATE play.rematch_successors SET initial_snapshot = ${game.initialSnapshot.asJson} WHERE game_id = ${next.value}::uuid".update.run
+                .transact(xa)
+                .void
+            )
+          restored <- db.rematches.successor(next)
+        yield assertEquals(restored, Some(game))
       }
     }

@@ -132,6 +132,10 @@ enum RematchCommit:
   case Existing(game: RematchSuccessor)
   case Rejected
 
+/** Identifies a corrupt private record without exposing JSON values or decoder details. */
+final case class CorruptRematchRecord(table: String, rowId: GameId, field: String)
+    extends RuntimeException(s"Invalid rematch record: $table/${rowId.value}/$field")
+
 /** Postgres-only foundation; no HTTP routes, room activation or public DTOs are supplied by this seam. */
 trait RematchStore:
   def session(sourceId: GameId): IO[Option[RematchSession]]

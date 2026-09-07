@@ -13,6 +13,7 @@ import io.circe.syntax.*
 
 import java.sql.SQLException
 import java.time.Instant
+import java.util.UUID
 import scala.concurrent.duration.*
 
 /** One locked source row serializes contenders across processes, not just inside a coordinator's mutex. */
@@ -69,7 +70,7 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
               case None =>
                 val transition = RematchCommands.transition(s, seat, action, now)
                 val next       = transition.toOption.filter(_ != s).map(_.copy(version = s.version + 1)).getOrElse(s)
-                val error      = transition.left.toOption
+                val error      = transition.left.toOption.map(_.wire)
                 for
                   _ <- writeProgress(next).whenA(next != s)
                   _ <-
@@ -84,6 +85,18 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
 
   def successor(gameId: GameId): IO[Option[RematchSuccessor]] =
     readSuccessor(gameId).transact(xa).timeout(Timeout)
+
+  def successorRecords(gameIds: List[GameId]): IO[List[Either[CorruptRematchRecord, RematchSuccessor]]] =
+    if gameIds.isEmpty then IO.pure(Nil)
+    else
+      // One bound array avoids both an N+1 boot query and the SQL parameter limit for a large live-game set.
+      val ids = gameIds.distinct.map(id => UUID.fromString(id.value)).toArray
+      (successorColumns ++ fr"WHERE game_id = ANY($ids)")
+        .query[SuccessorRow]
+        .to[List]
+        .map(_.map(decodeSuccessor))
+        .transact(xa)
+        .timeout(BootTimeout)
 
   def advance(sourceId: GameId, expectedVersion: Long, change: RematchChange): IO[RematchWrite] =
     (for
@@ -107,7 +120,7 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
                       phase = RematchPhase.Offered,
                       consents = Set(by),
                       offeredBy = Some(by),
-                      deadlineAt = now.plusSeconds(WindowSeconds)
+                      deadlineAt = now.plusSeconds(RematchResponseWindowSeconds)
                     )
                   )
                 case RematchChange.Accept(by)
@@ -201,8 +214,9 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
           WHERE phase IN ('offered', 'starting') AND successor_id IS NULL""".update.run.transact(xa).timeout(Timeout)
 
 private[store] object PgRematchStore:
-  private val WindowSeconds                = 15L
   private val Timeout                      = 5.seconds
+  private val BootTimeout                  = 30.seconds
+  private val InitialJoinWindowSeconds     = 15L
   private val Seats                        = Set(Seat.White, Seat.Black)
   private def clock: ConnectionIO[Instant] = sql"SELECT clock_timestamp()".query[Instant].unique
 
@@ -326,7 +340,7 @@ private[store] object PgRematchStore:
         _ <- sql"""INSERT INTO play.rematch_sessions (source_game_id, root_game_id, source, ended_at, deadline_at)
                    VALUES (${id.value}::uuid, $rootId::uuid, ${source.asJson}, $endedAt,
                            ${endedAt.plusSeconds(
-            WindowSeconds
+            RematchResponseWindowSeconds
           )}) ON CONFLICT (source_game_id) DO NOTHING""".update.run.void
           .whenA(source.players(Seat.White).externalId == white && source.players(Seat.Black).externalId == black)
       yield ()
@@ -343,7 +357,7 @@ private[store] object PgRematchStore:
     for
       now <- clock
       snapshot = initial.copy(createdAtEpochMs = Some(now.toEpochMilli))
-      deadline = now.plusSeconds(WindowSeconds)
+      deadline = now.plusSeconds(InitialJoinWindowSeconds)
       // Strict insert still fences two unrelated sources racing for the same candidate ID.
       _ <- sql"""INSERT INTO play.games (id, status, snapshot, origin)
                  VALUES (${gameId.value}::uuid, 'active', ${snapshot.asJson}, 'direct')""".update.run

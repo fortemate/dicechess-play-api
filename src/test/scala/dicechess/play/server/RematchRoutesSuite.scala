@@ -17,6 +17,7 @@ import org.testcontainers.utility.DockerImageName
 import org.typelevel.ci.*
 
 import java.time.Instant
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import scala.concurrent.duration.*
 
@@ -127,6 +128,19 @@ class RematchRoutesSuite extends munit.CatsEffectSuite with TestContainerForAll:
       )
     )
 
+  private def rawPost(
+      app: HttpApp[IO],
+      id: GameId,
+      token: String,
+      body: String,
+      origin: String = Origin
+  ): IO[Response[IO]] =
+    val headers = List(Header.Raw(ci"Origin", origin), Header.Raw(ci"X-DiceChess-CSRF", "1"))
+    val req     = request(Method.POST, s"/games/${id.value}/rematch", Some(token), headers = headers)
+      .withEntity(body)(using org.http4s.EntityEncoder.stringEncoder[IO])
+      .withContentType(org.http4s.headers.`Content-Type`(org.http4s.MediaType.application.json))
+    app.run(req)
+
   private def json(response: Response[IO]): IO[Json] = response.as[Json]
 
   private def noStore(response: Response[IO]): Unit =
@@ -231,21 +245,51 @@ class RematchRoutesSuite extends munit.CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  test("body validation is strict, all responses are uncacheable, and configured writes return Retry-After"):
+  test("body validation is strict at the 1 KiB boundary, and all responses are uncacheable"):
+    withContainers { pg =>
+      resources(pg).use { (db, registry) =>
+        seed(db, Principal.Guest(GuestWhite), Principal.Guest(GuestBlack)).flatMap { (id, _, _) =>
+          app(db, registry).use { routes =>
+            val validBody  = s"""{"requestId":"${UUID.randomUUID()}","action":"propose"}"""
+            val validBytes = validBody.getBytes(StandardCharsets.UTF_8).length
+            val boundary   = validBody + (" " * (1024 - validBytes))
+            val oversized  = validBody + (" " * (1025 - validBytes))
+            val extra      = validBody.dropRight(1) + ",\"extra\":true}"
+            for
+              invalidId <- rawPost(routes, id, WhiteToken, """{"requestId":"nope","action":"propose"}""")
+              extraKey  <- rawPost(routes, id, WhiteToken, extra)
+              exact     <- rawPost(routes, id, WhiteToken, boundary)
+              tooLarge  <- rawPost(routes, id, WhiteToken, oversized)
+            yield
+              assertEquals(invalidId.status, Status.BadRequest)
+              assertEquals(extraKey.status, Status.BadRequest)
+              assertEquals(exact.status, Status.Ok)
+              assertEquals(tooLarge.status, Status.BadRequest)
+              noStore(invalidId)
+              noStore(extraKey)
+              noStore(exact)
+              noStore(tooLarge)
+          }
+        }
+      }
+    }
+
+  test("configured writes return Retry-After after the IP budget is exhausted"):
     withContainers { pg =>
       resources(pg).use { (db, registry) =>
         seed(db, Principal.Guest(GuestWhite), Principal.Guest(GuestBlack)).flatMap { (id, _, _) =>
           val limits = RematchLimiter.Config(writesPerMinute = 2)
           app(db, registry, limits = limits).use { routes =>
-            val baseHeaders = List(Header.Raw(ci"Origin", Origin), Header.Raw(ci"X-DiceChess-CSRF", "1"))
             val invalidBody = Json.obj("requestId" -> "nope".asJson, "action" -> "propose".asJson)
+            // The malformed request, first valid request, and second valid request are three charges to the same IP key;
+            // the second valid request is therefore rejected before actor/state handling.
             for
               bad <- routes.run(
                 request(
                   Method.POST,
                   s"/games/${id.value}/rematch",
                   Some(WhiteToken),
-                  headers = baseHeaders,
+                  headers = List(Header.Raw(ci"Origin", Origin), Header.Raw(ci"X-DiceChess-CSRF", "1")),
                   body = Some(invalidBody)
                 )
               )

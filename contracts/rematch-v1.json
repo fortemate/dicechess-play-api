@@ -72,6 +72,9 @@
   "startupActive": {
     "phase": "active"
   },
+  "startupAborted": {
+    "phase": "aborted"
+  },
   "timeControls": [
     {
       "Unlimited": {}

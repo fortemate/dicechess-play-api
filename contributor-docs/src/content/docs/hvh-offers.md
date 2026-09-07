@@ -179,7 +179,11 @@ Use `Content-Type: application/json`, an exact allowed `Origin`, and `X-DiceChes
 for every POST (including guest requests). `PLAY_CORS_ORIGINS` must explicitly name the
 browser origin. Account callers send their session cookie; guests send only their source
 capability in `X-Rematch-Seat-Token`. A verified account session takes precedence over that
-header. The added CORS request header does not expand the configured origin allowlist.
+header. The added CORS request header does not expand the configured origin allowlist. The
+CSRF/origin check runs before seat lookup and deliberately uses `403 not_participant` for a
+missing or untrusted origin, preserving the current wire contract without revealing whether
+the caller is a participant. With PostgreSQL enabled but no explicit origin allowlist, reads
+may still work while all POST mutations are refused; the server warns about this at startup.
 No seat, account UUID, guest UUID, or token is accepted from the JSON body.
 
 Bodies are limited to 1 KiB and must contain exactly the two fields below. IDs use canonical

@@ -8,7 +8,9 @@ import io.circe.generic.semiauto.deriveEncoder
 import java.time.Instant
 
 final case class RematchSettings(timeControl: TimeControl, rated: Boolean, mode: String = "classic")
-    derives Codec.AsObject
+object RematchSettings:
+  given Encoder.AsObject[RematchSettings] = deriveEncoder
+
 final case class RematchJoin(seat: Seat, token: String) derives Codec.AsObject:
   override def toString: String = s"RematchJoin($seat,<redacted>)"
 final case class PrivateRematch(

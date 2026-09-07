@@ -19,10 +19,15 @@ final class RematchCoordinator private (
     def page(after: Option[GameId]): IO[Unit] = pg.rematchCommands.pendingCreation(after, 100).flatMap { rows =>
       rows.traverse_ {
         case Right(s)    => successor(s).void
-        case Left(error) => Console[IO].errorln(s"[play][rematch] skipped corrupt source ${error.rowId.value}")
+        case Left(error) =>
+          Console[IO].errorln(
+            s"[play][rematch] skipped corrupt source ${error.rowId.value}: ${RematchFailure.describe(error)}"
+          )
       } *> rows.lastOption.traverse_(s => page(Some(s.fold(_.rowId, _.sourceId))))
     }
-    (page(None).handleErrorWith(_ => Console[IO].errorln("[play][rematch] accepted-work scan will retry")) *>
+    (page(None).handleErrorWith(error =>
+      Console[IO].errorln(s"[play][rematch] accepted-work scan will retry: ${RematchFailure.describe(error)}")
+    ) *>
       IO.sleep(1.second)).foreverM
 
   def readable(id: GameId): IO[Boolean] =
@@ -57,7 +62,11 @@ final class RematchCoordinator private (
                   }
               }
             }
-            .handleErrorWith(_ => Console[IO].errorln(s"[play][rematch] publication pending for ${s.sourceId.value}"))
+            .handleErrorWith(error =>
+              Console[IO].errorln(
+                s"[play][rematch] publication pending for ${s.sourceId.value}: ${RematchFailure.describe(error)}"
+              )
+            )
             .guarantee(pending.update(_ - s.sourceId))
           supervisor
             .supervise(run)

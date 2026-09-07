@@ -1448,7 +1448,7 @@ object GameRoom:
               case RematchStartupPhase.AwaitingJoins => PublicRematchStartupPhase.AwaitingJoins
               case RematchStartupPhase.Active        => PublicRematchStartupPhase.Active
               case RematchStartupPhase.Aborted       => PublicRematchStartupPhase.Aborted,
-            Option.when(startup.phase == RematchStartupPhase.AwaitingJoins)(rematchJoinDeadline.get)
+            rematchJoinDeadline.filter(_ => startup.phase == RematchStartupPhase.AwaitingJoins)
           )
         }
         .orElse(Option.when(resumedActiveRematch)(PublicRematchStartup(PublicRematchStartupPhase.Active)))

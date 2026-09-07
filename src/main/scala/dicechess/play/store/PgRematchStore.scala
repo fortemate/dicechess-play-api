@@ -15,6 +15,7 @@ import java.sql.SQLException
 import java.time.Instant
 import java.util.UUID
 import scala.concurrent.duration.*
+import scala.util.Try
 
 /** One locked source row serializes contenders across processes, not just inside a coordinator's mutex. */
 final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchStore with RematchCommands:
@@ -87,16 +88,23 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
     readSuccessor(gameId).transact(xa).timeout(Timeout)
 
   def successorRecords(gameIds: List[GameId]): IO[List[Either[CorruptRematchRecord, RematchSuccessor]]] =
-    if gameIds.isEmpty then IO.pure(Nil)
-    else
-      // One bound array avoids both an N+1 boot query and the SQL parameter limit for a large live-game set.
-      val ids = gameIds.distinct.map(id => UUID.fromString(id.value)).toArray
-      (successorColumns ++ fr"WHERE game_id = ANY($ids)")
-        .query[SuccessorRow]
-        .to[List]
-        .map(_.map(decodeSuccessor))
-        .transact(xa)
-        .timeout(BootTimeout)
+    IO.defer {
+      // GameId is string-backed. Invalid inputs are isolated just like malformed rows, without an eager throw.
+      val (invalid, valid) = gameIds.distinct.partitionMap { id =>
+        Try(UUID.fromString(id.value)).toEither.leftMap(_ => CorruptRematchRecord("rematch_successors", id, "game_id"))
+      }
+      val failures = invalid.map(_.asLeft[RematchSuccessor])
+      if valid.isEmpty then IO.pure(failures)
+      else
+        // One bound array avoids both an N+1 boot query and the SQL parameter limit for a large live-game set.
+        val ids = valid.toArray
+        (successorColumns ++ fr"WHERE game_id = ANY($ids)")
+          .query[SuccessorRow]
+          .to[List]
+          .map(rows => failures ++ rows.map(decodeSuccessor))
+          .transact(xa)
+          .timeout(BootTimeout)
+    }
 
   def advance(sourceId: GameId, expectedVersion: Long, change: RematchChange): IO[RematchWrite] =
     (for

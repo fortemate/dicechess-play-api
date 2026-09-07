@@ -167,8 +167,8 @@ trait RematchStore:
   ): IO[RematchCommit]
   def successor(gameId: GameId): IO[Option[RematchSuccessor]]
 
-  /** Batch boot metadata for the supplied live games. Missing successors are ordinary games; malformed records remain
-    * individual failures so recovery can skip those rooms without hiding a storage outage.
+  /** Batch boot metadata for the supplied live games. Missing successors are ordinary games; invalid IDs and malformed
+    * records remain individual failures so recovery can skip those rooms without hiding a storage outage.
     */
   def successorRecords(gameIds: List[GameId]): IO[List[Either[CorruptRematchRecord, RematchSuccessor]]]
 

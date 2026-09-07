@@ -136,6 +136,10 @@ enum RematchCommit:
 final case class CorruptRematchRecord(table: String, rowId: GameId, field: String)
     extends RuntimeException(s"Invalid rematch record: $table/${rowId.value}/$field")
 
+/** A definitive rejected write, distinct from a possibly committed database failure. */
+final case class RematchTransitionRejected(gameId: GameId, deadlineExpired: Boolean)
+    extends RuntimeException(s"Rematch transition rejected: ${gameId.value}; deadlineExpired=$deadlineExpired")
+
 /** Postgres-only foundation; no HTTP routes, room activation or public DTOs are supplied by this seam. */
 trait RematchStore:
   def session(sourceId: GameId): IO[Option[RematchSession]]
@@ -156,6 +160,13 @@ trait RematchStore:
     * loadActive deliberately excludes these games.
     */
   def pendingStartup(after: Option[GameId], limit: Int): IO[List[RematchSuccessor]]
+
+  /** Recovery keeps malformed rows addressable so one private record cannot block every other game on boot. */
+  def pendingStartupRecords(
+      after: Option[GameId],
+      limit: Int
+  ): IO[List[Either[CorruptRematchRecord, RematchSuccessor]]] =
+    pendingStartup(after, limit).map(_.map(Right(_)))
 
   /** Store observed join history/activation. Live connection checks and terminal game writes belong to #128. */
   def updateStartup(gameId: GameId, expectedVersion: Long, next: RematchStartup): IO[Boolean]

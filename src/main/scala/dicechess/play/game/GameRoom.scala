@@ -6,7 +6,15 @@ import cats.syntax.all.*
 import dicechess.engine.domain.{GameState, Move}
 import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
-import dicechess.play.store.{GameSnapshot, TurnRecord}
+import dicechess.play.store.{
+  GameSnapshot,
+  TurnRecord,
+  RematchStartup,
+  RematchStartupPhase,
+  CorruptRematchRecord,
+  RematchTransitionRejected
+}
+import java.time.Instant
 import fs2.Stream
 
 import java.security.SecureRandom
@@ -34,6 +42,7 @@ final class GameRoom private (
     idleCheck: FiniteDuration,
     done: Deferred[IO, GameOver],
     presence: Ref[IO, Map[Seat, Int]],
+    rematchConnections: Ref[IO, Map[GameRoom.PresenceLease, GameRoom.LeasePresence]],
     graceFibers: Ref[IO, Map[Seat, Fiber[IO, Throwable, Unit]]],
     disconnectGrace: FiniteDuration,
     seedGrace: FiniteDuration,
@@ -41,7 +50,9 @@ final class GameRoom private (
     persist: GameSnapshot => IO[Unit],
     mode: Durability,
     stalledRef: Ref[IO, Boolean],
-    inFlightReply: Ref[IO, Option[Deferred[IO, GameRoom.TurnVerdict]]]
+    inFlightReply: Ref[IO, Option[Deferred[IO, GameRoom.TurnVerdict]]],
+    initialJoin: Option[GameRoom.InitialJoinGate],
+    consumerFiber: Ref[IO, Option[Fiber[IO, Throwable, Unit]]]
 ):
   import GameRoom.*
 
@@ -222,6 +233,15 @@ final class GameRoom private (
   /** Begin the game (roll the first turn). Call after subscribers have attached. */
   def start: IO[Unit] = inbox.offer(Msg.Begin)
 
+  // The companion factories are the only callers; keep the startup effect private to this class and companion.
+  private val runConsumer: IO[Unit] =
+    supervisedConsume.start.flatMap(fiber => consumerFiber.set(Some(fiber)))
+
+  /** Process shutdown: required rooms leave their last committed snapshot for bootstrap recovery. */
+  private[play] def stopForRestart: IO[Unit] =
+    consumerFiber.getAndSet(None).flatMap(_.traverse_(_.cancel)) *>
+      graceFibers.getAndSet(Map.empty).flatMap(_.values.toList.traverse_(_.cancel))
+
   /** Terminate a room that was constructed but could not be committed by its caller. The abort is serialized through
     * the room inbox, preserving the single-writer invariant and producing the same auditable technical result as any
     * other internal room failure.
@@ -267,14 +287,70 @@ final class GameRoom private (
     */
   def connection(seat: Seat): Resource[IO, Unit] =
     seat.side match
-      case None    => Resource.unit
+      case None                             => Resource.unit
+      case Some(_) if initialJoin.isDefined =>
+        // Install cleanup before the cancelable acknowledgement. The shared lease map makes closure visible even
+        // while the writer is blocked, without allowing transports to mutate the writer's aggregate counts.
+        Resource
+          .make(
+            IO(new PresenceLease(seat)).flatTap(lease =>
+              rematchConnections.update(_.updated(lease, LeasePresence(None, None)))
+            )
+          )(releasePresence)
+          .evalTap(lease => presenceMessage(seat, true, lease))
+          .void
       case Some(_) => Resource.make(onConnect(seat))(_ => onDisconnect(seat))
 
   /** Whether at least one transport currently holds `seat`. The showcase coordinator's no-show check (#46) reads this:
     * a claimant who was handed a seat token but never opened the socket is forfeited after the claim grace, so an
     * abandoned claim cannot hold the table for the whole of its clock.
     */
-  def seatConnected(seat: Seat): IO[Boolean] = presence.get.map(_.getOrElse(seat, 0) > 0)
+  def seatConnected(seat: Seat): IO[Boolean] =
+    (if initialJoin.isDefined then liveRematchPresence else presence.get).map(_.getOrElse(seat, 0) > 0)
+
+  private def releasePresence(lease: PresenceLease): IO[Unit] =
+    rematchConnections
+      .modify { live =>
+        if live.get(lease).exists(_.admittedAt.isDefined) then (live, true)
+        else (live - lease, false)
+      }
+      .flatMap {
+        case false => IO.unit
+        case true  =>
+          initialJoin.get.now
+            .flatMap { closedAt =>
+              rematchConnections.update { live =>
+                live.get(lease).fold(live)(entry => live.updated(lease, entry.copy(closedAt = Some(closedAt))))
+              } *> presenceMessage(lease.seat, false, lease)
+            }
+            .guarantee(rematchConnections.update(_ - lease))
+      }
+
+  private def rematchPresence(at: Option[Instant]): IO[Map[Seat, Int]] =
+    rematchConnections.get.map(_.collect {
+      case (lease, entry) if entry.presentAt(at) => lease.seat
+    }.groupMapReduce(identity)(_ => 1)(_ + _))
+
+  private def liveRematchPresence: IO[Map[Seat, Int]] = rematchPresence(None)
+
+  private def admitPresence(lease: PresenceLease, at: Instant): IO[Boolean] =
+    rematchConnections.modify { live =>
+      live.get(lease) match
+        case Some(entry) if entry.closedAt.isEmpty =>
+          (live.updated(lease, entry.copy(admittedAt = Some(at))), true)
+        case _ => (live, false)
+    }
+
+  private def presenceMessage(seat: Seat, connected: Boolean, lease: PresenceLease): IO[Unit] =
+    consumerFiber.get.flatMap {
+      case None        => IO.unit
+      case Some(fiber) =>
+        Deferred[IO, Unit].flatMap { reply =>
+          inbox.offer(Msg.Presence(seat, connected, lease, reply)) *> IO
+            .race(reply.get, IO.race(done.get, fiber.join))
+            .void
+        }
+    }
 
   private def onConnect(seat: Seat): IO[Unit] =
     presence.update(m => m.updated(seat, m.getOrElse(seat, 0) + 1)) *> cancelGrace(seat)
@@ -283,6 +359,78 @@ final class GameRoom private (
     presence
       .updateAndGet(m => m.updated(seat, math.max(0, m.getOrElse(seat, 1) - 1)))
       .flatMap(m => if m.getOrElse(seat, 0) == 0 then scheduleForfeit(seat) else IO.unit)
+
+  /** Only the room writer mutates presence for a rematch, including after activation. */
+  private def handlePresence(seat: Seat, connected: Boolean, lease: PresenceLease): IO[Unit] =
+    stateRef.get.flatMap { s =>
+      if s.ended then IO.unit
+      else
+        initialJoin.get.now.flatMap { at =>
+          // A late message cannot change the winner: expire against presence BEFORE this message.
+          if s.awaitingJoins && !at.isBefore(initialJoin.get.deadline) then expireInitialJoin
+          else
+            (if connected then admitPresence(lease, at) else IO.pure(true))
+              .ifM(updatePresence(s, seat, connected, at), IO.unit)
+        }
+    }
+
+  private def updatePresence(s: Session, seat: Seat, connected: Boolean, at: Instant): IO[Unit] =
+    liveRematchPresence.flatTap(presence.set).flatMap { counts =>
+      if s.awaitingJoins then recordInitialPresence(s, seat, connected, counts, at)
+      else updatePresenceGrace(seat, connected, counts)
+    }
+
+  private def updatePresenceGrace(seat: Seat, connected: Boolean, counts: Map[Seat, Int]): IO[Unit] =
+    if connected then cancelGrace(seat)
+    else if counts.getOrElse(seat, 0) == 0 then scheduleForfeit(seat)
+    else IO.unit
+
+  private def recordInitialPresence(
+      s: Session,
+      seat: Seat,
+      connected: Boolean,
+      counts: Map[Seat, Int],
+      at: Instant
+  ): IO[Unit] =
+    val joined = s.rematchStartup.get.joined ++ Option.when(connected)(seat)
+    val next   = s.copy(rematchStartup = s.rematchStartup.map(_.copy(joined = joined)))
+    if Set(Seat.White, Seat.Black).forall(counts.getOrElse(_, 0) > 0) then
+      IO.monotonic.flatMap { mono =>
+        val active = next.copy(
+          started = true,
+          startedAt = Some(mono),
+          rematchStartup = Some(RematchStartup(RematchStartupPhase.Active, joined, Some(at)))
+        )
+        commit(active)
+          .flatMap(st => if st.hasAllSeeds then beginTurn(st).flatMap(stateRef.set) else IO.unit)
+          .handleErrorWith {
+            case rejected: RematchTransitionRejected if rejected.deadlineExpired =>
+              // Both transports arrived in time, but storage missed the window: no player caused this failure.
+              endGame(s, GameOver(GameResult.Draw, Termination.Aborted)).flatMap(stateRef.set)
+            case error => IO.raiseError(error)
+          }
+      }
+    else commit(next).void
+
+  def awaitingJoinDeadline: IO[Option[Instant]] =
+    stateRef.get.map(s => Option.when(s.awaitingJoins)(initialJoin.get.deadline))
+
+  private def expireInitialJoin: IO[Unit] =
+    stateRef.get.flatMap { s =>
+      if !s.awaitingJoins || s.ended then IO.unit
+      else
+        initialJoin.get.now.flatMap { now =>
+          if now.isBefore(initialJoin.get.deadline) then IO.unit
+          else
+            rematchPresence(Some(initialJoin.get.deadline)).flatMap { counts =>
+              val connected = Set(Seat.White, Seat.Black).filter(counts.getOrElse(_, 0) > 0)
+              val over      = connected.toList match
+                case seat :: Nil => GameOver(GameResult.Win(seat.side.get), Termination.Timeout)
+                case _           => GameOver(GameResult.Draw, Termination.Aborted)
+              endGame(s, over).flatMap(stateRef.set)
+            }
+        }
+    }
 
   /** Start the grace timer for a now-unmanned seat. It forfeits only if the seat is *still* unmanned when the timer
     * elapses — the post-sleep re-check makes a reconnect that races the scheduling safe even if `cancelGrace` missed
@@ -421,42 +569,48 @@ final class GameRoom private (
       .flatMap: deadline =>
         inbox.take
           .timeoutTo(deadline, IO.pure(Msg.Timeout))
-          .flatMap:
-            case Msg.Begin =>
-              stateRef.get.flatMap { s =>
-                // Idempotent: a Begin never re-rolls (ply > 0) or revives an ended game. Otherwise it marks the game
-                // started and rolls as soon as both client seeds are in — which also kicks a game resumed from a
-                // snapshot that had started but not yet rolled. If seeds are still missing, `deadlineFor`/`onTimeout`
-                // force-start once the seed grace elapses (so a game never stalls).
-                if s.ply > 0L || s.ended then IO.unit
-                else
-                  IO.monotonic.flatMap { now =>
-                    val started = if s.started then s else s.copy(started = true, startedAt = Some(now))
-                    // Commit `started` (and any seeds already in) before the opening roll, so a roll failure aborts
-                    // from current state rather than from stale state (dropping seeds / re-starting) — and, in the
-                    // required mode, so `stateRef` keeps holding only committed state for the abort to start from.
-                    commit(started).flatMap: committed =>
-                      if committed.hasAllSeeds then beginTurn(committed).flatMap(stateRef.set) else IO.unit
-                  }
-              } *> continue
-            case Msg.Command(seat, command, receivedAt, reply) =>
-              // The reply is parked while the command runs so a writer failure mid-command (a required write that
-              // exhausted its retries, an engine invariant) can still settle it AFTER the technical abort commits —
-              // otherwise `submitTurn` would wait on it forever. Cleared once `process` has answered it itself.
-              inFlightReply.set(reply) *>
-                stateRef.get.flatMap(s => process(s, seat, command, receivedAt, reply)).flatMap(stateRef.set) *>
-                inFlightReply.set(None) *> continue
-            case Msg.ArmDrawOfferMsg(seat, armed, reply) =>
-              stateRef.get.flatMap { s =>
-                val (sNext, response) = s.armDrawOffer(seat, armed)
-                stateRef.set(sNext) *> reportDrawArmRefusal(seat, response) *> reply.complete(response).void
-              } *> continue
-            case Msg.Timeout =>
-              stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
-            case Msg.Abort =>
-              abortIfActive
-            case Msg.ClaimSeat(seat, claimer, displayName, rating, reply) =>
-              stateRef.get.flatMap(s => onClaimSeat(s, seat, claimer, displayName, rating, reply)) *> continue
+          .flatMap { message =>
+            expireInitialJoin *> (message match
+              case Msg.Begin =>
+                stateRef.get.flatMap { s =>
+                  // Idempotent: a Begin never re-rolls (ply > 0) or revives an ended game. Otherwise it marks the game
+                  // started and rolls as soon as both client seeds are in — which also kicks a game resumed from a
+                  // snapshot that had started but not yet rolled. If seeds are still missing, `deadlineFor`/`onTimeout`
+                  // force-start once the seed grace elapses (so a game never stalls).
+                  if s.ply > 0L || s.ended || s.awaitingJoins then IO.unit
+                  else
+                    IO.monotonic.flatMap { now =>
+                      val started = if s.started then s else s.copy(started = true, startedAt = Some(now))
+                      // Commit `started` (and any seeds already in) before the opening roll, so a roll failure aborts
+                      // from current state rather than from stale state (dropping seeds / re-starting) — and, in the
+                      // required mode, so `stateRef` keeps holding only committed state for the abort to start from.
+                      commit(started).flatMap: committed =>
+                        if committed.hasAllSeeds then beginTurn(committed).flatMap(stateRef.set) else IO.unit
+                    }
+                } *> continue
+              case Msg.Command(seat, command, receivedAt, reply) =>
+                // The reply is parked while the command runs so a writer failure mid-command (a required write that
+                // exhausted its retries, an engine invariant) can still settle it AFTER the technical abort commits —
+                // otherwise `submitTurn` would wait on it forever. Cleared once `process` has answered it itself.
+                inFlightReply.set(reply) *>
+                  stateRef.get.flatMap(s => process(s, seat, command, receivedAt, reply)).flatMap(stateRef.set) *>
+                  inFlightReply.set(None) *> continue
+              case Msg.ArmDrawOfferMsg(seat, armed, reply) =>
+                stateRef.get.flatMap { s =>
+                  val (sNext, response) = if s.awaitingJoins then
+                    (s, DrawOfferArmed(armed = false, reason = Some("waiting for both players")))
+                  else s.armDrawOffer(seat, armed)
+                  stateRef.set(sNext) *> reportDrawArmRefusal(seat, response) *> reply.complete(response).void
+                } *> continue
+              case Msg.Presence(seat, connected, lease, reply) =>
+                handlePresence(seat, connected, lease) *> reply.complete(()).void *> continue
+              case Msg.Timeout =>
+                stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
+              case Msg.Abort =>
+                abortIfActive
+              case Msg.ClaimSeat(seat, claimer, displayName, rating, reply) =>
+                stateRef.get.flatMap(s => onClaimSeat(s, seat, claimer, displayName, rating, reply)) *> continue)
+          }
 
   /** Bind `seat` to `claimer` and re-emit, so every board relabels that side (`players` rides on the snapshot). Runs on
     * the writer fiber; re-checks [[GameRoom.claimable]] because the public entry point checked it before queueing and
@@ -521,6 +675,10 @@ final class GameRoom private (
     */
   private def deadlineFor(s: Session): IO[FiniteDuration] =
     if s.ended then IO.pure(idleCheck)
+    else if s.awaitingJoins then
+      initialJoin.get.now.map(now =>
+        math.max(0L, java.time.Duration.between(now, initialJoin.get.deadline).toNanos).nanos
+      )
     else if s.awaitingSeeds then
       // Time left in the opening seed grace before we force-start with whatever seeds have arrived.
       IO.monotonic.map(now => floorZero(seedGrace - s.startedAt.fold(Duration.Zero: FiniteDuration)(now - _)))
@@ -559,6 +717,7 @@ final class GameRoom private (
     */
   private def drainRefusing: IO[Unit] =
     inbox.tryTake.flatMap:
+      case Some(Msg.Presence(_, _, _, reply))     => reply.complete(()).attempt.void *> drainRefusing
       case Some(Msg.Command(_, _, _, reply))      => answer(reply, TurnVerdict.Refused(GameOverReason)) *> drainRefusing
       case Some(Msg.ArmDrawOfferMsg(_, _, reply)) =>
         reply.complete(DrawOfferArmed(armed = false, reason = Some(GameOverReason))).attempt.void *> drainRefusing
@@ -584,7 +743,10 @@ final class GameRoom private (
     *     state. The writer fiber is halted for as long as the write is retried, and the mover's clock is credited for
     *     that stall: a database hiccup is the server's fault, not the player's.
     */
-  private def commit(s: Session): IO[Session] =
+  private def commit(input: Session): IO[Session] =
+    val s = if input.ended && input.awaitingJoins then
+      input.copy(rematchStartup = input.rematchStartup.map(_.copy(phase = RematchStartupPhase.Aborted)))
+    else input
     mode match
       case Durability.BestEffort         => stateRef.set(s) *> persistQuietly(s).as(s)
       case required: Durability.Required =>
@@ -596,8 +758,21 @@ final class GameRoom private (
   /** After the fail-closed creation snapshot, persistence is availability-first: a later store failure is logged and
     * the game plays on in memory rather than wedging the writer fiber mid-game.
     */
+  private def persistSession(s: Session): IO[Unit] =
+    initialJoin.fold(persist(snapshotOf(s)))(gate => gate.save(snapshotOf(s), s.rematchStartup.get))
+
   private def persistQuietly(s: Session): IO[Unit] =
-    persist(snapshotOf(s)).handleErrorWith(e => Console[IO].errorln(s"[play][persist] snapshot write failed: $e"))
+    persistSession(s).handleErrorWith(e => Console[IO].errorln(s"[play][persist] snapshot write failed: $e"))
+
+  private def confirmUncertainWrite(s: Session): IO[Boolean] = initialJoin match
+    case None       => IO.pure(false)
+    case Some(gate) =>
+      gate.confirms(snapshotOf(s), s.rematchStartup.get).handleErrorWith {
+        case error: CorruptRematchRecord => IO.raiseError(error)
+        case _                           =>
+          // The server cannot infer rollback while storage is unavailable. Release transports, then keep reconciling.
+          dropAllSubscribers *> IO.sleep(1.second) *> confirmUncertainWrite(s)
+      }
 
   /** The fail-closed write: retry per the policy that applies (terminal for an ending, intermediate otherwise), report
     * every attempt to the telemetry sink, release the subscribers once the stall outlives the grace, and answer how
@@ -605,8 +780,7 @@ final class GameRoom private (
     * turns into a technical abort from the last durable version (`stateRef`, untouched by this method on failure).
     */
   private def persistRequired(required: Durability.Required, s: Session): IO[FiniteDuration] =
-    val policy   = if s.ended then required.terminal else required.intermediate
-    val snapshot = snapshotOf(s)
+    val policy = if s.ended then required.terminal else required.intermediate
 
     // Telemetry is observational: a sink that fails must never turn a committed write into a failed commit, nor skip
     // a retry's delay. Its own failure is the one thing reported by the fallback logger instead.
@@ -616,7 +790,7 @@ final class GameRoom private (
         .handleErrorWith(e => Console[IO].errorln(s"[play][persist][required] telemetry sink failed on $event: $e"))
 
     def attempt(failed: Int, startedAt: FiniteDuration, dropped: Boolean): IO[FiniteDuration] =
-      persist(snapshot).attempt.flatMap:
+      persistSession(s).attempt.flatMap:
         case Right(()) =>
           if failed == 0 then IO.pure(Duration.Zero)
           else
@@ -624,7 +798,9 @@ final class GameRoom private (
               val stalledFor = now - startedAt
               stalledRef.set(false) *>
                 report(PersistenceTelemetry.SaveRecovered(s.version, failed + 1, stalledFor)).as(stalledFor)
-        case Left(error) =>
+        case Left(error: RematchTransitionRejected) => IO.raiseError(error)
+        case Left(error: CorruptRematchRecord)      => IO.raiseError(error)
+        case Left(error)                            =>
           val attempts = failed + 1
           IO.monotonic.flatMap: now =>
             val stalledFor = now - startedAt
@@ -632,8 +808,17 @@ final class GameRoom private (
               // Left stalled: the technical abort that follows is itself a required write, still under way.
               stalledRef.set(true) *>
                 report(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, None, error)) *>
-                report(PersistenceTelemetry.SaveAbandoned(s.version, attempts)) *>
-                IO.raiseError(RequiredSaveAbandoned(s.version, attempts, error))
+                confirmUncertainWrite(s).flatMap {
+                  case true =>
+                    IO.monotonic.flatMap { recoveredAt =>
+                      val elapsed = recoveredAt - startedAt
+                      stalledRef.set(false) *> report(PersistenceTelemetry.SaveRecovered(s.version, attempts, elapsed))
+                        .as(elapsed)
+                    }
+                  case false =>
+                    report(PersistenceTelemetry.SaveAbandoned(s.version, attempts)) *>
+                      IO.raiseError(RequiredSaveAbandoned(s.version, attempts, error))
+                }
             else
               val delay   = policy.backoff(attempts)
               val dropNow = !dropped && stalledFor >= required.stalledSubscriberGrace
@@ -792,7 +977,9 @@ final class GameRoom private (
   ): IO[Session] =
     s.status match
       case GameStatus.Ended(_) => answer(reply, TurnVerdict.Refused(GameOverReason)).as(s)
-      case GameStatus.Active   =>
+      case GameStatus.Active if s.awaitingJoins && !command.isInstanceOf[GameCommand.SubmitSeed] =>
+        answer(reply, TurnVerdict.Refused("waiting for both players")).as(s)
+      case GameStatus.Active =>
         command match
           case GameCommand.Resign =>
             seat.side match
@@ -939,6 +1126,21 @@ final class GameRoom private (
     reply.traverse_(_.complete(verdict).void)
 
 object GameRoom:
+  final private class PresenceLease(val seat: Seat)
+
+  final private case class LeasePresence(admittedAt: Option[Instant], closedAt: Option[Instant]):
+    def presentAt(at: Option[Instant]): Boolean = at match
+      case None           => admittedAt.isDefined && closedAt.isEmpty
+      case Some(deadline) =>
+        admittedAt.exists(_.isBefore(deadline)) && closedAt.forall(closed => !closed.isBefore(deadline))
+
+  final case class InitialJoinGate(
+      deadline: Instant,
+      startup: RematchStartup,
+      save: (GameSnapshot, RematchStartup) => IO[Unit],
+      now: IO[Instant] = IO.realTimeInstant,
+      confirms: (GameSnapshot, RematchStartup) => IO[Boolean] = (_, _) => IO.pure(false)
+  )
 
   /** Whether `seat` may be rebound to `claimer` (#285).
     *
@@ -1070,6 +1272,7 @@ object GameRoom:
   )
 
   private enum Msg:
+    case Presence(seat: Seat, connected: Boolean, lease: PresenceLease, reply: Deferred[IO, Unit])
     case Begin
     case Abort
     case Command(
@@ -1150,7 +1353,8 @@ object GameRoom:
       // Toggle count per seat per turn.
       drawTogglesThisTurn: Map[Seat, Int] = Map.empty,
       // Configured cooldown turns before re-offering.
-      drawReofferTurns: Int = DefaultDrawReofferTurns
+      drawReofferTurns: Int = DefaultDrawReofferTurns,
+      rematchStartup: Option[RematchStartup] = None
   ):
     def ended: Boolean = status match
       case GameStatus.Ended(_) => true
@@ -1217,6 +1421,8 @@ object GameRoom:
       * external id as a deterministic, already-public fallback (so a missing seed never stalls the game).
       */
     def seedFor(seat: Seat): String = clientSeeds.getOrElse(seat, players.get(seat).fold("")(_.externalId))
+
+    def awaitingJoins: Boolean = rematchStartup.exists(_.phase == RematchStartupPhase.AwaitingJoins)
 
     def publicAt(now: FiniteDuration, maxInlinePaths: Int): PublicGameState =
       val (revealed, seeds) = status match
@@ -1327,7 +1533,7 @@ object GameRoom:
             // restart. Not retried either — a failed creation is the caller's to compensate (the admission ticket is
             // released, the claim fails), which is cheaper and more honest than a claim that hangs on a retry loop.
             _ <- poll(persist(room.snapshotOf(session0)))
-            _ <- room.supervisedConsume.start
+            _ <- room.runConsumer
           yield Right(room)
 
   /** Rebuild a room from a durable snapshot after a restart. Tokens, seeds, clocks and turn history come from the
@@ -1351,63 +1557,68 @@ object GameRoom:
       maxInlinePaths: Int = DefaultMaxInlineTurnPaths,
       drawReofferTurns: Int = DefaultDrawReofferTurns,
       persist: GameSnapshot => IO[Unit] = _ => IO.unit,
-      durability: Durability = Durability.BestEffort
+      durability: Durability = Durability.BestEffort,
+      initialJoin: Option[InitialJoinGate] = None
   ): IO[Either[String, GameRoom]] =
     EngineOps.parse(snapshot.dfen) match
       case Left(error)   => IO.pure(Left(s"corrupt snapshot dfen: $error"))
       case Right(state0) =>
-        IO.monotonic.flatMap { now =>
-          // The cache is transient; a pending roll's turns re-derive from the persisted DFEN (dice included).
-          val (turns, tree) =
-            if snapshot.pendingDrawOffer.isDefined then (Map.empty[List[String], List[Move]], MoveTree.empty)
-            else if snapshot.pending then turnCache(state0)
-            else (Map.empty[List[String], List[Move]], MoveTree.empty)
-          val session0 = Session(
-            state0,
-            snapshot.version,
-            snapshot.players,
-            displayNames,
-            ratings,
-            dice,
-            snapshot.ply,
-            snapshot.pending,
-            snapshot.status,
-            snapshot.timeControl,
-            // A pre-existing row from before this field existed has no key at all (see GameSnapshot.rated) —
-            // resolve that to unrated, exactly like createdAtEpochMs's own absent-key story.
-            rated = snapshot.rated.getOrElse(false),
-            ladder = snapshot.ladder.getOrElse(false),
-            // One resolution rule for a legacy row, shared with the store's column projection and the V5 backfill.
-            origin = snapshot.effectiveOrigin,
-            remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
-            // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
-            // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.
-            turnStartedAt = Option.when(snapshot.pending)(now),
-            started = snapshot.started,
-            startedAt = None,
-            clientSeeds = snapshot.clientSeeds,
-            lastRoll = snapshot.lastRoll,
-            turns = snapshot.turns,
-            createdAtEpochMs = snapshot.createdAtEpochMs,
-            legalTurns = turns,
-            legalTree = tree,
-            pendingDrawOffer = snapshot.pendingDrawOffer,
-            lastDrawOfferer = snapshot.lastDrawOfferer,
-            drawReofferTurns = drawReofferTurns
-          )
-          build(
-            session0,
-            snapshot.seatTokens,
-            fanOutBuffer,
-            idleCheck,
-            disconnectGrace,
-            seedGrace,
-            maxInlinePaths,
-            persist,
-            durability
-          )
-            .flatTap(_.supervisedConsume.start)
-            .map(Right(_))
+        IO.uncancelable { _ =>
+          IO.monotonic.flatMap { now =>
+            // The cache is transient; a pending roll's turns re-derive from the persisted DFEN (dice included).
+            val (turns, tree) =
+              if snapshot.pendingDrawOffer.isDefined then (Map.empty[List[String], List[Move]], MoveTree.empty)
+              else if snapshot.pending then turnCache(state0)
+              else (Map.empty[List[String], List[Move]], MoveTree.empty)
+            val session0 = Session(
+              state0,
+              snapshot.version,
+              snapshot.players,
+              displayNames,
+              ratings,
+              dice,
+              snapshot.ply,
+              snapshot.pending,
+              snapshot.status,
+              snapshot.timeControl,
+              // A pre-existing row from before this field existed has no key at all (see GameSnapshot.rated) —
+              // resolve that to unrated, exactly like createdAtEpochMs's own absent-key story.
+              rated = snapshot.rated.getOrElse(false),
+              ladder = snapshot.ladder.getOrElse(false),
+              // One resolution rule for a legacy row, shared with the store's column projection and the V5 backfill.
+              origin = snapshot.effectiveOrigin,
+              remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
+              // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
+              // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.
+              turnStartedAt = Option.when(snapshot.pending)(now),
+              started = snapshot.started,
+              startedAt = None,
+              clientSeeds = snapshot.clientSeeds,
+              lastRoll = snapshot.lastRoll,
+              turns = snapshot.turns,
+              createdAtEpochMs = snapshot.createdAtEpochMs,
+              legalTurns = turns,
+              legalTree = tree,
+              pendingDrawOffer = snapshot.pendingDrawOffer,
+              lastDrawOfferer = snapshot.lastDrawOfferer,
+              drawReofferTurns = drawReofferTurns,
+              rematchStartup = initialJoin.map(_.startup)
+            )
+            build(
+              session0,
+              snapshot.seatTokens,
+              fanOutBuffer,
+              idleCheck,
+              disconnectGrace,
+              seedGrace,
+              maxInlinePaths,
+              persist,
+              durability,
+              initialJoin
+            )
+              .flatTap(_.runConsumer)
+              .map(Right(_))
+          }
         }
 
   private def build(
@@ -1419,7 +1630,8 @@ object GameRoom:
       seedGrace: FiniteDuration,
       maxInlinePaths: Int,
       persist: GameSnapshot => IO[Unit],
-      durability: Durability
+      durability: Durability,
+      initialJoin: Option[InitialJoinGate] = None
   ): IO[GameRoom] =
     for
       ref         <- Ref.of[IO, Session](session0)
@@ -1428,9 +1640,11 @@ object GameRoom:
       nextId      <- Ref.of[IO, Long](0L)
       done        <- Deferred[IO, GameOver]
       presence    <- Ref.of[IO, Map[Seat, Int]](Map.empty)
+      connections <- Ref.of[IO, Map[PresenceLease, LeasePresence]](Map.empty)
       graceFibers <- Ref.of[IO, Map[Seat, Fiber[IO, Throwable, Unit]]](Map.empty)
       stalled     <- Ref.of[IO, Boolean](false)
       inFlight    <- Ref.of[IO, Option[Deferred[IO, TurnVerdict]]](None)
+      consumer    <- Ref.of[IO, Option[Fiber[IO, Throwable, Unit]]](None)
     yield new GameRoom(
       ref,
       inbox,
@@ -1441,6 +1655,7 @@ object GameRoom:
       idleCheck,
       done,
       presence,
+      connections,
       graceFibers,
       disconnectGrace,
       seedGrace,
@@ -1448,7 +1663,9 @@ object GameRoom:
       persist,
       durability,
       stalled,
-      inFlight
+      inFlight,
+      initialJoin,
+      consumer
     )
 
   /** Starting clocks for a timed control: both seats get the initial bank (SuddenDeath/Fischer). PerMove keeps no bank
@@ -1506,7 +1723,7 @@ object GameRoom:
           floorZero(bank - elapsed).toMillis
         Some(Clocks(remainingFor(Seat.White), remainingFor(Seat.Black)))
 
-  private def mintTokens(seats: Iterable[Seat]): IO[Map[Seat, String]] =
+  private[play] def mintTokens(seats: Iterable[Seat]): IO[Map[Seat, String]] =
     seats.toList.traverse(seat => randomToken.map(seat -> _)).map(_.toMap)
 
   private def randomToken: IO[String] = IO:

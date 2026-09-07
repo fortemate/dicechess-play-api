@@ -6,7 +6,8 @@ import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
 import dicechess.play.game.{Durability, GameRoom, PersistenceTelemetry}
-import dicechess.play.store.GameStore
+import dicechess.play.store.{GameStore, PgGameStore, RematchSuccessor}
+import java.time.Instant
 
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
@@ -28,6 +29,49 @@ final class GameRegistry private (
     deregisterHooks: CopyOnWriteArrayList[GameId => IO[Unit]],
     resumeHooks: CopyOnWriteArrayList[List[(GameId, List[Principal], GameOrigin)] => IO[Unit]]
 ):
+
+  private var rematchService: Option[RematchService] = None
+  def rematches: Option[RematchService]              = rematchService
+
+  private[server] def buildRematch(game: RematchSuccessor, pg: PgGameStore, now: IO[Instant]): IO[GameRoom] =
+    val snapshot = game.initialSnapshot
+    for
+      at <- now
+      budget = java.time.Duration.between(at, game.joinDeadlineAt).toNanos.max(0L).nanos
+      metadata <- (
+        resolveNicknames(snapshot.players.values.map(_.externalId).toList),
+        ratingsFor(snapshot.players.values.map(_.externalId).toList, snapshot.timeControl)
+      ).parTupled.timeout(budget)
+      (names, ratings) = metadata
+      dice <- IO.fromEither(
+        DiceSource.fromHexSeed(snapshot.serverSeed).leftMap(_ => new IllegalStateException("invalid rematch dice seed"))
+      )
+      room <- GameRoom
+        .restore(
+          snapshot,
+          dice,
+          displayNames = names,
+          ratings = ratings,
+          disconnectGrace = disconnectGrace,
+          drawReofferTurns = drawReofferTurns,
+          durability = Durability.required(GameRegistry.logPersistence(game.gameId)),
+          initialJoin = Some(
+            GameRoom.InitialJoinGate(
+              game.joinDeadlineAt,
+              game.startup,
+              (s, startup) => pg.saveRematch(game.gameId, s, startup),
+              now,
+              (s, startup) => pg.confirmsRematch(game.gameId, s, startup)
+            )
+          )
+        )
+        .flatMap(value => IO.fromEither(value.leftMap(_ => new IllegalStateException("invalid rematch initial state"))))
+    yield room
+
+  private[server] def publishRematch(id: GameId, room: GameRoom): IO[Unit] =
+    val cleanup =
+      get(id).flatMap(existing => IO.defer(deregisterHooks.asScala.toList.traverse_(_(id))).whenA(existing.isEmpty))
+    register(id, room, hooksFirst = true).onError(_ => cleanup).onCancel(cleanup)
 
   /** Seat ratings for one game's participants, in the game's OWN category (#290 + #280).
     *
@@ -220,6 +264,9 @@ final class GameRegistry private (
     * that fails to restore is logged and skipped — one corrupt row must not take the server down.
     */
   def resume: IO[Int] =
+    rematchService.traverse_(_.recoverOnRestart) *> resumeActive
+
+  private def resumeActive: IO[Int] =
     store.loadActive.flatMap: snapshots =>
       // A snapshot does not persist display names, so they are resolved again on boot — otherwise a restart would leave
       // every live game's opponents anonymous for the rest of its life. ONE query covering every resumed game's seats,
@@ -318,14 +365,15 @@ final class GameRegistry private (
               if rest.isEmpty then index.removed(claimer) else index.updated(claimer, rest)
             .unlessA(alive)
 
-  private def register(id: GameId, room: GameRoom): IO[Unit] =
+  private def register(id: GameId, room: GameRoom, hooksFirst: Boolean = false): IO[Unit] =
     (room.seating, room.origin).flatMapN: (seats, origin) =>
       val players = seats.values.toList
-      rooms.update(_.updated(id, room)) *>
+      val hooks   = IO.defer(registerHooks.asScala.toList.traverse_(_(id, players, origin)))
+      val publish = rooms.update(_.updated(id, room)) *>
         byPlayer.update(index =>
           players.foldLeft(index)((acc, p) => acc.updated(p, acc.getOrElse(p, Set.empty) + id))
         ) *>
-        IO.defer(registerHooks.asScala.toList.traverse_(_(id, players, origin))) *>
+        hooks.unlessA(hooksFirst) *>
         // Deregister against the room's FINAL seating, not the list captured here: a seat rebound mid-game (#285) adds
         // an index entry for the claimer, and cleaning up the original list would leak it forever — one `byPlayer`
         // entry per friend game, for the life of the process. A rebind only ever replaces one of two identical
@@ -336,6 +384,7 @@ final class GameRegistry private (
         // live rooms and so returns nothing for a stale entry either way. A test asserting through it would pass with
         // or without this line, which is worse than none.
         (room.result *> room.seating.flatMap(fin => deregister(id, fin.values.toList.distinct))).start.void
+      if hooksFirst then hooks *> IO.uncancelable(_ => publish) else publish
 
   private[server] def deregister(id: GameId, players: List[Principal]): IO[Unit] =
     IO.uncancelable: _ =>
@@ -414,7 +463,7 @@ object GameRegistry:
     (
       Ref.of[IO, Map[GameId, GameRoom]](Map.empty),
       Ref.of[IO, Map[Principal, Set[GameId]]](Map.empty)
-    ).mapN: (rooms, byPlayer) =>
+    ).mapN { (rooms, byPlayer) =>
       new GameRegistry(
         rooms,
         byPlayer,
@@ -428,6 +477,13 @@ object GameRegistry:
         new CopyOnWriteArrayList(),
         new CopyOnWriteArrayList()
       )
+    }.flatTap: registry =>
+      store match
+        case pg: PgGameStore =>
+          RematchService
+            .create(registry, pg, diceSource)
+            .flatMap(service => IO { registry.rematchService = Some(service) })
+        case _ => IO.unit
 
   /** Whether `p` can sustain a meaningful rating at all: a human guest's identity is free to reset, and an anon-team
     * bot (`POST /bot/anon`) is the same kind of throwaway for bots — resetting either would make rating free. Shared by

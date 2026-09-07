@@ -95,6 +95,12 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
       .recover { case e: SQLException if e.getSQLState == "23505" => RematchCommit.Rejected }
 
   def pendingStartup(after: Option[GameId], limit: Int): IO[List[RematchSuccessor]] =
+    pendingStartupRecords(after, limit).flatMap(_.sequence.liftTo[IO])
+
+  override def pendingStartupRecords(
+      after: Option[GameId],
+      limit: Int
+  ): IO[List[Either[CorruptRematchRecord, RematchSuccessor]]] =
     val cursor = after.fold("00000000-0000-0000-0000-000000000000")(_.value)
     (successorColumns ++ fr"""WHERE startup_phase <> 'active' AND (startup_phase = 'awaiting_joins' OR
           (startup_phase = 'aborted' AND EXISTS
@@ -102,7 +108,7 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
         AND game_id > $cursor::uuid ORDER BY game_id LIMIT ${limit.max(0).min(500).toLong}""")
       .query[SuccessorRow]
       .to[List]
-      .flatMap(_.traverse(decodeSuccessor).liftTo[ConnectionIO])
+      .map(_.map(decodeSuccessor))
       .transact(xa)
       .timeout(Timeout)
 

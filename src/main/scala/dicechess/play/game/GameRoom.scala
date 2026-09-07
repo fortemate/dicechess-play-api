@@ -319,27 +319,36 @@ final class GameRoom private (
             presence
               .updateAndGet(m => m.updated(seat, (m.getOrElse(seat, 0) + (if connected then 1 else -1)).max(0)))
               .flatMap { counts =>
-                if !s.awaitingJoins then
-                  if connected then cancelGrace(seat)
-                  else if counts.getOrElse(seat, 0) == 0 then scheduleForfeit(seat)
-                  else IO.unit
-                else
-                  val joined = s.rematchStartup.get.joined ++ Option.when(connected)(seat)
-                  val next   = s.copy(rematchStartup = s.rematchStartup.map(_.copy(joined = joined)))
-                  if Set(Seat.White, Seat.Black).forall(counts.getOrElse(_, 0) > 0) then
-                    IO.monotonic.flatMap { mono =>
-                      val active = next.copy(
-                        started = true,
-                        startedAt = Some(mono),
-                        rematchStartup = Some(RematchStartup(RematchStartupPhase.Active, joined, Some(at)))
-                      )
-                      commit(active)
-                        .flatMap(st => if st.hasAllSeeds then beginTurn(st).flatMap(stateRef.set) else IO.unit)
-                    }
-                  else commit(next).void
+                if s.awaitingJoins then recordInitialPresence(s, seat, connected, counts, at)
+                else updatePresenceGrace(seat, connected, counts)
               }
         }
     }
+
+  private def updatePresenceGrace(seat: Seat, connected: Boolean, counts: Map[Seat, Int]): IO[Unit] =
+    if connected then cancelGrace(seat)
+    else if counts.getOrElse(seat, 0) == 0 then scheduleForfeit(seat)
+    else IO.unit
+
+  private def recordInitialPresence(
+      s: Session,
+      seat: Seat,
+      connected: Boolean,
+      counts: Map[Seat, Int],
+      at: Instant
+  ): IO[Unit] =
+    val joined = s.rematchStartup.get.joined ++ Option.when(connected)(seat)
+    val next   = s.copy(rematchStartup = s.rematchStartup.map(_.copy(joined = joined)))
+    if Set(Seat.White, Seat.Black).forall(counts.getOrElse(_, 0) > 0) then
+      IO.monotonic.flatMap { mono =>
+        val active = next.copy(
+          started = true,
+          startedAt = Some(mono),
+          rematchStartup = Some(RematchStartup(RematchStartupPhase.Active, joined, Some(at)))
+        )
+        commit(active).flatMap(st => if st.hasAllSeeds then beginTurn(st).flatMap(stateRef.set) else IO.unit)
+      }
+    else commit(next).void
 
   def awaitingJoinDeadline: IO[Option[Instant]] =
     stateRef.get.map(s => Option.when(s.awaitingJoins)(initialJoin.get.deadline))

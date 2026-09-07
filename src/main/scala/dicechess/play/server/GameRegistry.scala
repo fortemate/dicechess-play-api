@@ -33,11 +33,6 @@ final class GameRegistry private (
   private var rematchService: Option[RematchService] = None
   def rematches: Option[RematchService]              = rematchService
 
-  private def initRematches: IO[Unit] = store match
-    case pg: PgGameStore =>
-      RematchService.create(this, pg, diceSource).flatMap(service => IO { rematchService = Some(service) })
-    case _ => IO.unit
-
   private[server] def buildRematch(game: RematchSuccessor, pg: PgGameStore, now: IO[Instant]): IO[GameRoom] =
     val snapshot = game.initialSnapshot
     for
@@ -482,7 +477,13 @@ object GameRegistry:
         new CopyOnWriteArrayList(),
         new CopyOnWriteArrayList()
       )
-    }.flatTap(_.initRematches)
+    }.flatTap: registry =>
+      store match
+        case pg: PgGameStore =>
+          RematchService
+            .create(registry, pg, diceSource)
+            .flatMap(service => IO { registry.rematchService = Some(service) })
+        case _ => IO.unit
 
   /** Whether `p` can sustain a meaningful rating at all: a human guest's identity is free to reset, and an anon-team
     * bot (`POST /bot/anon`) is the same kind of throwaway for bots — resetting either would make rating free. Shared by

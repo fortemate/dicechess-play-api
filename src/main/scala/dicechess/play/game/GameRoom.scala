@@ -42,6 +42,7 @@ final class GameRoom private (
     idleCheck: FiniteDuration,
     done: Deferred[IO, GameOver],
     presence: Ref[IO, Map[Seat, Int]],
+    rematchConnections: Ref[IO, Map[GameRoom.PresenceLease, GameRoom.LeasePresence]],
     graceFibers: Ref[IO, Map[Seat, Fiber[IO, Throwable, Unit]]],
     disconnectGrace: FiniteDuration,
     seedGrace: FiniteDuration,
@@ -232,7 +233,8 @@ final class GameRoom private (
   /** Begin the game (roll the first turn). Call after subscribers have attached. */
   def start: IO[Unit] = inbox.offer(Msg.Begin)
 
-  private def runConsumer: IO[Unit] =
+  // The companion factories are the only callers; keep the startup effect private to this class and companion.
+  private val runConsumer: IO[Unit] =
     supervisedConsume.start.flatMap(fiber => consumerFiber.set(Some(fiber)))
 
   /** Process shutdown: required rooms leave their last committed snapshot for bootstrap recovery. */
@@ -285,37 +287,81 @@ final class GameRoom private (
     */
   def connection(seat: Seat): Resource[IO, Unit] =
     seat.side match
-      case None    => Resource.unit
+      case None                             => Resource.unit
+      case Some(_) if initialJoin.isDefined =>
+        // Install cleanup before the cancelable acknowledgement. The shared lease map makes closure visible even
+        // while the writer is blocked, without allowing transports to mutate the writer's aggregate counts.
+        Resource
+          .make(
+            IO(new PresenceLease(seat)).flatTap(lease =>
+              rematchConnections.update(_.updated(lease, LeasePresence(None, None)))
+            )
+          )(releasePresence)
+          .evalTap(lease => presenceMessage(seat, true, lease))
+          .void
       case Some(_) => Resource.make(onConnect(seat))(_ => onDisconnect(seat))
 
   /** Whether at least one transport currently holds `seat`. The showcase coordinator's no-show check (#46) reads this:
     * a claimant who was handed a seat token but never opened the socket is forfeited after the claim grace, so an
     * abandoned claim cannot hold the table for the whole of its clock.
     */
-  def seatConnected(seat: Seat): IO[Boolean] = presence.get.map(_.getOrElse(seat, 0) > 0)
+  def seatConnected(seat: Seat): IO[Boolean] =
+    (if initialJoin.isDefined then liveRematchPresence else presence.get).map(_.getOrElse(seat, 0) > 0)
 
-  private def presenceMessage(seat: Seat, connected: Boolean): IO[Unit] =
+  private def releasePresence(lease: PresenceLease): IO[Unit] =
+    rematchConnections
+      .modify { live =>
+        if live.get(lease).exists(_.admittedAt.isDefined) then (live, true)
+        else (live - lease, false)
+      }
+      .flatMap {
+        case false => IO.unit
+        case true  =>
+          initialJoin.get.now
+            .flatMap { closedAt =>
+              rematchConnections.update { live =>
+                live.get(lease).fold(live)(entry => live.updated(lease, entry.copy(closedAt = Some(closedAt))))
+              } *> presenceMessage(lease.seat, false, lease)
+            }
+            .guarantee(rematchConnections.update(_ - lease))
+      }
+
+  private def rematchPresence(at: Option[Instant]): IO[Map[Seat, Int]] =
+    rematchConnections.get.map(_.collect {
+      case (lease, entry) if entry.presentAt(at) => lease.seat
+    }.groupMapReduce(identity)(_ => 1)(_ + _))
+
+  private def liveRematchPresence: IO[Map[Seat, Int]] = rematchPresence(None)
+
+  private def admitPresence(lease: PresenceLease, at: Instant): IO[Boolean] =
+    rematchConnections.modify { live =>
+      live.get(lease) match
+        case Some(entry) if entry.closedAt.isEmpty =>
+          (live.updated(lease, entry.copy(admittedAt = Some(at))), true)
+        case _ => (live, false)
+    }
+
+  private def presenceMessage(seat: Seat, connected: Boolean, lease: PresenceLease): IO[Unit] =
     consumerFiber.get.flatMap {
       case None        => IO.unit
       case Some(fiber) =>
         Deferred[IO, Unit].flatMap { reply =>
-          inbox.offer(Msg.Presence(seat, connected, reply)) *> IO.race(reply.get, IO.race(done.get, fiber.join)).void
+          inbox.offer(Msg.Presence(seat, connected, lease, reply)) *> IO
+            .race(reply.get, IO.race(done.get, fiber.join))
+            .void
         }
     }
 
   private def onConnect(seat: Seat): IO[Unit] =
-    if initialJoin.isDefined then presenceMessage(seat, true)
-    else presence.update(m => m.updated(seat, m.getOrElse(seat, 0) + 1)) *> cancelGrace(seat)
+    presence.update(m => m.updated(seat, m.getOrElse(seat, 0) + 1)) *> cancelGrace(seat)
 
   private def onDisconnect(seat: Seat): IO[Unit] =
-    if initialJoin.isDefined then presenceMessage(seat, false)
-    else
-      presence
-        .updateAndGet(m => m.updated(seat, math.max(0, m.getOrElse(seat, 1) - 1)))
-        .flatMap(m => if m.getOrElse(seat, 0) == 0 then scheduleForfeit(seat) else IO.unit)
+    presence
+      .updateAndGet(m => m.updated(seat, math.max(0, m.getOrElse(seat, 1) - 1)))
+      .flatMap(m => if m.getOrElse(seat, 0) == 0 then scheduleForfeit(seat) else IO.unit)
 
   /** Only the room writer mutates presence for a rematch, including after activation. */
-  private def handlePresence(seat: Seat, connected: Boolean): IO[Unit] =
+  private def handlePresence(seat: Seat, connected: Boolean, lease: PresenceLease): IO[Unit] =
     stateRef.get.flatMap { s =>
       if s.ended then IO.unit
       else
@@ -323,13 +369,15 @@ final class GameRoom private (
           // A late message cannot change the winner: expire against presence BEFORE this message.
           if s.awaitingJoins && !at.isBefore(initialJoin.get.deadline) then expireInitialJoin
           else
-            presence
-              .updateAndGet(m => m.updated(seat, (m.getOrElse(seat, 0) + (if connected then 1 else -1)).max(0)))
-              .flatMap { counts =>
-                if s.awaitingJoins then recordInitialPresence(s, seat, connected, counts, at)
-                else updatePresenceGrace(seat, connected, counts)
-              }
+            (if connected then admitPresence(lease, at) else IO.pure(true))
+              .ifM(updatePresence(s, seat, connected, at), IO.unit)
         }
+    }
+
+  private def updatePresence(s: Session, seat: Seat, connected: Boolean, at: Instant): IO[Unit] =
+    liveRematchPresence.flatTap(presence.set).flatMap { counts =>
+      if s.awaitingJoins then recordInitialPresence(s, seat, connected, counts, at)
+      else updatePresenceGrace(seat, connected, counts)
     }
 
   private def updatePresenceGrace(seat: Seat, connected: Boolean, counts: Map[Seat, Int]): IO[Unit] =
@@ -374,7 +422,7 @@ final class GameRoom private (
         initialJoin.get.now.flatMap { now =>
           if now.isBefore(initialJoin.get.deadline) then IO.unit
           else
-            presence.get.flatMap { counts =>
+            rematchPresence(Some(initialJoin.get.deadline)).flatMap { counts =>
               val connected = Set(Seat.White, Seat.Black).filter(counts.getOrElse(_, 0) > 0)
               val over      = connected.toList match
                 case seat :: Nil => GameOver(GameResult.Win(seat.side.get), Termination.Timeout)
@@ -554,8 +602,8 @@ final class GameRoom private (
                   else s.armDrawOffer(seat, armed)
                   stateRef.set(sNext) *> reportDrawArmRefusal(seat, response) *> reply.complete(response).void
                 } *> continue
-              case Msg.Presence(seat, connected, reply) =>
-                handlePresence(seat, connected) *> reply.complete(()).void *> continue
+              case Msg.Presence(seat, connected, lease, reply) =>
+                handlePresence(seat, connected, lease) *> reply.complete(()).void *> continue
               case Msg.Timeout =>
                 stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
               case Msg.Abort =>
@@ -669,7 +717,7 @@ final class GameRoom private (
     */
   private def drainRefusing: IO[Unit] =
     inbox.tryTake.flatMap:
-      case Some(Msg.Presence(_, _, reply))        => reply.complete(()).attempt.void *> drainRefusing
+      case Some(Msg.Presence(_, _, _, reply))     => reply.complete(()).attempt.void *> drainRefusing
       case Some(Msg.Command(_, _, _, reply))      => answer(reply, TurnVerdict.Refused(GameOverReason)) *> drainRefusing
       case Some(Msg.ArmDrawOfferMsg(_, _, reply)) =>
         reply.complete(DrawOfferArmed(armed = false, reason = Some(GameOverReason))).attempt.void *> drainRefusing
@@ -1078,6 +1126,14 @@ final class GameRoom private (
     reply.traverse_(_.complete(verdict).void)
 
 object GameRoom:
+  final private class PresenceLease(val seat: Seat)
+
+  final private case class LeasePresence(admittedAt: Option[Instant], closedAt: Option[Instant]):
+    def presentAt(at: Option[Instant]): Boolean = at match
+      case None           => admittedAt.isDefined && closedAt.isEmpty
+      case Some(deadline) =>
+        admittedAt.exists(_.isBefore(deadline)) && closedAt.forall(closed => !closed.isBefore(deadline))
+
   final case class InitialJoinGate(
       deadline: Instant,
       startup: RematchStartup,
@@ -1216,7 +1272,7 @@ object GameRoom:
   )
 
   private enum Msg:
-    case Presence(seat: Seat, connected: Boolean, reply: Deferred[IO, Unit])
+    case Presence(seat: Seat, connected: Boolean, lease: PresenceLease, reply: Deferred[IO, Unit])
     case Begin
     case Abort
     case Command(
@@ -1584,6 +1640,7 @@ object GameRoom:
       nextId      <- Ref.of[IO, Long](0L)
       done        <- Deferred[IO, GameOver]
       presence    <- Ref.of[IO, Map[Seat, Int]](Map.empty)
+      connections <- Ref.of[IO, Map[PresenceLease, LeasePresence]](Map.empty)
       graceFibers <- Ref.of[IO, Map[Seat, Fiber[IO, Throwable, Unit]]](Map.empty)
       stalled     <- Ref.of[IO, Boolean](false)
       inFlight    <- Ref.of[IO, Option[Deferred[IO, TurnVerdict]]](None)
@@ -1598,6 +1655,7 @@ object GameRoom:
       idleCheck,
       done,
       presence,
+      connections,
       graceFibers,
       disconnectGrace,
       seedGrace,

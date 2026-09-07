@@ -56,6 +56,10 @@ class RematchJoinSuite extends CatsEffectSuite:
       yield (r, time, saves)
     } { case (r, _, _) => r.abort }
 
+  private def waitUntilConnected(r: GameRoom, seat: Seat, remaining: Int): IO[Unit] =
+    if remaining <= 0 then IO.raiseError(new RuntimeException(s"$seat did not become connected"))
+    else r.seatConnected(seat).ifM(IO.unit, IO.sleep(10.millis) *> waitUntilConnected(r, seat, remaining - 1))
+
   test("Begin, seeds and short PerMove clocks cannot start a rematch before both seats join") {
     room.use { (r, _, saves) =>
       r.connection(Seat.White).use { _ =>
@@ -256,4 +260,131 @@ class RematchJoinSuite extends CatsEffectSuite:
       allocated <- pending.joinWithNever.timeout(1.second)
       _         <- allocated._2.timeout(1.second)
     yield ()
+  }
+
+  List(Seat.Black, Seat.White).foreach { cancelledSeat =>
+    test(s"cancelling a queued $cancelledSeat connection cannot activate a rematch when the writer resumes") {
+      for
+        clock   <- Ref.of[IO, IO[Instant]](IO.pure(epoch))
+        blocked <- Deferred[IO, Unit]
+        resume  <- Deferred[IO, Unit]
+        saved   <- Ref.of[IO, List[GameSnapshot]](Nil)
+        dice    <- IO.fromEither(DiceSource.fromHexSeed(initial.serverSeed).leftMap(new RuntimeException(_)))
+        made    <- GameRoom.restore(
+          initial,
+          dice,
+          durability = Durability.required(_ => IO.unit),
+          initialJoin = Some(
+            GameRoom.InitialJoinGate(
+              epoch.plusSeconds(15),
+              RematchStartup(RematchStartupPhase.AwaitingJoins, Set.empty, None),
+              (snapshot, _) => saved.update(_ :+ snapshot),
+              clock.get.flatten
+            )
+          )
+        )
+        r = made.toOption.get
+        _ <- r
+          .connection(Seat.White)
+          .use { _ =>
+            (for
+              _            <- clock.set(blocked.complete(()).void *> resume.get.as(epoch))
+              _            <- r.start
+              _            <- blocked.get
+              pending      <- r.connection(cancelledSeat).use(_ => IO.never[Unit]).start
+              _            <- IO.sleep(50.millis)
+              cancellation <- pending.cancel.start
+              _            <- IO.sleep(50.millis)
+              _            <- resume.complete(())
+              _            <- cancellation.joinWithNever.timeout(1.second)
+              blackOnline  <- r.seatConnected(Seat.Black)
+              whiteOnline  <- r.seatConnected(Seat.White)
+              snapshots    <- saved.get
+              _            <- IO {
+                assert(!blackOnline, "cancellation must remove the black connection")
+                assert(whiteOnline, "the original white connection must remain counted")
+                assert(!snapshots.exists(_.started), "a cancelled pending connection must not open the join gate")
+              }
+            yield ()).guarantee(resume.complete(()).void)
+          }
+        whiteAfter <- r.seatConnected(Seat.White)
+      yield assert(!whiteAfter, "the original white connection must be released after the use scope")
+    }
+  }
+
+  List(
+    ("during the join window", epoch.plusSeconds(10), epoch.plusSeconds(10), None, true),
+    (
+      "at the deadline",
+      epoch.plusSeconds(10),
+      epoch.plusSeconds(15),
+      Some(GameOver(GameResult.Draw, Termination.Aborted)),
+      false
+    ),
+    (
+      "after the deadline",
+      epoch.plusSeconds(16),
+      epoch.plusSeconds(16),
+      Some(GameOver(GameResult.Win(Side.White), Termination.Timeout)),
+      false
+    )
+  ).foreach { case (label, closeAt, evaluationAt, expectedResult, blackExpectedOnline) =>
+    test(s"an admitted white closing before queued black is processed $label") {
+      for
+        now       <- Ref.of[IO, Instant](epoch)
+        stalled   <- Ref.of[IO, Boolean](false)
+        blocked   <- Deferred[IO, Unit]
+        resume    <- Deferred[IO, Unit]
+        blackBody <- Deferred[IO, Unit]
+        saved     <- Ref.of[IO, List[GameSnapshot]](Nil)
+        dice      <- IO.fromEither(DiceSource.fromHexSeed(initial.serverSeed).leftMap(new RuntimeException(_)))
+        made      <- GameRoom.restore(
+          initial,
+          dice,
+          durability = Durability.required(_ => IO.unit),
+          initialJoin = Some(
+            GameRoom.InitialJoinGate(
+              epoch.plusSeconds(15),
+              RematchStartup(RematchStartupPhase.AwaitingJoins, Set.empty, None),
+              (snapshot, _) =>
+                saved.update(_ :+ snapshot) *>
+                  stalled
+                    .getAndSet(false)
+                    .flatMap:
+                      case true  => blocked.complete(()).void *> resume.get
+                      case false => IO.unit,
+              now.get
+            )
+          )
+        )
+        r = made.toOption.get
+        white       <- r.connection(Seat.White).use(_ => IO.never[Unit]).start
+        _           <- waitUntilConnected(r, Seat.White, 100)
+        _           <- r.start
+        _           <- stalled.set(true)
+        _           <- r.submit(Seat.White, GameCommand.SubmitSeed("white-seed-123456")).start
+        _           <- blocked.get
+        black       <- r.connection(Seat.Black).use(_ => blackBody.complete(()).void *> IO.never[Unit]).start
+        _           <- IO.sleep(50.millis)
+        _           <- now.set(closeAt)
+        closing     <- white.cancel.start
+        _           <- IO.sleep(50.millis)
+        _           <- now.set(evaluationAt)
+        _           <- resume.complete(())
+        _           <- closing.joinWithNever.timeout(1.second)
+        _           <- blackBody.get.timeout(1.second)
+        whiteOnline <- r.seatConnected(Seat.White)
+        blackOnline <- r.seatConnected(Seat.Black)
+        snapshots   <- saved.get
+        result <- expectedResult.fold(IO.pure[Option[GameOver]](None))(_ => r.result.timeout(1.second).map(Some(_)))
+        _      <- IO {
+          assert(!whiteOnline, "closing the admitted white connection must remove white")
+          assertEquals(blackOnline, blackExpectedOnline)
+          assert(!snapshots.exists(_.started), "queued black must not activate after white closed")
+          assertEquals(result, expectedResult)
+        }
+        _ <- black.cancel
+        _ <- r.stopForRestart
+      yield ()
+    }
   }

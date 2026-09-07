@@ -4,6 +4,9 @@ import dicechess.play.core.*
 import io.circe.derivation.{Configuration, ConfiguredCodec}
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.{Codec, Decoder, Encoder, Json, KeyDecoder}
+import io.circe.syntax.*
+
+import java.time.Instant
 
 /** JSON wire codecs for the transport-neutral protocol. The WebSocket edge (and later the Bot API) are codecs over
   * these types — the game core never imports JSON.
@@ -62,19 +65,51 @@ object Codecs:
     Encoder.instance(encodeMoveTree)
   )
 
-  given Codec[GameResult]          = deriveCodec
-  given Codec[GameOver]            = deriveCodec
-  given Codec[GameStatus]          = deriveCodec
-  given Codec[TimeControl]         = deriveCodec
-  given Codec[Seek]                = deriveCodec
-  given Codec[Clocks]              = deriveCodec
-  given Codec[ClientSeeds]         = deriveCodec
-  given Codec[Principal]           = deriveCodec
-  given Codec[DrawOffer]           = deriveCodec
-  given Codec[MayOfferDrawBy]      = deriveCodec
-  given Codec[PublicPlayer]        = deriveCodec
-  given Codec[Players]             = deriveCodec
-  given Codec[PublicGameState]     = deriveCodec
+  given Codec[GameResult]                = deriveCodec
+  given Codec[GameOver]                  = deriveCodec
+  given Codec[GameStatus]                = deriveCodec
+  given Codec[TimeControl]               = deriveCodec
+  given Codec[Seek]                      = deriveCodec
+  given Codec[Clocks]                    = deriveCodec
+  given Codec[ClientSeeds]               = deriveCodec
+  given Codec[Principal]                 = deriveCodec
+  given Codec[DrawOffer]                 = deriveCodec
+  given Codec[MayOfferDrawBy]            = deriveCodec
+  given Codec[PublicRematchStartupPhase] = wireNameCodec(
+    "PublicRematchStartupPhase",
+    PublicRematchStartupPhase.values.toList,
+    _.wireName
+  )
+  given Codec[PublicRematchStartup] = Codec.from(
+    Decoder.instance { cursor =>
+      val instantDecoder =
+        Decoder.decodeString.emap(value => scala.util.Try(Instant.parse(value)).toEither.left.map(_.getMessage))
+      for
+        phase    <- cursor.downField("phase").as[PublicRematchStartupPhase]
+        deadline <- cursor
+          .downField("joinDeadlineAt")
+          .as[Option[Instant]](using Decoder.decodeOption(using instantDecoder))
+      yield PublicRematchStartup(phase, deadline)
+    },
+    Encoder.instance { startup =>
+      val fields = List(
+        Some("phase" -> startup.phase.asJson),
+        startup.joinDeadlineAt.map(at => "joinDeadlineAt" -> at.toString.asJson)
+      ).flatten
+      Json.obj(fields*)
+    }
+  )
+  given Codec[PublicPlayer]                                  = deriveCodec
+  given Codec[Players]                                       = deriveCodec
+  private val publicGameStateDerived: Codec[PublicGameState] = deriveCodec
+  given Codec[PublicGameState]                               = Codec.from(
+    publicGameStateDerived,
+    Encoder.instance(state =>
+      publicGameStateDerived(state).mapObject(fields =>
+        if state.rematchStartup.isDefined then fields else fields.remove("rematchStartup")
+      )
+    )
+  )
   given Codec[GameMoves]           = deriveCodec
   given Codec[SnapshotTurn]        = deriveCodec
   given Codec[DrawOfferArmed]      = deriveCodec

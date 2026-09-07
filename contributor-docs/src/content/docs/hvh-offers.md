@@ -1,16 +1,17 @@
 ---
 title: HvH offers and rematches
-description: Proposed offer, game-start, and spectator-continuation contract for classic human rematches.
+description: Version 1 HTTP, game-start, and spectator-continuation contract for classic human rematches.
 ---
 
 # HvH offers and rematches
 
-**Status: proposed; implementation is not available yet.** Design gate:
+**Contract version: 1 (coordinator/API #129).** Backend implementation is in this repository;
+participant and spectator UI integration are separate follow-up tasks. Design gate:
 [dicechess-play-api#8](https://github.com/fortemate/dicechess-play-api/issues/8).
 Implementation parent: [dicechess-play#104](https://github.com/fortemate/dicechess-play/issues/104).
 This document is the public implementation contract. Product rationale is maintained in the
 private Fortemate ADR 007. API paths below are relative to the configured API base URL.
-The timings and wire shapes below are proposed defaults for this first implementation.
+The timings and wire shapes below define version 1. Direct challenges remain a proposal.
 
 ## Scope and product rules
 
@@ -70,7 +71,7 @@ colour assignment. Atomically persist the successor's initial snapshot, final pa
 new credential material, and predecessor link. Register a readable room behind a persisted
 rematch-only `awaiting-joins` gate. At that point return `matched` and the caller's join data.
 
-The implementation must add a durable **15-second first-join deadline from commit** for
+The server enforces a durable **15-second first-join deadline from commit** for
 rematch games. Invoke `Begin` exactly once only after both new seats connect; no seed timeout
 or clock may run before that gate opens. A first-join command at or after the deadline is late.
 One never-connected participant loses to the participant who joined; if neither ever joined,
@@ -154,7 +155,11 @@ successor because publication or the requesting connection failed.
   analytics, errors, or server logs. Rate-limit reads and mutations with bounded configured
   limits; return `429` with `Retry-After`, without altering existing deadlines.
 
-## Proposed HTTP contract
+## HTTP contract v1
+
+[Machine-readable v1 fixtures](https://github.com/fortemate/dicechess-play-api/blob/main/contracts/rematch-v1.json)
+are checked against the production encoders by `RematchWireSuite`. Use them for participant
+and spectator frontend fixtures. The example capabilities are synthetic.
 
 The UI polls independently of the finished game socket. Start with one-second status polling
 while waiting; pause background polling and immediately read back on focus/reconnect.
@@ -168,6 +173,22 @@ explicit user action.
 | `POST /games/{id}/rematch`          | Authorized source participant | Apply an action and return canonical private state                                                                    |
 | `GET /games/{id}/continuation`      | Public                        | Public waiting/matched/closed projection, independent of live room retention                                          |
 | `GET /games/{id}/ws?mode=spectator` | Public                        | Explicit read-only game subscription; no seat restoration or claim                                                    |
+
+The routes require PostgreSQL; an in-memory deployment returns `503 temporarily_unavailable`.
+Use `Content-Type: application/json`, an exact allowed `Origin`, and `X-DiceChess-CSRF: 1`
+for every POST (including guest requests). `PLAY_CORS_ORIGINS` must explicitly name the
+browser origin. Account callers send their session cookie; guests send only their source
+capability in `X-Rematch-Seat-Token`. A verified account session takes precedence over that
+header. The added CORS request header does not expand the configured origin allowlist.
+No seat, account UUID, guest UUID, or token is accepted from the JSON body.
+
+Bodies are limited to 1 KiB and must contain exactly the two fields below. IDs use canonical
+UUID syntax. All rematch/continuation responses, including errors, have `Cache-Control: no-store`.
+Default fixed-window limits are 120 reads and 30 mutations per minute per IP, plus the same
+limits per authenticated participant identity. The limiter configuration is bounded at
+construction (`RematchLimiter.Config`) and tracks at most 10,000 keys; exhaustion is also
+`429 rate_limited` with `Retry-After: 60`. These defaults are process-local and do not change
+the authoritative opportunity deadlines.
 
 Every POST has a client-generated UUID `requestId` and one of `propose`, `accept`, `decline`,
 or `cancel`. Retrying the same ID/payload is safe and returns current canonical state;
@@ -249,10 +270,44 @@ Use `400 invalid_request`, `401 authentication_required`, `403 not_participant`,
 `error.code`; any state attached to an error must have the caller's authorized projection.
 A `503` never implies that a commit did not happen: read back and retry the same source.
 A terminal replay of an earlier valid command returns its current terminal state while its request record is retained; a new attempt to reopen a closed
-opportunity receives `410`. Retain request-ID recognition for at least 24 hours and document
-the configured retention. Regardless of request-ID expiry, persist terminal source state and
+opportunity receives `410`. Request-ID recognition is retained for 24 hours from the first attempt, scoped to the
+source game and final seat. Replays do not extend retention. Old receipts are cleaned up
+on the next command for that source; inactive sources can retain them longer. Regardless of request-ID expiry, persist terminal source state and
 the unique successor mapping for the source retention period. An expired request record
 cannot authorize another game or colour draw.
+
+### Successor snapshots
+
+Both `GET /games/{id}` and the `state` of a WebSocket `Snapshot` include the optional
+`rematchStartup` object for successor games. Ordinary games omit it. Its exact pending shape is:
+
+```json
+{
+  "rematchStartup": {
+    "phase": "awaiting_joins",
+    "joinDeadlineAt": "2026-09-07T12:00:35Z"
+  }
+}
+```
+
+After activation it is `{ "phase": "active" }`; a successor whose startup ends without
+activation exposes `{ "phase": "aborted" }` together with the normal terminal game status.
+No connection counts, joined identities, or capabilities appear here. Clients keep the board
+in a waiting state until activation. The initial join deadline is not a chess clock.
+
+Private responses always include inherited `settings`; `closed` also carries `closedReason`
+(`declined`, `cancelled`, `expired`, `technical_failure`, or `restart`). Public `closed` omits
+that reason. A successful POST can first return `starting`; poll the same source until
+`matched` or `closed`. Accepted work is supervised independently of request cancellation,
+and a bounded database scan picks up accepted commands whose response was lost. This is
+server recovery, not a notification bus. `matched` can point to either live state or the
+existing `/games/{nextGameId}/history` route if the successor has already ended.
+
+A failed command returns `{ "error": { "code": "invalid_transition" }, "state": ... }`
+when an authorized canonical state is available. Failed authorization never attaches state.
+Replaying an earlier rejected command keeps its error and returns current authorized state;
+replaying an earlier successful command returns `200` with current state, including `closed`.
+Clients should not infer a rollback from `503`: retry the same request ID or read the source.
 
 ## Spectator continuation
 

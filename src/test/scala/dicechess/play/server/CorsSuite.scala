@@ -155,11 +155,12 @@ class CorsSuite extends munit.CatsEffectSuite:
     */
   test("the credentialed preflight allows every request header the session-gated surfaces send"):
     val needed = List(
-      "content-type",     // every JSON body
-      "authorization",    // POST /me/bots/claim — the session says who, the bot's token proves control
-      "if-match",         // webhook mutations compare the opaque slot revision
-      "x-dicechess-csrf", // webhook mutations and session showcase claims require the same-origin CSRF signal
-      "idempotency-key"   // POST /showcase/claim (#46) — mandatory, and sent with the session cookie when signed in
+      "content-type",         // every JSON body
+      "authorization",        // POST /me/bots/claim — the session says who, the bot's token proves control
+      "if-match",             // webhook mutations compare the opaque slot revision
+      "x-dicechess-csrf",     // webhook mutations and session showcase claims require the same-origin CSRF signal
+      "x-rematch-seat-token", // Guest rematch readback and commands
+      "idempotency-key"       // POST /showcase/claim (#46) — mandatory, and sent with the session cookie when signed in
     )
     app("https://play.jc.id.lv")
       .run(

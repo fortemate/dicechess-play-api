@@ -96,7 +96,28 @@ final class PgGameStore private (xa: Transactor[IO])
   override def durable: Boolean = true
 
   /** Durable rematch state; activation uses the registry service and participant routes belong to #129. */
-  val rematches: RematchStore = new PgRematchStore(xa)
+  private val rematchRecords           = new PgRematchStore(xa)
+  val rematches: RematchStore          = rematchRecords
+  val rematchCommands: RematchCommands = rematchRecords
+
+  /** Existence and ongoing-human eligibility without exposing a private snapshot through HTTP. */
+  private[play] def continuationSource(id: GameId): IO[Option[Boolean]] =
+    (for
+      row        <- sql"SELECT snapshot FROM play.games WHERE id = ${id.value}::uuid".query[Json].option
+      historical <- sql"""SELECT EXISTS(SELECT 1 FROM play.game_archive WHERE game_id = ${id.value}::uuid)
+                      OR EXISTS(SELECT 1 FROM play.game_results WHERE game_id = ${id.value}::uuid)"""
+        .query[Boolean]
+        .unique
+      snapshot <- row.traverse(
+        _.as[GameSnapshot].leftMap(_ => CorruptRematchRecord("games", id, "snapshot")).liftTo[ConnectionIO]
+      )
+    yield snapshot
+      .map(s =>
+        s.status == GameStatus.Active && !s.effectiveOrigin.isShowcase &&
+          s.effectiveOrigin != GameOrigin.Ladder && !s.ladder.contains(true) &&
+          s.players.keySet == Set(Seat.White, Seat.Black) && s.players.values.forall(!_.isInstanceOf[Principal.Bot])
+      )
+      .orElse(Option.when(historical)(false))).transact(xa).timeout(PgGameStore.BackfillTimeout)
 
   /** Upsert the snapshot — and, in the SAME transaction, enqueue the finished game's analytics payload and write its
     * `game_results` and `game_archive` (#177) rows: the snapshot write and all three handoffs are atomic, so a crash

@@ -31,6 +31,7 @@ import dicechess.play.server.{
   PlayerRoutes,
   PlayRoutes,
   RatingRoutes,
+  RematchRoutes,
   SeatGuard,
   SessionWebhookRoutes,
   ShowcaseConfig,
@@ -378,7 +379,11 @@ object Main extends IOApp.Simple:
       // The sweepers (seeks, pending challenges), the ladder scheduler, the rating batch, the webhook loop, and the
       // ingest deliverer are supervised concurrently with the server: if any mandatory loop fails, the error propagates
       // and shuts down the server rather than letting /health pretend everything is running.
-      _ <- webhookResource.use { webhookService =>
+      runtimeResources = (
+        webhookResource,
+        RematchRoutes.resource(registry, pgStore, authSession, allowedOrigins)
+      ).tupled
+      _ <- runtimeResources.use { (webhookService, rematchRoutes) =>
         // The leaderboard/profile API reads bots + game_results — DB-only seams, so without persistence the
         // routes are simply not mounted (404), same spirit as the rating batch above.
         val leaderboard =
@@ -495,7 +500,7 @@ object Main extends IOApp.Simple:
                 ) <+>
                   leaderboard <+>
                   catalog <+> playerGames <+> strength <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
-                  ownerBots <+> adminBots <+> managedWebhooks <+> showcaseRoutes <+>
+                  ownerBots <+> adminBots <+> managedWebhooks <+> showcaseRoutes <+> rematchRoutes <+>
                   WebhookRoutes(botAuth, webhookService, webhookLimit, pgStore) <+>
                   BotRoutes(
                     botAuth,

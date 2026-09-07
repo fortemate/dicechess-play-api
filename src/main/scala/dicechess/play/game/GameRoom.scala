@@ -401,7 +401,15 @@ final class GameRoom private (
           startedAt = Some(mono),
           rematchStartup = Some(RematchStartup(RematchStartupPhase.Active, joined, Some(at)))
         )
-        commit(active)
+        emit(
+          active,
+          version =>
+            GameEvent.Snapshot(
+              version,
+              active.copy(version = version).publicAt(mono, maxInlinePaths),
+              snapshotHistory(active)
+            )
+        )
           .flatMap(st => if st.hasAllSeeds then beginTurn(st).flatMap(stateRef.set) else IO.unit)
           .handleErrorWith {
             case rejected: RematchTransitionRejected if rejected.deadlineExpired =>
@@ -1354,7 +1362,9 @@ object GameRoom:
       drawTogglesThisTurn: Map[Seat, Int] = Map.empty,
       // Configured cooldown turns before re-offering.
       drawReofferTurns: Int = DefaultDrawReofferTurns,
-      rematchStartup: Option[RematchStartup] = None
+      rematchStartup: Option[RematchStartup] = None,
+      rematchJoinDeadline: Option[Instant] = None,
+      resumedActiveRematch: Boolean = false
   ):
     def ended: Boolean = status match
       case GameStatus.Ended(_) => true
@@ -1431,6 +1441,17 @@ object GameRoom:
       val activeSt      = EngineOps.activeSeat(state)
       val isDrawPending = pending && pendingDrawOffer.exists(_ != activeSt)
       val dicePending   = pending && !isDrawPending
+      val publicRematch = rematchStartup
+        .map { startup =>
+          PublicRematchStartup(
+            startup.phase match
+              case RematchStartupPhase.AwaitingJoins => PublicRematchStartupPhase.AwaitingJoins
+              case RematchStartupPhase.Active        => PublicRematchStartupPhase.Active
+              case RematchStartupPhase.Aborted       => PublicRematchStartupPhase.Aborted,
+            Option.when(startup.phase == RematchStartupPhase.AwaitingJoins)(rematchJoinDeadline.get)
+          )
+        }
+        .orElse(Option.when(resumedActiveRematch)(PublicRematchStartup(PublicRematchStartupPhase.Active)))
       PublicGameState(
         version,
         EngineOps.serialize(state),
@@ -1457,7 +1478,8 @@ object GameRoom:
         Option.when(dicePending)(mayOffer(activeSt)),
         Option.when(status == GameStatus.Active)(
           MayOfferDrawBy(white = mayOffer(Seat.White), black = mayOffer(Seat.Black))
-        )
+        ),
+        publicRematch
       )
 
     /** The pair of client seeds actually folded into the dice, for the end-of-game reveal. */
@@ -1558,7 +1580,9 @@ object GameRoom:
       drawReofferTurns: Int = DefaultDrawReofferTurns,
       persist: GameSnapshot => IO[Unit] = _ => IO.unit,
       durability: Durability = Durability.BestEffort,
-      initialJoin: Option[InitialJoinGate] = None
+      initialJoin: Option[InitialJoinGate] = None,
+      // Display-only metadata: ordinary restart recovery must not reintroduce the initial-join gate.
+      resumedActiveRematch: Boolean = false
   ): IO[Either[String, GameRoom]] =
     EngineOps.parse(snapshot.dfen) match
       case Left(error)   => IO.pure(Left(s"corrupt snapshot dfen: $error"))
@@ -1602,7 +1626,9 @@ object GameRoom:
               pendingDrawOffer = snapshot.pendingDrawOffer,
               lastDrawOfferer = snapshot.lastDrawOfferer,
               drawReofferTurns = drawReofferTurns,
-              rematchStartup = initialJoin.map(_.startup)
+              rematchStartup = initialJoin.map(_.startup),
+              rematchJoinDeadline = initialJoin.map(_.deadline),
+              resumedActiveRematch = resumedActiveRematch
             )
             build(
               session0,

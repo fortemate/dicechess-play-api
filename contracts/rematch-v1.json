@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "privateOffered": {
+    "sourceGameId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "serverNow": "2026-09-07T12:00:20Z",
+    "myConsent": true,
+    "allowedActions": [
+      "cancel"
+    ],
+    "settings": {
+      "timeControl": {
+        "Fischer": {
+          "initialSeconds": 300,
+          "incrementSeconds": 3
+        }
+      },
+      "rated": false,
+      "mode": "classic"
+    },
+    "phase": "offered",
+    "deadlineAt": "2026-09-07T12:00:29Z"
+  },
+  "privateMatchedBlack": {
+    "sourceGameId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "serverNow": "2026-09-07T12:00:20Z",
+    "myConsent": true,
+    "allowedActions": [],
+    "settings": {
+      "timeControl": {
+        "Fischer": {
+          "initialSeconds": 300,
+          "incrementSeconds": 3
+        }
+      },
+      "rated": false,
+      "mode": "classic"
+    },
+    "phase": "matched",
+    "nextGameId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "joinDeadlineAt": "2026-09-07T12:00:35Z",
+    "join": {
+      "seat": "Black",
+      "token": "example-black-capability"
+    }
+  },
+  "publicMatched": {
+    "sourceGameId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "serverNow": "2026-09-07T12:00:20Z",
+    "phase": "matched",
+    "nextGameId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  },
+  "publicWaiting": {
+    "sourceGameId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "serverNow": "2026-09-07T12:00:20Z",
+    "phase": "waiting",
+    "deadlineAt": "2026-09-07T12:00:29Z"
+  },
+  "publicActiveSource": {
+    "sourceGameId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "serverNow": "2026-09-07T12:00:20Z",
+    "phase": "waiting"
+  },
+  "publicClosed": {
+    "sourceGameId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "serverNow": "2026-09-07T12:00:20Z",
+    "phase": "closed"
+  },
+  "startupAwaiting": {
+    "phase": "awaiting_joins",
+    "joinDeadlineAt": "2026-09-07T12:00:35Z"
+  },
+  "startupActive": {
+    "phase": "active"
+  },
+  "timeControls": [
+    {
+      "Unlimited": {}
+    },
+    {
+      "SuddenDeath": {
+        "initialSeconds": 300
+      }
+    },
+    {
+      "Fischer": {
+        "initialSeconds": 300,
+        "incrementSeconds": 3
+      }
+    },
+    {
+      "PerMove": {
+        "secondsPerMove": 15
+      }
+    }
+  ]
+}

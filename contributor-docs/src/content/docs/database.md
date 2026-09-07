@@ -327,9 +327,17 @@ credentials, and startup history outlive operational-game retention.
 
 Pending successors are reconciled through their explicit startup state. `PgGameStore.loadActive`
 excludes successors that are still awaiting joins or otherwise not active, so boot does not restore
-one as an ordinary game room. Source-seat authorization and live activation/routes remain the
-responsibility of #129 and #128; this migration and store seam do not claim that the full rematch
-feature is deployed.
+one as an ordinary game room. Activation persists the `started` snapshot and the successor's
+`active` startup phase, join history, and activation timestamp in one transaction; retries are
+idempotent. The persisted `joined_white` / `joined_black` flags record that a seat joined during
+startup, but do not represent current connection presence.
+
+At bootstrap, pending startup rows are handled before ordinary room resume: unfinished offers are
+closed as restarts, while successors awaiting joins (or already marked aborted with an active
+snapshot) are technically aborted and saved before transports are admitted. A rematch technical
+abort is retained in `game_archive` with a null sporting result and no rating eligibility; the
+ordinary abort path is otherwise unchanged. Coordinator and HTTP integration remain #129; this
+is the storage and terminal-save seam, not a claim that the full rematch feature is deployed.
 
 ### `users` — registered player accounts (#232, ADR-0017)
 

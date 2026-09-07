@@ -22,8 +22,9 @@ import io.circe.{Decoder, Json}
   * history worth serving — is overridden for `origin = showcase`: the showcase promises that every played game is
   * recorded, and a technical abort is exactly the case an operator later needs to audit. Such a row carries the full
   * moves, dice and fairness material but `result = null` and `sporting_eligible = false`, so it can never leak into a
-  * rating, an analytics corpus (the outbox still excludes it) or a future public win/draw/loss score. Non-showcase
-  * aborts keep the pre-#47 behaviour and are not archived.
+  * rating, an analytics corpus (the outbox still excludes it) or a future public win/draw/loss score. Other aborts keep
+  * the pre-#47 behaviour unless the durable rematch caller requests retention, so an accepted successor remains
+  * readable after a technical failure.
   */
 object GameArchive:
 
@@ -42,12 +43,12 @@ object GameArchive:
   def payload(snapshot: GameSnapshot): Option[Json] = entry(snapshot).map(_.payload)
 
   /** [[payload]] together with its column projection — what `PgGameStore` writes. */
-  def entry(snapshot: GameSnapshot): Option[Entry] =
+  def entry(snapshot: GameSnapshot, retainTechnicalAbort: Boolean = false): Option[Entry] =
     val origin = snapshot.effectiveOrigin
     snapshot.status match
-      case GameStatus.Active                                                        => None
-      case GameStatus.Ended(GameOver(_, Termination.Aborted)) if !origin.isShowcase => None
-      case GameStatus.Ended(GameOver(result, termination))                          =>
+      case GameStatus.Active                                                                                 => None
+      case GameStatus.Ended(GameOver(_, Termination.Aborted)) if !origin.isShowcase && !retainTechnicalAbort => None
+      case GameStatus.Ended(GameOver(result, termination))                                                   =>
         val eligible = sportingEligible(termination)
         (snapshot.players.get(Seat.White), snapshot.players.get(Seat.Black)).mapN { (white, black) =>
           val json = Json.obj(

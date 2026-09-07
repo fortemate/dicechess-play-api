@@ -95,7 +95,7 @@ final class PgGameStore private (xa: Transactor[IO])
     */
   override def durable: Boolean = true
 
-  /** Durable rematch foundation; participant routes and activation are wired by subsequent implementation tasks. */
+  /** Durable rematch state; activation uses the registry service and participant routes belong to #129. */
   val rematches: RematchStore = new PgRematchStore(xa)
 
   /** Upsert the snapshot — and, in the SAME transaction, enqueue the finished game's analytics payload and write its
@@ -110,6 +110,16 @@ final class PgGameStore private (xa: Transactor[IO])
     * projected out of the JSON so reconciliation and aggregation never have to decode it.
     */
   def save(id: GameId, snapshot: GameSnapshot): IO[Unit] =
+    Console[IO]
+      .errorln(s"[play][store] ended game ${id.value} produced no game_results row: players=${snapshot.players.keySet}")
+      .whenA(snapshot.ended && PgGameStore.finishedGameOf(snapshot).isEmpty) *>
+      saveTransaction(id, snapshot).transact(xa).timeout(SaveTimeout)
+
+  private def saveTransaction(
+      id: GameId,
+      snapshot: GameSnapshot,
+      retainTechnicalAbort: Boolean = false
+  ): ConnectionIO[Unit] =
     val status = if snapshot.ended then "ended" else "active"
     val origin = snapshot.effectiveOrigin.wireName
     val upsert =
@@ -128,12 +138,6 @@ final class PgGameStore private (xa: Transactor[IO])
     // finishedGameOf returning None while the snapshot IS ended means players was missing a seat — a malformed
     // snapshot, not the normal "still active" case. The games-table write still goes through (it's the more
     // foundational record), but a gap here must be visible, not silent, same as loadActive's corrupt-row logging.
-    val warnIfMalformed =
-      Console[IO]
-        .errorln(
-          s"[play][store] ended game ${id.value} produced no game_results row: players=${snapshot.players.keySet}"
-        )
-        .whenA(snapshot.ended && finishedGame.isEmpty)
     val recordResult = finishedGame match
       case None     => ().pure[ConnectionIO]
       case Some(fg) =>
@@ -143,15 +147,88 @@ final class PgGameStore private (xa: Transactor[IO])
               VALUES (${id.value}::uuid, ${fg.whiteExternalId}, ${fg.blackExternalId}, ${fg.result},
                       ${fg.termination}, ${fg.rated}, ${fg.timeControl}, ${fg.serverSeed}, ${fg.ladder}, $origin)
               ON CONFLICT (game_id) DO NOTHING""".update.run.void
-    val archive = GameArchive.entry(snapshot) match
-      case None        => ().pure[ConnectionIO]
-      case Some(entry) =>
-        sql"""INSERT INTO play.game_archive (game_id, payload, origin, sporting_eligible)
-              VALUES (${id.value}::uuid, ${entry.payload}, ${entry.origin.wireName}, ${entry.sportingEligible})
-              ON CONFLICT (game_id) DO NOTHING""".update.run.void
-    warnIfMalformed *> (upsert *> enqueue *> recordResult *> archive *> PgRematchStore.captureSource(id, snapshot))
+    val keepAbort = snapshot.status match
+      case GameStatus.Ended(GameOver(_, Termination.Aborted)) =>
+        sql"SELECT EXISTS (SELECT 1 FROM play.rematch_successors WHERE game_id = ${id.value}::uuid)"
+          .query[Boolean]
+          .unique
+      case _ => false.pure[ConnectionIO]
+    val archive = keepAbort.flatMap { rematch =>
+      GameArchive.entry(snapshot, retainTechnicalAbort || rematch) match
+        case None        => ().pure[ConnectionIO]
+        case Some(entry) =>
+          sql"""INSERT INTO play.game_archive (game_id, payload, origin, sporting_eligible)
+                VALUES (${id.value}::uuid, ${entry.payload}, ${entry.origin.wireName}, ${entry.sportingEligible})
+                ON CONFLICT (game_id) DO NOTHING""".update.run.void
+    }
+    upsert *> enqueue *> recordResult *> archive *> PgRematchStore.captureSource(id, snapshot)
+
+  private[play] def rematchSnapshot(id: GameId): IO[GameSnapshot] =
+    sql"SELECT snapshot FROM play.games WHERE id = ${id.value}::uuid"
+      .query[Json]
+      .unique
+      .flatMap(_.as[GameSnapshot].leftMap(_ => CorruptRematchRecord("games", id, "snapshot")).liftTo[ConnectionIO])
       .transact(xa)
       .timeout(SaveTimeout)
+
+  /** Resolve an ambiguous write only after its transaction has released the successor lock. */
+  private[play] def confirmsRematch(id: GameId, snapshot: GameSnapshot, expected: RematchStartup): IO[Boolean] =
+    (for
+      _ <- sql"SELECT game_id FROM play.rematch_successors WHERE game_id = ${id.value}::uuid FOR UPDATE"
+        .query[java.util.UUID]
+        .unique
+      row <- sql"""SELECT g.snapshot, r.startup_phase, r.joined_white, r.joined_black
+                   FROM play.rematch_successors r JOIN play.games g ON g.id = r.game_id
+                   WHERE r.game_id = ${id.value}::uuid""".query[(Json, String, Boolean, Boolean)].unique
+      saved <- row._1.as[GameSnapshot].leftMap(_ => CorruptRematchRecord("games", id, "snapshot")).liftTo[ConnectionIO]
+    yield saved == snapshot && row._2 == expected.phase.stored && row._3 == expected.joined(Seat.White) &&
+      row._4 == expected.joined(Seat.Black)).transact(xa).timeout(SaveTimeout)
+
+  /** Startup and the operational/terminal snapshot share one commit. The row lock also fences restart recovery. */
+  private[play] def saveRematch(id: GameId, snapshot: GameSnapshot, next: RematchStartup): IO[Unit] =
+    (for
+      row <- sql"""SELECT startup_phase, joined_white, joined_black, join_deadline_at, activated_at
+                   FROM play.rematch_successors WHERE game_id = ${id.value}::uuid FOR UPDATE"""
+        .query[(String, Boolean, Boolean, Instant, Option[Instant])]
+        .unique
+      now      <- sql"SELECT clock_timestamp()".query[Instant].unique
+      existing <- sql"SELECT snapshot FROM play.games WHERE id = ${id.value}::uuid".query[Json].option
+      prior    <- existing
+        .traverse(_.as[GameSnapshot].leftMap(_ => CorruptRematchRecord("games", id, "snapshot")))
+        .liftTo[ConnectionIO]
+      (phase, white, black, deadline, priorActivated) = row
+      joined = Option.when(white)(Seat.White).toSet ++ Option.when(black)(Seat.Black)
+      same   = prior.contains(
+        snapshot
+      ) && phase == next.phase.stored && joined == next.joined
+      allowed = !prior.exists(_.version > snapshot.version) && joined.subsetOf(next.joined) && next.joined.subsetOf(
+        Set(Seat.White, Seat.Black)
+      ) &&
+        (phase match
+          case "awaiting_joins" =>
+            next.phase match
+              case RematchStartupPhase.AwaitingJoins => !snapshot.started && !snapshot.ended && next.activatedAt.isEmpty
+              case RematchStartupPhase.Active        =>
+                snapshot.started && !snapshot.ended && next.joined.size == 2 &&
+                now.isBefore(deadline) && next.activatedAt.isDefined
+              case RematchStartupPhase.Aborted => snapshot.ended && next.activatedAt.isEmpty
+          case "active"  => next.phase == RematchStartupPhase.Active && snapshot.started && !prior.exists(_.ended)
+          case "aborted" => next.phase == RematchStartupPhase.Aborted && snapshot.ended && !prior.exists(_.ended)
+          case _         => false)
+      activated =
+        if phase == "active" then priorActivated
+        else Option.when(next.phase == RematchStartupPhase.Active)(now)
+      _ <-
+        if same then ().pure[ConnectionIO]
+        else if !allowed then
+          new IllegalStateException("rematch startup transition rejected").raiseError[ConnectionIO, Unit]
+        else
+          sql"""UPDATE play.rematch_successors SET startup_phase = ${next.phase.stored},
+                startup_version = startup_version + 1, joined_white = ${next.joined(Seat.White)},
+                joined_black = ${next.joined(Seat.Black)}, activated_at = $activated
+                WHERE game_id = ${id.value}::uuid""".update.run *>
+            saveTransaction(id, snapshot, retainTechnicalAbort = true)
+    yield ()).transact(xa).timeout(SaveTimeout)
 
   // ── OutboxStore ─────────────────────────────────────────────────────────────
 

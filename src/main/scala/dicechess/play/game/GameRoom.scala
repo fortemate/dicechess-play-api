@@ -1454,7 +1454,7 @@ object GameRoom:
   /** Starting clocks for a timed control: both seats get the initial bank (SuddenDeath/Fischer). PerMove keeps no bank
     * (each turn gets a fresh budget) and Unlimited has no clock, so both start empty.
     */
-  private def initialRemaining(timeControl: TimeControl, seats: Iterable[Seat]): Map[Seat, FiniteDuration] =
+  private[play] def initialRemaining(timeControl: TimeControl, seats: Iterable[Seat]): Map[Seat, FiniteDuration] =
     timeControl match
       case TimeControl.SuddenDeath(init) => seats.map(_ -> init.seconds).toMap
       case TimeControl.Fischer(init, _)  => seats.map(_ -> init.seconds).toMap

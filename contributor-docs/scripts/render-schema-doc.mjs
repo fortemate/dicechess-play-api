@@ -133,19 +133,17 @@ function renderFkFreeNarrative() {
 }
 
 /**
- * Cardinality of a foreign key, derived rather than assumed: if the child's FK columns are
- * themselves covered by a primary key or unique constraint, at most one child row can exist
- * per parent (1:1); otherwise the parent may have many (1:many). Both of today's foreign keys
- * happen to be the 1:1 shape, so hardcoding would look right until the first plain
- * one-to-many migration silently rendered wrong.
+ * Cardinality of a foreign key, derived rather than assumed: if a nonempty primary key or
+ * unique constraint consists only of the child's FK columns, at most one child row can exist
+ * per parent (1:1); otherwise the parent may have many (1:many).
  */
 function cardinality(childTable, fkColumns) {
 	const covered = (childTable?.constraints ?? []).some(
 		(c) =>
 			(c.type === 'PRIMARY KEY' || c.type === 'UNIQUE') &&
 			fkColumns.length > 0 &&
-			fkColumns.every((col) => (c.columns ?? []).includes(col)) &&
-			(c.columns ?? []).length === fkColumns.length,
+			(c.columns ?? []).length > 0 &&
+			(c.columns ?? []).every((col) => fkColumns.includes(col)),
 	);
 	return covered ? '||--o|' : '||--o{';
 }

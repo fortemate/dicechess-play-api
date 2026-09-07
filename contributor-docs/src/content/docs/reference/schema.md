@@ -38,6 +38,8 @@ erDiagram
     nickname_history
     outbox
     released_nicknames
+    rematch_sessions
+    rematch_successors
     showcase_claims
     showcase_table
     user_guest_links
@@ -51,6 +53,8 @@ erDiagram
     bots ||--o{ bot_webhook_stats : ""
     bots ||--o| bot_webhooks : ""
     games ||--o| outbox : ""
+    rematch_sessions ||--o| rematch_successors : ""
+    rematch_successors ||--o| rematch_sessions : ""
     users ||--o{ user_guest_links : ""
     users ||--o{ user_identities : ""
     users ||--o{ user_ratings : ""
@@ -366,6 +370,73 @@ Indexes:
 Indexes:
 
 - `released_nicknames_lookup_idx` — `CREATE INDEX released_nicknames_lookup_idx ON public.released_nicknames USING btree (nickname_lower, expires_at)`
+
+### `rematch_sessions`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `source_game_id` | `uuid` | no | — | PK, FK → rematch_successors(source_game_id, game_id) |
+| `root_game_id` | `uuid` | no | — | — |
+| `source` | `jsonb` | no | — | — |
+| `ended_at` | `timestamp with time zone` | no | — | — |
+| `phase` | `text` | no | `'available'::text` | — |
+| `version` | `bigint` | no | `0` | — |
+| `consent_white` | `boolean` | no | `false` | — |
+| `consent_black` | `boolean` | no | `false` | — |
+| `offered_by` | `text` | yes | — | — |
+| `deadline_at` | `timestamp with time zone` | no | — | — |
+| `closed_reason` | `text` | yes | — | — |
+| `successor_id` | `uuid` | yes | — | unique, FK → rematch_successors(source_game_id, game_id) |
+
+Check constraints:
+
+- `CHECK (((phase = 'matched'::text) = (successor_id IS NOT NULL)))`
+- `CHECK (((phase = 'closed'::text) = (closed_reason IS NOT NULL)))`
+- `CHECK (((successor_id IS NULL) OR ((successor_id <> source_game_id) AND (successor_id <> root_game_id))))`
+- `CHECK (((phase <> 'available'::text) OR ((NOT consent_white) AND (NOT consent_black) AND (offered_by IS NULL))))`
+- `CHECK (((phase <> 'offered'::text) OR ((consent_white <> consent_black) AND (offered_by IS NOT NULL) AND (((offered_by = 'White'::text) AND consent_white) OR ((offered_by = 'Black'::text) AND consent_black)))))`
+- `CHECK (((phase <> ALL (ARRAY['starting'::text, 'matched'::text])) OR (consent_white AND consent_black AND (offered_by IS NOT NULL))))`
+- `CHECK ((closed_reason = ANY (ARRAY['declined'::text, 'cancelled'::text, 'expired'::text, 'technical_failure'::text, 'restart'::text])))`
+- `CHECK ((offered_by = ANY (ARRAY['White'::text, 'Black'::text])))`
+- `CHECK ((phase = ANY (ARRAY['available'::text, 'offered'::text, 'starting'::text, 'matched'::text, 'closed'::text])))`
+- `CHECK ((version >= 0))`
+
+Indexes:
+
+- `rematch_sessions_pending_idx` — `CREATE INDEX rematch_sessions_pending_idx ON public.rematch_sessions USING btree (source_game_id) WHERE (phase = ANY (ARRAY['offered'::text, 'starting'::text]))`
+- `rematch_sessions_pkey` — `CREATE UNIQUE INDEX rematch_sessions_pkey ON public.rematch_sessions USING btree (source_game_id)`
+- `rematch_sessions_successor_id_key` — `CREATE UNIQUE INDEX rematch_sessions_successor_id_key ON public.rematch_sessions USING btree (successor_id)`
+
+### `rematch_successors`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `game_id` | `uuid` | no | — | PK, unique |
+| `source_game_id` | `uuid` | no | — | FK → rematch_sessions(source_game_id), unique, unique |
+| `initial_snapshot` | `jsonb` | no | — | — |
+| `committed_at` | `timestamp with time zone` | no | — | — |
+| `join_deadline_at` | `timestamp with time zone` | no | — | — |
+| `startup_phase` | `text` | no | `'awaiting_joins'::text` | — |
+| `startup_version` | `bigint` | no | `0` | — |
+| `joined_white` | `boolean` | no | `false` | — |
+| `joined_black` | `boolean` | no | `false` | — |
+| `activated_at` | `timestamp with time zone` | yes | — | — |
+
+Check constraints:
+
+- `CHECK ((game_id <> source_game_id))`
+- `CHECK ((join_deadline_at = (committed_at + '00:00:15'::interval)))`
+- `CHECK (((startup_phase = 'active'::text) = (activated_at IS NOT NULL)))`
+- `CHECK (((startup_phase <> 'active'::text) OR (joined_white AND joined_black)))`
+- `CHECK ((startup_phase = ANY (ARRAY['awaiting_joins'::text, 'active'::text, 'aborted'::text])))`
+- `CHECK ((startup_version >= 0))`
+
+Indexes:
+
+- `rematch_successors_pending_idx` — `CREATE INDEX rematch_successors_pending_idx ON public.rematch_successors USING btree (game_id) WHERE (startup_phase <> 'active'::text)`
+- `rematch_successors_pkey` — `CREATE UNIQUE INDEX rematch_successors_pkey ON public.rematch_successors USING btree (game_id)`
+- `rematch_successors_source_game_id_game_id_key` — `CREATE UNIQUE INDEX rematch_successors_source_game_id_game_id_key ON public.rematch_successors USING btree (source_game_id, game_id)`
+- `rematch_successors_source_game_id_key` — `CREATE UNIQUE INDEX rematch_successors_source_game_id_key ON public.rematch_successors USING btree (source_game_id)`
 
 ### `showcase_claims`
 

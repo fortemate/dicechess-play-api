@@ -95,6 +95,9 @@ final class PgGameStore private (xa: Transactor[IO])
     */
   override def durable: Boolean = true
 
+  /** Durable rematch foundation; participant routes and activation are wired by subsequent implementation tasks. */
+  val rematches: RematchStore = new PgRematchStore(xa)
+
   /** Upsert the snapshot — and, in the SAME transaction, enqueue the finished game's analytics payload and write its
     * `game_results` and `game_archive` (#177) rows: the snapshot write and all three handoffs are atomic, so a crash
     * can't record a finished game that analytics, the ladder/rating projection, or the durable history record never
@@ -146,7 +149,9 @@ final class PgGameStore private (xa: Transactor[IO])
         sql"""INSERT INTO play.game_archive (game_id, payload, origin, sporting_eligible)
               VALUES (${id.value}::uuid, ${entry.payload}, ${entry.origin.wireName}, ${entry.sportingEligible})
               ON CONFLICT (game_id) DO NOTHING""".update.run.void
-    warnIfMalformed *> (upsert *> enqueue *> recordResult *> archive).transact(xa).timeout(SaveTimeout)
+    warnIfMalformed *> (upsert *> enqueue *> recordResult *> archive *> PgRematchStore.captureSource(id, snapshot))
+      .transact(xa)
+      .timeout(SaveTimeout)
 
   // ── OutboxStore ─────────────────────────────────────────────────────────────
 
@@ -2196,7 +2201,9 @@ final class PgGameStore private (xa: Transactor[IO])
     * single bad row must not stop every other game from resuming.
     */
   def loadActive: IO[List[(GameId, GameSnapshot)]] =
-    sql"""SELECT id::text, snapshot FROM play.games WHERE status = 'active'"""
+    sql"""SELECT id::text, snapshot FROM play.games g WHERE status = 'active'
+          AND NOT EXISTS (SELECT 1 FROM play.rematch_successors r
+                          WHERE r.game_id = g.id AND r.startup_phase <> 'active')"""
       .query[(String, Json)]
       .to[List]
       .transact(xa)

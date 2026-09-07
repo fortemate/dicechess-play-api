@@ -307,6 +307,30 @@ duplicated terminal save converges on one row of each. Retention never touches t
 does prune the aborted showcase game's operational snapshot once the archive row exists, the same
 rule every other archived game follows.
 
+### `rematch_sessions` — durable rematch roots (V7)
+
+This is the private storage foundation for the rematch flow, not a deployed HTTP feature. On the
+first eligible terminal save, the server captures the final two participants, their rematch
+conditions, and the root game id in an immutable source record. Guest capabilities are stored as
+SHA-256 token hashes; account-owned seats remain tied to their private participant identity. The
+row has its own versioned offer/consent state and deadline, so it survives pruning of the
+operational game snapshot. It deliberately has no foreign key to `games`.
+
+### `rematch_successors` — private successor startup state (V7)
+
+The successor row preserves the immutable initial snapshot, including seat credentials, colour
+assignment, and the short startup join window. A source can have at most one successor. Committing
+one locks the source row and, in one transaction, inserts the active `games` snapshot, inserts this
+private successor record, and marks the source matched; a retry returns the existing successor and
+cannot replace its snapshot. The successor also has no foreign key to `games`, so rematch identity,
+credentials, and startup history outlive operational-game retention.
+
+Pending successors are reconciled through their explicit startup state. `PgGameStore.loadActive`
+excludes successors that are still awaiting joins or otherwise not active, so boot does not restore
+one as an ordinary game room. Source-seat authorization and live activation/routes remain the
+responsibility of #129 and #128; this migration and store seam do not claim that the full rematch
+feature is deployed.
+
 ### `users` — registered player accounts (#232, ADR-0017)
 
 The account behind optional Google sign-in. Its `id` is a UUID **this server mints** at first

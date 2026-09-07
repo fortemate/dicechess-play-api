@@ -117,7 +117,7 @@ final class PgGameStore private (xa: Transactor[IO])
           s.effectiveOrigin != GameOrigin.Ladder && !s.ladder.contains(true) &&
           s.players.keySet == Set(Seat.White, Seat.Black) && s.players.values.forall(!_.isInstanceOf[Principal.Bot])
       )
-      .orElse(Option.when(historical)(false))).transact(xa).timeout(PgGameStore.BackfillTimeout)
+      .orElse(Option.when(historical)(false))).transact(xa).timeout(PgGameStore.SaveTimeout)
 
   /** Upsert the snapshot — and, in the SAME transaction, enqueue the finished game's analytics payload and write its
     * `game_results` and `game_archive` (#177) rows: the snapshot write and all three handoffs are atomic, so a crash

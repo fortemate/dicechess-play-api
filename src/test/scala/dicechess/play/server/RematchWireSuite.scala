@@ -80,7 +80,8 @@ class RematchWireSuite extends CatsEffectSuite:
         PublicRematchStartupPhase.AwaitingJoins,
         Some(now.plusSeconds(15))
       ).asJson,
-      "startupActive" -> PublicRematchStartup(PublicRematchStartupPhase.Active).asJson
+      "startupActive"  -> PublicRematchStartup(PublicRematchStartupPhase.Active).asJson,
+      "startupAborted" -> PublicRematchStartup(PublicRematchStartupPhase.Aborted).asJson
     )
     actual.foreach((key, json) => assertEquals(json, fixtures.hcursor.downField(key).as[Json].toOption.get, key))
 

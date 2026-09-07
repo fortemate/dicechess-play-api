@@ -235,6 +235,10 @@ object Main extends IOApp.Simple:
       _ <- warnInertShowcase(enabled = showcaseConfig.enabled, persistenceOn = pgStore.isDefined)
       _ <- warnShowcaseWithoutWebhooks(enabled = showcaseConfig.enabled, webhooksOn = Webhooks.configFromEnv.isDefined)
       _ <- warnInertAdmins(sessionOn = authSession.isDefined, persistenceOn = pgStore.isDefined)
+      _ <- warnInertRematch(
+        persistenceOn = pgStore.isDefined,
+        originsConfigured = allowedOrigins.isExplicitlyConfigured
+      )
       _ <- warnInertWebhookManagement(
         enabled = managedWebhookConfig.isDefined,
         sessionOn = authSession.isDefined,
@@ -659,6 +663,19 @@ object Main extends IOApp.Simple:
           "driven, so the table will stay unavailable. Set WEBHOOK_TIMEOUT_SECONDS or disable the showcase."
       )
       .whenA(enabled && !webhooksOn)
+
+  /** Continuation reads are public and participant GETs may work, but mutations deliberately require an explicit origin
+    * and CSRF signal. With PostgreSQL enabled and the historical empty CORS setting, reads appear healthy while every
+    * POST is refused; make that deployment mistake visible at boot.
+    */
+  private def warnInertRematch(persistenceOn: Boolean, originsConfigured: Boolean): IO[Unit] =
+    cats.effect.std
+      .Console[IO]
+      .errorln(
+        "[play][rematch] PLAY_DB_URL is configured but PLAY_CORS_ORIGINS is unset — rematch reads work, but all POST " +
+          "mutations are refused. Set an explicit PLAY_CORS_ORIGINS allowlist."
+      )
+      .whenA(persistenceOn && !originsConfigured)
 
   /** ADR-004's feature flag must never produce a half-mounted cookie mutation surface. In particular, the historical
     * empty CORS setting means public credential-less reads; it is not an origin policy suitable for session writes.

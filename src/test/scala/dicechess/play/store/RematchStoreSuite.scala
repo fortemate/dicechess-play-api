@@ -19,6 +19,7 @@ import org.testcontainers.utility.DockerImageName
 
 import java.time.Instant
 import java.util.UUID
+import scala.util.Try
 
 class RematchStoreSuite extends CatsEffectSuite with TestContainerForAll:
   override val containerDef: PostgreSQLContainer.Def =
@@ -488,6 +489,42 @@ class RematchStoreSuite extends CatsEffectSuite with TestContainerForAll:
               yield assertEquals(committed(result).initialSnapshot.timeControl, control)).guarantee(room.abort)
             yield ()
           }
+      }
+    }
+
+  test("successorRecords defers invalid IDs, deduplicates inputs, and preserves missing and empty results"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        val source   = fixture
+        val invalidA = GameId("not-a-uuid")
+        val invalidB = GameId("also-not-a-uuid")
+        for
+          started <- start(db, source)
+          next    <- GameId.random
+          winner  <- db.rematches.commitSuccessor(started._1, started._2.version, next, initial(source)).map(committed)
+          missing <- GameId.random
+          mixedConstruction = Try(
+            db.rematches.successorRecords(List(next, missing, invalidA, invalidA, next, invalidB, invalidB))
+          )
+          mixed <- IO.fromTry(mixedConstruction).flatten
+          allInvalidConstruction = Try(db.rematches.successorRecords(List(invalidA, invalidA, invalidB)))
+          allInvalid <- IO.fromTry(allInvalidConstruction).flatten
+          emptyConstruction = Try(db.rematches.successorRecords(Nil))
+          empty <- IO.fromTry(emptyConstruction).flatten
+        yield
+          assert(mixedConstruction.isSuccess, "successorRecords must not throw while constructing the IO")
+          assertEquals(mixed.collect { case Right(record) => record.gameId }, List(winner.gameId))
+          val mixedErrors = mixed.collect { case Left(error) => error }
+          assertEquals(mixedErrors.size, 2)
+          assertEquals(mixedErrors.map(_.rowId).toSet, Set(invalidA, invalidB))
+          assert(mixedErrors.forall(_.table == "rematch_successors"))
+          assert(mixedErrors.forall(_.field == "game_id"))
+          assert(allInvalidConstruction.isSuccess, "all-invalid successorRecords must still construct an IO")
+          assertEquals(allInvalid.collect { case Left(error) => error.rowId }.toSet, Set(invalidA, invalidB))
+          assertEquals(allInvalid.size, 2)
+          assert(allInvalid.forall(_.isLeft))
+          assert(emptyConstruction.isSuccess, "empty successorRecords must still construct an IO")
+          assertEquals(empty, Nil)
       }
     }
 

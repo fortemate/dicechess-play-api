@@ -1,6 +1,7 @@
 package dicechess.play.server
 
 import cats.effect.{IO, Resource}
+import cats.effect.std.Console
 import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.store.*
@@ -55,7 +56,13 @@ object RematchRoutes:
                   case (Some(db), Some(service)) => f(db, service, GameId(id.toString))
                   case _                         => IO.pure(problem("temporarily_unavailable"))
         }
-        .handleErrorWith(_ => IO.pure(problem("temporarily_unavailable")))
+        .handleErrorWith { error =>
+          Console[IO]
+            .errorln(
+              s"[play][rematch] ${req.method} ${req.uri.path}: ${RematchFailure.describe(error)}"
+            )
+            .as(problem("temporarily_unavailable"))
+        }
         .map(_.putHeaders(Header.Raw(ci"Cache-Control", "no-store"), Header.Raw(ci"Pragma", "no-cache")))
 
     private def privateResponse(service: RematchCoordinator, state: RematchRead, seat: Seat, error: Option[String]) =
@@ -126,6 +133,7 @@ object RematchRoutes:
         }
       case req @ POST -> Root / "games" / id / "rematch" =>
         guarded(req, id) { (db, service, game) =>
+          // Reject before seat lookup: this code intentionally discloses no participant status on CSRF failure.
           if !csrf(req, origins) then IO.pure(problem("not_participant"))
           else
             participant(req, db, game) { seat =>

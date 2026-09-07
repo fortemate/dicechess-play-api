@@ -102,7 +102,15 @@ class RematchServiceSuite extends CatsEffectSuite with TestContainerForAll:
       resources(pg).use { (db, reg) =>
         val delegate = db.rematches
         val records  = new RematchStore:
-          export delegate.{session, successor, advance, pendingStartup, updateStartup, closeUncommittedOnRestart}
+          export delegate.{
+            session,
+            successor,
+            successorRecords,
+            advance,
+            pendingStartup,
+            updateStartup,
+            closeUncommittedOnRestart
+          }
           def commitSuccessor(id: GameId, v: Long, next: GameId, snapshot: GameSnapshot): IO[RematchCommit] =
             delegate.commitSuccessor(id, v, next, snapshot) *> IO.raiseError(
               new RuntimeException("response lost after commit")
@@ -395,6 +403,75 @@ class RematchServiceSuite extends CatsEffectSuite with TestContainerForAll:
         yield
           assertEquals(terminal.status, GameStatus.Ended(GameOver(GameResult.Draw, Termination.Aborted)))
           assert(archive.isDefined)
+      }
+    }
+  }
+
+  test("batch resume metadata isolates corrupt active successors and distinguishes ordinary and missing games") {
+    withContainers { pg =>
+      val raw = for
+        ec <- ExecutionContexts.fixedThreadPool[IO](2)
+        xa <- HikariTransactor
+          .newHikariTransactor[IO]("org.postgresql.Driver", pg.jdbcUrl, pg.username, pg.password, ec)
+      yield xa
+      (resources(pg), raw).tupled.use { case ((db, reg), xa) =>
+        for
+          games <- List.fill(2)(()).traverse { _ =>
+            for
+              source <- accepted(db, fixture)
+              game   <- reg.rematches.get.create(source).map(_.toOption.get)
+              room   <- reg.get(game.gameId).map(_.get)
+              _      <- room.connection(Seat.White).use(_ => room.connection(Seat.Black).use(_ => room.stopForRestart))
+            yield game
+          }
+          healthy = games.head
+          corrupt = games.last
+          ordinary <- GameId.random
+          missing  <- GameId.random
+          active   <- db.rematchSnapshot(healthy.gameId)
+          _        <- db.save(
+            ordinary,
+            active.copy(seatTokens = Map(Seat.White -> "ordinary-white", Seat.Black -> "ordinary-black"))
+          )
+          _ <- (for
+            _ <-
+              sql"UPDATE play.rematch_successors SET initial_snapshot = ${Json.obj()} WHERE game_id = ${corrupt.gameId.value}::uuid".update.run
+                .transact(xa)
+            batch <- db.rematches.successorRecords(
+              List(healthy.gameId, corrupt.gameId, ordinary, missing, healthy.gameId)
+            )
+            empty        <- db.rematches.successorRecords(Nil)
+            ordinaryOnly <- db.rematches.successorRecords(List(ordinary, missing))
+            _            <- IO {
+              assertEquals(batch.size, 2)
+              assertEquals(batch.flatMap(_.toOption).map(_.gameId), List(healthy.gameId))
+              assertEquals(batch.flatMap(_.left.toOption).map(_.rowId), List(corrupt.gameId))
+              assertEquals(empty, Nil)
+              assertEquals(ordinaryOnly, Nil)
+            }
+            resumed <- GameRegistry.create(store = db)
+            _       <- (for
+              count <- resumed.resume
+              bad   <- resumed.get(corrupt.gameId)
+              good  <- resumed.get(healthy.gameId).map(_.get)
+              state <- good.snapshot
+              plain <- resumed.get(ordinary).map(_.get).flatMap(_.snapshot)
+            yield
+              assertEquals(count, 2)
+              assertEquals(bad, None)
+              assertEquals(state.rematchStartup, Some(PublicRematchStartup(PublicRematchStartupPhase.Active)))
+              assertEquals(plain.rematchStartup, None)
+            ).guarantee(resumed.list.flatMap(_.traverse_(_._2.stopForRestart)))
+          yield ()).guarantee(
+            sql"UPDATE play.rematch_successors SET initial_snapshot = ${corrupt.initialSnapshot.asJson} WHERE game_id = ${corrupt.gameId.value}::uuid".update.run
+              .transact(xa)
+              .void
+          )
+          _ <- games.traverse_(game =>
+            db.save(game.gameId, active.copy(status = GameStatus.Ended(GameOver(GameResult.Draw, Termination.Aborted))))
+          )
+          _ <- db.save(ordinary, active.copy(status = GameStatus.Ended(GameOver(GameResult.Draw, Termination.Aborted))))
+        yield ()
       }
     }
   }

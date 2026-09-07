@@ -140,6 +140,8 @@ object Cors:
       ci"if-none-match",
       ci"x-dicechess-csrf",
       ci"idempotency-key",
+      // Guest rematch sends its source-seat capability in this non-safelisted header. Listing it only lets the
+      // browser preflight an already allowed origin; RematchRoutes still verifies the token and seat server-side.
       ci"x-rematch-seat-token"
     )
 

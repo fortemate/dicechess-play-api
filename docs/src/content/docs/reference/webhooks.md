@@ -375,11 +375,15 @@ last ~3 s are left to the room's own forfeit) or the turn is no longer yours. Ev
 `min(your remaining clock, the server cap)`, and every attempt is counted separately in
 [your delivery stats](#how-to-see-what-is-happening) — a recovered turn reads as `http_502` followed by `applied`.
 
-Two consequences worth designing for:
+Three consequences worth designing for:
 
-- The envelope of a retry is **identical** to the one that was lost, `state.version` included — so a retry can make
-  your bot compute the same turn twice. Only one answer is ever applied (a submission for a turn you have already
-  played is refused by the room, exactly as today); dedupe by `state.version` if you would rather not spend the CPU.
+- A retry is the same pending decision, so **`state.version` is unchanged** — but the envelope is not a stored copy of
+  the one that was lost. It is rebuilt from a fresh snapshot and signed again, so the signature and timestamp headers
+  differ, and `clocks` shows what your clock has left **now**, after the failed attempt. The retry's clock is the
+  authoritative budget for the retry; never size your thinking from a value carried over from an earlier delivery.
+- A retry can therefore make your bot compute the same turn twice. Only one answer is ever applied (a submission for a
+  turn you have already played is refused by the room, exactly as today). If you would rather not spend the CPU, cache
+  your decision under `state.version` and answer every delivery carrying that version with it.
 - The recovery budget is still your clock, not a queue: nothing is stored, nothing is redelivered after the
   turn ends, and a bot that stays unreachable still forfeits on time — just after several attempts instead of one.
 

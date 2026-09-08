@@ -26,11 +26,14 @@
 # quietly.
 #
 # It therefore has a real side effect: ONE casual game against a catalog bot, played by a synthetic
-# guest id. Nobody moves, so it ends on its own clock (default 60s) and lands in `game_results` as
-# a timeout loss for that guest. Rated is never requested and could not apply anyway — a guest seat
-# is always casual (#279) — so nothing reaches a rating. Set PLAY_GAME=0 to stop after the
-# read-only steps when even that row is unwanted; the check then no longer covers the resolvers,
-# which is the whole reason it exists.
+# guest id. Nobody moves, so it ends on its own clock (default 300s, a Blitz control matching
+# RatingCategory.Default reported on the catalog card) and lands in `game_results` as a timeout loss
+# for that guest. Rated is never requested and could not apply anyway — a guest seat is always casual
+# (#279) — so nothing reaches a rating. Set PLAY_GAME=0 to stop after the read-only steps when even
+# that row is unwanted; the check then no longer covers the resolvers, which is the whole reason it
+# exists. Overriding CLOCK_SECONDS to a non-Blitz control (e.g. 60s Bullet) will report a missing
+# seat rating as PASS (PARTIAL) if the deployment has no settled ratings in that speed category,
+# because provisional on the card refers to Blitz.
 #
 # Usage:
 #   BASE_URL=https://api.fortemate.com scripts/post-deploy-check.sh
@@ -42,7 +45,18 @@ BASE_URL="${BASE_URL:?set BASE_URL, e.g. BASE_URL=https://api.fortemate.com scri
 BASE_URL="${BASE_URL%/}"
 EXPECT_VERSION="${EXPECT_VERSION:-}"
 PLAY_GAME="${PLAY_GAME:-1}"
-CLOCK_SECONDS="${CLOCK_SECONDS:-60}"
+CLOCK_SECONDS="${CLOCK_SECONDS:-300}"
+
+# Category boundaries mirror src/main/scala/dicechess/play/core/RatingCategory.scala (Bullet < 180s, Blitz < 480s, Rapid >= 480s).
+# Catalog cards report a rating in RatingCategory.Default (blitz).
+CARD_CATEGORY="blitz"
+if [ "$CLOCK_SECONDS" -lt 180 ]; then
+  GAME_CATEGORY="bullet"
+elif [ "$CLOCK_SECONDS" -lt 480 ]; then
+  GAME_CATEGORY="blitz"
+else
+  GAME_CATEGORY="rapid"
+fi
 
 command -v jq >/dev/null || { echo "check: FAIL — jq is required (mise run setup installs it)" >&2; exit 1; }
 
@@ -142,10 +156,17 @@ jq -e 'has("rated")' <<<"$HTTP_BODY" >/dev/null || die "the live state does not 
 
 if [ "$PROVISIONAL" = "false" ]; then
   RATING=$(jq -r '.players.black.rating // empty' <<<"$HTTP_BODY")
-  [ -n "$RATING" ] || die "a settled bot carried no rating — settledRatingsByExternalId returned nothing"
-  say "settled seat rating resolved from the database — $RATING"
-  say "the game ends on its own clock in ~${CLOCK_SECONDS}s; it is casual and reaches no rating"
-  say "PASS"
+  if [ -n "$RATING" ]; then
+    say "settled seat rating resolved from the database — $RATING"
+    say "the game ends on its own clock in ~${CLOCK_SECONDS}s; it is casual and reaches no rating"
+    say "PASS"
+  elif [ "$GAME_CATEGORY" != "$CARD_CATEGORY" ]; then
+    say "the game ends on its own clock in ~${CLOCK_SECONDS}s; it is casual and reaches no rating"
+    say "PASS (PARTIAL) — catalog card provisional refers to $CARD_CATEGORY but game control is $GAME_CATEGORY, so no seat rating was expected and"
+    say "                settledRatingsByExternalId was NOT exercised by this run"
+  else
+    die "a settled bot carried no rating — settledRatingsByExternalId returned nothing"
+  fi
 else
   # Not a failure — a catalog can legitimately hold only freshly opened bots — but it must not read
   # as a full pass either: the query this check exists for did not run.

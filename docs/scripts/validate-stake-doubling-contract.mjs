@@ -186,6 +186,8 @@ assert(
 for (const [name, state] of [
   ["state-opportunity", stateOpportunity],
   ["state-response", stateResponse],
+  ["webhook-opportunity", fixture("examples/webhook-opportunity.json").state],
+  ["webhook-decision", fixture("examples/webhook-decision.json").state],
 ]) {
   for (const [seatName, player] of Object.entries(state.players ?? {})) {
     if (player?.kind === "Human") {
@@ -316,6 +318,14 @@ accepts(
   "#/$defs/DoubleOpportunityResponse",
   mutated(fixture("examples/webhook-opportunity-response.json"), (r) => (r.armDrawOffer = true)),
   "opportunity response with armDrawOffer",
+);
+rejects(
+  "#/$defs/DoubleOpportunityResponse",
+  mutated(fixture("examples/webhook-opportunity-response.json"), (r) => {
+    r.offerDouble = true;
+    r.armDrawOffer = true;
+  }),
+  "opportunity response with both offerDouble and armDrawOffer",
 );
 accepts(
   "#/$defs/DoubleOpportunityResponse",

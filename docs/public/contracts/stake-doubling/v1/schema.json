@@ -459,7 +459,14 @@
         "resign": { "type": "boolean" },
         "armDrawOffer": { "type": "boolean" }
       },
-      "required": ["decisionId", "offerDouble"]
+      "required": ["decisionId", "offerDouble"],
+      "if": {
+        "properties": { "armDrawOffer": { "const": true } },
+        "required": ["armDrawOffer"]
+      },
+      "then": {
+        "properties": { "offerDouble": { "const": false } }
+      }
     },
     "DoubleDecisionWebhook": {
       "type": "object",

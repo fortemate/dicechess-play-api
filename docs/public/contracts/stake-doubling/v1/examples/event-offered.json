@@ -5,6 +5,10 @@
     "by": "White",
     "to": "Black",
     "currentStake": 10,
-    "proposedStake": 20
+    "proposedStake": 20,
+    "clocks": {
+      "white": 295000,
+      "black": 300000
+    }
   }
 }

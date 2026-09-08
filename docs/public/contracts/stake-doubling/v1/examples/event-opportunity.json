@@ -5,6 +5,10 @@
     "seat": "White",
     "mayOfferDouble": true,
     "currentStake": 10,
-    "proposedStake": 20
+    "proposedStake": 20,
+    "clocks": {
+      "white": 300000,
+      "black": 300000
+    }
   }
 }

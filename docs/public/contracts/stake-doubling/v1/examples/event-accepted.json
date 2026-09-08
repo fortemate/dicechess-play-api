@@ -5,6 +5,10 @@
     "by": "Black",
     "currentStake": 20,
     "cubeValue": 2,
-    "cubeOwner": "Black"
+    "cubeOwner": "Black",
+    "clocks": {
+      "white": 295000,
+      "black": 295000
+    }
   }
 }

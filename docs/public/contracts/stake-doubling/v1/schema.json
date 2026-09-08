@@ -350,9 +350,10 @@
             "seat": { "$ref": "#/$defs/Seat" },
             "mayOfferDouble": { "const": true },
             "currentStake": { "$ref": "#/$defs/Stake" },
-            "proposedStake": { "$ref": "#/$defs/Stake" }
+            "proposedStake": { "$ref": "#/$defs/Stake" },
+            "clocks": { "$ref": "#/$defs/Clocks" }
           },
-          "required": ["v", "decisionId", "seat", "mayOfferDouble", "currentStake", "proposedStake"]
+          "required": ["v", "decisionId", "seat", "mayOfferDouble", "currentStake", "proposedStake", "clocks"]
         }
       },
       "required": ["DoubleOpportunity"]
@@ -370,9 +371,10 @@
             "by": { "$ref": "#/$defs/Seat" },
             "to": { "$ref": "#/$defs/Seat" },
             "currentStake": { "$ref": "#/$defs/Stake" },
-            "proposedStake": { "$ref": "#/$defs/Stake" }
+            "proposedStake": { "$ref": "#/$defs/Stake" },
+            "clocks": { "$ref": "#/$defs/Clocks" }
           },
-          "required": ["v", "offerId", "by", "to", "currentStake", "proposedStake"]
+          "required": ["v", "offerId", "by", "to", "currentStake", "proposedStake", "clocks"]
         }
       },
       "required": ["DoubleOffered"]
@@ -390,9 +392,10 @@
             "by": { "$ref": "#/$defs/Seat" },
             "currentStake": { "$ref": "#/$defs/Stake" },
             "cubeValue": { "type": "integer", "enum": [2, 4, 8, 16, 32, 64] },
-            "cubeOwner": { "$ref": "#/$defs/Seat" }
+            "cubeOwner": { "$ref": "#/$defs/Seat" },
+            "clocks": { "$ref": "#/$defs/Clocks" }
           },
-          "required": ["v", "offerId", "by", "currentStake", "cubeValue", "cubeOwner"]
+          "required": ["v", "offerId", "by", "currentStake", "cubeValue", "cubeOwner", "clocks"]
         }
       },
       "required": ["DoubleAccepted"]
@@ -410,9 +413,10 @@
             "by": { "$ref": "#/$defs/Seat" },
             "currentStake": { "$ref": "#/$defs/Stake" },
             "proposedStake": { "$ref": "#/$defs/Stake" },
-            "reason": { "type": "string", "enum": ["declined", "timeout", "disconnect"] }
+            "reason": { "type": "string", "enum": ["declined", "timeout", "disconnect", "resign"] },
+            "clocks": { "$ref": "#/$defs/Clocks" }
           },
-          "required": ["v", "offerId", "by", "currentStake", "proposedStake", "reason"]
+          "required": ["v", "offerId", "by", "currentStake", "proposedStake", "reason", "clocks"]
         }
       },
       "required": ["DoubleDeclined"]
@@ -452,7 +456,8 @@
       "properties": {
         "decisionId": { "$ref": "#/$defs/DecisionId" },
         "offerDouble": { "type": "boolean" },
-        "resign": { "type": "boolean" }
+        "resign": { "type": "boolean" },
+        "armDrawOffer": { "type": "boolean" }
       },
       "required": ["decisionId", "offerDouble"]
     },

@@ -50,9 +50,14 @@ final private case class WebhookNonceEcho(nonce: String) derives Codec.AsObject
   * clock allows (#119; see [[Webhooks.Config.retryBackoff]] for the incident that named the schedule). Still no
   * dead-letter and no dispatcher state: a retry lives entirely in the per-(game, seat) runner's own stack.
   *
-  * '''Delivery rate is structurally bounded''': a bot receives at most one POST per turn of a game it is seated in,
-  * games are bounded by the scheduler's pair cap and the challenge flow — there is no queue an attacker could pump. The
-  * registration endpoint (the only caller-triggered outbound POST) carries its own per-IP limiter in the routes.
+  * '''Delivery rate is structurally bounded''': a bot receives at most one POST per turn of a game it is seated in —
+  * plus, since #119, that turn's transport retries, spaced by [[Webhooks.Config.retryBackoff]] and ending when the turn
+  * does. The turn itself is bounded under every time control: a clocked seat by its own clock (`retryClockFloor` leaves
+  * the last seconds to the room's forfeit), a clockless one by the room's anti-abandonment cap
+  * (`GameRoom.DefaultIdleCheck`, 120 s), after which the game has ended and the next `deliver` finds nothing to do. So
+  * the retries are a small constant factor on an already-bounded rate, not a queue an attacker could pump; games
+  * themselves are bounded by the scheduler's pair cap and the challenge flow. The registration endpoint (the only
+  * caller-triggered outbound POST) carries its own per-IP limiter in the routes.
   *
   * The scan loop discovers rooms via `registry.list` (cheap: an in-memory map), so webhook runners attach for games
   * however they started — challenge, seek, ladder scheduler — and re-attach automatically after a restart's `resume`.
@@ -286,7 +291,7 @@ final class Webhooks private (
               outcome <- classifyDrawDecision(id, seat, room, bot, hook, attempt, plan)
               _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
               _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
-              _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan, retries)
+              _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan)
             yield ()
           }
         else if isOurTurn then {
@@ -301,7 +306,7 @@ final class Webhooks private (
             outcome <- classifyTurn(id, seat, room, bot, hook, attempt, plan)
             _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
             _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
-            _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan, retries)
+            _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan)
           yield ()
         } else IO.unit
     }
@@ -338,6 +343,9 @@ final class Webhooks private (
     * belonged to a generation that no longer exists — the current one has not been asked yet), and a transport retry
     * sleeps its backoff step first. A stale outcome therefore consumes the retry plan rather than adding to it, and
     * starts the fresh generation's attempt counter at zero: its first request is its first attempt.
+    *
+    * The next attempt's index is read off the plan rather than passed alongside it: `RetryStep.attempt` IS
+    * `retries + 1`, and carrying it twice would let the sleep and the log line drift apart.
     */
   private def deliverAgain(
       id: GameId,
@@ -346,11 +354,10 @@ final class Webhooks private (
       bot: Principal.Bot,
       lastVersion: Ref[IO, Long],
       outcome: DeliveryOutcome,
-      plan: Option[RetryStep],
-      retries: Int
+      plan: Option[RetryStep]
   ): IO[Unit] =
     if outcome == DeliveryOutcome.StaleRegistration then IO.cede *> deliver(id, room, seat, bot, lastVersion)
-    else plan.traverse_(step => IO.sleep(step.delay) *> deliver(id, room, seat, bot, lastVersion, retries + 1))
+    else plan.traverse_(step => IO.sleep(step.delay) *> deliver(id, room, seat, bot, lastVersion, step.attempt))
 
   /** The one log line a planned retry emits, in place of the terminal "(clock decides)" the same failure used to print:
     * same reason text, different ending, so `grep` over a game's log reads as the sequence of attempts it was.

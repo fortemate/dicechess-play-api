@@ -997,28 +997,32 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       fixture <- retryFixture("dead-retrying", initialSeconds = 2)
       (registry, store, room, _, calls, statsStore) = fixture
       forfeitConfig                                 = retryConfig.copy(retryBackoff = List(200.millis))
-      over <- Webhooks
+      observed <- Webhooks
         .create(registry, store, dead, forfeitConfig, allowAll, statsStore)
         .use { webhooks =>
           webhooks.statsLoop.background.use { _ =>
-            webhooks.attachSweep *>
-              room.result.timeoutTo(
+            for
+              _    <- webhooks.attachSweep
+              over <- room.result.timeoutTo(
                 20.seconds,
                 IO.raiseError(new RuntimeException("the room hung instead of flagging the dead webhook"))
               )
+              // Both counts are taken INSIDE the service's scope on purpose: releasing the resource cancels every
+              // supervised runner, so a count read after `use` would freeze for that reason and prove nothing about
+              // the loop. Several backoff steps have to pass here with the counter still, on its own.
+              atEnd    <- attempts.get
+              _        <- IO.sleep(10 * forfeitConfig.retryBackoff.head)
+              afterEnd <- attempts.get
+            yield (over, atEnd, afterEnd)
           }
         }
-      // The runner is cancelled with the resource above, so this proves the loop had already stopped on its own:
-      // the count is taken after the game ended and must not move while the last backoff step would still be due.
-      duringGame <- attempts.get
-      _          <- IO.sleep(1.second)
-      afterGame  <- attempts.get
-      recorded   <- calls.get
+      (over, atEnd, afterEnd) = observed
+      recorded <- calls.get
     yield
       assertEquals(over.termination, Termination.Timeout)
       assertEquals(over.result, GameResult.Win(Side.Black), "the webhook seat (White) must lose on time")
-      assert(duringGame > 1, s"the delivery was not retried before the clock ran out: $duringGame attempt(s)")
-      assertEquals(afterGame, duringGame, "a retry was still in flight after the game ended")
+      assert(atEnd > 1, s"the delivery was not retried before the clock ran out: $atEnd attempt(s)")
+      assertEquals(afterEnd, atEnd, "the retry loop kept delivering after the game ended")
       assert(
         recorded.nonEmpty && recorded.forall(_._3 == DeliveryOutcome.Unreachable),
         s"every attempt must be recorded as its own unreachable delivery: $recorded"
@@ -1094,6 +1098,62 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       assertEquals(decision.seat, Seat.Black)
       assert(decision.state.drawOffer.exists(_.pending), "the decision envelope must carry the pending offer")
       assert(!decision.state.dicePending, "a capable bot decides before it sees any dice")
+
+  test("an Unlimited seat has no clock to floor, so the room's end of turn is what stops the retries (#119)"):
+    // A clockless seat never trips `retryClockFloor` — `budget` is `None` and `forall` is vacuously true — so what
+    // bounds the loop there is the room, not the schedule: `deliver` re-reads the snapshot and does nothing once the
+    // game is no longer Active. In production the room reaches that state by itself, via the 120 s anti-abandonment
+    // cap `GameRoom.deadlineFor` applies to an Unlimited turn (`DefaultIdleCheck`); this test reaches the same state
+    // in milliseconds by ending the game outright, because a registry-made room always gets the 120 s default.
+    for
+      attempts <- Ref.of[IO, Int](0)
+      down = Client[IO](_ =>
+        cats.effect.Resource.eval(
+          attempts.update(_ + 1).as(Response[IO](Status.InternalServerError))
+        )
+      )
+      registry            <- GameRegistry.create(store = GameStore.noop)
+      store               <- WebhookStore.inMemory
+      (calls, statsStore) <- capturingStats
+      hooked: Principal.Bot   = Principal.Bot("hooks", "unlimited-500")
+      opponent: Principal.Bot = Principal.Bot("acme", "idle-unlimited")
+      _    <- store.put(BotWebhook(hooked.team, hooked.name, "https://down.example/hook", "s" * 64, Instant.EPOCH))
+      made <- registry.createWithDice(hooked, opponent, alwaysMovableDice, TimeControl.Unlimited)
+      room = made.toOption.get._2
+      _        <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _        <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      observed <- Webhooks
+        .create(registry, store, down, retryConfig, allowAll, statsStore)
+        .use { webhooks =>
+          webhooks.statsLoop.background.use { _ =>
+            for
+              _ <- webhooks.attachSweep
+              // Several attempts with no clock in sight: the loop really is running unbounded by any budget…
+              retried <- attempts.get
+                .iterateUntil(_ >= 3)
+                .timeoutTo(10.seconds, IO.raiseError(new RuntimeException("a clockless seat was never retried")))
+              // …and this is the only thing that ends it. Everything below stays inside the service's scope:
+              // releasing it cancels the runner, which would freeze the counter for the wrong reason.
+              _ <- room.submit(Seat.White, GameCommand.Resign)
+              _ <- room.result.timeoutTo(
+                10.seconds,
+                IO.raiseError(new RuntimeException("the room never reached a terminal state"))
+              )
+              atEnd    <- attempts.get
+              _        <- IO.sleep(20 * retryConfig.retryBackoff.head)
+              afterEnd <- attempts.get
+            yield (retried, atEnd, afterEnd)
+          }
+        }
+      (retried, atEnd, afterEnd) = observed
+      recorded <- calls.get
+    yield
+      assert(retried >= 3, s"expected the clockless seat to be retried, got $retried attempt(s)")
+      assertEquals(afterEnd, atEnd, "the retry loop kept delivering after the game ended")
+      assert(
+        recorded.nonEmpty && recorded.forall(_._3 == DeliveryOutcome.HttpStatus(500)),
+        s"every attempt must be recorded as its own 500: $recorded"
+      )
 
   test("a 502 on a drawDecision leaves the offer pending for the retry to answer (#119)"):
     // Same script as the accepting-draw test above: White auto-passes, Black plays, White then offers a draw, which

@@ -5,6 +5,10 @@
     "by": "Black",
     "currentStake": 10,
     "proposedStake": 20,
-    "reason": "declined"
+    "reason": "declined",
+    "clocks": {
+      "white": 295000,
+      "black": 295000
+    }
   }
 }

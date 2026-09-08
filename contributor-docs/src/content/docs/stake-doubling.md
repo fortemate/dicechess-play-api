@@ -225,16 +225,22 @@ neutral command vocabulary becomes:
 ```
 
 The event vocabulary becomes `DoubleOpportunity`, `DoubleOffered`, `DoubleAccepted`, and
-`DoubleDeclined`. A declined event carries a machine-readable reason. `GameEnded.termination` remains
-the factual game termination and gains one additive member, `DoubleDeclined`, used only for an explicit
-decline; timeout and disconnect keep `Timeout` and `Resign`. Adding the member is an additive change to
-the live AsyncAPI `GameEnded` enum and to the OpenAPI `GameHistory.termination` vocabulary
-(`double_declined`), delivered with the transport and persistence work; clients must already tolerate
-unknown termination values. The Bot API exposes equivalent synchronous REST actions and two signed
-webhook delivery types:
+`DoubleDeclined`. Each cube event carries the authoritative `clocks` snapshot (`{ white, black }` or `null`
+on `Unlimited`). A declined event carries a machine-readable reason (`declined`, `timeout`, `disconnect`,
+or `resign`). When the responder resigns during a pending offer, `DoubleDeclined{reason: "resign"}` is
+emitted immediately before `GameEnded` to terminate the cube episode cleanly on stream and socket.
+`GameEnded.termination` remains the factual game termination and gains one additive member,
+`DoubleDeclined`, used only for an explicit decline; timeout, disconnect, and resignation keep `Timeout`
+and `Resign`. Adding the member is an additive change to the live AsyncAPI `GameEnded` enum and to the
+OpenAPI `GameHistory.termination` vocabulary (`double_declined`), delivered with the transport and
+persistence work; clients must already tolerate unknown termination values. The Bot API exposes
+equivalent synchronous REST actions and two signed webhook delivery types:
 
-- `doubleOpportunity` -> `{ "decisionId": "...", "offerDouble": false }` (false means roll);
-- `doubleDecision` -> `{ "decisionId": "...", "acceptDouble": false }`.
+- `doubleOpportunity` -> `{ "decisionId": "...", "offerDouble": false }` (false means roll; optional
+  `resign: true` to forfeit immediately, optional `armDrawOffer: true` to arm the standing draw-offer
+  flag for the roll);
+- `doubleDecision` -> `{ "decisionId": "...", "acceptDouble": false }` (optional `resign: true` to
+  resign during the response phase).
 
 Both contexts are dice-free. `yourTurn` is delivered only after `DiceRolled` and continues to use the
 existing move response. The runtime maps the two new deliveries to independent optional strategy
@@ -360,6 +366,102 @@ The GO decision is decomposed into independently mergeable work:
 - [play-api #64](https://github.com/fortemate/dicechess-play-api/issues/64) — the human-only rollout
   gate, natively blocked by every required server, runtime, analytics, client, release, and compatible
   bot predecessor.
+
+## Addendum: Owner requirements, HvH staked admission, and protocol refinements (2026-09-08)
+
+Following the initial acceptance of ADR-0019, cross-repository design work in ADR 006 (fortemate-internal
+`content/decisions/adr-006-resign-draw-and-doubling-protocol.md`, issue #108) and HvH offer/accept
+coordination (`play-api#8`, ADR 007) mapped open questions and owner requirements into normative
+addenda. The additions below refine the v1 contract:
+
+### 1. Roll-button policy (Policy A)
+
+Two roll policies were evaluated for turns where the active player cannot double:
+
+- **Policy A (accepted):** The pre-roll decision step opens only when the turn owner is eligible to
+  offer (`mayOfferDouble = true`). If the seat is ineligible—because the cube belongs to the opponent or
+  has reached `maximumMultiplier`—the server automatically rolls and proceeds immediately to `DiceRolled`.
+  Clients render this directly from `doubling.decision`: when no decision is present, the interface displays
+  a non-blocking indicator (e.g. "Cube belongs to opponent, rolled automatically").
+- **Policy B (rejected):** An explicit pre-roll step on every turn requiring manual roll confirmation.
+  Rejected because it creates an artificial participant-type bifurcation in the room state machine and
+  violates the schema invariant `kind: offer => mayOfferDouble: true`.
+
+A future client-side preference ("always roll manually in staked games") may sit on top of Policy A
+without changing the server state machine or wire protocol.
+
+### 2. Human-versus-Human (HvH) staked admission via offer/accept
+
+Staked games require that both seats belong to authenticated accounts (or registered bots with the
+`doubling` capability), and that both participants hold pre-reserved exposure
+(`initialStake * maximumMultiplier`) before the room exists.
+
+- **Classic friend links remain un-staked:** The existing friend-by-link flow (`POST /games`), where the
+  creator claims one seat and holds the second seat for an anonymous claim, remains classic-only.
+- **Strict offer/accept progression:** Staked HvH games enter exclusively through the offer/accept
+  protocol designed in `play-api#8` / ADR 007, staged in the following order:
+  1. Direct challenge to a specific authenticated account, and rematch between the same two participants
+     (inheriting time control, resetting the cube to 1 centered and resetting stake to base);
+  2. Link invitation with a known, authenticated second participant;
+  3. Open seeks with stake.
+- **Reservation and acknowledgement:** Both seats reserve maximum exposure before room instantiation. The
+  accepting participant must echo the full `stake` object; any missing or mismatched stake is rejected with
+  `409 stake acknowledgement required`. Anonymous accepters are rejected with `403 Forbidden`.
+
+### 3. Bounded time control for human seats
+
+To prevent indefinite capital lockup in staked games:
+
+- Human seats in staked games require a bounded time control (`Fischer`, `SuddenDeath`, or `PerMove`).
+- `Unlimited` time control is restricted to registered bot-versus-bot challenges.
+
+### 4. Clocks on cube stream events
+
+To prevent client-side clock drift during decision actor transitions, all four doubling stream events
+carry the authoritative `clocks` snapshot (`{ white, black }` or `null` for `Unlimited`):
+
+- `DoubleOpportunity`: includes `clocks` as of the opportunity opening.
+- `DoubleOffered`: includes `clocks` with elapsed offer time charged to the turn owner, while the responder's
+  clock remains untouched.
+- `DoubleAccepted`: includes `clocks` charging elapsed response time to the responder (without increment),
+  leaving the turn owner's clock paused.
+- `DoubleDeclined`: includes `clocks` reflecting elapsed response time charged to the responder.
+
+### 5. Responder resignation during double response (`DoubleDeclined{reason: "resign"}`)
+
+When a responder resigns while a `doubleResponse` step is pending:
+
+- The responder forfeits at the pre-offer `currentStake`, matching standard resignation settlement.
+- Before publishing the terminal `GameEnded(Resign, ...)`, the room emits
+  `DoubleDeclined{reason: "resign", clocks}` to cleanly close the open cube episode on stream and socket.
+- The machine-readable decline `reason` enum is `["declined", "timeout", "disconnect", "resign"]`.
+
+### 6. Answer members: `resign` and `armDrawOffer`
+
+Webhook delivery responses and client decision commands support additional action members:
+
+- `resign: true`: Accepted on both `doubleOpportunity` and `doubleDecision` responses, triggering an
+  immediate resignation.
+- `armDrawOffer: true`: Accepted on `doubleOpportunity` responses. When returned by an eligible seat, the
+  server arms the standing `drawOfferArmed` flag for the upcoming turn before rolling. This guarantees
+  that webhook bots in staked games can offer draws even across forced passes without needing extra
+  out-of-band requests.
+
+### 7. Poll-only bot decision visibility (`GET /bot/games`)
+
+To eliminate blind spots for poll-only bots during doubling episodes:
+
+- `GET /bot/games` reports the caller's active decision via the `decision` member:
+  `null`, `{"kind": "drawResponse"}`, `{"kind": "doubleOffer", "id": "double_..."}`, or
+  `{"kind": "doubleResponse", "id": "double_..."}`.
+- Poll-only bots observe pending opportunities and offers directly without inferring state from dice absence.
+
+### 8. Fixture hygiene and capability reservation
+
+- Staked decision state fixtures render authenticated human participants with explicit nicknames
+  (`name: "alice"`), resolving the previous guest mask artifact (`name: null`).
+- The canonical `doubling` capability remains `reserved` and unselectable. No live routes, admission
+  surfaces, or room state transitions are enabled until the human-only rollout gate (`play-api#64`).
 
 ## Consequences
 

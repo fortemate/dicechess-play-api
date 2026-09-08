@@ -15,7 +15,7 @@
     "clientSeeds": null,
     "legalMoves": null,
     "players": {
-      "white": { "kind": "Human", "name": null, "rating": null },
+      "white": { "kind": "Human", "name": "alice", "rating": null },
       "black": { "kind": "Bot", "name": "acme aggressive", "rating": null }
     },
     "rated": false,

@@ -45,6 +45,16 @@ capabilities exist nowhere else in the protocol. Poll-only bots and the static `
 register webhooks, so they cannot be seated in a staked game. The REST actions and stream events below
 are an alternative channel for admitted bots and for human clients, not a way in.
 
+Human-versus-human staked admission is restricted to the offer/accept protocol (ADR 007 / `play-api#8`),
+ordered as: (1) direct challenge to a specific account and rematch between the same two participants;
+(2) link invitation with a known second participant; (3) open seeks with stake. Both seats must reserve
+maximum exposure (`initialStake * maximumMultiplier`) before the room exists. The accepting participant
+must echo the full `stake` object (`409 stake acknowledgement required` on divergence or omission);
+anonymous accepters receive `403 Forbidden`. Friend-by-link `POST /games` remains classic-only.
+
+Human seats require a bounded time control (`Fischer`, `SuddenDeath`, or `PerMove`). `Unlimited` time
+control is restricted to bot-versus-bot challenges.
+
 ## Creation opt-in
 
 The first version adds `stake` to authenticated `POST /lobby/play-bot` requests. `guestId` keeps its
@@ -61,7 +71,8 @@ offer; an omitted `timeControl` keeps the live `Unlimited` default:
 The whole `stake` object is required when present. There are no partial defaults. `maximumMultiplier`
 must be one of `2, 4, 8, 16, 32, 64`, and the server validates the maximum amount without integer
 overflow. `rated: true`, a guest, unavailable durable storage or settlement, a bot without an active
-`doubling` webhook, or an unsupported creation surface is rejected rather than downgraded.
+`doubling` webhook, an unbounded time control for a human seat, or an unsupported creation surface is
+rejected rather than downgraded.
 
 ## Public game state
 
@@ -70,7 +81,8 @@ schema names the pre-roll shape `StakedDecisionSnapshot`: the live `PublicGameSt
 present, `dicePending: false`, and `legalMoves: null`. Classic and post-roll snapshots keep the live
 `PublicGameState` shape, which gains the optional nullable `doubling` member.
 
-Before White rolls, an offer is legal:
+Before White rolls, an offer is legal. Authenticated human seats carry their account nickname (e.g. `alice`),
+distinguishing them from the classic guest mask (`name: null`):
 
 <ContractFixture name="state-opportunity" />
 
@@ -132,13 +144,17 @@ server wait may fall back to `202`; the stream or snapshot remains authoritative
 
 ## Stream events
 
-An eligible staked pre-roll phase publishes a dice-free opportunity at the current version. If the cube
-belongs to the opponent or has reached the configured cap, the existing automatic roll path continues
-without a decision:
+The server follows Roll Policy A: an eligible staked pre-roll phase publishes a dice-free opportunity
+at the current version. If the cube belongs to the opponent or has reached the configured multiplier cap,
+the server automatically rolls and continues without creating a decision. A client preference ("always roll
+manually in staked games") may sit on top of Policy A without changing the server state machine.
+
+All four doubling stream events carry the authoritative `clocks` snapshot (`{ white, black }` or `null`
+on `Unlimited`), preventing client clock drift during decision actor transitions:
 
 <ContractFixture name="event-opportunity" />
 
-Offering, taking, and dropping each commit one version:
+Offering, taking, and dropping each commit one version with authoritative clocks:
 
 <ContractFixture name="event-offered" />
 
@@ -146,9 +162,12 @@ Offering, taking, and dropping each commit one version:
 
 <ContractFixture name="event-declined" />
 
-`reason` is `declined`, `timeout`, or `disconnect`. Only an explicit `declined` response ends the game
-with the new `DoubleDeclined` termination, an additive member of `GameEnded.termination`; timeout and
-disconnect keep their factual `Timeout` and `Resign` terminations while settling the same current
+`reason` is `declined`, `timeout`, `disconnect`, or `resign`. When the responder resigns while a double
+response is pending, the server emits `DoubleDeclined{reason: "resign", clocks}` immediately before
+`GameEnded` so that the cube episode terminates cleanly on stream and socket before termination
+settlement (at the pre-offer `currentStake`). Only an explicit `declined` response ends the game with the
+new `DoubleDeclined` termination, an additive member of `GameEnded.termination`; timeout, disconnect,
+and resignation keep their factual `Timeout` and `Resign` terminations while settling the same current
 stake. Clients must tolerate unknown termination values, as they already should.
 
 ## Webhook deliveries
@@ -162,11 +181,17 @@ Offer or roll:
 
 <ContractFixture name="webhook-opportunity-response" />
 
+The `doubleOpportunity` response accepts optional `resign: true` to forfeit immediately, and optional
+`armDrawOffer: true` to arm the standing draw-offer flag for the turn being rolled (allowing webhook bots
+to offer draws even across forced passes).
+
 Take or drop:
 
 <ContractFixture name="webhook-decision" />
 
 <ContractFixture name="webhook-decision-response" />
+
+The `doubleDecision` response accepts optional `resign: true` to forfeit during the response phase.
 
 Transport failures are never read as a financial action, and the two deliveries fail differently. A
 missing, malformed, oversized, late, non-200, or wrong-kind answer to `doubleOpportunity` is treated
@@ -174,6 +199,10 @@ exactly like `offerDouble: false`: the server rolls, as it does after a failed `
 failure on `doubleDecision` is never read as an acceptance or a decline: the decision stays pending and
 the responder's clock decides. Runtime strategy defaults explicitly return `offerDouble: false` and
 `acceptDouble: false` only when the callback itself succeeds.
+
+Poll-only bots observe pending decisions via `GET /bot/games`, where the `decision` property reports
+`null`, `{"kind": "drawResponse"}`, `{"kind": "doubleOffer", "id": "..."}`, or
+`{"kind": "doubleResponse", "id": "..."}`.
 
 ## Ordering with draws, dice, and reconnects
 

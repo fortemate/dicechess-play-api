@@ -157,6 +157,47 @@ assert(
   stateResponse.clocks[responder] === stateOpportunity.clocks[responder],
   "the responder's clock is untouched until its phase begins",
 );
+assert(
+  canonical(opportunity.clocks) === canonical(stateOpportunity.clocks),
+  "opportunity event clocks must equal opportunity snapshot clocks",
+);
+assert(
+  canonical(offered.clocks) === canonical(stateResponse.clocks),
+  "DoubleOffered event clocks must equal response snapshot clocks",
+);
+assert(
+  accepted.clocks[owner] === offered.clocks[owner],
+  "accepted event must leave the offerer clock paused",
+);
+assert(
+  accepted.clocks[responder] <= offered.clocks[responder],
+  "accepted event must charge elapsed response time to the responder",
+);
+assert(
+  declined.clocks[owner] === offered.clocks[owner],
+  "declined event must leave the offerer clock paused",
+);
+assert(
+  declined.clocks[responder] <= offered.clocks[responder],
+  "declined event must charge elapsed response time to the responder",
+);
+
+// Authenticated human seats must carry a non-null nickname, not the guest mask null.
+for (const [name, state] of [
+  ["state-opportunity", stateOpportunity],
+  ["state-response", stateResponse],
+  ["webhook-opportunity", fixture("examples/webhook-opportunity.json").state],
+  ["webhook-decision", fixture("examples/webhook-decision.json").state],
+]) {
+  for (const [seatName, player] of Object.entries(state.players ?? {})) {
+    if (player?.kind === "Human") {
+      assert(
+        typeof player.name === "string" && player.name.trim().length > 0,
+        `${name}: authenticated human seat ${seatName} must carry a nickname`,
+      );
+    }
+  }
+}
 
 // Webhook deliveries carry exactly the snapshot a stream or GET /games/{id} would serve.
 assert(
@@ -240,6 +281,61 @@ rejects(
   "#/$defs/DoubleOpportunityWebhook",
   mutated(fixture("examples/webhook-opportunity.json"), (w) => (w.state = structuredClone(stateResponse))),
   "an opportunity delivery carrying a response decision",
+);
+
+// Event clock requirements and reason vocabulary.
+rejects(
+  "#/$defs/DoubleOpportunityEvent",
+  mutated(fixture("examples/event-opportunity.json"), (e) => delete e.DoubleOpportunity.clocks),
+  "an opportunity event without clocks",
+);
+rejects(
+  "#/$defs/DoubleOfferedEvent",
+  mutated(fixture("examples/event-offered.json"), (e) => delete e.DoubleOffered.clocks),
+  "an offer event without clocks",
+);
+rejects(
+  "#/$defs/DoubleAcceptedEvent",
+  mutated(fixture("examples/event-accepted.json"), (e) => delete e.DoubleAccepted.clocks),
+  "an accepted event without clocks",
+);
+rejects(
+  "#/$defs/DoubleDeclinedEvent",
+  mutated(fixture("examples/event-declined.json"), (e) => delete e.DoubleDeclined.clocks),
+  "a declined event without clocks",
+);
+accepts(
+  "#/$defs/DoubleDeclinedEvent",
+  mutated(fixture("examples/event-declined.json"), (e) => (e.DoubleDeclined.reason = "resign")),
+  "DoubleDeclined with reason resign",
+);
+rejects(
+  "#/$defs/DoubleDeclinedEvent",
+  mutated(fixture("examples/event-declined.json"), (e) => (e.DoubleDeclined.reason = "invalid")),
+  "DoubleDeclined with invalid reason",
+);
+accepts(
+  "#/$defs/DoubleOpportunityResponse",
+  mutated(fixture("examples/webhook-opportunity-response.json"), (r) => (r.armDrawOffer = true)),
+  "opportunity response with armDrawOffer",
+);
+rejects(
+  "#/$defs/DoubleOpportunityResponse",
+  mutated(fixture("examples/webhook-opportunity-response.json"), (r) => {
+    r.offerDouble = true;
+    r.armDrawOffer = true;
+  }),
+  "opportunity response with both offerDouble and armDrawOffer",
+);
+accepts(
+  "#/$defs/DoubleOpportunityResponse",
+  mutated(fixture("examples/webhook-opportunity-response.json"), (r) => (r.resign = true)),
+  "opportunity response with resign",
+);
+accepts(
+  "#/$defs/DoubleDecisionResponse",
+  mutated(fixture("examples/webhook-decision-response.json"), (r) => (r.resign = true)),
+  "decision response with resign",
 );
 
 const outcome = "#/$defs/DecisionOutcome";

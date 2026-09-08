@@ -246,6 +246,28 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       }
     loop.timeoutTo(5.seconds, IO.raiseError(new RuntimeException("deterministic White turn never became ready")))
 
+  /** White, driven by the room's own event stream instead of a polling loop: every roll that lands on White's side is
+    * answered with its first legal path plus a draw offer. The tree is read uncapped from the room (a three-pawn roll
+    * is never inlined) and checked against the roll it answers — `subscribe` can show one version twice, and a forced
+    * pass announces a roll with no legal turn.
+    */
+  private def whitePlays(room: GameRoom): IO[Unit] =
+    def play(version: Long): IO[Unit] =
+      room.legalMoves.flatMap { moves =>
+        val whiteToMove = EngineOps.parse(moves.dfen).exists(EngineOps.activeSeat(_) == Seat.White)
+        val ready       = moves.version == version && moves.dicePending && whiteToMove &&
+          moves.legalMoves.children.nonEmpty
+        room.submitTurn(Seat.White, firstPath(moves.legalMoves), offerDraw = true).void.whenA(ready)
+      }
+    room.subscribe
+      .evalMap {
+        case GameEvent.Snapshot(v, state, _) if state.activeSeat == Seat.White && state.dicePending => play(v)
+        case GameEvent.DiceRolled(v, Seat.White, _, _, _, _)                                        => play(v)
+        case _                                                                                      => IO.unit
+      }
+      .compile
+      .drain
+
   private def verifyRegistrationFence(mutation: RegistrationMutation): IO[Unit] =
     val webhookBot: Principal.Bot = Principal.Bot("hooks", s"fence-${mutation.label}")
     val opponent: Principal.Bot   = Principal.Bot("acme", s"opponent-${mutation.label}")
@@ -576,6 +598,10 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       )
 
   test("a dead endpoint forfeits on the clock without hanging the room"):
+    // Deliberately still the SINGLE-ATTEMPT path after #119: the transport retries are floored at
+    // `retryClockFloor` (3 s by default) and this game's whole clock is 2 s, so the very first failure is already
+    // below the floor and the runner hands the turn straight back to the room's forfeit. The retry loop's own
+    // behaviour — attempts, then a forfeit anyway — is asserted by "retries stop at the clock floor" below.
     val dead = Client[IO](_ => cats.effect.Resource.eval(IO.raiseError(new java.net.ConnectException("refused"))))
     // The scripted game (die faces: 1 = pawn, 2 = knight, 3 = bishop, 4 = rook, 5 = queen, 6 = king). Turn 0, White:
     // bishop/rook/queen have no legal turn from the initial position, so the room passes for White itself — a forced
@@ -795,6 +821,209 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       s"expected an Applied record for hooks/applied-stats, got: $recorded"
     )
 
+  // ── transport retries (#119) ─────────────────────────────────────────────────
+
+  /** The production schedule is 2 s → 5 s → 10 s → 20 s → every 30 s under a 3 s clock floor. These tests exercise
+    * exactly that code path with the numbers compressed, so a retry costs milliseconds of wall time instead of seconds;
+    * the schedule itself is data, and `Webhooks.Config.DefaultRetryBackoff` is what production reads.
+    */
+  private val retryConfig = Webhooks.Config(
+    timeout = 5.seconds,
+    scanEvery = 50.millis,
+    retryBackoff = List(20.millis),
+    retryClockFloor = 100.millis
+  )
+
+  /** Every roll is pawn/knight/bishop, so BOTH seats always have a real decision — no forced pass, therefore the
+    * webhook seat's clock starts on its very first turn and a delivery is owed immediately.
+    */
+  private val alwaysMovableDice = new DiceSource:
+    def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 2, 3)
+    def commit: String                                                       = "retry-commit"
+    def reveal: String                                                       = "retry-seed"
+
+  /** The 2026-09-06 shape: the first `failFirst` requests fail the way the tunnel failed, every later one answers a
+    * legal turn. `attempts` counts every request that actually reached the endpoint, which is what separates "the
+    * runner retried" from "the runner gave up". The registration is placed straight into the store, so this endpoint
+    * never sees the ownership handshake and (like `fencedEndpoint`) does its own thing with signatures — HMAC itself is
+    * covered by the full-game test.
+    */
+  private def flakyEndpoint(
+      registry: GameRegistry,
+      attempts: Ref[IO, Int],
+      failFirst: Int,
+      fail: IO[Response[IO]]
+  ): HttpApp[IO] =
+    HttpApp[IO] { req =>
+      req.bodyText.compile.string.flatMap { body =>
+        attempts.updateAndGet(_ + 1).flatMap { seen =>
+          if seen <= failFirst then fail
+          else
+            decode[WebhookEnvelope](body) match
+              case Left(_)         => IO.pure(Response[IO](Status.BadRequest))
+              case Right(envelope) => resolveMoves(registry, envelope).flatMap(moves => Ok(BotMove(moves).asJson))
+        }
+      }
+    }
+
+  /** A webhook-seated White (registered directly at the store seam) against a greedy Black on a real clock, plus the
+    * telemetry capture every retry assertion reads. Shared by the tests below so each states only its own endpoint.
+    */
+  private def retryFixture(
+      label: String,
+      initialSeconds: Int = 60
+  ): IO[
+    (
+        GameRegistry,
+        WebhookStore,
+        GameRoom,
+        BotConnection,
+        Ref[IO, List[(String, String, DeliveryOutcome, FiniteDuration)]],
+        WebhookStatsStore
+    )
+  ] =
+    for
+      registry            <- GameRegistry.create(store = GameStore.noop)
+      store               <- WebhookStore.inMemory
+      (calls, statsStore) <- capturingStats
+      hooked: Principal.Bot   = Principal.Bot("hooks", label)
+      opponent: Principal.Bot = Principal.Bot("acme", s"greedy-$label")
+      _    <- store.put(BotWebhook(hooked.team, hooked.name, "https://flaky.example/hook", "s" * 64, Instant.EPOCH))
+      made <- registry.createWithDice(hooked, opponent, alwaysMovableDice, TimeControl.SuddenDeath(initialSeconds))
+      room = made.toOption.get._2
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      driver = BotConnection(opponent, Seat.Black, BotRegistry.getAlgorithm("greedy").get)
+    yield (registry, store, room, driver, calls, statsStore)
+
+  /** Cleanup shared by the retry tests: resign and WAIT for the terminal state, so no room outlives its test (the same
+    * reason spelled out at length in "garbage and non-200 responses submit nothing").
+    */
+  private def settle(room: GameRoom): IO[Unit] =
+    room.submit(Seat.White, GameCommand.Resign) *>
+      room.result
+        .timeoutTo(10.seconds, IO.raiseError(new RuntimeException("the room never reached a terminal state")))
+        .void
+
+  test("a 502 is retried inside the turn and the retry's move is applied (#119)"):
+    for
+      fixture <- retryFixture("flaky-502")
+      (registry, store, room, driver, calls, statsStore) = fixture
+      attempts <- Ref.of[IO, Int](0)
+      endpoint = flakyEndpoint(registry, attempts, failFirst = 1, IO.pure(Response[IO](Status.BadGateway)))
+      recorded <- Webhooks
+        .create(registry, store, Client.fromHttpApp(endpoint), retryConfig, allowAll, statsStore)
+        .use(webhooks => awaitDelivery(driver, room, webhooks, calls, _.exists(_._3 == DeliveryOutcome.Applied)))
+      _ <- settle(room)
+    yield assertEquals(
+      recorded.map(_._3).takeWhile(_ != DeliveryOutcome.Applied),
+      List(DeliveryOutcome.HttpStatus(502)),
+      s"the 502 must be recorded as its own attempt and be followed by the applied retry: $recorded"
+    )
+
+  test("a delivery that times out is retried inside the turn (#119)"):
+    // The endpoint accepts the connection and then goes quiet for far longer than the per-attempt window, which is
+    // this server's own `TimedOut` — the outcome the tunnel's EOF could equally have produced.
+    val mute = IO.sleep(30.seconds) *> Ok("{}")
+    for
+      fixture <- retryFixture("flaky-timeout")
+      (registry, store, room, driver, calls, statsStore) = fixture
+      attempts <- Ref.of[IO, Int](0)
+      endpoint = flakyEndpoint(registry, attempts, failFirst = 1, mute)
+      recorded <- Webhooks
+        .create(
+          registry,
+          store,
+          Client.fromHttpApp(endpoint),
+          retryConfig.copy(timeout = 200.millis),
+          allowAll,
+          statsStore
+        )
+        .use(webhooks => awaitDelivery(driver, room, webhooks, calls, _.exists(_._3 == DeliveryOutcome.Applied)))
+      _ <- settle(room)
+    yield assertEquals(
+      recorded.map(_._3).takeWhile(_ != DeliveryOutcome.Applied),
+      List(DeliveryOutcome.TimedOut),
+      s"the timeout must be recorded as its own attempt and be followed by the applied retry: $recorded"
+    )
+
+  /** Drives one turn against an endpoint that answers `answer`, waits for `expected` to be recorded, then gives the
+    * runner many backoff intervals' worth of grace: whatever the endpoint said, exactly one request must ever have
+    * reached it. Answers the bot genuinely gave are final — retrying them would be this server second-guessing a
+    * decision, not recovering a lost message.
+    */
+  private def assertNotRetried(label: String, answer: IO[Response[IO]], expected: DeliveryOutcome): IO[Unit] =
+    for
+      fixture <- retryFixture(label)
+      (registry, store, room, driver, calls, statsStore) = fixture
+      attempts <- Ref.of[IO, Int](0)
+      endpoint = flakyEndpoint(registry, attempts, failFirst = Int.MaxValue, answer)
+      _ <- Webhooks
+        .create(registry, store, Client.fromHttpApp(endpoint), retryConfig, allowAll, statsStore)
+        .use { webhooks =>
+          awaitDelivery(driver, room, webhooks, calls, _.exists(_._3 == expected)) *>
+            IO.sleep(20 * retryConfig.retryBackoff.head)
+        }
+      seen     <- attempts.get
+      recorded <- calls.get
+      _        <- settle(room)
+    yield
+      assertEquals(seen, 1, s"$label: a final answer was delivered more than once: $recorded")
+      assertEquals(
+        recorded.map(_._3),
+        List(expected),
+        s"$label: expected exactly one $expected record, got: $recorded"
+      )
+
+  test("a 4xx is a final answer, not a transport failure — it is never retried (#119)"):
+    assertNotRetried("final-4xx", IO.pure(Response[IO](Status.BadRequest)), DeliveryOutcome.HttpStatus(400))
+
+  test("a deliberate decline is never retried (#119)"):
+    assertNotRetried("final-declined", Ok(BotMove(Nil).asJson), DeliveryOutcome.Declined)
+
+  test("a turn the room refuses is never retried (#119)"):
+    // `a1a1` is well-formed and decodes, so the answer reaches the room and the room rejects it — a `Refused`
+    // outcome, which is the bot having answered wrongly rather than not having answered at all.
+    assertNotRetried("final-refused", Ok(BotMove(List("a1a1")).asJson), DeliveryOutcome.Refused)
+
+  test("retries stop at the clock floor: a dead endpoint still forfeits, and stops once the game is over (#119)"):
+    for
+      attempts <- Ref.of[IO, Int](0)
+      dead = Client[IO](_ =>
+        cats.effect.Resource.eval(
+          attempts.update(_ + 1) *> IO.raiseError[Response[IO]](new java.net.ConnectException("refused"))
+        )
+      )
+      fixture <- retryFixture("dead-retrying", initialSeconds = 2)
+      (registry, store, room, _, calls, statsStore) = fixture
+      forfeitConfig                                 = retryConfig.copy(retryBackoff = List(200.millis))
+      over <- Webhooks
+        .create(registry, store, dead, forfeitConfig, allowAll, statsStore)
+        .use { webhooks =>
+          webhooks.statsLoop.background.use { _ =>
+            webhooks.attachSweep *>
+              room.result.timeoutTo(
+                20.seconds,
+                IO.raiseError(new RuntimeException("the room hung instead of flagging the dead webhook"))
+              )
+          }
+        }
+      // The runner is cancelled with the resource above, so this proves the loop had already stopped on its own:
+      // the count is taken after the game ended and must not move while the last backoff step would still be due.
+      duringGame <- attempts.get
+      _          <- IO.sleep(1.second)
+      afterGame  <- attempts.get
+      recorded   <- calls.get
+    yield
+      assertEquals(over.termination, Termination.Timeout)
+      assertEquals(over.result, GameResult.Win(Side.Black), "the webhook seat (White) must lose on time")
+      assert(duringGame > 1, s"the delivery was not retried before the clock ran out: $duringGame attempt(s)")
+      assertEquals(afterGame, duringGame, "a retry was still in flight after the game ended")
+      assert(
+        recorded.nonEmpty && recorded.forall(_._3 == DeliveryOutcome.Unreachable),
+        s"every attempt must be recorded as its own unreachable delivery: $recorded"
+      )
+
   test("webhook bot with 'draws' capability receives drawDecision and can accept draw"):
     // The scripted game (die faces: 1 = pawn ... 6 = king). Turn 0, White: bishop/rook/queen cannot move from the
     // initial position, so the room auto-passes. Turn 1, Black: three pawns — 3376 legal paths, more than the room
@@ -823,28 +1052,6 @@ class WebhooksSuite extends munit.CatsEffectSuite:
             case Left(_) => IO.pure(Response[IO](Status.BadRequest))
         }
       }
-
-    /** White, driven by the room's own event stream instead of a polling loop: every roll that lands on White's side is
-      * answered with its first legal path plus a draw offer. The tree is read uncapped from the room (a three-pawn roll
-      * is never inlined) and checked against the roll it answers — `subscribe` can show one version twice, and a forced
-      * pass announces a roll with no legal turn.
-      */
-    def whitePlays(room: GameRoom): IO[Unit] =
-      def play(version: Long): IO[Unit] =
-        room.legalMoves.flatMap { moves =>
-          val whiteToMove = EngineOps.parse(moves.dfen).exists(EngineOps.activeSeat(_) == Seat.White)
-          val ready       = moves.version == version && moves.dicePending && whiteToMove &&
-            moves.legalMoves.children.nonEmpty
-          room.submitTurn(Seat.White, firstPath(moves.legalMoves), offerDraw = true).void.whenA(ready)
-        }
-      room.subscribe
-        .evalMap {
-          case GameEvent.Snapshot(v, state, _) if state.activeSeat == Seat.White && state.dicePending => play(v)
-          case GameEvent.DiceRolled(v, Seat.White, _, _, _, _)                                        => play(v)
-          case _                                                                                      => IO.unit
-        }
-        .compile
-        .drain
 
     for
       registry  <- GameRegistry.create(store = GameStore.noop)
@@ -887,6 +1094,99 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       assertEquals(decision.seat, Seat.Black)
       assert(decision.state.drawOffer.exists(_.pending), "the decision envelope must carry the pending offer")
       assert(!decision.state.dicePending, "a capable bot decides before it sees any dice")
+
+  test("a 502 on a drawDecision leaves the offer pending for the retry to answer (#119)"):
+    // Same script as the accepting-draw test above: White auto-passes, Black plays, White then offers a draw, which
+    // gates Black's roll behind a `drawDecision`. The difference is that the FIRST such delivery comes back 502.
+    // Pre-#119 a transport failure declined on the bot's behalf — the offer would be gone and the game would play on,
+    // so `room.result` would never see a draw. The retry must find the offer still pending and accept it.
+    val scriptedDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] =
+        if ply == 0L then List(3, 4, 5) else List(1, 1, 1)
+      def commit: String = "draw-retry-commit"
+      def reveal: String = "draw-retry-seed"
+
+    def flakyDrawBot(registry: GameRegistry, seen: Ref[IO, List[String]], failures: Ref[IO, Int]): HttpApp[IO] =
+      HttpApp[IO] { req =>
+        req.bodyText.compile.string.flatMap { body =>
+          decode[WebhookEnvelope](body) match
+            case Left(_)         => IO.pure(Response[IO](Status.BadRequest))
+            case Right(envelope) =>
+              seen.update(_ :+ envelope.`type`) *> {
+                envelope.`type` match
+                  case "drawDecision" =>
+                    failures.getAndUpdate(_ + 1).flatMap { already =>
+                      if already == 0 then IO.pure(Response[IO](Status.BadGateway))
+                      else Ok(BotMove(moves = Nil, acceptDraw = Some(true)).asJson)
+                    }
+                  case "yourTurn" => resolveMoves(registry, envelope).flatMap(m => Ok(BotMove(m).asJson))
+                  case _          => IO.pure(Response[IO](Status.BadRequest))
+              }
+        }
+      }
+
+    for
+      registry            <- GameRegistry.create(store = GameStore.noop)
+      store               <- WebhookStore.inMemory
+      (calls, statsStore) <- capturingStats
+      seen                <- Ref.of[IO, List[String]](Nil)
+      failures            <- Ref.of[IO, Int](0)
+      webhookBot: Principal.Bot = Principal.Bot("hooks", "draw-retrier")
+      _ <- store.put(
+        BotWebhook(
+          webhookBot.team,
+          webhookBot.name,
+          "https://bot.example/hook",
+          "secret" * 8,
+          Instant.EPOCH,
+          capabilities = List(WebhookCapability.Draws)
+        )
+      )
+      human = Principal.Guest("human-119")
+      made <- registry.createWithDice(human, webhookBot, scriptedDice)
+      (_, room) = made.toOption.get
+      _   <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _   <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      res <- Webhooks
+        .create(
+          registry,
+          store,
+          Client.fromHttpApp(flakyDrawBot(registry, seen, failures)),
+          retryConfig,
+          allowAll,
+          statsStore
+        )
+        .use { webhooks =>
+          (whitePlays(room).background, webhooks.statsLoop.background).tupled.use { _ =>
+            for
+              _        <- webhooks.attachSweep
+              finished <- room.result.timeoutTo(
+                10.seconds,
+                IO.raiseError(new RuntimeException("the 502 consumed the draw offer instead of leaving it pending"))
+              )
+              // The draw ends the room the instant it applies; the stats drain is deliberately off that path
+              // (`recordDelivery` only `tryOffer`s), so wait for the last record rather than racing the loop.
+              _ <- calls.get
+                .iterateUntil(_.sizeIs >= 3)
+                .timeoutTo(5.seconds, IO.raiseError(new RuntimeException("delivery telemetry never arrived")))
+            yield finished
+          }
+        }
+      types    <- seen.get
+      recorded <- calls.get
+    yield
+      assertEquals(res.result, GameResult.Draw)
+      assertEquals(res.termination, Termination.Draw)
+      assertEquals(
+        types,
+        List("yourTurn", "drawDecision", "drawDecision"),
+        s"the decision must be delivered twice — once lost, once answered: $types"
+      )
+      assertEquals(
+        recorded.map(_._3),
+        List(DeliveryOutcome.Applied, DeliveryOutcome.HttpStatus(502), DeliveryOutcome.Applied),
+        s"the failed decision must be its own recorded attempt, not a fabricated decline: $recorded"
+      )
 
   test("webhook bot without 'draws' capability has draw auto-declined and receives yourTurn with dice"):
     def regularBot(registry: GameRegistry, receivedEvents: Ref[IO, List[String]]): HttpApp[IO] =

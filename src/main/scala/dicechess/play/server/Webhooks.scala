@@ -42,9 +42,13 @@ final private case class WebhookNonceEcho(nonce: String) derives Codec.AsObject
   * '''Single-writer respected''': the per-game runner is an ordinary room subscriber that feeds `submitTurn` — a
   * command source exactly like a WebSocket player or a polling bot, never a second writer.
   *
-  * '''Reliability is the clock''': delivery is single-attempt with a bounded timeout (`min(config, the mover's
-  * remaining clock)`); on timeout / non-200 / garbage the runner does nothing — the room's own deadline forfeits the
-  * game exactly as it would for a polling bot that stopped polling. No retries, no dead-letter, no dispatcher state.
+  * '''Reliability is the clock''': every attempt is bounded by `min(config, the mover's remaining clock)`, and the
+  * clock — never a queue — is the recovery budget. An answer the bot actually gave (garbage, a 4xx, an empty `moves`, a
+  * refusal) is final: the runner does nothing and the room's own deadline forfeits the game exactly as it would for a
+  * polling bot that stopped polling. A delivery that never reached the bot at all — a 5xx from something in front of
+  * it, our own timeout, a connection that never completed — is retried in place on a backoff for as long as the seat's
+  * clock allows (#119; see [[Webhooks.Config.retryBackoff]] for the incident that named the schedule). Still no
+  * dead-letter and no dispatcher state: a retry lives entirely in the per-(game, seat) runner's own stack.
   *
   * '''Delivery rate is structurally bounded''': a bot receives at most one POST per turn of a game it is seated in,
   * games are bounded by the scheduler's pair cap and the challenge flow — there is no queue an attacker could pump. The
@@ -235,13 +239,19 @@ final class Webhooks private (
 
   /** One delivery attempt: re-read the registration (rotation-aware), re-check against a FRESH snapshot that it is
     * still this seat's decision or turn, POST the envelope (drawDecision or yourTurn), and feed the answer to the room.
+    *
+    * `retries` counts the transport retries already spent on THIS decision — 0 on the first attempt. It selects the
+    * next backoff step and is reported in the log line. Nothing else carries across attempts on purpose: every attempt
+    * re-reads the registration and a fresh snapshot, so it re-derives `min(remaining clock, config.timeout)` and stops
+    * itself the moment the turn or the pending decision is gone (the seat moved, the game ended, the clock forfeited).
     */
   private def deliver(
       id: GameId,
       room: GameRoom,
       seat: Seat,
       bot: Principal.Bot,
-      lastVersion: Ref[IO, Long]
+      lastVersion: Ref[IO, Long],
+      retries: Int = 0
   ): IO[Unit] =
     (store.get(bot.team, bot.name), room.snapshot).flatMapN {
       case (None, _)           => IO.unit // deleted mid-game: stop delivering, exactly as documented on DELETE
@@ -272,11 +282,11 @@ final class Webhooks private (
               started <- IO.monotonic
               attempt <- postDetailed(hook.url, hook.secret, body, timeout)
               elapsed <- IO.monotonic.map(_ - started)
-              outcome <- classifyDrawDecision(id, seat, room, bot, hook, attempt)
+              plan = retryPlan(attempt, budget, elapsed, retries)
+              outcome <- classifyDrawDecision(id, seat, room, bot, hook, attempt, plan)
               _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
               _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
-              _       <- (IO.cede *> deliver(id, room, seat, bot, lastVersion))
-                .whenA(outcome == DeliveryOutcome.StaleRegistration)
+              _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan, retries)
             yield ()
           }
         else if isOurTurn then {
@@ -287,14 +297,71 @@ final class Webhooks private (
             started <- IO.monotonic
             attempt <- postDetailed(hook.url, hook.secret, body, timeout)
             elapsed <- IO.monotonic.map(_ - started)
-            outcome <- classifyTurn(id, seat, room, bot, hook, attempt)
+            plan = retryPlan(attempt, budget, elapsed, retries)
+            outcome <- classifyTurn(id, seat, room, bot, hook, attempt, plan)
             _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
             _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
-            _       <- (IO.cede *> deliver(id, room, seat, bot, lastVersion))
-              .whenA(outcome == DeliveryOutcome.StaleRegistration)
+            _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan, retries)
           yield ()
         } else IO.unit
     }
+
+  /** Is this failure worth another attempt, and after how long? Only the transport-level ones are: a 5xx from whatever
+    * sits in front of the bot, our own timeout, a connection that never completed. In all three the bot said nothing,
+    * so the decision is still genuinely pending and one more request may well produce the move — which is exactly what
+    * did not happen on 2026-09-06 (see [[Config.retryBackoff]]). Everything else is the bot's own answer, or our own
+    * URL policy, and stays final.
+    *
+    * `budget` is the seat's clock as of the snapshot this attempt was built from, so `budget - elapsed` is what the
+    * clock has left now. Below [[Config.retryClockFloor]] a further attempt would only race the room's own forfeit, so
+    * the loop stops and lets the clock decide, exactly as before. An `Unlimited` game has no `budget`; there the room's
+    * anti-abandonment deadline ends the turn and the next `deliver` finds nothing to do.
+    */
+  private def retryPlan(
+      attempt: PostOutcome,
+      budget: Option[FiniteDuration],
+      elapsed: FiniteDuration,
+      retries: Int
+  ): Option[RetryStep] =
+    val transient = attempt match
+      case PostOutcome.HttpStatus(code)                   => code >= 500
+      case PostOutcome.TimedOut | PostOutcome.Unreachable => true
+      case _                                              => false
+    val clockAllows = budget.forall(_ - elapsed > config.retryClockFloor)
+    Option
+      .when(transient && clockAllows)(config.retryBackoff.lift(retries).orElse(config.retryBackoff.lastOption))
+      .flatten
+      .map(RetryStep(_, retries + 1))
+
+  /** The single "deliver again?" decision both envelope types share, and the one place the two reasons to re-deliver
+    * are kept from stacking: a stale registration is re-delivered IMMEDIATELY by the pre-#119 fence path (the answer
+    * belonged to a generation that no longer exists — the current one has not been asked yet), and a transport retry
+    * sleeps its backoff step first. A stale outcome therefore consumes the retry plan rather than adding to it, and
+    * starts the fresh generation's attempt counter at zero: its first request is its first attempt.
+    */
+  private def deliverAgain(
+      id: GameId,
+      room: GameRoom,
+      seat: Seat,
+      bot: Principal.Bot,
+      lastVersion: Ref[IO, Long],
+      outcome: DeliveryOutcome,
+      plan: Option[RetryStep],
+      retries: Int
+  ): IO[Unit] =
+    if outcome == DeliveryOutcome.StaleRegistration then IO.cede *> deliver(id, room, seat, bot, lastVersion)
+    else plan.traverse_(step => IO.sleep(step.delay) *> deliver(id, room, seat, bot, lastVersion, retries + 1))
+
+  /** The one log line a planned retry emits, in place of the terminal "(clock decides)" the same failure used to print:
+    * same reason text, different ending, so `grep` over a game's log reads as the sequence of attempts it was.
+    */
+  private def retrying(id: GameId, bot: Principal.Bot, reason: String, step: RetryStep): IO[Unit] =
+    // Whole seconds are what the configured schedule is made of; the millisecond form exists so a compressed
+    // schedule (the tests') does not log every step as the "0s" that truncation would otherwise produce.
+    val delay = if step.delay >= 1.second then s"${step.delay.toSeconds}s" else s"${step.delay.toMillis}ms"
+    Console[IO].errorln(
+      s"[play][webhook] game ${id.value} ${bot.externalId}: $reason — retrying in $delay (attempt ${step.attempt})"
+    )
 
   private def classifyDrawDecision(
       id: GameId,
@@ -302,10 +369,18 @@ final class Webhooks private (
       room: GameRoom,
       bot: Principal.Bot,
       hook: BotWebhook,
-      attempt: PostOutcome
+      attempt: PostOutcome,
+      plan: Option[RetryStep]
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
       Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
+
+    def ifCurrent(value: IO[DeliveryOutcome]): IO[DeliveryOutcome] =
+      store
+        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(IO.unit)
+        .flatMap:
+          case None    => IO.pure(DeliveryOutcome.StaleRegistration)
+          case Some(_) => value
 
     def respond(accept: Boolean): IO[Option[GameRoom.TurnVerdict]] =
       store
@@ -316,6 +391,15 @@ final class Webhooks private (
       respond(accept = false).flatMap:
         case None    => IO.pure(DeliveryOutcome.StaleRegistration)
         case Some(_) => failed(reason, outcome)
+
+    /** A transport failure the runner will retry must leave the offer PENDING — declining it here would answer on
+      * behalf of a bot that never spoke, and there would be nothing left for the retry to deliver. Without a plan the
+      * pre-#119 behaviour stands: decline, reveal the dice, let the clock decide.
+      */
+    def transient(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
+      plan match
+        case Some(step) => ifCurrent(retrying(id, bot, reason, step).as(outcome))
+        case None       => declineThen(reason, outcome)
 
     def decision(accept: Boolean): IO[DeliveryOutcome] =
       respond(accept).flatMap:
@@ -345,14 +429,14 @@ final class Webhooks private (
           DeliveryOutcome.OversizedBody
         )
       case PostOutcome.HttpStatus(code) =>
-        declineThen(
+        transient(
           s"endpoint answered HTTP $code",
           DeliveryOutcome.HttpStatus(code)
         )
       case PostOutcome.TimedOut =>
-        declineThen(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
+        transient(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
       case PostOutcome.Unreachable =>
-        declineThen(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
+        transient(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
       case PostOutcome.PolicyRejected(reason) =>
         declineThen(reason, DeliveryOutcome.Unreachable)
 
@@ -362,7 +446,8 @@ final class Webhooks private (
       room: GameRoom,
       bot: Principal.Bot,
       hook: BotWebhook,
-      attempt: PostOutcome
+      attempt: PostOutcome,
+      plan: Option[RetryStep]
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
       Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
@@ -373,6 +458,15 @@ final class Webhooks private (
         .flatMap:
           case None    => IO.pure(DeliveryOutcome.StaleRegistration)
           case Some(_) => value
+
+    /** Nothing to undo on a turn — the roll simply stays unanswered — so a planned retry only swaps the terminal log
+      * line for the retry one. The registration fence still runs: an answer from a replaced generation is stale, and
+      * the fresh generation's own delivery supersedes the retry (see `deliverAgain`).
+      */
+    def transient(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
+      plan match
+        case Some(step) => ifCurrent(retrying(id, bot, reason, step).as(outcome))
+        case None       => ifCurrent(failed(reason, outcome))
 
     def submit(move: BotMove): IO[DeliveryOutcome] =
       store
@@ -403,9 +497,9 @@ final class Webhooks private (
       case PostOutcome.OversizedBody =>
         ifCurrent(failed(OversizedBodyMessage, DeliveryOutcome.OversizedBody))
       case PostOutcome.HttpStatus(code) =>
-        ifCurrent(failed(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code)))
-      case PostOutcome.TimedOut    => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut))
-      case PostOutcome.Unreachable => ifCurrent(failed(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable))
+        transient(s"endpoint answered HTTP $code", DeliveryOutcome.HttpStatus(code))
+      case PostOutcome.TimedOut               => transient(CouldNotReachEndpointMessage, DeliveryOutcome.TimedOut)
+      case PostOutcome.Unreachable            => transient(CouldNotReachEndpointMessage, DeliveryOutcome.Unreachable)
       case PostOutcome.PolicyRejected(reason) => ifCurrent(failed(reason, DeliveryOutcome.Unreachable))
 
   /** The one resignation path every delivery answer shares (ADR 006 §3.3): `resign: true` wins over every other member
@@ -596,12 +690,28 @@ object Webhooks:
     */
   private val DeliveryEventQueueCapacity = 512
 
+  /** One scheduled retry of a transport failure: how long to wait, and which attempt it will be (1-based, for the log).
+    * Produced by [[Webhooks.retryPlan]] and consumed by [[Webhooks.deliverAgain]] — a value rather than a bare duration
+    * so the classifier's log line and the runner's sleep can never disagree about the attempt number.
+    */
+  final private case class RetryStep(delay: FiniteDuration, attempt: Int)
+
   /** @param timeout
     *   the per-turn window: the longest a delivery may take, before the mover's remaining clock caps it further.
     * @param scanEvery
     *   how often the dispatcher re-scans for turns it owes a delivery.
+    * @param retryBackoff
+    *   the wait before each successive retry of a TRANSPORT failure, the last entry repeating for every further
+    *   attempt; empty disables retries. See [[Config.DefaultRetryBackoff]].
+    * @param retryClockFloor
+    *   stop retrying once the seat's clock holds less than this. See [[Config.DefaultRetryClockFloor]].
     */
-  final case class Config(timeout: FiniteDuration, scanEvery: FiniteDuration = 2.seconds):
+  final case class Config(
+      timeout: FiniteDuration,
+      scanEvery: FiniteDuration = 2.seconds,
+      retryBackoff: List[FiniteDuration] = Config.DefaultRetryBackoff,
+      retryClockFloor: FiniteDuration = Config.DefaultRetryClockFloor
+  ):
 
     /** The shared HTTP client's own deadlines must sit ABOVE the per-turn window, or they — not this config — decide
       * when a delivery dies. Ember's defaults are 45 s (`timeout`, the header-receive cut) and 60 s
@@ -625,6 +735,28 @@ object Webhooks:
     private val ClientTimeoutHeadroom: FiniteDuration = 10.seconds
     private val ClientIdleHeadroom: FiniteDuration    = 30.seconds
 
+    /** Why transport failures are retried at all, recorded here so nobody re-derives it: on 2026-09-06 the featured
+      * showcase bot `rpi3/hunter-book` lost game `d78dbdc1` on time with ~4:50 left on its clock because ONE `yourTurn`
+      * delivery came back `502` from the Cloudflare tunnel in front of it — the connector logged `Unable to reach the
+      * origin service … EOF`, i.e. the origin had closed an idle connection before answering. The bot was healthy and
+      * had answered the previous three plies in 0–7 s, but nothing re-triggers a delivery while it is the bot's own
+      * turn (`run` reacts to game events, and the state cannot change until this seat moves), so the human waited five
+      * minutes for a win on time. Rare per delivery — 3 × `http_502` against 10 855 applied deliveries in 24 h — and
+      * certain per game once it happens.
+      *
+      * Front-loaded, so the common case (one dropped connection) costs the bot ~2 s of its clock, then widening so an
+      * endpoint that is genuinely down is not hammered for the length of a long clock. The LAST entry repeats for every
+      * further attempt, which makes this list read as "2 s, 5 s, 10 s, 20 s, then every 30 s". An empty list disables
+      * transport retries and restores the pre-#119 single-attempt behaviour.
+      */
+    val DefaultRetryBackoff: List[FiniteDuration] = List(2.seconds, 5.seconds, 10.seconds, 20.seconds, 30.seconds)
+
+    /** The clock floor that ends the retry loop. Below this the room's own forfeit is about to fire, and a further
+      * attempt could only race it — worse, it could land a move on a clock that has already expired. Stopping here
+      * hands the turn back to exactly the pre-#119 behaviour: the clock decides.
+      */
+    val DefaultRetryClockFloor: FiniteDuration = 3.seconds
+
     /** Same split as `LadderScheduler.Config.fromValues`: the raw value comes in, only a strictly positive integer
       * enables the feature — a zero/negative/garbled timeout is treated as absent rather than busy-looping or disabling
       * deliveries silently at runtime.
@@ -637,7 +769,9 @@ object Webhooks:
     * capped by the mover's remaining clock.
     *
     * Sizing it is a deployment decision, and it is a *cap*, not a promise: what a given bot actually gets is
-    * `min(its remaining clock, this cap, whatever its own hosting allows)`.
+    * `min(its remaining clock, this cap, whatever its own hosting allows)`. It bounds one ATTEMPT: since #119 a
+    * transport failure may be retried inside the same turn, so what bounds a turn end to end is still the seat's clock
+    * — this value only decides how long any single request may hang before it counts as failed.
     *
     * The floor is what the engine's `TimeManager` legitimately asks for — on Fischer(600,10) its target reaches ~57 s
     * once `movesToGo` bottoms out, and ~68 s on a clock the increment has grown (observed in production). Configure

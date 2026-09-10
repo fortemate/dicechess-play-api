@@ -909,7 +909,20 @@ final class GameRoom private (
 
     emitRoll.flatMap: s2 =>
       if turns.nonEmpty then
-        if s2.turnStartedAt.isDefined then IO.pure(s2)
+        if s2.turnStartedAt.isDefined then
+          IO.monotonic.map: now =>
+            val deliberation = s2.turnStartedAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(now - start))
+            val bankAfterDeliberation = floorZero(s2.remaining.getOrElse(seat, Duration.Zero) - deliberation)
+            val remainingMoveGrace    =
+              s2.turnStartedAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(start - now))
+            val rollGrace =
+              if distinctPlayers(s0) && isHuman(s0, seat) then RollAnimationDuration
+              else Duration.Zero
+            val totalGrace = remainingMoveGrace + rollGrace
+            s2.copy(
+              remaining = s2.remaining.updated(seat, bankAfterDeliberation),
+              turnStartedAt = Some(now + totalGrace)
+            )
         else startClock(s2, presentationGraceFor(s0, seat))
       else
         val passed   = rolled.endTurn()
@@ -962,7 +975,9 @@ final class GameRoom private (
           legalTurns = Map.empty,
           legalTree = MoveTree.empty
         )
-        emit(s1, v => GameEvent.DrawOffered(v, offerer)).flatMap(s => startClock(s, presentationGraceFor(s0, seat)))
+        emit(s1, v => GameEvent.DrawOffered(v, offerer)).flatMap(s =>
+          startClock(s, presentationGraceFor(s0, seat, includeRoll = false))
+        )
       case _ =>
         revealDiceAndBegin(s0.copy(pendingDrawOffer = None))
 
@@ -1737,25 +1752,42 @@ object GameRoom:
   /** Analytics colour letter for a *player* seat (turn records are only ever created for the side that moved). */
   private def colorLetter(seat: Seat): String = if seat == Seat.White then "w" else "b"
 
+  private[play] def distinctPlayers(s: Session): Boolean =
+    (s.players.get(Seat.White), s.players.get(Seat.Black)) match
+      case (Some(w), Some(b)) => w != b
+      case _                  => false
+
+  private[play] def isHuman(s: Session, seat: Seat): Boolean =
+    s.players.get(seat) match
+      case Some(Principal.Guest(_) | Principal.User(_)) => true
+      case _                                            => false
+
   /** Delay before a player's chess clock begins ticking after a turn transition.
     *
-    * In Bot vs Bot matches, both players are automated and need no presentation pause. When a human player faces an
-    * opponent's completed turn, their board presents the opponent's moves (`MoveStepDuration` per move) followed by the
-    * dice roll animation (`RollAnimationDuration`), or the pass dwell (`PassDwellDuration`) if the opponent passed.
-    * Pausing the clock for this grace window prevents human players from losing clock time while observing animations.
+    * In Bot vs Bot matches, or games where one principal controls both seats, no presentation pause is needed. When a
+    * human player faces an opponent's completed turn, their board presents the opponent's moves (`MoveStepDuration` per
+    * move) followed optionally by the dice roll animation (`RollAnimationDuration`), or the pass dwell
+    * (`PassDwellDuration`) if the opponent passed. Pausing the clock for this grace window prevents human players from
+    * losing clock time while observing animations.
     */
   private[play] def presentationGraceFor(s: Session, nextSeat: Seat): FiniteDuration =
-    s.players.get(nextSeat) match
-      case Some(Principal.Bot(_, _)) | None             => Duration.Zero
-      case Some(Principal.Guest(_) | Principal.User(_)) =>
-        s.turns.lastOption match
-          case None                                                            => Duration.Zero
-          case Some(lastTurn) if lastTurn.activeColor == colorLetter(nextSeat) => Duration.Zero
-          case Some(lastTurn)                                                  =>
-            val dwell =
-              if lastTurn.moves.isEmpty then PassDwellDuration
-              else MoveStepDuration * lastTurn.moves.length
-            dwell + RollAnimationDuration
+    presentationGraceFor(s, nextSeat, includeRoll = true)
+
+  private[play] def presentationGraceFor(
+      s: Session,
+      nextSeat: Seat,
+      includeRoll: Boolean
+  ): FiniteDuration =
+    if !distinctPlayers(s) || !isHuman(s, nextSeat) then Duration.Zero
+    else
+      s.turns.lastOption match
+        case None                                                            => Duration.Zero
+        case Some(lastTurn) if lastTurn.activeColor == colorLetter(nextSeat) => Duration.Zero
+        case Some(lastTurn)                                                  =>
+          val dwell =
+            if lastTurn.moves.isEmpty then PassDwellDuration
+            else MoveStepDuration * lastTurn.moves.length
+          if includeRoll then dwell + RollAnimationDuration else dwell
 
   /** The completed-turn history for a joining client's `Snapshot`, mapped from the room's analytics `turns`. */
   private def snapshotHistory(s: Session): List[SnapshotTurn] =

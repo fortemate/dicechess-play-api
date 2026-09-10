@@ -45,6 +45,7 @@ val PostgresDriverVersion     = "42.7.13"
 val TestcontainersVersion     = "0.43.0"
 val TestcontainersJavaVersion = "1.21.3"
 val DockerJavaVersion         = "3.7.1"
+val BouncyCastleVersion       = "1.78.1"
 
 lazy val root = (project in file("."))
   .enablePlugins(JavaAppPackaging)
@@ -78,9 +79,10 @@ lazy val root = (project in file("."))
       // Logging backend for Ember
       "ch.qos.logback" % "logback-classic" % LogbackVersion % Runtime,
       // Testing
-      "org.scalameta" %% "munit"                  % MunitVersion           % Test,
-      "org.typelevel" %% "munit-cats-effect"      % MunitCatsEffectVersion % Test,
-      "org.http4s"    %% "http4s-jdk-http-client" % Http4sJdkClientVersion % Test,
+      "org.scalameta"   %% "munit"                  % MunitVersion           % Test,
+      "org.typelevel"   %% "munit-cats-effect"      % MunitCatsEffectVersion % Test,
+      "org.http4s"      %% "http4s-jdk-http-client" % Http4sJdkClientVersion % Test,
+      "org.bouncycastle" % "bcpkix-jdk18on"         % BouncyCastleVersion    % Test,
       // PostgreSQL Testcontainers
       "com.dimafeng"          %% "testcontainers-scala-munit"      % TestcontainersVersion     % Test,
       "com.dimafeng"          %% "testcontainers-scala-postgresql" % TestcontainersVersion     % Test,

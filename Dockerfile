@@ -12,18 +12,13 @@ RUN tar -xzf /tmp/sbt.tgz -C /usr/local && ln -s /usr/local/sbt/bin/sbt /usr/loc
 
 WORKDIR /build
 
-# Resolve dependencies first for layer caching. The engine artifact comes from
-# GitHub Packages, so sbt needs a read:packages token — passed as a BuildKit
-# secret so it never lands in an image layer.
-ARG GITHUB_ACTOR=rabestro
+# Resolve dependencies first for layer caching.
 COPY project/ project/
 COPY build.sbt ./
-RUN --mount=type=secret,id=github_token \
-    GITHUB_TOKEN=$(cat /run/secrets/github_token) sbt update
+RUN sbt update
 
 COPY src/main/ src/main/
-RUN --mount=type=secret,id=github_token \
-    GITHUB_TOKEN=$(cat /run/secrets/github_token) sbt stage && \
+RUN sbt stage && \
     mkdir -p /build/target/universal && \
     cp -a /build/target/out/jvm/*/*/universal/stage /build/target/universal/
 

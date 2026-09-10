@@ -68,16 +68,12 @@ reviews:
 
     - path: ".github/workflows/**"
       instructions: |
-        CI/CD for a Scala 3 service that resolves the engine from GitHub Packages.
+        CI/CD for a Scala 3 service that resolves dependencies from Maven Central.
         When reviewing:
         - Prefer pinned action versions.
-        - Ensure GITHUB_TOKEN / packages:read is present where the engine artifact
-          is resolved, and secrets are not exposed to forks.
 
     - path: "build.sbt"
       instructions: |
         SBT build for a Scala 3 cats-effect service.
         When reviewing:
         - Keep library versions consistent and compatible with Scala 3.8.3.
-        - Verify the GitHub Packages resolver/credentials stay free of network calls
-          at load time.

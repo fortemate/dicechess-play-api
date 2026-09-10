@@ -26,7 +26,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   check:
@@ -61,10 +60,6 @@ jobs:
           sbt shutdown
           rm -rf target/covcache
           sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"
-        env:
-          # Resolves com.fortemate:dicechess-engine from GitHub Packages
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify and locate scoverage report
         run: |

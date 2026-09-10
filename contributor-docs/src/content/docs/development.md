@@ -3,22 +3,6 @@ title: Development Setup
 description: Toolchain, the commands that mirror CI, the quality gates a pull request must clear, and the traps that produce a false green.
 ---
 
-## Before anything else: GitHub auth
-
-```bash
-gh auth login
-```
-
-The engine artifact resolves from GitHub Packages, which requires authentication **even for
-public packages**; `build.sbt` reads the token via `gh auth token`. If you skip this, the
-failure looks like a broken build rather than a missing credential:
-
-```text
-unresolved dependency: com.fortemate#dicechess-engine...
-```
-
-That signature always means auth, never a broken build.
-
 ## Toolchain
 
 Tools are pinned in `mise.toml`: Java temurin-25, native scalafmt, lefthook, betterleaks, actionlint, gh,

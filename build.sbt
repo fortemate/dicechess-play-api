@@ -25,23 +25,8 @@ ThisBuild / developers := List(
   )
 )
 
-// The engine artifact is published on Maven Central and GitHub Packages
-ThisBuild / resolvers ++= Seq(
-  Resolver.mavenCentral,
-  "GitHub Packages (fortemate)" at "https://maven.pkg.github.com/fortemate/dicechess-engine"
-)
-
-def ghValue(envVar: String, ghArgs: String*): Option[String] =
-  sys.env
-    .get(envVar)
-    .filter(_.nonEmpty)
-    .orElse(scala.util.Try(scala.sys.process.Process("gh" +: ghArgs).!!.trim).toOption)
-    .filter(_.nonEmpty)
-
-ThisBuild / credentials ++= (for {
-  token <- ghValue("GITHUB_TOKEN", "auth", "token")
-  user = sys.env.get("GITHUB_ACTOR").filter(_.nonEmpty).getOrElse("git")
-} yield Credentials("GitHub Package Registry", "maven.pkg.github.com", user, token)).toSeq
+// The engine artifact is published on Maven Central
+ThisBuild / resolvers += Resolver.mavenCentral
 
 val DiceChessEngineVersion    = "0.9.0"
 val CatsEffectVersion         = "3.7.1"

@@ -50,7 +50,7 @@ consumer block play. That rule is spelled out in
 `play-api` sits in the middle of four contracts. Changing either side of one without the other
 is the most common way to break the platform.
 
-- **Consumes** `com.fortemate:dicechess-engine`, a JVM artifact from GitHub Packages with the
+- **Consumes** `com.fortemate:dicechess-engine`, a JVM artifact from Maven Central with the
   version pinned in `build.sbt`. It is the single source of truth for the rules — legality is
   never reimplemented here. Legal moves ship on the wire as a prefix tree of UCI micro-moves.
 - **Publishes** the client wire protocol in `wire/Codecs.scala`, consumed by the

@@ -86,10 +86,7 @@ jobs:
           load: true
           tags: local-smoke:test
           build-args: |
-            GITHUB_ACTOR=${{ github.actor }}
             APP_VERSION=${{ steps.version.outputs.app_version }}
-          secrets: |
-            github_token=${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha
 
       - name: Run container smoke test
@@ -107,10 +104,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            GITHUB_ACTOR=${{ github.actor }}
             APP_VERSION=${{ steps.version.outputs.app_version }}
-          secrets: |
-            github_token=${{ secrets.GITHUB_TOKEN }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}

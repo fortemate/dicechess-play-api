@@ -30,7 +30,7 @@ ThisBuild / resolvers += Resolver.mavenCentral
 
 val DiceChessEngineVersion    = "0.9.0"
 val CatsEffectVersion         = "3.7.1"
-val Fs2Version                = "3.13.0"
+val Fs2Version                = "3.14.0"
 val Http4sVersion             = "0.23.30"
 val CirceVersion              = "0.14.10"
 val LogbackVersion            = "1.6.3"

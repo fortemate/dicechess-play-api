@@ -946,20 +946,31 @@ final class GameRoom private (
               s2.turnsSinceLastOffer.updated(seat, s2.turnsSinceLastOffer.getOrElse(seat, 0) + 1)
             )
 
-        val s3 = s2.copy(
-          state = passed,
-          pending = false,
-          legalTurns = Map.empty,
-          legalTree = MoveTree.empty,
-          armedDrawOffer = nextArmed,
-          drawTogglesThisTurn = nextToggles,
-          pendingDrawOffer = newPendingOffer,
-          lastDrawOfferer = newLastOfferer,
-          turnsSinceLastOffer = nextTurnsSinceLastOffer,
-          turns = s2.turns :+ TurnRecord(s2.ply, colorLetter(seat), dice, Nil, passDfen, Some(0L))
-        )
-        emit(s3, v => GameEvent.TurnPlayed(v, seat, Nil, passDfen))
-          .flatMap(advanceOrEnd)
+        val settleDeliberation =
+          if s2.turnStartedAt.isDefined then
+            IO.monotonic.map: now =>
+              val deliberation = s2.turnStartedAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(now - start))
+              val bankAfterDeliberation = floorZero(s2.remaining.getOrElse(seat, Duration.Zero) - deliberation)
+              (s2.remaining.updated(seat, bankAfterDeliberation), deliberation.toMillis)
+          else IO.pure((s2.remaining, 0L))
+
+        settleDeliberation.flatMap: (nextRemaining, elapsedMs) =>
+          val s3 = s2.copy(
+            state = passed,
+            pending = false,
+            remaining = nextRemaining,
+            turnStartedAt = None,
+            legalTurns = Map.empty,
+            legalTree = MoveTree.empty,
+            armedDrawOffer = nextArmed,
+            drawTogglesThisTurn = nextToggles,
+            pendingDrawOffer = newPendingOffer,
+            lastDrawOfferer = newLastOfferer,
+            turnsSinceLastOffer = nextTurnsSinceLastOffer,
+            turns = s2.turns :+ TurnRecord(s2.ply, colorLetter(seat), dice, Nil, passDfen, Some(elapsedMs))
+          )
+          emit(s3, v => GameEvent.TurnPlayed(v, seat, Nil, passDfen))
+            .flatMap(advanceOrEnd)
 
   /** Either open the pre-roll gate for an active draw offer (suspending auto-roll) or reveal dice immediately. */
   private def beginTurnOrPreRoll(s0: Session): IO[Session] =
@@ -991,7 +1002,7 @@ final class GameRoom private (
 
   private def endGame(s: Session, over: GameOver): IO[Session] =
     emit(
-      s.copy(pending = false, status = GameStatus.Ended(over)),
+      s.copy(pending = false, status = GameStatus.Ended(over), turnStartedAt = None),
       v => GameEvent.GameEnded(v, over, Some(s.dice.reveal), Some(s.clientSeedsRevealed))
     ).flatTap(_ => done.complete(over).attempt.void)
 

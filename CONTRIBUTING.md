@@ -21,9 +21,8 @@ relicensing rights, which is why a CLA is used instead.
 ## Prerequisites
 
 - [mise](https://mise.jdx.dev) manages the local toolchain (Java 25, scalafmt, lefthook, …).
-- SBT is the build tool; the dice-chess **engine** is resolved from GitHub Packages, which
-  requires a GitHub token even for public packages. The build reads it from the `gh` CLI
-  automatically (`gh auth login` once), or from `GITHUB_TOKEN` in CI.
+- SBT is the build tool; all library dependencies including the dice-chess **engine** are resolved directly from Maven Central.
+
 
 ## Setup
 

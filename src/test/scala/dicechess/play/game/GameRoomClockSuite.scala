@@ -277,63 +277,60 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
     )
     assertEquals(GameRoom.presentationGraceFor(s, Seat.Black), Duration.Zero)
 
-  test("Draw decline after initial grace window freezes clock at post-deliberation bank for roll animation"):
-    val botVsHuman = Map[Seat, Principal](
-      Seat.White -> Principal.Bot("acme", "greedy"),
-      Seat.Black -> Principal.Guest("human")
-    )
-    val white = BotConnection(Principal.Bot("acme", "greedy"), Seat.White, greedy)
-    GameRoom
-      .create(botVsHuman, dice, timeControl = TimeControl.SuddenDeath(60), seedGrace = 50.millis)
-      .flatMap {
-        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
-        case Right(room) =>
-          white.run(room).background.use { _ =>
-            for
-              offeredFiber <- room.subscribe
-                .collectFirst { case e: GameEvent.DrawOffered => e }
-                .compile
-                .lastOrError
-                .start
-              _ <- room.armDrawOffer(Seat.White, true)
-              _ <- room.start
-              // Wait for White bot to move and deliver the draw offer (DrawOffered emitted)
-              _   <- offeredFiber.joinWithNever.timeout(10.seconds)
-              ps1 <- room.snapshot
-              _ = assertEquals(ps1.drawOffer, Some(DrawOffer(true)))
-              // Wait 3.5 seconds from DrawOffered so initial move grace (at most 3s) expires and Black deliberates
-              _ <- IO.sleep(3500.millis)
-              // Black declines the draw
-              verdict <- room.respondDraw(Seat.Black, accept = false)
-              _ = assert(verdict.isInstanceOf[GameRoom.TurnVerdict.Applied], s"decline applied: $verdict")
-              // Immediately after decline, dice are revealed and roll animation (600ms) plays
-              snapDuringRoll1 <- room.snapshot
-              clocks1    = snapDuringRoll1.clocks.getOrElse(fail("missing clocks"))
-              bankAtRoll = clocks1.black
-              _          = assert(bankAtRoll < 60000L, s"deliberation should have debited the bank, got $bankAtRoll")
-              // 200ms into roll animation, Black's clock must remain frozen at bankAtRoll
-              _               <- IO.sleep(200.millis)
-              snapDuringRoll2 <- room.snapshot
-              clocks2 = snapDuringRoll2.clocks.getOrElse(fail("missing clocks"))
-              _       = assertEquals(clocks2.black, bankAtRoll)
-              // Another 200ms later (400ms total, still within 600ms roll animation), clock is still frozen
-              _               <- IO.sleep(200.millis)
-              snapDuringRoll3 <- room.snapshot
-              clocks3 = snapDuringRoll3.clocks.getOrElse(fail("missing clocks"))
-              _       = assertEquals(clocks3.black, bankAtRoll)
-              // Wait 600ms more (1000ms total after decline > 600ms roll animation); now clock begins ticking
-              _            <- IO.sleep(600.millis)
-              snapPostRoll <- room.snapshot
-              clocksPost = snapPostRoll.clocks.getOrElse(fail("missing clocks"))
-              _ = assert(clocksPost.black < bankAtRoll, s"clock should have started ticking, got ${clocksPost.black}")
-            yield ()
-          }
-      }
-
   private def leafPath(tree: MoveTree): List[String] =
     tree.children.headOption match
       case None              => Nil
       case Some((uci, next)) => uci :: leafPath(next)
+
+  test("Draw decline after initial grace window freezes clock at post-deliberation bank for roll animation"):
+    val fixedDice = new DiceSource:
+      def commit: String                                     = "fixed-commit"
+      def reveal: String                                     = "fixed-reveal"
+      def roll(ply: Long, sW: String, sB: String): List[Int] = List(1, 2, 3)
+
+    for
+      roomRes <- GameRoom.create(
+        seats,
+        fixedDice,
+        timeControl = TimeControl.SuddenDeath(60),
+        seedGrace = 50.millis
+      )
+      room   <- IO.fromEither(roomRes.left.map(e => RuntimeException(s"room creation failed: $e")))
+      _      <- room.start
+      _      <- IO.sleep(200.millis)
+      moves0 <- room.legalMoves
+      path0 = leafPath(moves0.legalMoves)
+      _           <- room.submitTurn(Seat.White, path0, offerDraw = true)
+      snapPreRoll <- room.snapshot
+      _ = assertEquals(snapPreRoll.activeSeat, Seat.Black)
+      _ = assertEquals(snapPreRoll.drawOffer, Some(DrawOffer(pending = true)))
+      // Wait 3.5 seconds so initial move grace (at most 3s) expires and Black deliberates
+      _ <- IO.sleep(3500.millis)
+      // Black declines the draw
+      verdict <- room.respondDraw(Seat.Black, accept = false)
+      _ = assert(verdict.isInstanceOf[GameRoom.TurnVerdict.Applied], s"decline applied: $verdict")
+      // Immediately after decline, dice are revealed and roll animation (600ms) plays
+      snapDuringRoll1 <- room.snapshot
+      clocks1    = snapDuringRoll1.clocks.getOrElse(fail("missing clocks"))
+      bankAtRoll = clocks1.black
+      _          = assert(bankAtRoll < 60000L, s"deliberation should have debited the bank, got $bankAtRoll")
+      // 200ms into roll animation, Black's clock must remain frozen at bankAtRoll
+      _               <- IO.sleep(200.millis)
+      snapDuringRoll2 <- room.snapshot
+      clocks2 = snapDuringRoll2.clocks.getOrElse(fail("missing clocks"))
+      _       = assertEquals(clocks2.black, bankAtRoll)
+      // Another 200ms later (400ms total, still within 600ms roll animation), clock is still frozen
+      _               <- IO.sleep(200.millis)
+      snapDuringRoll3 <- room.snapshot
+      clocks3 = snapDuringRoll3.clocks.getOrElse(fail("missing clocks"))
+      _       = assertEquals(clocks3.black, bankAtRoll)
+      // Wait 600ms more (1000ms total after decline > 600ms roll animation); now clock begins ticking
+      _            <- IO.sleep(600.millis)
+      snapPostRoll <- room.snapshot
+      clocksPost = snapPostRoll.clocks.getOrElse(fail("missing clocks"))
+      _          = assertEquals(snapPostRoll.activeSeat, Seat.Black)
+      _          = assert(clocksPost.black < bankAtRoll, s"clock should have started ticking, got ${clocksPost.black}")
+    yield ()
 
   test("Draw decline followed by forced pass does not leak turnStartedAt to opponent or penalize their clock"):
     val passDice = new DiceSource:

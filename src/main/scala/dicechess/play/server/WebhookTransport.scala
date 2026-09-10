@@ -82,7 +82,7 @@ object WebhookTransport:
   private[server] def from(resolver: Resolver, clientFactory: ClientFactory): WebhookTransport =
     new Live(resolver, clientFactory)
 
-  private def pinnedClient(
+  private[server] def pinnedClient(
       network: Network[IO],
       tlsContext: TLSContext[IO],
       target: ResolvedWebhookTarget

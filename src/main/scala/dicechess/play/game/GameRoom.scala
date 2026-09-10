@@ -696,8 +696,9 @@ final class GameRoom private (
         case None         => IO.pure(idleCheck)
         case Some(budget) =>
           IO.monotonic.map: now =>
-            val elapsed = s.turnStartedAt.fold(Duration.Zero)(now - _)
-            floorZero(budget - elapsed)
+            val elapsed = s.turnStartedAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(now - start))
+            val grace   = s.turnStartedAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(start - now))
+            floorZero(budget - elapsed) + grace
 
   /** The time available to `mover` for the current turn: their bank (SuddenDeath/Fischer), a fresh per-move budget
     * (PerMove), or `None` for Unlimited (no chess clock — the `idleCheck` cap applies instead).
@@ -710,10 +711,11 @@ final class GameRoom private (
       case TimeControl.Fischer(_, _)  => Some(s.remaining.getOrElse(mover, Duration.Zero))
 
   /** Start the mover's clock for a turn that has a real decision (a legal move). Forced passes never reach here, so
-    * they cost nothing.
+    * they cost nothing. When `delay > Duration.Zero` (e.g. presentation grace during opponent move playback),
+    * `turnStartedAt` is set in the future so that clock depletion is deferred until the presentation finishes.
     */
-  private def startClock(s: Session): IO[Session] =
-    IO.monotonic.map(now => s.copy(turnStartedAt = Some(now)))
+  private def startClock(s: Session, delay: FiniteDuration): IO[Session] =
+    IO.monotonic.map(now => s.copy(turnStartedAt = Some(now + delay)))
 
   private def continue: IO[Unit] =
     stateRef.get.flatMap(s => if s.ended then drainRefusing else consume)
@@ -906,7 +908,9 @@ final class GameRoom private (
         emit(s1, v => GameEvent.DiceRolled(v, seat, dice, EngineOps.serialize(rolled), clocks, inline))
 
     emitRoll.flatMap: s2 =>
-      if turns.nonEmpty then if s2.turnStartedAt.isDefined then IO.pure(s2) else startClock(s2)
+      if turns.nonEmpty then
+        if s2.turnStartedAt.isDefined then IO.pure(s2)
+        else startClock(s2, presentationGraceFor(s0, seat))
       else
         val passed   = rolled.endTurn()
         val passDfen = EngineOps.serialize(passed)
@@ -958,7 +962,7 @@ final class GameRoom private (
           legalTurns = Map.empty,
           legalTree = MoveTree.empty
         )
-        emit(s1, v => GameEvent.DrawOffered(v, offerer)).flatMap(startClock)
+        emit(s1, v => GameEvent.DrawOffered(v, offerer)).flatMap(s => startClock(s, presentationGraceFor(s0, seat)))
       case _ =>
         revealDiceAndBegin(s0.copy(pendingDrawOffer = None))
 
@@ -1194,6 +1198,13 @@ object GameRoom:
     * the game force-starts and any missing seat falls back to its (already-public) external id, so a game never stalls.
     */
   val DefaultSeedGrace: FiniteDuration = FiniteDuration(5, "seconds")
+
+  /** Move presentation and animation timings matching client-side SPA (`timings.ts`). Used to pause clocks while moves
+    * are played out for human players.
+    */
+  val MoveStepDuration: FiniteDuration      = 1000.millis
+  val RollAnimationDuration: FiniteDuration = 600.millis
+  val PassDwellDuration: FiniteDuration     = 1500.millis
 
   /** Accepted bounds for a client dice seed (characters). The lower bound asks for real entropy (≥16 chars, e.g. the
     * hex of 8+ random bytes); the upper bound caps abuse. A weak or absent seed only weakens that seat's own
@@ -1726,6 +1737,26 @@ object GameRoom:
   /** Analytics colour letter for a *player* seat (turn records are only ever created for the side that moved). */
   private def colorLetter(seat: Seat): String = if seat == Seat.White then "w" else "b"
 
+  /** Delay before a player's chess clock begins ticking after a turn transition.
+    *
+    * In Bot vs Bot matches, both players are automated and need no presentation pause. When a human player faces an
+    * opponent's completed turn, their board presents the opponent's moves (`MoveStepDuration` per move) followed by the
+    * dice roll animation (`RollAnimationDuration`), or the pass dwell (`PassDwellDuration`) if the opponent passed.
+    * Pausing the clock for this grace window prevents human players from losing clock time while observing animations.
+    */
+  private[play] def presentationGraceFor(s: Session, nextSeat: Seat): FiniteDuration =
+    s.players.get(nextSeat) match
+      case Some(Principal.Bot(_, _)) | None             => Duration.Zero
+      case Some(Principal.Guest(_) | Principal.User(_)) =>
+        s.turns.lastOption match
+          case None                                                            => Duration.Zero
+          case Some(lastTurn) if lastTurn.activeColor == colorLetter(nextSeat) => Duration.Zero
+          case Some(lastTurn)                                                  =>
+            val dwell =
+              if lastTurn.moves.isEmpty then PassDwellDuration
+              else MoveStepDuration * lastTurn.moves.length
+            dwell + RollAnimationDuration
+
   /** The completed-turn history for a joining client's `Snapshot`, mapped from the room's analytics `turns`. */
   private def snapshotHistory(s: Session): List[SnapshotTurn] =
     s.turns.iterator
@@ -1735,7 +1766,7 @@ object GameRoom:
   /** Remaining time per side as of `now`, in millis — the mover's in-progress turn already subtracted so a snapshot is
     * live, not frozen at the last completed turn. `None` for Unlimited (no clock).
     */
-  private def liveClocks(s: Session, now: FiniteDuration): Option[Clocks] =
+  private[play] def liveClocks(s: Session, now: FiniteDuration): Option[Clocks] =
     s.timeControl match
       case TimeControl.Unlimited => None
       case timeControl           =>
@@ -1745,7 +1776,9 @@ object GameRoom:
             case TimeControl.PerMove(spm) => spm.seconds
             case _                        => s.remaining.getOrElse(seat, Duration.Zero)
           val elapsed =
-            if mover.contains(seat) then s.turnStartedAt.fold(Duration.Zero: FiniteDuration)(now - _) else Duration.Zero
+            if mover.contains(seat) then
+              s.turnStartedAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(now - start))
+            else Duration.Zero
           floorZero(bank - elapsed).toMillis
         Some(Clocks(remainingFor(Seat.White), remainingFor(Seat.Black)))
 

@@ -4917,3 +4917,54 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(archived2, archived)
       }
     }
+
+  test("pool telemetry exposes Hikari metrics and samples acquisition time (#120)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        for
+          stats <- db.currentPoolStats(sampleAcquire = true)
+          acq   <- db.sampleAcquireTime
+        yield
+          assert(stats.total >= 0, "total connections must be non-negative")
+          assert(stats.active >= 0, "active connections must be non-negative")
+          assert(stats.idle >= 0, "idle connections must be non-negative")
+          assert(stats.waiting >= 0, "waiting threads must be non-negative")
+          assert(stats.acquireTimeMs.isDefined, "sampleAcquire = true must record acquire time")
+          assert(acq.isDefined, "sampleAcquireTime must return Some duration against a live pool")
+      }
+    }
+
+  private def captureStderr[A](io: IO[A]): IO[(A, String)] =
+    for
+      baos   <- IO(new java.io.ByteArrayOutputStream())
+      ps     <- IO(new java.io.PrintStream(baos, true, "UTF-8"))
+      oldErr <- IO(System.err)
+      res    <- (IO(System.setErr(ps)) *> io).guarantee(IO(System.setErr(oldErr)) *> IO(ps.close()))
+    yield (res, baos.toString("UTF-8"))
+
+  test("timedOp logs a WARN when operation exceeds 1s (#120)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        captureStderr(db.timedOp("test.slow", 2.seconds)(IO.sleep(1100.millis))).map { case (_, err) =>
+          assert(err.contains("[play][db][warn] operation 'test.slow' slow: took"), s"expected slow warn, got: $err")
+          assert(err.contains("threshold: 1000ms"), s"expected threshold, got: $err")
+          assert(err.contains("attribution:"), s"expected attribution, got: $err")
+          assert(err.contains("pool: active="), s"expected pool stats, got: $err")
+        }
+      }
+    }
+
+  test("timedOp logs a WARN and re-raises TimeoutException when operation times out (#120)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        captureStderr(db.timedOp("test.timeout", 200.millis)(IO.sleep(1.second)).attempt).map { case (res, err) =>
+          assert(res.isLeft && res.left.toOption.get.isInstanceOf[java.util.concurrent.TimeoutException])
+          assert(
+            err.contains("[play][db][warn] operation 'test.timeout' timed out after"),
+            s"expected timeout warn, got: $err"
+          )
+          assert(err.contains("attribution:"), s"expected attribution, got: $err")
+          assert(err.contains("pool: active="), s"expected pool stats, got: $err")
+        }
+      }
+    }

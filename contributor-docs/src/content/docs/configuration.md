@@ -24,6 +24,7 @@ src/main/scala`) rather than from documentation, which drifts.
 | Variable | Effect |
 | --- | --- |
 | `PLAY_DB_URL`, `PLAY_DB_USER`, `PLAY_DB_PASSWORD` | Enable Postgres persistence. Unset means fully in-memory: a restart drops every game. |
+| `PLAY_DB_POOL_SIZE` | Maximum Hikari pool size (and matching `connectEC` pool size). Defaults to `10`. |
 
 ## Analytics ingest
 

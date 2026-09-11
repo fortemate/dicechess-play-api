@@ -74,7 +74,8 @@ final class Webhooks private (
     attached: Ref[IO, Set[(GameId, Seat)]],
     runners: Supervisor[IO],
     stats: WebhookStatsStore,
-    deliveryEvents: Queue[IO, Webhooks.DeliveryEvent]
+    deliveryEvents: Queue[IO, Webhooks.DeliveryEvent],
+    featuredBot: Option[Principal.Bot]
 ):
   import Webhooks.*
 
@@ -380,7 +381,15 @@ final class Webhooks private (
       plan: Option[RetryStep]
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
-      Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
+      val alertFeatured =
+        if featuredBot.contains(bot) then
+          Console[IO].errorln(
+            s"[play][showcase] featured bot delivery failed: game ${id.value} ${bot.externalId}: $reason"
+          )
+        else IO.unit
+      (alertFeatured *> Console[IO].errorln(
+        s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)"
+      )).as(outcome)
 
     def ifCurrent(value: IO[DeliveryOutcome]): IO[DeliveryOutcome] =
       store
@@ -457,7 +466,15 @@ final class Webhooks private (
       plan: Option[RetryStep]
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
-      Console[IO].errorln(s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)").as(outcome)
+      val alertFeatured =
+        if featuredBot.contains(bot) then
+          Console[IO].errorln(
+            s"[play][showcase] featured bot delivery failed: game ${id.value} ${bot.externalId}: $reason"
+          )
+        else IO.unit
+      (alertFeatured *> Console[IO].errorln(
+        s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)"
+      )).as(outcome)
 
     def ifCurrent(value: IO[DeliveryOutcome]): IO[DeliveryOutcome] =
       store
@@ -813,9 +830,10 @@ object Webhooks:
       config: Config,
       checkUrl: String => IO[Either[String, Uri]] = WebhookSecurity.checkPublicHttps,
       stats: WebhookStatsStore = WebhookStatsStore.noop,
-      transport: Option[WebhookTransport] = None
+      transport: Option[WebhookTransport] = None,
+      featuredBot: Option[Principal.Bot] = None
   ): Resource[IO, Webhooks] =
     Supervisor[IO](await = false).evalMap { runners =>
       (Ref.of[IO, Set[(GameId, Seat)]](Set.empty), Queue.bounded[IO, DeliveryEvent](DeliveryEventQueueCapacity))
-        .mapN(new Webhooks(registry, store, client, checkUrl, transport, config, _, runners, stats, _))
+        .mapN(new Webhooks(registry, store, client, checkUrl, transport, config, _, runners, stats, _, featuredBot))
     }

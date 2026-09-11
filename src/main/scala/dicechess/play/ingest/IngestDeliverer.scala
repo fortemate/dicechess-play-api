@@ -24,9 +24,15 @@ import scala.concurrent.duration.*
 final class IngestDeliverer(outbox: OutboxStore, client: Client[IO], config: IngestDeliverer.Config):
   import IngestDeliverer.*
 
-  /** Poll → deliver → sleep, forever. Scoped to the server by the caller (`.background`). */
+  /** Poll → deliver → sleep, forever. Scoped to the server by the caller (`.background`).
+    *
+    * A failed poll cycle (e.g. PgGameStore.due timeout during database or connectEC starvation, or transient database
+    * outage) must not crash the deliverer loop or supervisor. We log the failure and retry after pollEvery (#120).
+    */
   def loop: IO[Nothing] =
-    (deliverDueOnce *> IO.sleep(config.pollEvery)).foreverM
+    (deliverDueOnce.handleErrorWith { e =>
+      Console[IO].errorln(s"[play][ingest] poll cycle failed: $e").as(Nil)
+    } *> IO.sleep(config.pollEvery)).foreverM
 
   /** One polling cycle; returns each row's outcome (exposed for tests). */
   def deliverDueOnce: IO[List[Outcome]] =

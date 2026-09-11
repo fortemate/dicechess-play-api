@@ -266,7 +266,7 @@ final class ShowcaseTable private (
     * forget the game as current, and re-evaluate the table. Idempotent per game — a second watcher for the same id is a
     * no-op, and a duplicate completion finds nothing left to clear.
     */
-  private def watch(game: LiveGame): IO[Unit] =
+  private[server] def watch(game: LiveGame): IO[Unit] =
     watched
       .modify(ids => (ids + game.id, ids.contains(game.id)))
       .flatMap:
@@ -274,7 +274,14 @@ final class ShowcaseTable private (
         case false =>
           supervisor
             .supervise(
-              game.room.result.attempt.void *>
+              game.room.result.attempt.flatMap {
+                case Right(GameOver(GameResult.Win(winner), Termination.Timeout)) if winner == game.humanColor =>
+                  val botName = config.featuredBot.map(_.externalId).getOrElse("featured bot")
+                  Console[IO].errorln(
+                    s"[play][showcase] featured bot delivery failed: game ${game.id.value} $botName forfeited on the clock"
+                  )
+                case _ => IO.unit
+              } *>
                 phase.update {
                   case Phase.Live(live) if live.id == game.id => Phase.Finishing(live)
                   case other                                  => other

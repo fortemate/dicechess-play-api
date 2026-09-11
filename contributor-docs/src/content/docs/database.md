@@ -438,6 +438,57 @@ key would either block that or cascade away the very history these tables exist 
 by the strength report, while the `ladder` boolean marks ladder-origin games and new rows leave
 `pairing_id` null. Migration `V2` dropped six single-scale `glicko_*` columns on `bots` and `users` (#9) after per-category ratings landed.
 
+## Connection pool sizing, connectEC, and game-end starvation (#120)
+
+### The incident: 60 s timeouts and CPU starvation at game end
+
+During load tests and production runs with multiple concurrent games (e.g. 8 simultaneous games on a 2 vCPU node), the server observed periodic 60-second timeouts on `PgGameStore.outbox.due` and CPU saturation shortly after games ended. Crucially, client WebSocket connections were abruptly terminated with timeout exceptions.
+
+Investigation revealed a confluence of resource bottlenecks:
+
+1. **The game-end write burst (`saveTransaction`)**:
+   When a game ends, the terminal snapshot is persisted via `PgGameStore.saveTransaction`. This transaction:
+   - Updates `games` with the final status and version.
+   - Upserts `user_games` and appends to `user_game_history`.
+   - Inserts into `game_results`.
+   - Emits an outbox event (`game.ended`) to `outbox`.
+   - Serializes and stores the complete turn tree archive JSON payload into `game_archives`.
+   This multi-table transaction holds a database connection significantly longer than intermediate snapshot writes.
+
+2. **Ingest outbox polling (`IngestDeliverer.loop`)**:
+   `IngestDeliverer` polls `outbox.due(limit = 100)` with `FOR UPDATE SKIP LOCKED` on a tight 1-second interval. When multiple games end, the outbox table experiences concurrent locking and polling contention.
+
+3. **CPU starvation from the rating batch (`RatingSupervisor`)**:
+   Every `LADDER_INTERVAL_SECONDS` (15 s in staging/test, 30 s in production), the rating supervisor polls `finishedRatedSince` and executes iterative Bradley-Terry bootstrapping across all historical rated games. On a 2 vCPU deployment, this numerical optimization consumed nearly 100% of available CPU, degrading thread scheduling across the JVM.
+
+4. **The `connectEC` thread pool bottleneck**:
+   `PgGameStore.resource` allocated a fixed thread pool of **4 threads** for `connectEC` (`Executors.newFixedThreadPool(4)`), while Hikari was configured with a maximum pool size of **10 connections**. Because blocking JDBC queries run on `connectEC`, having fewer execution threads than database connections created an artificial bottleneck: connections sat idle while JDBC tasks queued for one of the 4 threads. In combination with CPU starvation, queued calls to `PgGameStore.outbox.due` spent their entire 60-second timeout waiting for an execution thread.
+
+### Why exceptions surfaced on WebSocket fibers
+
+1. **Supervisor tear-down via `parTupled`**:
+   In `Main.scala`, all background processes (`ingestDeliverer.loop`, `ratingSupervisor.loop`, and the Ember HTTP/WebSocket server) are composed concurrently using `parTupled`. When `IngestDeliverer.loop` failed due to an unhandled 60 s timeout in `deliverDueOnce`, the unhandled exception crashed the fiber. In Cats Effect, an unhandled exception in one branch of `parTupled` triggers cooperative cancellation of all sibling fibers — immediately aborting the Ember server and terminating every active WebSocket connection.
+
+2. **Ember 60 s idle timeout**:
+   During active play, ping frames and player moves keep WebSocket connections alive. When a game completes and the terminal save stalls or background fibers starve of CPU, no further messages are dispatched. If this delay reaches 60 seconds, Ember's built-in idle timeout fires and closes the socket.
+
+### The solution and sizing doctrine
+
+1. **Align `connectEC` to pool size (`PLAY_DB_POOL_SIZE`)**:
+   The `connectEC` thread pool is now dynamically sized to match `config.poolSize` (`Executors.newFixedThreadPool(config.poolSize)`). Database connections never starve waiting for an available execution thread. The pool size is configurable via `PLAY_DB_POOL_SIZE` (default 10).
+
+2. **Resilient background loops**:
+   `IngestDeliverer.deliverDueOnce` inside `loop` is wrapped with `.handleErrorWith`. Transient database timeouts or connection errors log a warning (`[play][ingest] poll cycle failed: ...`) and return `Nil`, allowing the deliverer to pause and retry on the next interval without bubbling up and crashing the root supervisor.
+
+3. **Pool telemetry and runtime attribution**:
+   - `PgGameStore` exposes `HikariPoolMXBean` metrics (`active`, `idle`, `waiting`, `total`) and samples connection acquisition time (`sampleAcquireTime`).
+   - A background fiber (`poolTelemetryLoop`, default 60 s) logs pool statistics periodically.
+   - All `PgGameStore` database operations are wrapped with `.timed(opName, timeout)`. If an operation exceeds 1 second (well below `SaveTimeout`), a `WARN` is logged attributing the latency to pool exhaustion (`waiting > 0`, high acquire time) or a slow SQL statement.
+
+4. **Featured bot delivery failure alerting**:
+   When webhook delivery to the featured showcase bot fails (transport failure, timeout, 5xx, or refusal) or when the featured bot forfeits on the clock, the system logs a `WARN` with a stable marker:
+   `[play][showcase] featured bot delivery failed: ...`
+
 ## Changing the schema
 
 - Add a new numbered migration; never edit one that has been applied anywhere.

@@ -108,6 +108,12 @@ final class PgGameStore private (xa: HikariTransactor[IO])
       Console[IO].errorln(s"[play][db][pool] telemetry error: $err")
     } *> IO.sleep(interval)).foreverM
 
+  private[store] def attributeDelay(stats: PgGameStore.PoolStats, timeout: Boolean): String =
+    if stats.waiting > 0 then s"pool exhaustion (waiting=${stats.waiting})"
+    else if stats.active >= stats.total && stats.total > 0 then s"pool saturated (active=${stats.active})"
+    else if timeout then "slow statement, db contention or connectEC starvation"
+    else "slow statement or db contention"
+
   /** Bounded query wrapper with timing and pool attribution telemetry (#120).
     *
     * If execution exceeds [[SlowStatementThreshold]] (1s), logs a `WARN` with the operation name, elapsed time, and
@@ -122,10 +128,7 @@ final class PgGameStore private (xa: HikariTransactor[IO])
         .flatMap { (elapsed, res) =>
           if elapsed >= SlowStatementThreshold then
             currentPoolStats(sampleAcquire = false).flatMap { stats =>
-              val attribution =
-                if stats.waiting > 0 then s"pool exhaustion (waiting=${stats.waiting})"
-                else if stats.active >= stats.total && stats.total > 0 then s"pool saturated (active=${stats.active})"
-                else "slow statement or db contention"
+              val attribution = attributeDelay(stats, timeout = false)
               Console[IO]
                 .errorln(
                   s"[play][db][warn] operation '$op' slow: took ${elapsed.toMillis}ms (threshold: ${SlowStatementThreshold.toMillis}ms, attribution: $attribution, pool: $stats)"
@@ -140,10 +143,7 @@ final class PgGameStore private (xa: HikariTransactor[IO])
               now <- IO.monotonic
               elapsed = now - start
               stats <- currentPoolStats(sampleAcquire = false)
-              attribution =
-                if stats.waiting > 0 then s"pool exhaustion (waiting=${stats.waiting})"
-                else if stats.active >= stats.total && stats.total > 0 then s"pool saturated (active=${stats.active})"
-                else "slow statement, db contention or connectEC starvation"
+              attribution = attributeDelay(stats, timeout = true)
               _ <- Console[IO].errorln(
                 s"[play][db][warn] operation '$op' timed out after ${elapsed.toMillis}ms (timeout: ${timeout.toMillis}ms, attribution: $attribution, pool: $stats)"
               )
@@ -3624,11 +3624,13 @@ object PgGameStore:
     */
   final case class Config(url: String, user: String, password: String, poolSize: Int = 10)
 
-  def configFromEnv: Option[Config] =
-    sys.env.get("PLAY_DB_URL").filter(_.nonEmpty).map { url =>
-      val poolSize = sys.env.get("PLAY_DB_POOL_SIZE").flatMap(_.toIntOption).filter(_ > 0).getOrElse(10)
-      Config(url, sys.env.getOrElse("PLAY_DB_USER", "play"), sys.env.getOrElse("PLAY_DB_PASSWORD", ""), poolSize)
+  def parseConfig(env: Map[String, String]): Option[Config] =
+    env.get("PLAY_DB_URL").filter(_.nonEmpty).map { url =>
+      val poolSize = env.get("PLAY_DB_POOL_SIZE").flatMap(_.toIntOption).filter(_ > 0).getOrElse(10)
+      Config(url, env.getOrElse("PLAY_DB_USER", "play"), env.getOrElse("PLAY_DB_PASSWORD", ""), poolSize)
     }
+
+  def configFromEnv: Option[Config] = parseConfig(sys.env)
 
   /** Migrate (Flyway owns schema `play`, creating it if absent) and open a pooled transactor. Returns the concrete
     * type: the caller wires it as the registry's `GameStore` and the deliverer's `OutboxStore`.

@@ -371,6 +371,22 @@ final class Webhooks private (
       s"[play][webhook] game ${id.value} ${bot.externalId}: $reason — retrying in $delay (attempt ${step.attempt})"
     )
 
+  private def logFailedDelivery(
+      id: GameId,
+      bot: Principal.Bot,
+      reason: String,
+      outcome: DeliveryOutcome
+  ): IO[DeliveryOutcome] =
+    val alertFeatured =
+      if featuredBot.contains(bot) then
+        Console[IO].errorln(
+          s"[play][showcase] featured bot delivery failed: game ${id.value} ${bot.externalId}: $reason"
+        )
+      else IO.unit
+    (alertFeatured *> Console[IO].errorln(
+      s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)"
+    )).as(outcome)
+
   private def classifyDrawDecision(
       id: GameId,
       seat: Seat,
@@ -381,15 +397,7 @@ final class Webhooks private (
       plan: Option[RetryStep]
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
-      val alertFeatured =
-        if featuredBot.contains(bot) then
-          Console[IO].errorln(
-            s"[play][showcase] featured bot delivery failed: game ${id.value} ${bot.externalId}: $reason"
-          )
-        else IO.unit
-      (alertFeatured *> Console[IO].errorln(
-        s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)"
-      )).as(outcome)
+      logFailedDelivery(id, bot, reason, outcome)
 
     def ifCurrent(value: IO[DeliveryOutcome]): IO[DeliveryOutcome] =
       store
@@ -466,15 +474,7 @@ final class Webhooks private (
       plan: Option[RetryStep]
   ): IO[DeliveryOutcome] =
     def failed(reason: String, outcome: DeliveryOutcome): IO[DeliveryOutcome] =
-      val alertFeatured =
-        if featuredBot.contains(bot) then
-          Console[IO].errorln(
-            s"[play][showcase] featured bot delivery failed: game ${id.value} ${bot.externalId}: $reason"
-          )
-        else IO.unit
-      (alertFeatured *> Console[IO].errorln(
-        s"[play][webhook] game ${id.value} ${bot.externalId}: $reason (clock decides)"
-      )).as(outcome)
+      logFailedDelivery(id, bot, reason, outcome)
 
     def ifCurrent(value: IO[DeliveryOutcome]): IO[DeliveryOutcome] =
       store

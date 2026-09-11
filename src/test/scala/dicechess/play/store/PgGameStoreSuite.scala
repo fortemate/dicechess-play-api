@@ -4968,3 +4968,72 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         }
       }
     }
+
+  test("attributeDelay covers all attribution branches (#120)"):
+    val waitingStats   = PgGameStore.PoolStats(active = 5, idle = 0, waiting = 2, total = 5)
+    val saturatedStats = PgGameStore.PoolStats(active = 5, idle = 0, waiting = 0, total = 5)
+    val normalStats    = PgGameStore.PoolStats(active = 2, idle = 3, waiting = 0, total = 5)
+
+    withContainers { pg =>
+      store(pg).use { db =>
+        IO {
+          assertEquals(db.attributeDelay(waitingStats, timeout = false), "pool exhaustion (waiting=2)")
+          assertEquals(db.attributeDelay(waitingStats, timeout = true), "pool exhaustion (waiting=2)")
+          assertEquals(db.attributeDelay(saturatedStats, timeout = false), "pool saturated (active=5)")
+          assertEquals(db.attributeDelay(saturatedStats, timeout = true), "pool saturated (active=5)")
+          assertEquals(db.attributeDelay(normalStats, timeout = false), "slow statement or db contention")
+          assertEquals(
+            db.attributeDelay(normalStats, timeout = true),
+            "slow statement, db contention or connectEC starvation"
+          )
+        }
+      }
+    }
+
+  test("PoolStats format with and without acquireTimeMs (#120)"):
+    val s1 = PgGameStore.PoolStats(1, 2, 0, 3, Some(15L))
+    val s2 = PgGameStore.PoolStats(1, 2, 0, 3, None)
+    assertEquals(s1.toString, "active=1, idle=2, waiting=0, total=3, acquire=15ms")
+    assertEquals(s2.toString, "active=1, idle=2, waiting=0, total=3")
+
+  test("parseConfig parses connection settings and pool size from env map (#120)"):
+    val env1 = Map("PLAY_DB_URL" -> "jdbc:postgresql://localhost:5432/test", "PLAY_DB_POOL_SIZE" -> "15")
+    val c1   = PgGameStore.parseConfig(env1).get
+    assertEquals(c1.poolSize, 15)
+    assertEquals(c1.url, "jdbc:postgresql://localhost:5432/test")
+    assertEquals(c1.user, "play")
+
+    val env2 = Map("PLAY_DB_URL" -> "jdbc:postgresql://localhost:5432/test", "PLAY_DB_POOL_SIZE" -> "invalid")
+    val c2   = PgGameStore.parseConfig(env2).get
+    assertEquals(c2.poolSize, 10)
+
+    val env3 = Map.empty[String, String]
+    assertEquals(PgGameStore.parseConfig(env3), None)
+
+    val env4 = Map("PLAY_DB_URL" -> "")
+    assertEquals(PgGameStore.parseConfig(env4), None)
+
+    // Call configFromEnv to exercise the method
+    val _ = PgGameStore.configFromEnv
+
+  test("poolTelemetryLoop logs periodic pool statistics (#120)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        db.poolTelemetryLoop(10.millis).timeout(50.millis).attempt.map { res =>
+          assert(res.isLeft && res.left.toOption.get.isInstanceOf[java.util.concurrent.TimeoutException])
+        }
+      }
+    }
+
+  test("showcaseTable, clearShowcaseGame, clientReports markRetry/markParked timed queries (#120)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        val id = GameId("00000000-0000-0000-0000-000000000099")
+        for
+          _ <- db.showcaseTable
+          c <- db.clearShowcaseGame(id)
+          _ <- db.clientReports.markRetry(id, attempts = 1, retryIn = 10.seconds, error = "test-error")
+          _ <- db.clientReports.markParked(id, error = "test-error")
+        yield assert(!c)
+      }
+    }

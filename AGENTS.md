@@ -38,7 +38,7 @@ via mise). If a tool is missing, run `bash scripts/jules-setup.sh` instead of in
   - `core/` — domain models (`Protocol.scala`, `Identity.scala`, `RatingCategory.scala`, `Seek.scala`, `BotEvent.scala`, `GameId.scala`).
   - `game/` — `GameRoom.scala` (authoritative room fiber, turn clocks, move validation), `EngineOps.scala` (bridge to engine), `PlayerConnection.scala`.
   - `dice/` — `DiceSource.scala` (CSPRNG with commit-reveal).
-  - `rating/` — `Glicko2.scala`, `BradleyTerry.scala`, `Sprt.scala`, `RatingBatch.scala`, `StrengthCache.scala`, `StrengthReport.scala`.
+  - `rating/` — `Glicko2.scala`, `BradleyTerry.scala`, `Sprt.scala`, `RatingBatch.scala`, `StrengthCache.scala`, `StrengthReport.scala`, `RatingReplay.scala` (offline chronological replay over a corpus export, #145; runner `RatingReplayMain`).
   - `server/` — http4s routes (`PlayRoutes`, `BotRoutes`, `LobbyRoutes`, `AuthRoutes`, `AdminBotRoutes`, `WebhookRoutes`, `LeaderboardRoutes`, `MeRoutes`, `HealthRoutes`, `Cors.scala`, `GoogleAuth.scala`, `BotAuth.scala`, `WebhookSecurity.scala`).
   - `store/` — Doobie PostgreSQL storage (`GameStore`, `PgGameStore`, `UserStore`, `GameArchive`, `AdminBotStore`, `WebhookStats`).
   - `ingest/` — `IngestDeliverer.scala` (outbox publisher), `PlaysiteIngest.scala`.

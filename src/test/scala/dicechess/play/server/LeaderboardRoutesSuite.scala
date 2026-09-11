@@ -63,7 +63,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   private def stubRatings(known: Map[RatedIdentity, Map[RatingCategory, Glicko]]): RatingStore = new RatingStore:
     def unappliedRatedGames(limit: Int): IO[List[GameResultRow]]                              = IO.pure(Nil)
     def applyRatingUpdate(gameId: GameId, white: RatingUpdate, black: RatingUpdate): IO[Unit] = IO.unit
-    def markRatingApplied(gameId: GameId): IO[Unit]                                           = IO.unit
+    def markRatingApplied(gameId: GameId, reason: String): IO[Unit]                           = IO.unit
     def ratingChangeFor(gameId: GameId): IO[Option[GameRatingChange]]                         = IO.pure(None)
     def categoryRatingOf(identity: RatedIdentity, category: RatingCategory): IO[Glicko]       =
       IO.pure(known.getOrElse(identity, Map.empty).getOrElse(category, Glicko.Initial))

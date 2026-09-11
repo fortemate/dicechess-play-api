@@ -25,6 +25,20 @@ The multiplier is measured, not borrowed: chess uses 40 expected moves per side,
 
 The ladder plays a single control (5 + 3, Blitz), so that is the scale [`GET /leaderboard`](../reference/rest/#leaderboard) answers on when you do not name one, and the scale the strength report is built from.
 
+## Which games count: rating domains
+
+A game is classified **once, at creation**, into one of three rating domains, and the classification is carried in the live snapshot as `ratingDomain` and recorded on the finished game (#146):
+
+| `ratingDomain` | Meaning | `rated` |
+| --- | --- | --- |
+| `competitive` | A canonical rating may move: two accounts against each other, or two registered bots the ladder scheduler paired. | `true` |
+| `training` | A person against a bot. No canonical rating moves — the game is the input of a separately named training estimate — but it is recorded as asked for. | `false` |
+| `casual` | Nothing moves: a guest or anonymous seat, self-play, an `Unlimited`/`PerMove` control, a direct bot challenge or seek under the matrix policy, or simply a game nobody asked to have rated. | `false` |
+
+`rated` keeps its meaning of "moves a canonical rating", so `rated: true` implies `competitive`, and a `training` game reads `rated: false` even though the request asked for rated — that is the downgrade you can read back in the seek, the snapshot and `GET /games/{id}/rating`.
+
+Which pairings land where is a **deployment policy**, `RATING_POLICY`: `legacy` (the rule every game before this classification existed was created under — any two registered, non-anonymous participants may play rated on a bounded control, whatever the pairing) or `matrix` (the table above, from the bot-rating-boundaries decision). The policy version that classified a game is recorded with it, so the two populations can always be told apart; flipping the policy never reclassifies a finished game. Human-versus-bot games therefore either move both canonical ratings (`legacy`) or none (`matrix`) — never one side only.
+
 ## The three numbers
 
 Dice Chess uses [Glicko-2](http://www.glicko.net/glicko/glicko2.pdf) (Glickman), not plain Elo. Elo gives you one number; Glicko-2 gives you three, because a rating built on 3 games and a rating built on 300 games shouldn't be trusted equally:
@@ -57,7 +71,7 @@ There is deliberately **no idle-time RD inflation** here (the part of Glicko-2 w
 
 Reach for it instead of the obvious-looking alternative — read your rating, play, read it again. Since the batch applies games one at a time and up to a minute late, any *other* game of yours that lands in between is folded into that difference: play two games back to back and the subtraction reports the earlier one, which can show a rating drop after a win. Poll the `applied` flag — `false` means the batch has not reached this game yet, and once it is `true` the answer is final.
 
-Final includes both seats coming back `null`, which means the game moved nobody's rating. That happens when:
+The response also says **why**: `outcome` is `pending`, `applied`, `skipped` (with the batch's `reason`), `casual` or `legacy`, and `ratingDomain` names the domain above. Final includes both seats coming back `null`, which means the game moved nobody's rating. That happens when:
 
 - the game was **casual** — rated is the player's own choice at game creation, and only rated games reach the batch;
 - the control was **`Unlimited` or `PerMove`** — see [One rating per speed](#one-rating-per-speed): such a game is casual by construction;

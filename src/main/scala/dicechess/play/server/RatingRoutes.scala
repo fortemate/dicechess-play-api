@@ -30,7 +30,14 @@ final case class GameRatingResponse(
     gameId: String,
     applied: Boolean,
     white: Option[SeatRatingChangeResponse],
-    black: Option[SeatRatingChangeResponse]
+    black: Option[SeatRatingChangeResponse],
+    // What the batch decided (#146): `pending`, `applied`, `skipped`, `casual` or `legacy` — the stamp alone
+    // (`applied`) never says whether a rating moved; this does. `reason` is the batch's own words for a skip.
+    outcome: String,
+    reason: Option[String],
+    // The namespace the game was classified into at creation: `competitive`, `training`, `casual`; `null` for a
+    // game recorded before classification existed.
+    ratingDomain: Option[String]
 ) derives Codec.AsObject
 
 /** Public, unauthenticated per-game rating movement (#296) — the read side of what `RatingBatch` records.
@@ -72,7 +79,15 @@ object RatingRoutes:
             }
 
   private def responseFor(id: String, change: GameRatingChange): GameRatingResponse =
-    GameRatingResponse(id, change.applied, change.white.map(seat), change.black.map(seat))
+    GameRatingResponse(
+      id,
+      change.applied,
+      change.white.map(seat),
+      change.black.map(seat),
+      change.outcome.wireName,
+      change.reason,
+      change.domain.map(_.wireName)
+    )
 
   private def seat(change: SeatRatingChange): SeatRatingChangeResponse =
     SeatRatingChangeResponse(change.before, change.after)

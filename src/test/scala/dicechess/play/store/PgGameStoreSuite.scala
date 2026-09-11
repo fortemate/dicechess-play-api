@@ -75,6 +75,16 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
     snapshotFixture(GameStatus.Ended(GameOver(result, termination)))
       .copy(players = Map(Seat.White -> white, Seat.Black -> black), rated = Some(rated), ladder = Some(ladder))
 
+  /** Stand in for the rating batch having applied these rows (#146): the leaderboard and profile records count the
+    * population whose rating actually moved (`rating_outcome = 'applied'`), not every row that asked to be rated, so a
+    * suite that seeds rated rows without running the batch marks them applied the way the batch's stamp would.
+    */
+  private def markApplied(xa: doobie.Transactor[IO], ids: GameId*): IO[Unit] =
+    ids.toList.traverse_ { id =>
+      sql"""UPDATE play.game_results SET rating_outcome = 'applied', rating_applied_at = now()
+            WHERE game_id = ${id.value}::uuid""".update.run.transact(xa)
+    }
+
   test("a snapshot round-trips through jsonb, and upserts replace by game id"):
     withContainers { pg =>
       store(pg).use { db =>
@@ -2333,6 +2343,62 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  test("a finished game persists its classification and starts its outcome as pending or casual (#146)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val human               = Principal.User("44444444-4444-4444-4444-444444444444")
+        val bot                 = Principal.Bot("b146-team", "b146-bot")
+        def columns(id: GameId) =
+          sql"""SELECT white_kind, black_kind, rated_requested, rating_domain, rating_policy_version, rating_outcome,
+                       rating_skip_reason
+                FROM play.game_results WHERE game_id = ${id.value}::uuid"""
+            .query[(String, String, Option[Boolean], String, Int, String, Option[String])]
+            .unique
+            .transact(xa)
+        for
+          rated  <- GameId.random
+          casual <- GameId.random
+          legacy <- GameId.random
+          abort  <- GameId.random
+          _      <- db.save(
+            rated,
+            endedResultFixture(human, bot, rated = true).copy(
+              ratedRequested = Some(true),
+              ratingDomain = Some(RatingDomain.Competitive),
+              ratingPolicyVersion = Some(1)
+            )
+          )
+          _ <- db.save(
+            casual,
+            endedResultFixture(bot, human, rated = false).copy(
+              ratedRequested = Some(true),
+              ratingDomain = Some(RatingDomain.Training),
+              ratingPolicyVersion = Some(2)
+            )
+          )
+          // A snapshot from before the classification existed: no keys at all.
+          _ <- db.save(legacy, endedResultFixture(Principal.Guest("b146-guest"), bot, rated = true))
+          _ <- db.save(
+            abort,
+            endedResultFixture(human, bot, rated = true, termination = Termination.Aborted).copy(
+              ratedRequested = Some(true),
+              ratingDomain = Some(RatingDomain.Competitive),
+              ratingPolicyVersion = Some(1)
+            )
+          )
+          r <- columns(rated)
+          c <- columns(casual)
+          l <- columns(legacy)
+          a <- columns(abort)
+        yield
+          assertEquals(r, ("human", "bot", Some(true), "competitive", 1, "pending", None))
+          assertEquals(c, ("bot", "human", Some(true), "training", 2, "casual", None), "training: recorded, not queued")
+          assertEquals(l, ("guest", "bot", None, "legacy", 0, "pending", None), "unknown stays unknown, kinds derive")
+          assertEquals(a._6, "casual", "a technical abort has no sporting outcome and is never queued")
+          assertEquals(a._4, "competitive", "…but its creation-time classification is kept as the fact it is")
+      }
+    }
+
   test("an active (not yet ended) game does not get a game_results row (#98)"):
     withContainers { pg =>
       store(pg).use { db =>
@@ -3068,7 +3134,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
 
   test("the leaderboard lists converged bots best-first with their rated records and hides provisional ones (#103)"):
     withContainers { pg =>
-      store(pg).use { db =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
         val strong: Principal.Bot = Principal.Bot("lb-suite", "strong")
         val weak: Principal.Bot   = Principal.Bot("lb-suite", "weak")
         for
@@ -3092,10 +3158,11 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             idB,
             endedResultFixture(weak, strong, rated = true, result = GameResult.Win(Side.Black))
           ) // strong wins as Black
-          idC   <- GameId.random
-          _     <- db.save(idC, endedResultFixture(strong, weak, rated = true, result = GameResult.Draw))
-          idD   <- GameId.random
-          _     <- db.save(idD, endedResultFixture(strong, weak, rated = false)) // casual: excluded from the tally
+          idC <- GameId.random
+          _   <- db.save(idC, endedResultFixture(strong, weak, rated = true, result = GameResult.Draw))
+          idD <- GameId.random
+          _   <- db.save(idD, endedResultFixture(strong, weak, rated = false)) // casual: excluded from the tally
+          _     <- markApplied(xa, idA, idB, idC) // the record counts applied games only (#146)
           board <- db.leaderboard(RatingCategory.Default, maxRd = 110.0).map(_.filter(_.team == "lb-suite"))
         yield
           assertEquals(board.map(_.name), List("strong", "weak"), "best conservative estimate first; 'fresh' hidden")
@@ -3250,7 +3317,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
 
   test("categoryTalliesFor counts rated decided games from either seat, and is empty for a stranger (#103)"):
     withContainers { pg =>
-      store(pg).use { db =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
         val a = Principal.Bot("lb-tally", "a")
         val b = Principal.Bot("lb-tally", "b")
         for
@@ -3260,6 +3327,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _   <- db.save(idB, endedResultFixture(b, a, rated = true, result = GameResult.Win(Side.Black))) // a as Black
           idC <- GameId.random
           _        <- db.save(idC, endedResultFixture(a, b, rated = false)) // casual: excluded
+          _        <- markApplied(xa, idA, idB)
           tallyA   <- db.categoryTalliesFor(a.externalId)
           tallyB   <- db.categoryTalliesFor(b.externalId)
           stranger <- db.categoryTalliesFor("bot:team:lb-tally:nobody")
@@ -3794,7 +3862,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
 
   test("deleting an account cascades identities and guest links but leaves game history untouched"):
     withContainers { pg =>
-      store(pg).use { db =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
         for
           user    <- db.upsertOnLogin("google", "sub-delete", None, IO.pure("DeletedNick"))
           guestId <- IO(UUID.randomUUID().toString)
@@ -3804,6 +3872,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             gameId,
             endedResultFixture(Principal.User(user.id), Principal.Bot("delete-team", "delete-bot"), rated = true)
           )
+          _       <- markApplied(xa, gameId) // the record counts applied games only (#146)
           deleted <- db.deleteUser(user.id)
           gone    <- db.userById(user.id)
           // The same Google subject signing in again gets a FRESH account (the identity row cascaded)
@@ -4511,13 +4580,14 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
 
   test("the board and its record are scoped to one category — a Rapid game never counts on the Blitz board (#280)"):
     withContainers { pg =>
-      store(pg).use { db =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
         val team                                                                   = "cat-board"
         val fast: Principal.Bot                                                    = Principal.Bot(team, "fast")
         val slow: Principal.Bot                                                    = Principal.Bot(team, "slow")
         def game(white: Principal.Bot, black: Principal.Bot, control: TimeControl) =
           GameId.random.flatMap(id =>
-            db.save(id, endedResultFixture(white, black, rated = true).copy(timeControl = control))
+            db.save(id, endedResultFixture(white, black, rated = true).copy(timeControl = control)) *>
+              markApplied(xa, id) // the record counts applied games only (#146)
           )
         for
           _     <- db.register(team, "fast", "hash-cat-board-fast")

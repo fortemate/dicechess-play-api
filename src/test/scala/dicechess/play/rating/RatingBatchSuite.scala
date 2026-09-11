@@ -66,7 +66,11 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
       lastRoll = Nil,
       turns = Vector.empty,
       rated = Some(rated),
-      ladder = Some(ladder)
+      ladder = Some(ladder),
+      // What the registry writes under the legacy policy (#146): the classification behind `rated`.
+      ratedRequested = Some(rated),
+      ratingDomain = Some(if rated then RatingDomain.Competitive else RatingDomain.Casual),
+      ratingPolicyVersion = Some(RatingPolicy.Legacy.version)
     )
 
   /** One ladder-scheduler game (#190) that `loser` loses — the shape the auto-park streak counts (`ladder = true`, the
@@ -173,7 +177,19 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(aliceR, Glicko.Initial, "no rating may change on a skipped game")
           // A skipped game is a FINAL "nobody's rating moved", not a not-yet: a client polling `applied` has to stop
           // here rather than wait for numbers that will never be written (#296).
-          assertEquals(change, Some(GameRatingChange(applied = true, white = None, black = None)))
+          assertEquals(
+            change,
+            Some(
+              GameRatingChange(
+                applied = true,
+                white = None,
+                black = None,
+                outcome = RatingOutcome.Skipped,
+                reason = Some("a participant has no rating state (a guest, an unregistered bot, or a deleted account)"),
+                domain = Some(RatingDomain.Competitive)
+              )
+            )
+          )
       }
     }
 
@@ -216,7 +232,15 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
         yield
           assertEquals(
             pending,
-            Some(GameRatingChange(applied = false, white = None, black = None)),
+            Some(
+              GameRatingChange(
+                applied = false,
+                white = None,
+                black = None,
+                outcome = RatingOutcome.Pending,
+                domain = Some(RatingDomain.Competitive)
+              )
+            ),
             "a finished-but-unapplied game is a temporary 'not yet' — the state a client polls through"
           )
           assertEquals(unknown, None, "an id with no result row is a missing game, not an unapplied one")
@@ -263,7 +287,7 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           _            <- db.save(idNew, endedFixture(bob, alice, rated = true))
           idCasual     <- GameId.random
           _            <- db.save(idCasual, endedFixture(alice, bob, rated = false))
-          _            <- db.markRatingApplied(idOld)
+          _            <- db.markRatingApplied(idOld, "test: pre-stamped")
           queue        <- db
             .unappliedRatedGames(1000)
             .map(_.map(_.gameId.value).filter(Set(idOld, idNew, idCasual).map(_.value)))
@@ -572,6 +596,43 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  test("the batch persists what it decided: applied rows say so, skipped rows carry the reason (#146)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        for
+          owner <- db.upsertOnLogin("google", "sub-rb-outcome", None, IO.pure("RbOutcome"))
+          me = Principal.User(owner.id)
+          _             <- db.register("rb-out", "mine", "hash-rb-out-mine", owner = Some(me.externalId))
+          _             <- db.register("rb-out", "theirs", "hash-rb-out-theirs")
+          ownGame       <- GameId.random
+          strangerGame  <- GameId.random
+          casualGame    <- GameId.random
+          _             <- db.save(ownGame, endedFixture(me, Principal.Bot("rb-out", "mine"), rated = true))
+          _             <- db.save(strangerGame, endedFixture(me, Principal.Bot("rb-out", "theirs"), rated = true))
+          _             <- db.save(casualGame, endedFixture(me, Principal.Bot("rb-out", "theirs"), rated = false))
+          pendingBefore <- db.ratingChangeFor(strangerGame)
+          _             <- batch(db).flatMap(_.tick)
+          own           <- db.ratingChangeFor(ownGame)
+          stranger      <- db.ratingChangeFor(strangerGame)
+          casual        <- db.ratingChangeFor(casualGame)
+          tally         <- db.categoryTalliesFor(me.externalId)
+          total         <- db.totalGamesFor(me.externalId)
+        yield
+          assertEquals(pendingBefore.map(_.outcome), Some(RatingOutcome.Pending), "queued, not yet visited")
+          assertEquals(stranger.map(_.outcome), Some(RatingOutcome.Applied))
+          assertEquals(stranger.flatMap(_.reason), None)
+          assertEquals(stranger.flatMap(_.domain), Some(RatingDomain.Competitive), "legacy policy: competitive")
+          assertEquals(own.map(_.outcome), Some(RatingOutcome.Skipped))
+          assertEquals(own.flatMap(_.reason), Some("a player's game against their own bot is never rated"))
+          assert(own.exists(_.applied), "a skip is still stamped — `applied` keeps meaning 'visited'")
+          assertEquals(casual.map(_.outcome), Some(RatingOutcome.Casual), "never queued, never stamped")
+          assert(casual.exists(!_.applied))
+          // The record counts the same population the rating moved on: one applied win, not the skipped or casual one.
+          assertEquals(tally.get(RatingCategory.Blitz), Some(ResultTally(wins = 1, draws = 0, losses = 0)))
+          assertEquals(total, 3, "the all-games counter still sees every decided game")
+      }
+    }
+
   test("a tick that applies a rated game also warms the strength cache with a report that includes it (#181)"):
     withContainers { pg =>
       store(pg).use { db =>
@@ -662,7 +723,7 @@ class RatingBatchResilienceSuite extends CatsEffectSuite:
   /** Hands the batch exactly one queued game, then reports the queue drained. */
   private def oneGameQueue(queue: Ref[IO, List[GameResultRow]]): RatingStore = new RatingStore:
     def unappliedRatedGames(limit: Int): IO[List[GameResultRow]]                              = queue.getAndSet(Nil)
-    def markRatingApplied(gameId: GameId): IO[Unit]                                           = IO.unit
+    def markRatingApplied(gameId: GameId, reason: String): IO[Unit]                           = IO.unit
     def applyRatingUpdate(gameId: GameId, white: RatingUpdate, black: RatingUpdate): IO[Unit] = IO.unit
     def ratingChangeFor(gameId: GameId): IO[Option[GameRatingChange]]                         = IO.pure(None)
     def categoryRatingOf(identity: RatedIdentity, category: RatingCategory): IO[Glicko]       =

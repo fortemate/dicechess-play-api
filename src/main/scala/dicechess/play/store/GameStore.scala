@@ -77,6 +77,13 @@ final case class GameSnapshot(
     // Originating surface of the game (ADR-005, #44, #45, #47). Option with None default so pre-existing snapshots
     // without this field continue to decode cleanly.
     origin: Option[GameOrigin] = None,
+    // The eligibility classification decided at creation (#146, `RatingPolicy.classify`): what was asked for, which
+    // rating namespace the game may move, and the policy version that decided. Same `Option`/absent-key story as
+    // `rated` above: a snapshot from before these fields existed has no key, and the store's projection writes such a
+    // row as `rating_domain = 'legacy'`, policy version 0 — unknown is recorded as unknown, never inferred.
+    ratedRequested: Option[Boolean] = None,
+    ratingDomain: Option[RatingDomain] = None,
+    ratingPolicyVersion: Option[Int] = None,
     // Whether a draw offer is currently pending (#327). `None` when no offer is pending.
     pendingDrawOffer: Option[Seat] = None,
     // The seat that last offered a draw, for the alternation anti-spam rule (#327).
@@ -737,17 +744,21 @@ final case class RatingUpdate(
   */
 final case class SeatRatingChange(before: Double, after: Double)
 
-/** The rating movement recorded for one finished game (#296).
+/** The rating movement recorded for one finished game (#296), and what the batch decided about it (#146).
   *
   * `applied` answers "has the batch visited this game yet", which is the only thing a poller can wait on: the batch
   * runs up to `RATING_INTERVAL_SECONDS` behind the game's end. A seat is `None` once applied when its rating did not
   * move — a casual game, a guest seat, an unregistered bot, self-play, a deleted account — and that is a final answer,
-  * not a not-yet.
+  * not a not-yet. `outcome` says WHICH of those it was, `reason` in the batch's own words when it skipped, and `domain`
+  * the namespace the game was classified into at creation (`None` for a row written before classification existed).
   */
 final case class GameRatingChange(
     applied: Boolean,
     white: Option[SeatRatingChange],
-    black: Option[SeatRatingChange]
+    black: Option[SeatRatingChange],
+    outcome: RatingOutcome = RatingOutcome.Legacy,
+    reason: Option[String] = None,
+    domain: Option[RatingDomain] = None
 )
 
 trait RatingStore:
@@ -786,9 +797,10 @@ trait RatingStore:
 
   /** Stamp a game as applied WITHOUT touching any rating — for games the batch must skip permanently (a non-bot or
     * unregistered participant, a missing result, self-play): left unstamped they would clog the head of the queue
-    * forever.
+    * forever. `reason` is persisted with the `skipped` outcome (#146), so "why did my rating not move" has a stored
+    * answer rather than only a log line.
     */
-  def markRatingApplied(gameId: GameId): IO[Unit]
+  def markRatingApplied(gameId: GameId, reason: String): IO[Unit]
 
   /** The rating movement recorded for one finished game, or `None` when no `game_results` row exists for that id (an
     * unknown, unfinished, or in-memory-only game). Read side of [[applyRatingUpdate]], serving `GET /games/{id}/rating`

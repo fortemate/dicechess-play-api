@@ -54,6 +54,8 @@ object Codecs:
     wireNameCodec("WebhookCapabilityStatus", WebhookCapabilityStatus.values.toList, _.wireName)
   given Codec[GameOrigin] =
     wireNameCodec("GameOrigin", GameOrigin.valuesList, _.wireName)
+  given Codec[RatingDomain] =
+    wireNameCodec("RatingDomain", RatingDomain.values.toList, _.wireName)
 
   // MoveTree is recursive, so it can't be derived: a node encodes as the plain object of its children (sorted for a
   // stable wire), and any JSON object decodes back into nodes.

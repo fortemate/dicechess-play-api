@@ -35,7 +35,7 @@ via mise). If a tool is missing, run `bash scripts/jules-setup.sh` instead of in
 
 - `src/main/scala/dicechess/play/`
   - `Main.scala` — the app entry point (`IOApp.Simple`): env config → Flyway migrate → Hikari pool → Ember server + background fibers.
-  - `core/` — domain models (`Protocol.scala`, `Identity.scala`, `RatingCategory.scala`, `Seek.scala`, `BotEvent.scala`, `GameId.scala`).
+  - `core/` — domain models (`Protocol.scala`, `Identity.scala`, `RatingCategory.scala`, `RatingPolicy.scala` (eligibility matrix, rating domains and outcomes, #146), `Seek.scala`, `BotEvent.scala`, `GameId.scala`).
   - `game/` — `GameRoom.scala` (authoritative room fiber, turn clocks, move validation), `EngineOps.scala` (bridge to engine), `PlayerConnection.scala`.
   - `dice/` — `DiceSource.scala` (CSPRNG with commit-reveal).
   - `rating/` — `Glicko2.scala`, `BradleyTerry.scala`, `Sprt.scala`, `RatingBatch.scala`, `StrengthCache.scala`, `StrengthReport.scala`.

@@ -262,6 +262,21 @@ unregistered bot, self-play, a deleted account), which is stamped applied with n
 all. Together with the stamp they make a `game_results` row write-**twice** rather than
 write-once: one bookkeeping UPDATE, by a single writer, never revisited.
 
+V9 (#146) separates the three facts `rated` used to stand for. `white_kind`/`black_kind` say who sat
+in the seat (`human`, `bot`, `guest` — from the external id's shape, never a name); `rated_requested`
+is what the caller asked for; `rating_domain` is the namespace the game may move (`competitive`,
+`training`, `casual`) as decided at creation by `RatingPolicy.classify` under the
+`rating_policy_version` that was in force (1 legacy, 2 matrix); `rating_outcome` is what the batch
+did (`pending` → `applied` or `skipped`, with the batch's own words in `rating_skip_reason`; `casual`
+for a row that was never queued). The stamp alone is therefore never read as evidence of a numeric
+update any more, and the leaderboard and profile W-D-L count `rating_outcome IN ('applied','legacy')`
+rather than `rated = true`, so the record and the rating move in the same population. Rows written
+before V9 carry `rating_domain = 'legacy'`, version `0`, and an outcome backfilled only where the
+row proves it: numbers present → `applied`, never rated → `casual`, unstamped → `pending`, stamped
+without numbers → `legacy` (applied before per-row recording, or skipped without a stored reason —
+the data cannot say which, so it is not reinterpreted). The kinds are the one legacy field that is
+derivable and they are backfilled.
+
 `category` (#335) is a **STORED generated column**, `rating_category(time_control)` computed
 once at insert — the schema reference above cannot show that, so it reads as an ordinary nullable
 `text`. It exists because the readers used to call that function inside their `WHERE` clauses, and

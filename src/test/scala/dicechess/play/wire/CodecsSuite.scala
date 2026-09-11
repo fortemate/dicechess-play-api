@@ -238,7 +238,7 @@ class CodecsSuite extends munit.FunSuite:
     )
     assertEquals(
       (GameEvent.Snapshot(9L, terminal, Nil): GameEvent).asJson.noSpaces,
-      """{"Snapshot":{"v":9,"state":{"version":9,"dfen":"fen","activeSeat":"White","dicePending":false,"status":{"Ended":{"over":{"result":{"Win":{"side":"White"}},"termination":"KingCaptured"}}},"timeControl":{"Unlimited":{}},"clocks":null,"commit":"c0ffee","seed":"ab12","clientSeeds":{"white":"w","black":"b"},"legalMoves":null,"players":null,"rated":null,"drawOffer":null,"mayOfferDraw":null,"mayOfferDrawBy":null},"history":[]}}"""
+      """{"Snapshot":{"v":9,"state":{"version":9,"dfen":"fen","activeSeat":"White","dicePending":false,"status":{"Ended":{"over":{"result":{"Win":{"side":"White"}},"termination":"KingCaptured"}}},"timeControl":{"Unlimited":{}},"clocks":null,"commit":"c0ffee","seed":"ab12","clientSeeds":{"white":"w","black":"b"},"legalMoves":null,"players":null,"rated":null,"ratingDomain":null,"drawOffer":null,"mayOfferDraw":null,"mayOfferDrawBy":null},"history":[]}}"""
     )
 
   test("Seek and Players pin their wire shapes (who a lobby row / board is looking at)"):

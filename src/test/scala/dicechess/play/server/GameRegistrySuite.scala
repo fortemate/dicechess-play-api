@@ -60,9 +60,12 @@ class GameRegistrySuite extends munit.CatsEffectSuite:
     * principal until a friend uses a seat token, so the flag would write a `true` the batch then contradicts. See the
     * rationale comment on `PlayRoutes`'s `registry.create` call.
     */
-  test("isRated does NOT exclude self-play — the same principal on both seats still counts as rated"):
-    assert(GameRegistry.isRated(alice, alice, requested = true, Blitz))
-    assert(GameRegistry.isRated(Principal.User("u1"), Principal.User("u1"), requested = true, Blitz))
+  test("isRated excludes self-play at creation (#146) — the batch no longer has to contradict the column"):
+    // Before #146 the same principal on both seats passed `isRated` and was stamped rated, only for `RatingBatch` to
+    // skip it as "self-play carries no rating information" — the lie in the column #279 exists to keep honest. The
+    // classification decides it up front now; friend-by-link games (`POST /games`) still pass `requestedRated = false`.
+    assert(!GameRegistry.isRated(alice, alice, requested = true, Blitz))
+    assert(!GameRegistry.isRated(Principal.User("u1"), Principal.User("u1"), requested = true, Blitz))
 
   test("an uncategorised control forces casual however registered the participants are (#280)"):
     // There is one rating scale per speed now, and neither of these bounds how long a game lasts — so there is no
@@ -88,6 +91,53 @@ class GameRegistrySuite extends munit.CatsEffectSuite:
               assert(snaps.headOption.exists(_.rated.contains(true)), "the creation snapshot must be marked rated")
             }
         }
+      }
+    }
+
+  test("the creation snapshot carries the classification behind `rated` (#146)"):
+    Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
+      GameRegistry.create(store = capturingStore(written)).flatMap { registry =>
+        registry.create(alice, bob, Blitz, requestedRated = true).flatMap {
+          case Left(error) => IO.raiseError(RuntimeException(s"create failed: $error"))
+          case Right(_)    =>
+            written.get.map { snaps =>
+              val snap = snaps.headOption.getOrElse(fail("no creation snapshot"))
+              assertEquals(snap.ratedRequested, Some(true))
+              assertEquals(snap.ratingDomain, Some(RatingDomain.Competitive))
+              assertEquals(snap.ratingPolicyVersion, Some(1), "a registry not told otherwise is legacy")
+            }
+        }
+      }
+    }
+
+  test("under the matrix policy a human against a bot is a training game: rated=false, domain training (#146)"):
+    Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
+      GameRegistry.create(store = capturingStore(written), ratingPolicy = RatingPolicy.Matrix).flatMap { registry =>
+        registry.create(Principal.User("u1"), bob, Blitz, requestedRated = true).flatMap {
+          case Left(error) => IO.raiseError(RuntimeException(s"create failed: $error"))
+          case Right(_)    =>
+            written.get.map { snaps =>
+              val snap = snaps.headOption.getOrElse(fail("no creation snapshot"))
+              assertEquals(snap.rated, Some(false), "no canonical rating may move — the request is downgraded")
+              assertEquals(snap.ratedRequested, Some(true), "…while the request itself is kept on record")
+              assertEquals(snap.ratingDomain, Some(RatingDomain.Training))
+              assertEquals(snap.ratingPolicyVersion, Some(2))
+            }
+        }
+      }
+    }
+
+  test("under the matrix policy two bots compete only when the ladder scheduler paired them (#146)"):
+    Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
+      GameRegistry.create(store = capturingStore(written), ratingPolicy = RatingPolicy.Matrix).flatMap { registry =>
+        for
+          _     <- registry.create(alice, bob, Blitz, requestedRated = true) // a direct challenge
+          _     <- registry.create(alice, bob, Blitz, requestedRated = true, ladder = true)
+          snaps <- written.get
+        yield
+          val (direct, scheduled) = (snaps.head, snaps.find(_.ladder.contains(true)).get)
+          assertEquals((direct.rated, direct.ratingDomain), (Some(false), Some(RatingDomain.Casual)))
+          assertEquals((scheduled.rated, scheduled.ratingDomain), (Some(true), Some(RatingDomain.Competitive)))
       }
     }
 

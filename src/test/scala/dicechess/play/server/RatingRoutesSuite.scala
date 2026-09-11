@@ -1,7 +1,7 @@
 package dicechess.play.server
 
 import cats.effect.IO
-import dicechess.play.core.{GameId, RatingCategory}
+import dicechess.play.core.{GameId, RatingCategory, RatingDomain, RatingOutcome}
 import dicechess.play.rating.Glicko
 import dicechess.play.store.*
 import io.circe.Json
@@ -20,7 +20,7 @@ class RatingRoutesSuite extends munit.CatsEffectSuite:
   private def stubRatings(known: Map[String, GameRatingChange]): RatingStore = new RatingStore:
     def unappliedRatedGames(limit: Int): IO[List[GameResultRow]]                              = IO.pure(Nil)
     def applyRatingUpdate(gameId: GameId, white: RatingUpdate, black: RatingUpdate): IO[Unit] = IO.unit
-    def markRatingApplied(gameId: GameId): IO[Unit]                                           = IO.unit
+    def markRatingApplied(gameId: GameId, reason: String): IO[Unit]                           = IO.unit
     def ratingChangeFor(gameId: GameId): IO[Option[GameRatingChange]] = IO.pure(known.get(gameId.value))
     def categoryRatingOf(identity: RatedIdentity, category: RatingCategory): IO[Glicko] = IO.pure(Glicko.Initial)
     def categoryRatingsOf(identity: RatedIdentity): IO[Map[RatingCategory, Glicko]]     = IO.pure(Map.empty)
@@ -33,7 +33,10 @@ class RatingRoutesSuite extends munit.CatsEffectSuite:
   private val applied = GameRatingChange(
     applied = true,
     white = Some(SeatRatingChange(before = 1775.6714474976957, after = 1797.2144251082318)),
-    black = Some(SeatRatingChange(before = 1601.5, after = 1580.25))
+    black = Some(SeatRatingChange(before = 1601.5, after = 1580.25)),
+    outcome = RatingOutcome.Applied,
+    reason = None,
+    domain = Some(RatingDomain.Competitive)
   )
 
   test("GET /games/{id}/rating is 404 for an id with no result row"):
@@ -50,7 +53,8 @@ class RatingRoutesSuite extends munit.CatsEffectSuite:
     val expected = parse(
       s"""{"gameId":"$gameId","applied":true,
            "white":{"before":1775.6714474976957,"after":1797.2144251082318},
-           "black":{"before":1601.5,"after":1580.25}}"""
+           "black":{"before":1601.5,"after":1580.25},
+           "outcome":"applied","reason":null,"ratingDomain":"competitive"}"""
     ).toOption.get
     app(Map(gameId -> applied))
       .run(Request[IO](Method.GET, uri"/games/11111111-2222-3333-4444-555555555555/rating"))
@@ -63,6 +67,38 @@ class RatingRoutesSuite extends munit.CatsEffectSuite:
         )
         resp.as[Json].map(assertEquals(_, expected, "the SPA reads these field names — pin them"))
       }
+
+  test("a skipped game names its outcome and the batch's reason, so the stamp is never the only evidence (#146)"):
+    val skipped = GameRatingChange(
+      applied = true,
+      white = None,
+      black = None,
+      outcome = RatingOutcome.Skipped,
+      reason = Some("a player's game against their own bot is never rated"),
+      domain = Some(RatingDomain.Competitive)
+    )
+    app(Map(gameId -> skipped))
+      .run(Request[IO](Method.GET, uri"/games/11111111-2222-3333-4444-555555555555/rating"))
+      .flatMap { resp =>
+        assertEquals(resp.status, Status.Ok)
+        resp.as[Json].map { json =>
+          val c = json.hcursor
+          assertEquals(c.get[Boolean]("applied"), Right(true), "visited: the old poller contract still holds")
+          assertEquals(c.get[String]("outcome"), Right("skipped"))
+          assertEquals(c.get[String]("reason"), Right("a player's game against their own bot is never rated"))
+          assertEquals(c.get[String]("ratingDomain"), Right("competitive"))
+          assert(c.downField("white").focus.exists(_.isNull))
+        }
+      }
+
+  test("a row older than the classification answers legacy with no domain (#146)"):
+    val legacy = GameRatingChange(applied = true, white = None, black = None)
+    app(Map(gameId -> legacy))
+      .run(Request[IO](Method.GET, uri"/games/11111111-2222-3333-4444-555555555555/rating"))
+      .flatMap(_.as[Json].map { json =>
+        assertEquals(json.hcursor.get[String]("outcome"), Right("legacy"))
+        assert(json.hcursor.downField("ratingDomain").focus.exists(_.isNull))
+      })
 
   test("a game the batch has not reached yet answers applied:false, and must not be cached"):
     val pending = GameRatingChange(applied = false, white = None, black = None)

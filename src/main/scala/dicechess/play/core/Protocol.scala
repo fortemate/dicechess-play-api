@@ -222,6 +222,10 @@ final case class PublicGameState(
     // delta simply does not exist when the game finishes — the client refetches the profile/leaderboard instead of
     // being handed a number the server would have to invent.
     rated: Option[Boolean] = None,
+    // Which rating namespace the game may move (#146): `competitive` (a canonical rating — `rated` is then true),
+    // `training` (a human against a bot: no canonical rating moves, the game feeds the training estimate) or `casual`.
+    // Optional for wire evolution only, same rule as `rated`: absence means "the server does not say".
+    ratingDomain: Option[RatingDomain] = None,
     // Whether a draw offer from the opponent is currently pending for the side on move (#327).
     drawOffer: Option[DrawOffer] = None,
     // Whether the side to move is permitted to offer a draw on this turn under the alternation rule (#327).

@@ -27,7 +27,9 @@ final class GameRegistry private (
     diceSource: () => IO[DiceSource],
     registerHooks: CopyOnWriteArrayList[(GameId, List[Principal], GameOrigin) => IO[Unit]],
     deregisterHooks: CopyOnWriteArrayList[GameId => IO[Unit]],
-    resumeHooks: CopyOnWriteArrayList[List[(GameId, List[Principal], GameOrigin)] => IO[Unit]]
+    resumeHooks: CopyOnWriteArrayList[List[(GameId, List[Principal], GameOrigin)] => IO[Unit]],
+    /** The eligibility rule set every game this registry creates is classified under (#146). */
+    val ratingPolicy: RatingPolicy
 ):
 
   private var rematchService: Option[RematchService] = None
@@ -184,7 +186,7 @@ final class GameRegistry private (
         Map(Seat.White -> white, Seat.Black -> black),
         dice,
         timeControl,
-        rated = GameRegistry.isRated(white, black, requestedRated, timeControl),
+        classify(white, black, requestedRated, timeControl, origin, ladder),
         ladder = ladder,
         origin = origin
       )
@@ -205,10 +207,21 @@ final class GameRegistry private (
         Map(Seat.White -> white, Seat.Black -> black),
         dice,
         timeControl,
-        rated = GameRegistry.isRated(white, black, requestedRated, timeControl),
+        classify(white, black, requestedRated, timeControl, origin, ladder),
         ladder = ladder,
         origin = origin
       )
+
+  /** The game's eligibility under this registry's policy (#146) — decided once here, carried verbatim afterwards. */
+  private[server] def classify(
+      white: Principal,
+      black: Principal,
+      requestedRated: Boolean,
+      timeControl: TimeControl,
+      origin: GameOrigin,
+      ladder: Boolean
+  ): GameClassification =
+    RatingPolicy.classify(ratingPolicy, white, black, requestedRated, timeControl, origin, ladder)
 
   /** Shared room-creation seam behind `create`: build the room, register it, start it.
     *
@@ -221,7 +234,7 @@ final class GameRegistry private (
       players: Map[Seat, Principal],
       dice: DiceSource,
       timeControl: TimeControl,
-      rated: Boolean,
+      classification: GameClassification,
       ladder: Boolean,
       origin: GameOrigin
   ): IO[Either[String, (GameId, GameRoom)]] =
@@ -240,9 +253,12 @@ final class GameRegistry private (
           dice,
           config = GameRoom.GameConfig(
             timeControl = timeControl,
-            rated = rated,
+            rated = classification.rated,
             ladder = ladder,
-            origin = origin
+            origin = origin,
+            ratedRequested = classification.requestedRated,
+            ratingDomain = classification.domain,
+            ratingPolicyVersion = classification.policy.version
           ),
           metadata = GameRoom.SeatMetadata(displayNames = names, ratings = ratings),
           tuning = GameRoom.RoomTuning(
@@ -493,7 +509,10 @@ object GameRegistry:
       store: GameStore = GameStore.noop,
       resolveNicknames: List[String] => IO[Map[String, String]] = _ => IO.pure(Map.empty),
       resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]] = (_, _) => IO.pure(Map.empty),
-      diceSource: () => IO[DiceSource] = () => DiceSource.newCommitReveal()
+      diceSource: () => IO[DiceSource] = () => DiceSource.newCommitReveal(),
+      // `Legacy` by default (#146): a registry that is not told otherwise classifies exactly as every game before the
+      // policy existed was classified. Production reads `RatingPolicy.fromEnv`.
+      ratingPolicy: RatingPolicy = RatingPolicy.Legacy
   ): IO[GameRegistry] =
     (
       Ref.of[IO, Map[GameId, GameRoom]](Map.empty),
@@ -510,7 +529,8 @@ object GameRegistry:
         diceSource,
         new CopyOnWriteArrayList(),
         new CopyOnWriteArrayList(),
-        new CopyOnWriteArrayList()
+        new CopyOnWriteArrayList(),
+        ratingPolicy
       )
     }.flatTap: registry =>
       store match
@@ -525,10 +545,7 @@ object GameRegistry:
     * [[isRated]] (per-game eligibility) and `Lobby` (whether a seek's own creator/accepter may even ask for rated), so
     * the two can never disagree about who counts as anonymous.
     */
-  private[server] def isAnonymous(p: Principal): Boolean = p match
-    case Principal.Guest(_)     => true
-    case Principal.User(_)      => false
-    case Principal.Bot(team, _) => team == BotAuth.AnonTeam
+  private[server] def isAnonymous(p: Principal): Boolean = RatingPolicy.isAnonymous(p)
 
   /** Whether a game between these participants should count toward rating, given the caller's request (#279, ADR-0017).
     * Rated is player-chosen at creation, not operator-curated: any registered account or bot may play rated, and the
@@ -550,4 +567,6 @@ object GameRegistry:
       requested: Boolean,
       timeControl: TimeControl
   ): Boolean =
-    requested && !isAnonymous(white) && !isAnonymous(black) && RatingCategory.of(timeControl).isDefined
+    RatingPolicy
+      .classify(RatingPolicy.Legacy, white, black, requested, timeControl, GameOrigin.Legacy, ladder = false)
+      .rated

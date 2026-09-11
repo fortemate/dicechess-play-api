@@ -16,8 +16,11 @@ import dicechess.play.core.{
   GameOrigin,
   GameOver,
   GameStatus,
+  ParticipantKind,
   Principal,
   RatingCategory,
+  RatingDomain,
+  RatingOutcome,
   Seat,
   Side,
   Termination,
@@ -253,9 +256,12 @@ final class PgGameStore private (xa: HikariTransactor[IO])
       case Some(fg) =>
         sql"""INSERT INTO play.game_results
                 (game_id, white_external_id, black_external_id, result, termination, rated, time_control,
-                 server_seed, ladder, origin)
+                 server_seed, ladder, origin,
+                 white_kind, black_kind, rated_requested, rating_domain, rating_policy_version, rating_outcome)
               VALUES (${id.value}::uuid, ${fg.whiteExternalId}, ${fg.blackExternalId}, ${fg.result},
-                      ${fg.termination}, ${fg.rated}, ${fg.timeControl}, ${fg.serverSeed}, ${fg.ladder}, $origin)
+                      ${fg.termination}, ${fg.rated}, ${fg.timeControl}, ${fg.serverSeed}, ${fg.ladder}, $origin,
+                      ${fg.whiteKind}, ${fg.blackKind}, ${fg.ratedRequested}, ${fg.ratingDomain},
+                      ${fg.ratingPolicyVersion.toShort}, ${fg.ratingOutcome})
               ON CONFLICT (game_id) DO NOTHING""".update.run.void
     val keepAbort = snapshot.status match
       case GameStatus.Ended(GameOver(_, Termination.Aborted)) =>
@@ -2787,8 +2793,8 @@ final class PgGameStore private (xa: HikariTransactor[IO])
       .transact(xa)
       .timeout(SaveTimeout)
 
-  def markRatingApplied(gameId: GameId): IO[Unit] =
-    stampApplied(gameId, None, None).transact(xa).timeout(SaveTimeout)
+  def markRatingApplied(gameId: GameId, reason: String): IO[Unit] =
+    stampApplied(gameId, None, None, skipReason = Some(reason)).transact(xa).timeout(SaveTimeout)
 
   /** The recorded movement, or `None` for an id with no result row. `applied` reads the V6 stamp rather than the
     * presence of the V17 numbers, because those two genuinely differ: a skipped game is applied AND has no numbers, and
@@ -2796,18 +2802,24 @@ final class PgGameStore private (xa: HikariTransactor[IO])
     */
   def ratingChangeFor(gameId: GameId): IO[Option[GameRatingChange]] =
     sql"""SELECT rating_applied_at IS NOT NULL,
-                 white_rating_before, white_rating_after, black_rating_before, black_rating_after
+                 white_rating_before, white_rating_after, black_rating_before, black_rating_after,
+                 rating_outcome, rating_skip_reason, rating_domain
           FROM play.game_results
           WHERE game_id = ${gameId.value}::uuid"""
-      .query[(Boolean, Option[Double], Option[Double], Option[Double], Option[Double])]
+      .query[(Boolean, Option[Double], Option[Double], Option[Double], Option[Double], String, Option[String], String)]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.map { case (applied, whiteBefore, whiteAfter, blackBefore, blackAfter) =>
+      .map(_.map { case (applied, whiteBefore, whiteAfter, blackBefore, blackAfter, outcome, reason, domain) =>
         GameRatingChange(
           applied,
           (whiteBefore, whiteAfter).mapN(SeatRatingChange.apply),
-          (blackBefore, blackAfter).mapN(SeatRatingChange.apply)
+          (blackBefore, blackAfter).mapN(SeatRatingChange.apply),
+          // The CHECK constraints pin both vocabularies, so an unknown value is a hand-edited row; `legacy` and
+          // "no domain" are the honest readings of one rather than a crash on a public route.
+          RatingOutcome.fromWireName(outcome).getOrElse(RatingOutcome.Legacy),
+          reason,
+          RatingDomain.fromWireName(domain)
         )
       })
 
@@ -2883,16 +2895,23 @@ final class PgGameStore private (xa: HikariTransactor[IO])
   private def stampApplied(
       gameId: GameId,
       white: Option[RatingUpdate],
-      black: Option[RatingUpdate]
+      black: Option[RatingUpdate],
+      skipReason: Option[String] = None
   ): ConnectionIO[Unit] =
     def before(update: Option[RatingUpdate]) = update.map(_.before.rating)
     def after(update: Option[RatingUpdate])  = update.map(_.after.rating)
+    // The outcome travels with the stamp (#146): `applied` when both seats' updates are written, `skipped` with the
+    // batch's reason otherwise — so the stamp is never the only evidence of what happened to the row.
+    val outcome =
+      if white.isDefined && black.isDefined then RatingOutcome.Applied.wireName else RatingOutcome.Skipped.wireName
     sql"""UPDATE play.game_results
           SET rating_applied_at = now(),
               white_rating_before = ${before(white)},
               white_rating_after = ${after(white)},
               black_rating_before = ${before(black)},
-              black_rating_after = ${after(black)}
+              black_rating_after = ${after(black)},
+              rating_outcome = $outcome,
+              rating_skip_reason = $skipReason
           WHERE game_id = ${gameId.value}::uuid""".update.run.void
 
   // ── LeaderboardStore (#103) ───────────────────────────────────────────────
@@ -2925,14 +2944,14 @@ final class PgGameStore private (xa: HikariTransactor[IO])
                      CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
                      CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
               FROM play.game_results
-              WHERE rated = true AND result IS NOT NULL AND category = ${category.wireName}
+              WHERE rating_outcome IN ('applied', 'legacy') AND result IS NOT NULL AND category = ${category.wireName}
               UNION ALL
               SELECT black_external_id,
                      CASE WHEN result = -1 THEN 1 ELSE 0 END,
                      CASE WHEN result = 0  THEN 1 ELSE 0 END,
                      CASE WHEN result = 1  THEN 1 ELSE 0 END
               FROM play.game_results
-              WHERE rated = true AND result IS NOT NULL AND category = ${category.wireName}
+              WHERE rating_outcome IN ('applied', 'legacy') AND result IS NOT NULL AND category = ${category.wireName}
             ) sides
             GROUP BY external_id
           ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
@@ -2970,14 +2989,14 @@ final class PgGameStore private (xa: HikariTransactor[IO])
                      CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
                      CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
               FROM play.game_results
-              WHERE rated = true AND result IS NOT NULL AND category = ${category.wireName}
+              WHERE rating_outcome IN ('applied', 'legacy') AND result IS NOT NULL AND category = ${category.wireName}
               UNION ALL
               SELECT black_external_id,
                      CASE WHEN result = -1 THEN 1 ELSE 0 END,
                      CASE WHEN result = 0  THEN 1 ELSE 0 END,
                      CASE WHEN result = 1  THEN 1 ELSE 0 END
               FROM play.game_results
-              WHERE rated = true AND result IS NOT NULL AND category = ${category.wireName}
+              WHERE rating_outcome IN ('applied', 'legacy') AND result IS NOT NULL AND category = ${category.wireName}
             ) sides
             GROUP BY external_id
           ) t ON t.external_id = 'user:' || u.id::text
@@ -3006,7 +3025,7 @@ final class PgGameStore private (xa: HikariTransactor[IO])
             COALESCE(SUM(CASE WHEN (white_external_id = $externalId AND result = -1)
                                OR (black_external_id = $externalId AND result = 1) THEN 1 ELSE 0 END), 0)
           FROM play.game_results
-          WHERE rated = true AND result IS NOT NULL AND category IS NOT NULL
+          WHERE rating_outcome IN ('applied', 'legacy') AND result IS NOT NULL AND category IS NOT NULL
             AND (white_external_id = $externalId OR black_external_id = $externalId)
           GROUP BY 1"""
       .query[(String, Int, Int, Int)]
@@ -3447,7 +3466,17 @@ object PgGameStore:
       rated: Boolean,
       timeControl: String,
       serverSeed: String,
-      ladder: Boolean
+      ladder: Boolean,
+      // The classification columns (#146). Kinds come from the principals' identity shape — a fact of the row. The
+      // domain and policy version come from the snapshot and are `legacy`/0 for a snapshot written before they
+      // existed: unknown is recorded as unknown. `ratingOutcome` starts `pending` for a rated row (the batch has not
+      // visited it) and `casual` for one that will never be queued; the batch writes `applied`/`skipped`.
+      whiteKind: String,
+      blackKind: String,
+      ratedRequested: Option[Boolean],
+      ratingDomain: String,
+      ratingPolicyVersion: Int,
+      ratingOutcome: String
   )
 
   /** `None` while the game is still active (or, for an ended snapshot, if `players` is unexpectedly missing a seat —
@@ -3464,15 +3493,25 @@ object PgGameStore:
       case GameStatus.Ended(GameOver(result, termination)) =>
         val aborted = termination == Termination.Aborted
         (snapshot.players.get(Seat.White), snapshot.players.get(Seat.Black)).mapN { (white, black) =>
+          val rated = !aborted && snapshot.rated.getOrElse(false)
           FinishedGame(
             whiteExternalId = white.externalId,
             blackExternalId = black.externalId,
             result = Option.unless(aborted)(PlaysiteIngest.resultOf(result)),
             termination = PlaysiteIngest.terminationOf(termination),
-            rated = !aborted && snapshot.rated.getOrElse(false),
+            rated = rated,
             timeControl = snapshot.timeControl.toString,
             serverSeed = snapshot.serverSeed,
-            ladder = snapshot.ladder.getOrElse(false)
+            ladder = snapshot.ladder.getOrElse(false),
+            whiteKind = ParticipantKind.of(white).wireName,
+            blackKind = ParticipantKind.of(black).wireName,
+            ratedRequested = snapshot.ratedRequested,
+            // A technical abort has no sporting outcome, so it can move nothing: its domain is recorded as classified
+            // (the classification is a creation-time fact) but its outcome is `casual`, like every other row that
+            // never enters the queue.
+            ratingDomain = snapshot.ratingDomain.map(_.wireName).getOrElse(PgGameStore.LegacyDomain),
+            ratingPolicyVersion = snapshot.ratingPolicyVersion.getOrElse(0),
+            ratingOutcome = if rated then RatingOutcome.Pending.wireName else RatingOutcome.Casual.wireName
           )
         }
 
@@ -3504,6 +3543,9 @@ object PgGameStore:
   private def toBotRating(row: (Boolean, Option[String])): BotRating =
     val (onLadder, owner) = row
     BotRating(onLadder, owner)
+
+  /** The `rating_domain` written for a row whose snapshot predates classification (#146): unknown, never inferred. */
+  private val LegacyDomain: String = "legacy"
 
   private[store] type ResultTuple =
     (

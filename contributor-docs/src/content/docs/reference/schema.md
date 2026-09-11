@@ -288,16 +288,29 @@ Indexes:
 | `black_rating_after` | `double precision` | yes | — | — |
 | `category` | `text` | yes | — | — |
 | `origin` | `text` | no | `'legacy'::text` | — |
+| `white_kind` | `text` | yes | — | — |
+| `black_kind` | `text` | yes | — | — |
+| `rated_requested` | `boolean` | yes | — | — |
+| `rating_domain` | `text` | no | `'legacy'::text` | — |
+| `rating_policy_version` | `smallint` | no | `0` | — |
+| `rating_outcome` | `text` | no | `'legacy'::text` | — |
+| `rating_skip_reason` | `text` | yes | — | — |
 
 Check constraints:
 
+- `CHECK (((black_kind IS NULL) OR (black_kind = ANY (ARRAY['human'::text, 'bot'::text, 'guest'::text]))))`
 - `CHECK ((origin = ANY (ARRAY['showcase'::text, 'ladder'::text, 'catalog'::text, 'lobby'::text, 'direct'::text, 'legacy'::text])))`
+- `CHECK ((rating_domain = ANY (ARRAY['competitive'::text, 'training'::text, 'casual'::text, 'legacy'::text])))`
+- `CHECK ((rating_outcome = ANY (ARRAY['pending'::text, 'applied'::text, 'skipped'::text, 'casual'::text, 'legacy'::text])))`
+- `CHECK (((rating_outcome = 'skipped'::text) = (rating_skip_reason IS NOT NULL)))`
+- `CHECK (((white_kind IS NULL) OR (white_kind = ANY (ARRAY['human'::text, 'bot'::text, 'guest'::text]))))`
 
 Indexes:
 
 - `game_results_black_finished_idx` — `CREATE INDEX game_results_black_finished_idx ON public.game_results USING btree (black_external_id, finished_at DESC)`
 - `game_results_ladder_idx` — `CREATE INDEX game_results_ladder_idx ON public.game_results USING btree (ladder) WHERE ladder`
 - `game_results_origin_finished_idx` — `CREATE INDEX game_results_origin_finished_idx ON public.game_results USING btree (origin, finished_at DESC)`
+- `game_results_outcome_category_idx` — `CREATE INDEX game_results_outcome_category_idx ON public.game_results USING btree (rating_outcome, category) WHERE (result IS NOT NULL)`
 - `game_results_pairing_idx` — `CREATE INDEX game_results_pairing_idx ON public.game_results USING btree (pairing_id) WHERE (pairing_id IS NOT NULL)`
 - `game_results_pkey` — `CREATE UNIQUE INDEX game_results_pkey ON public.game_results USING btree (game_id)`
 - `game_results_rated_finished_idx` — `CREATE INDEX game_results_rated_finished_idx ON public.game_results USING btree (rated, finished_at)`

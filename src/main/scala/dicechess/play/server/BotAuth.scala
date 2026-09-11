@@ -176,8 +176,10 @@ object BotAuth:
   /** Env var holding the static bot roster: comma-separated `team|name|token` entries. */
   private val EnvVar = "PLAY_BOT_TOKENS"
 
-  /** Reserved team for anonymous bots — never used by static/registered bots, so anon can't impersonate them. */
-  val AnonTeam = "anon"
+  /** Reserved team for anonymous bots — never used by static/registered bots, so anon can't impersonate them. The value
+    * lives in `RatingPolicy.AnonBotTeam`, next to the eligibility rule that treats the team as anonymous (#146).
+    */
+  val AnonTeam: String = dicechess.play.core.RatingPolicy.AnonBotTeam
 
   /** Teams no self-service registration can claim: `anon` (ephemeral tokens) and `house` (official bots — normally
     * occupied by the static roster, reserved explicitly so a deploy with an empty roster leaves no squatting window).

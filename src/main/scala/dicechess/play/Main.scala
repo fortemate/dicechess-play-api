@@ -3,7 +3,7 @@ package dicechess.play
 import cats.effect.{IO, IOApp, Resource}
 import cats.syntax.all.*
 import com.comcast.ip4s.*
-import dicechess.play.core.{Principal, RatingCategory}
+import dicechess.play.core.{Principal, RatingCategory, RatingPolicy}
 import dicechess.play.game.GameRoom
 import dicechess.play.server.{
   AdminBotRoutes,
@@ -141,6 +141,9 @@ object Main extends IOApp.Simple:
     */
   private[play] def registryFor(store: GameStore, pgStore: Option[PgGameStore]): IO[GameRegistry] =
     GameRegistry.create(
+      // Which eligibility matrix new games are classified under (#146): `legacy` unless `RATING_POLICY=matrix`. Read
+      // once at boot and logged by `serve`, so an operator can see which population a deployment is producing.
+      ratingPolicy = RatingPolicy.fromEnv,
       // ADR 006 decision 1 leaves one number open: after how many of its own turns a seat's right to offer a draw
       // returns without the opponent offering. No governing body defines it for Dice Chess, so it is an operator
       // setting; anything but a positive integer keeps the shipped rule, where the right only ever passes.
@@ -279,6 +282,11 @@ object Main extends IOApp.Simple:
       // database: without PLAY_DB_URL there is no game_results queue to drain, so a set-but-useless env var gets a
       // loud warning instead of a silent no-op. It also owns refreshing `strengthCache` (#181): with the batch off,
       // GET /strength stays "not ready" forever — the same coupling rating updates and ladder auto-park already have.
+      // Which eligibility matrix this deployment classifies new games under (#146) — logged once so the population a
+      // deployment produces is on record next to its other rating settings.
+      _ <- IO.println(
+        s"[play][rating] eligibility policy: ${RatingPolicy.fromEnv.wireName} (v${RatingPolicy.fromEnv.version})"
+      )
       ratingLoop <- (RatingBatch.configFromEnv, pgStore) match
         case (None, _) =>
           IO.println("[play][rating] RATING_INTERVAL_SECONDS unset: no automatic rating updates")

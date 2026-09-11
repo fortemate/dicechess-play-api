@@ -263,7 +263,7 @@ final class RatingBatch private (
 
   private def skip(row: GameResultRow, why: String): IO[Unit] =
     Console[IO].errorln(s"[play][rating] game ${row.gameId.value} skipped ($why); stamped applied") *>
-      ratingStore.markRatingApplied(row.gameId)
+      ratingStore.markRatingApplied(row.gameId, why)
 
 object RatingBatch:
 

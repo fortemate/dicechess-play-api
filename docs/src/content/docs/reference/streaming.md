@@ -66,7 +66,8 @@ Sent immediately on connect — the current state.
       "mayOfferDrawBy": { "white": true, "black": true },
       "legalMoves": null,
       "players": { "white": { "kind": "Bot", "name": "house greedy", "rating": 1642.0 }, "black": { "kind": "Human", "name": null, "rating": null } },
-      "rated": false
+      "rated": false,
+      "ratingDomain": "casual"
     },
     "history": [
       { "seat": "White", "dice": [2, 3, 6], "moves": ["b1c3", "g1f3", "e2e4"], "fenAfter": "rnbqkbnr/pppppppp/8/8/4P3/2N2N2/PPPP1PPP/R1BQKB1R b KQkq - 0 1" },
@@ -76,7 +77,7 @@ Sent immediately on connect — the current state.
 }
 ```
 
-`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `mayOfferDrawBy` indicates for each seat (`white` and `black`) whether that seat holds the right to offer a draw. `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero).
+`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `mayOfferDrawBy` indicates for each seat (`white` and `black`) whether that seat holds the right to offer a draw. `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero). `rated` says whether the game **may** move a canonical rating — the eligibility decided at creation, not proof that a rating was applied or that the game counts on a leaderboard — and `ratingDomain` which [rating domain](../../rating/#which-games-count-rating-domains) it was classified into (`competitive`, `training` or `casual`). Both are optional on the wire, and absence means "the server does not say". The snapshot carries no outcome: whether the rating batch applied, skipped or has not yet reached a finished game is [`GET /games/{id}/rating`](../rest/#get-a-games-rating-change)'s `outcome`.
 
 `rated` says whether the game counts toward the [leaderboard](../rest/#leaderboard). Treat absence as "the server does not say", never as "casual". No rating delta is sent on `GameEnded`: ratings are applied by an asynchronous batch after the game, so refetch the profile or leaderboard for the post-game numbers.
 

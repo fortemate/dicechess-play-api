@@ -275,9 +275,14 @@ Every live game you are seated in — the polling counterpart of `GameStart` and
   "gameId": "game-uuid",
   "applied": true,
   "white": { "before": 1775.6714474976957, "after": 1797.2144251082318 },
-  "black": { "before": 1601.5, "after": 1580.25 }
+  "black": { "before": 1601.5, "after": 1580.25 },
+  "outcome": "applied",
+  "reason": null,
+  "ratingDomain": "competitive"
 }
 ```
+
+`outcome` says what the batch did — `pending` (not visited yet), `applied` (both seats moved, numbers present), `skipped` (visited, nothing moved; `reason` is the batch's own words, e.g. `a player's game against their own bot is never rated`), `casual` (never queued: the game was not rated) or `legacy` (recorded before outcomes were stored — numbers, when present, are still authoritative). `ratingDomain` is the namespace the game was classified into at creation — `competitive`, `training` or `casual`, `null` for a game older than the classification. `applied` keeps its old meaning ("has the batch visited this game") for existing pollers; read `outcome` to know whether a rating moved.
 
 Rating is applied by a background batch, not at game end, so a game that has just finished answers `"applied": false` with both seats `null` for up to `RATING_INTERVAL_SECONDS` — poll it. **Do not compute the change by diffing a player's current rating against an earlier one**: the batch applies games one at a time, so between a game's start and its application any number of that player's other games can land, and a client that diffs typically reports the *previous* game's change — a negative delta after a win, which Glicko-2 cannot produce.
 

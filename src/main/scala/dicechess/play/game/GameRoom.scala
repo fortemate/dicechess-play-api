@@ -866,6 +866,9 @@ final class GameRoom private (
       rated = Some(s.rated), // always written going forward; only pre-existing rows lack the key (see GameSnapshot)
       ladder = Some(s.ladder),
       origin = Some(s.origin),
+      ratedRequested = s.ratedRequested,
+      ratingDomain = s.ratingDomain,
+      ratingPolicyVersion = s.ratingPolicyVersion,
       remainingMs = s.remaining.map((seat, left) => seat -> left.toMillis),
       lastRoll = s.lastRoll,
       turns = s.turns,
@@ -1326,7 +1329,13 @@ object GameRoom:
       rated: Boolean = false,
       ladder: Boolean = false,
       origin: GameOrigin = GameOrigin.Legacy,
-      initialDfen: String = EngineOps.InitialDfen
+      initialDfen: String = EngineOps.InitialDfen,
+      // The eligibility classification behind `rated` (#146): what was asked for, the namespace, the policy version.
+      // `rated` stays a separate field because every reader of it predates the classification; the registry keeps the
+      // two consistent (`rated == classification.rated`).
+      ratedRequested: Boolean = false,
+      ratingDomain: RatingDomain = RatingDomain.Casual,
+      ratingPolicyVersion: Int = 0
   )
   object GameConfig:
     val Default: GameConfig = GameConfig()
@@ -1447,6 +1456,11 @@ object GameRoom:
       // auto-park (`RatingBatch.shouldPark`, #150).
       ladder: Boolean = false,
       origin: GameOrigin = GameOrigin.Legacy,
+      // The classification behind `rated` (#146), carried verbatim like it. `None` for a room restored from a snapshot
+      // written before classification existed — the store then records the row's domain as `legacy`.
+      ratedRequested: Option[Boolean] = None,
+      ratingDomain: Option[RatingDomain] = None,
+      ratingPolicyVersion: Option[Int] = None,
       remaining: Map[Seat, FiniteDuration] = Map.empty,
       turnStartedAt: Option[FiniteDuration] = None,
       // Provably-fair dice gate: `started` flips on the first Begin; `startedAt` stamps it (to measure the seed grace);
@@ -1588,6 +1602,7 @@ object GameRoom:
             )
           ),
         Some(rated),
+        ratingDomain,
         Option.when(isDrawPending)(DrawOffer(pending = true)),
         Option.when(dicePending)(mayOffer(activeSt)),
         Option.when(status == GameStatus.Active)(
@@ -1628,6 +1643,9 @@ object GameRoom:
               rated = config.rated,
               ladder = config.ladder,
               origin = config.origin,
+              ratedRequested = Some(config.ratedRequested),
+              ratingDomain = Some(config.ratingDomain),
+              ratingPolicyVersion = Some(config.ratingPolicyVersion),
               remaining = initialRemaining(config.timeControl, players.keys),
               createdAtEpochMs = Some(createdAt.toMillis),
               drawReofferTurns = tuning.drawReofferTurns
@@ -1689,6 +1707,10 @@ object GameRoom:
               ladder = snapshot.ladder.getOrElse(false),
               // One resolution rule for a legacy row, shared with the store's column projection and the V5 backfill.
               origin = snapshot.effectiveOrigin,
+              // Absent keys stay absent (#146): the store writes `legacy` for them rather than a guessed domain.
+              ratedRequested = snapshot.ratedRequested,
+              ratingDomain = snapshot.ratingDomain,
+              ratingPolicyVersion = snapshot.ratingPolicyVersion,
               remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
               // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
               // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.

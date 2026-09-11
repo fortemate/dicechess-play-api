@@ -485,7 +485,9 @@ object RatingReplay:
       replayedOnRecordedRows: Double
   ) derives ConfiguredCodec
 
-  /** Cumulative replayed pair-delta sum at the end of each UTC day, per category. */
+  /** Cumulative replayed pair-delta sum at the end of each UTC day, per category. Days are UTC dates of `finishedAt`
+    * and strictly increasing; a row the batch applied out of finish order counts on the latest open day.
+    */
   final case class DeltaPoint(day: String, category: String, games: Long, cumulativePairDeltaSum: Double)
       derives ConfiguredCodec
 
@@ -557,9 +559,11 @@ object RatingReplay:
   final case class DiffHistogram(category: String, kind: String, rows: Long, bins: List[DiffBin])
       derives ConfiguredCodec
 
-  /** Structural checks that need no rating arithmetic. `displacedRows` counts applied rated rows whose position in
-    * apply order differs from their position in finish order; `formulaMismatches` counts numeric rows whose recorded
-    * step is NOT reproduced from the recorded pre-game ratings (see [[Outcome.formulaHolds]]).
+  /** Structural checks that need no rating arithmetic. `oneSidedNumeric` counts rows where either recorded pair (before
+    * or after) is present for one seat only — the rows [[Outcome]] can only call a mismatch; `displacedRows` counts
+    * applied rated rows whose position in apply order differs from their position in finish order; `formulaMismatches`
+    * counts numeric rows whose recorded step is NOT reproduced from the recorded pre-game ratings (see
+    * [[Outcome.formulaHolds]]).
     */
   final case class Integrity(
       rows: Long,
@@ -573,8 +577,26 @@ object RatingReplay:
       categoryColumnDisagreements: Long
   ) derives ConfiguredCodec
 
+  /** Where a report came from (#145's "hashes, code revision, environment"): the exact input bytes, the code that
+    * replayed them and the runtime it ran on. Filled by the runner — the pure [[summarize]] knows none of it — so an
+    * archived `summary.json` identifies its inputs without the shell transcript that produced it.
+    */
+  final case class Provenance(
+      corpusFile: String,
+      corpusSha256: String,
+      participantsFile: Option[String],
+      participantsSha256: Option[String],
+      /** The implementation revision, when the operator names it (`revision=<git sha>`); a jar carries none. */
+      codeRevision: Option[String],
+      javaRuntime: String,
+      osArch: String,
+      scalaVersion: String,
+      ranAt: Instant
+  ) derives ConfiguredCodec
+
   final case class Summary(
       config: ConfigSummary,
+      provenance: Option[Provenance] = None,
       games: Long,
       firstFinishedAt: Option[Instant],
       lastFinishedAt: Option[Instant],
@@ -792,16 +814,20 @@ object RatingReplay:
     applied.foreach { o =>
       val cat = o.category.get
       val d   = dayOf(o.game.finishedAt)
+      // The day cursor only ever advances. Under `Order.Applied` the fold order is the batch's, and a displaced row
+      // (`Integrity.displacedRows`) can carry a `finishedAt` from a day already closed; it is attributed to the latest
+      // open day rather than reopening a closed one, so every `(day, category)` appears once and in order.
       day match
-        case Some(prev) if prev != d =>
+        case Some(prev) if LocalDate.parse(prev).isBefore(LocalDate.parse(d)) =>
           // Close every day between prev and d that had no games too, so the series has no gaps.
           var cursor = LocalDate.parse(prev)
           val target = LocalDate.parse(d)
           while cursor.isBefore(target) do
             closeDay(cursor.toString)
             cursor = cursor.plusDays(1)
-        case _ => ()
-      day = Some(d)
+          day = Some(d)
+        case None => day = Some(d)
+        case _    => ()
       val (n, sum) = cumulative.getOrElse(cat.wireName, (0L, 0.0))
       cumulative.update(cat.wireName, (n + 1, sum + pairDelta(o)))
       List((o.white, o.game.white, o.black), (o.black, o.game.black, o.white)).foreach {
@@ -897,7 +923,12 @@ object RatingReplay:
     val integrity    = Integrity(
       rows = games.size.toLong,
       duplicateGameIds = (games.size - games.map(_.gameId).distinct.size).toLong,
-      oneSidedNumeric = games.count(g => g.white.ratingAfter.isDefined != g.black.ratingAfter.isDefined).toLong,
+      oneSidedNumeric = games
+        .count(g =>
+          g.white.ratingAfter.isDefined != g.black.ratingAfter.isDefined ||
+            g.white.ratingBefore.isDefined != g.black.ratingBefore.isDefined
+        )
+        .toLong,
       numericWithoutStamp = games.count(g => g.numericRecorded && !g.applied).toLong,
       pendingRows = games.count(g => g.rated && !g.applied).toLong,
       displacedRows = displaced.toLong,
@@ -965,6 +996,26 @@ object RatingReplay:
         summary.config.tolerance.toString
       ),
       ""
+    )
+    val provenanceLines = summary.provenance.toList.flatMap(p =>
+      List(
+        line(
+          "inputs: %s sha256 %s; participants %s sha256 %s",
+          p.corpusFile,
+          p.corpusSha256,
+          p.participantsFile.getOrElse("-"),
+          p.participantsSha256.getOrElse("-")
+        ),
+        line(
+          "run: revision %s; %s; %s; Scala %s; at %s",
+          p.codeRevision.getOrElse("unknown"),
+          p.javaRuntime,
+          p.osArch,
+          p.scalaVersion,
+          p.ranAt.toString
+        ),
+        ""
+      )
     )
     val classLines =
       "--- verdicts by category ---" :: summary.classes.map(c => line("%-8s %-34s %8d", c.category, c.verdict, c.count))
@@ -1057,6 +1108,6 @@ object RatingReplay:
         i.categoryColumnDisagreements
       )
     )
-    (header ++ classLines ++ skipLines ++ mismatchLines ++ histogramLines ++ deltaLines ++ humanLines ++ finalLines ++
-      integrityLines)
+    (header ++ provenanceLines ++ classLines ++ skipLines ++ mismatchLines ++ histogramLines ++ deltaLines ++
+      humanLines ++ finalLines ++ integrityLines)
       .mkString("\n")

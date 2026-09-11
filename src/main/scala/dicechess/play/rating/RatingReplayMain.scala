@@ -9,6 +9,7 @@ import io.circe.syntax.*
 import java.io.{BufferedWriter, FileInputStream}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.zip.GZIPInputStream
 import scala.io.Source
@@ -21,98 +22,228 @@ import scala.io.Source
   *
   * Run: `mise run rating:replay -- corpus=<games.jsonl[.gz]> participants=<participants.jsonl> out=<dir> [ledger=true]
   * [order=applied|finished] [scale=per-category|single-until:<instant>[:blitz,rapid]] [resolution=current|lenient]
-  * [eligibility=rules|recorded] [tau=0.3] [tau-before=0.5 tau-switch-at=<instant>] [tolerance=1e-6] [inactive-days=7]`.
-  * All the logic lives in the separately unit-tested [[RatingReplay]]; this file is a thin shell, name-excluded from
-  * coverage like `Main.scala`.
+  * [eligibility=rules|recorded] [tau=0.3] [tau-before=0.5 tau-switch-at=<instant>] [tolerance=1e-6] [inactive-days=7]
+  * [revision=<git sha>]`.
+  *
+  * Every option is validated as a value ([[RatingReplayMain.parseOptions]]): an explicit value the runner does not
+  * understand is a refusal with a message and `ExitCode.Error`, never a silent default — a report for settings the
+  * operator did not ask for is worse than no report. A corpus row that does not decode is refused the same way, with
+  * its line number. The summary carries [[RatingReplay.Provenance]]: the SHA-256 of the input bytes, the revision the
+  * operator names, and the runtime — so an archived report identifies what produced it. All the replay logic lives in
+  * the separately unit-tested [[RatingReplay]]; this file is the shell, name-excluded from coverage like `Main.scala`.
   */
 object RatingReplayMain extends IOApp:
 
-  def run(args: List[String]): IO[ExitCode] =
-    val options = args.flatMap { arg =>
-      arg.split("=", 2) match
-        case Array(key, value) => Some(key.trim -> value.trim)
-        case _                 => None
-    }.toMap
+  /** What one invocation asked for, fully validated. */
+  final case class Options(
+      corpus: Path,
+      out: Path,
+      participants: Option[Path],
+      ledger: Boolean,
+      revision: Option[String],
+      config: RatingReplay.Config
+  )
 
-    (options.get("corpus"), options.get("out")) match
-      case (Some(corpus), Some(out)) =>
-        val config = configFrom(options)
+  def run(args: List[String]): IO[ExitCode] =
+    parseOptions(args) match
+      case Left(problem) =>
+        IO.println(s"[replay] $problem").as(ExitCode.Error) <* IO.println(Usage)
+      case Right(options) => replay(options)
+
+  private def replay(options: Options): IO[ExitCode] =
+    val loaded = for
+      games        <- IO.blocking(readAll[RatingReplay.Game](options.corpus))
+      participants <- options.participants.fold(IO.pure(Right(Nil): Either[String, List[RatingReplay.Participant]]))(
+        p => IO.blocking(readAll[RatingReplay.Participant](p))
+      )
+    yield (games, participants).tupled
+    loaded.flatMap {
+      case Left(problem)                => IO.println(s"[replay] $problem").as(ExitCode.Error)
+      case Right((games, participants)) =>
         for
-          games        <- IO.blocking(readAll[RatingReplay.Game](Paths.get(corpus)))
-          participants <- options
-            .get("participants")
-            .fold(IO.pure(List.empty[RatingReplay.Participant]))(p =>
-              IO.blocking(readAll[RatingReplay.Participant](Paths.get(p)))
-            )
-          _        <- IO.println(s"[replay] ${games.size} rows, ${participants.size} participants; replaying")
-          outcomes <- IO.blocking(RatingReplay.replay(games, config))
-          summary  <- IO.blocking(RatingReplay.summarize(outcomes, participants, config))
-          outDir   <- IO.blocking(Files.createDirectories(Paths.get(out)))
-          _        <- IO.blocking(Files.writeString(outDir.resolve("summary.json"), summary.asJson.spaces2, UTF_8))
+          _          <- IO.println(s"[replay] ${games.size} rows, ${participants.size} participants; replaying")
+          outcomes   <- IO.blocking(RatingReplay.replay(games, options.config))
+          provenance <- IO.blocking(provenanceOf(options))
+          summary    <- IO.blocking(
+            RatingReplay.summarize(outcomes, participants, options.config).copy(provenance = Some(provenance))
+          )
+          outDir <- IO.blocking(Files.createDirectories(options.out))
+          _      <- IO.blocking(Files.writeString(outDir.resolve("summary.json"), summary.asJson.spaces2, UTF_8))
           rendered = RatingReplay.render(summary)
           _ <- IO.blocking(Files.writeString(outDir.resolve("summary.txt"), rendered + "\n", UTF_8))
-          _ <- IO
-            .blocking(writeLedger(outDir.resolve("ledger.jsonl"), outcomes))
-            .whenA(options.get("ledger").exists(v => v == "true" || v == "1"))
+          _ <- IO.blocking(writeLedger(outDir.resolve("ledger.jsonl"), outcomes)).whenA(options.ledger)
           _ <- IO.println(rendered)
           _ <- IO.println(s"[replay] wrote ${outDir.toAbsolutePath}")
         yield ExitCode.Success
-      case _ =>
-        IO.println(
-          "[replay] usage: corpus=<games.jsonl[.gz]> out=<dir> [participants=<participants.jsonl>] [ledger=true] " +
-            "[order=applied|finished] [scale=per-category|single-until:<instant>[:blitz,rapid]] " +
-            "[resolution=current|lenient] [eligibility=rules|recorded] " +
-            "[tau=0.3] [tau-before=0.5 tau-switch-at=<instant>] [tolerance=1e-6] [inactive-days=7]"
-        ).as(ExitCode.Error)
+    }
 
-  private def configFrom(options: Map[String, String]): RatingReplay.Config =
-    val order = options.get("order") match
-      case Some("finished") => RatingReplay.Order.Finished
-      case _                => RatingReplay.Order.Applied
-    // `single-until:<instant>` seeds every category from the shared state; `single-until:<instant>:blitz,rapid` only
-    // the listed ones (the rest start fresh).
-    val scale = options.get("scale") match
-      case Some(s) if s.startsWith("single-until:") =>
-        val spec = s.stripPrefix("single-until:")
-        val zEnd =
-          spec.indexOf('Z') + 1 // the instant is UTC and ends in `Z`; anything after a following `:` is the list
-        val (at, categories) =
-          if zEnd > 0 && zEnd < spec.length && spec(zEnd) == ':' then (spec.take(zEnd), Some(spec.drop(zEnd + 1)))
-          else (spec, None)
-        val seeded = categories match
-          case Some(list) => list.split(',').toList.flatMap(RatingCategory.fromWireName).toSet
-          case None       => RatingCategory.values.toSet
-        RatingReplay.Scale.SingleUntil(Instant.parse(at), seeded)
-      case _ => RatingReplay.Scale.PerCategory
-    val resolution = options.get("resolution") match
-      case Some("lenient") => RatingReplay.Resolution.Lenient
-      case _               => RatingReplay.Resolution.Current
-    val tauAfter  = options.get("tau").flatMap(_.toDoubleOption).getOrElse(Glicko2.DefaultTau)
-    val tauBefore = options.get("tau-before").flatMap(_.toDoubleOption).getOrElse(tauAfter)
-    val tauSwitch = options.get("tau-switch-at").map(Instant.parse)
-    RatingReplay.Config(
-      order = order,
-      scale = scale,
-      resolution = resolution,
-      tau = RatingReplay.Tau(after = tauAfter, before = tauBefore, switchAt = tauSwitch),
-      tolerance = options.get("tolerance").flatMap(_.toDoubleOption).getOrElse(1e-6),
-      inactiveAfterDays = options.get("inactive-days").flatMap(_.toIntOption).getOrElse(7),
-      followRecorded = options.get("eligibility").contains("recorded")
+  private val Usage: String =
+    "[replay] usage: corpus=<games.jsonl[.gz]> out=<dir> [participants=<participants.jsonl>] [ledger=true] " +
+      "[order=applied|finished] [scale=per-category|single-until:<instant>[:blitz,rapid]] " +
+      "[resolution=current|lenient] [eligibility=rules|recorded] " +
+      "[tau=0.3] [tau-before=0.5 tau-switch-at=<instant>] [tolerance=1e-6] [inactive-days=7] [revision=<git sha>]"
+
+  private val Known: Set[String] = Set(
+    "corpus",
+    "out",
+    "participants",
+    "ledger",
+    "order",
+    "scale",
+    "resolution",
+    "eligibility",
+    "tau",
+    "tau-before",
+    "tau-switch-at",
+    "tolerance",
+    "inactive-days",
+    "revision"
+  )
+
+  /** `key=value` arguments to validated [[Options]]. Pure, so the refusals are testable without running anything: an
+    * argument without `=`, an unknown key, a duplicate key, or an explicit value that is not in the option's vocabulary
+    * is a `Left` naming it. Absent optional keys take the replay's own defaults ([[RatingReplay.Config]]).
+    */
+  def parseOptions(args: List[String]): Either[String, Options] =
+    for
+      pairs <- args.traverse { arg =>
+        arg.split("=", 2) match
+          case Array(key, value) if key.trim.nonEmpty => Right(key.trim -> value.trim)
+          case _                                      => Left(s"expected key=value, got '$arg'")
+      }
+      _ <- pairs.map(_._1).find(!Known.contains(_)).toLeft(()).left.map(k => s"unknown option '$k'")
+      _ <- pairs
+        .groupBy(_._1)
+        .collectFirst { case (k, vs) if vs.sizeIs > 1 => k }
+        .toLeft(())
+        .left
+        .map(k => s"option '$k' given more than once")
+      options = pairs.toMap
+      corpus <- options.get("corpus").filter(_.nonEmpty).toRight("corpus=<games.jsonl[.gz]> is required")
+      out    <- options.get("out").filter(_.nonEmpty).toRight("out=<dir> is required")
+      ledger <- options.get("ledger").fold(Right(false))(flag)
+      order  <- options.get("order").fold(Right(RatingReplay.Order.Applied)) {
+        case "applied"  => Right(RatingReplay.Order.Applied)
+        case "finished" => Right(RatingReplay.Order.Finished)
+        case other      => Left(s"order must be applied or finished, got '$other'")
+      }
+      scale      <- options.get("scale").fold(Right(RatingReplay.Scale.PerCategory))(scaleOf)
+      resolution <- options.get("resolution").fold(Right(RatingReplay.Resolution.Current)) {
+        case "current" => Right(RatingReplay.Resolution.Current)
+        case "lenient" => Right(RatingReplay.Resolution.Lenient)
+        case other     => Left(s"resolution must be current or lenient, got '$other'")
+      }
+      followRecorded <- options.get("eligibility").fold(Right(false)) {
+        case "rules"    => Right(false)
+        case "recorded" => Right(true)
+        case other      => Left(s"eligibility must be rules or recorded, got '$other'")
+      }
+      tauAfter  <- options.get("tau").fold(Right(Glicko2.DefaultTau))(positive("tau"))
+      tauBefore <- options.get("tau-before").fold(Right(tauAfter))(positive("tau-before"))
+      tauSwitch <- options.get("tau-switch-at").traverse(instant("tau-switch-at"))
+      tolerance <- options.get("tolerance").fold(Right(1e-6))(positive("tolerance"))
+      inactive  <- options.get("inactive-days").fold(Right(7)) { raw =>
+        raw.toIntOption.filter(_ > 0).toRight(s"inactive-days must be a positive integer, got '$raw'")
+      }
+    yield Options(
+      corpus = Paths.get(corpus),
+      out = Paths.get(out),
+      participants = options.get("participants").filter(_.nonEmpty).map(Paths.get(_)),
+      ledger = ledger,
+      revision = options.get("revision").filter(_.nonEmpty),
+      config = RatingReplay.Config(
+        order = order,
+        scale = scale,
+        resolution = resolution,
+        tau = RatingReplay.Tau(after = tauAfter, before = tauBefore, switchAt = tauSwitch),
+        tolerance = tolerance,
+        inactiveAfterDays = inactive,
+        followRecorded = followRecorded
+      )
     )
 
-  private def parse[A: io.circe.Decoder](line: String): A =
-    decode[A](line).fold(error => throw new IllegalArgumentException(s"corpus line does not decode: $error"), identity)
+  private def flag(raw: String): Either[String, Boolean] = raw match
+    case "true" | "1"  => Right(true)
+    case "false" | "0" => Right(false)
+    case other         => Left(s"ledger must be true or false, got '$other'")
+
+  private def positive(name: String)(raw: String): Either[String, Double] =
+    raw.toDoubleOption.filter(v => v > 0.0 && v.isFinite).toRight(s"$name must be a positive number, got '$raw'")
+
+  private def instant(name: String)(raw: String): Either[String, Instant] =
+    Either
+      .catchOnly[java.time.format.DateTimeParseException](Instant.parse(raw))
+      .left
+      .map(_ => s"$name must be an ISO-8601 UTC instant such as 2026-08-16T15:15:00Z, got '$raw'")
+
+  /** `per-category`, `single-until:<instant>` (every category seeded from the shared state) or
+    * `single-until:<instant>:blitz,rapid` (only the listed ones, the rest start fresh). The instant is UTC and ends in
+    * `Z`, so the list, when present, is whatever follows the `:` after it.
+    */
+  private def scaleOf(raw: String): Either[String, RatingReplay.Scale] =
+    if raw == "per-category" then Right(RatingReplay.Scale.PerCategory)
+    else if raw.startsWith("single-until:") then
+      val spec             = raw.stripPrefix("single-until:")
+      val zEnd             = spec.indexOf('Z') + 1
+      val (at, categories) =
+        if zEnd > 0 && zEnd < spec.length && spec(zEnd) == ':' then (spec.take(zEnd), Some(spec.drop(zEnd + 1)))
+        else (spec, None)
+      for
+        switchAt <- instant("scale=single-until")(at)
+        seeded   <- categories.fold(Right(RatingCategory.values.toSet): Either[String, Set[RatingCategory]]) { list =>
+          list
+            .split(',')
+            .toList
+            .traverse(name => RatingCategory.fromWireName(name).toRight(s"scale names an unknown category '$name'"))
+            .map(_.toSet)
+        }
+      yield RatingReplay.Scale.SingleUntil(switchAt, seeded)
+    else Left(s"scale must be per-category or single-until:<instant>[:categories], got '$raw'")
 
   /** Every non-empty line of a plain or gzipped UTF-8 JSONL file, decoded as it is read so only the typed rows are
     * kept: the production corpus is a few hundred thousand rows — comfortably in memory as objects, not as a second
-    * copy of the text — and the replay needs a sort before it can start anyway.
+    * copy of the text — and the replay needs a sort before it can start anyway. The first undecodable line refuses the
+    * whole file, by number: a corpus with one bad row is not a corpus minus one row.
     */
-  private def readAll[A: io.circe.Decoder](path: Path): List[A] =
+  private def readAll[A: io.circe.Decoder](path: Path): Either[String, List[A]] =
     val raw    = new FileInputStream(path.toFile)
     val stream = if path.toString.endsWith(".gz") then new GZIPInputStream(raw) else raw
     val source = Source.fromInputStream(stream, UTF_8.name)
-    try source.getLines().filter(_.nonEmpty).map(parse[A]).toList
+    try
+      source
+        .getLines()
+        .zipWithIndex
+        .filter(_._1.nonEmpty)
+        .toList
+        .traverse { (line, index) =>
+          decode[A](line).left.map(error => s"$path line ${index + 1} does not decode: ${error.getMessage}")
+        }
     finally source.close()
+
+  private def provenanceOf(options: Options): RatingReplay.Provenance =
+    RatingReplay.Provenance(
+      corpusFile = options.corpus.getFileName.toString,
+      corpusSha256 = sha256(options.corpus),
+      participantsFile = options.participants.map(_.getFileName.toString),
+      participantsSha256 = options.participants.map(sha256),
+      codeRevision = options.revision,
+      javaRuntime = s"${System.getProperty("java.vendor")} ${System.getProperty("java.runtime.version")}",
+      osArch = s"${System.getProperty("os.name")} ${System.getProperty("os.arch")}",
+      scalaVersion = scala.util.Properties.versionNumberString,
+      ranAt = Instant.now()
+    )
+
+  /** The digest of the file's bytes as given — a gzipped corpus hashes as the `.gz`, matching the `SHA256SUMS` next to
+    * it, so a report and its archive can be compared without unpacking anything.
+    */
+  private def sha256(path: Path): String =
+    val digest = MessageDigest.getInstance("SHA-256")
+    val stream = new java.security.DigestInputStream(new FileInputStream(path.toFile), digest)
+    try
+      val buffer = new Array[Byte](1 << 16)
+      while stream.read(buffer) != -1 do ()
+    finally stream.close()
+    digest.digest().map(b => f"$b%02x").mkString
 
   private def writeLedger(path: Path, outcomes: Vector[RatingReplay.Outcome]): Unit =
     val writer: BufferedWriter = Files.newBufferedWriter(path, UTF_8)

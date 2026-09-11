@@ -34,6 +34,12 @@ class RatingReplaySuite extends munit.FunSuite:
 
   override def beforeAll(): Unit =
     if sys.env.get("RATING_REPLAY_WRITE_FIXTURE").contains("1") then
+      // The committed bytes depend on `Double.toString`, whose shortest-representation contract only holds from JDK 19
+      // (JDK-4511638); the project pins Temurin 25. Refuse to write a fixture an older runtime would render differently.
+      assert(
+        Runtime.version().feature() >= 19,
+        s"write the fixture on JDK 19 or newer (the project's Temurin 25), not ${Runtime.version()}"
+      )
       Files.createDirectories(resources)
       Files.writeString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), gamesJsonl, UTF_8)
       Files.writeString(
@@ -79,7 +85,7 @@ class RatingReplaySuite extends munit.FunSuite:
     val committedGames = Files
       .readString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), UTF_8)
       .linesIterator
-      .map(line => io.circe.parser.decode[Game](line).fold(throw _, identity))
+      .map(line => io.circe.parser.decode[Game](line).fold(e => fail(s"undecodable game row '$line': $e"), identity))
       .toVector
     assertEquals(committedGames.size, games.size)
     committedGames.zip(games).foreach { (committed, generated) =>
@@ -99,7 +105,9 @@ class RatingReplaySuite extends munit.FunSuite:
     val committedParticipants = Files
       .readString(resources.resolve(s"${RatingReplayFixture.Version}.participants.jsonl"), UTF_8)
       .linesIterator
-      .map(line => io.circe.parser.decode[Participant](line).fold(throw _, identity))
+      .map(line =>
+        io.circe.parser.decode[Participant](line).fold(e => fail(s"undecodable participant row '$line': $e"), identity)
+      )
       .toVector
     assertEquals(committedParticipants.map(_.copy(ratings = Map.empty)), participants.map(_.copy(ratings = Map.empty)))
     committedParticipants.zip(participants).foreach { (committed, generated) =>
@@ -353,6 +361,104 @@ class RatingReplaySuite extends munit.FunSuite:
     assert(empty.contains("corpus: 0 rows"))
     assert(empty.contains("none"), "empty mismatch and human sections read 'none'")
     assert(empty.contains("integrity"))
+
+  test("the daily series never reopens a closed day when a row was applied out of finish order"):
+    // Move one applied row's finish two days back while keeping its apply stamp (and so its fold position): the fold
+    // visits it after its new finish day has already closed — the shape a displaced production row has.
+    val victim    = games.find(g => g.rated && g.applied && g.seqFinished > 200).get
+    val displaced = games.map(g =>
+      if g.gameId == victim.gameId then g.copy(finishedAt = g.finishedAt.minusSeconds(2L * 86400L)) else g
+    )
+    val summary = summarize(replay(displaced, lenientConfig), participants, lenientConfig)
+    for cat <- List("blitz", "rapid") do
+      val days = summary.drift.filter(_.category == cat).map(_.day)
+      assertEquals(days, days.distinct, s"$cat: each day appears once")
+      assertEquals(days, days.sorted, s"$cat: days are emitted in order")
+      val series = summary.deltaSeries.filter(_.category == cat).map(_.day)
+      assertEquals(series, series.distinct.sorted)
+    // The row still counts: the pool means include it on the latest open day rather than dropping it.
+    assertEquals(summary.games, games.size.toLong)
+
+  test("a recorded pair present for one seat only counts as one-sided whether it is the before or the after"):
+    val numeric = games.filter(g => g.numericRecorded).take(2)
+    val crafted = games.map(g =>
+      if g.gameId == numeric(0).gameId then g.copy(white = g.white.copy(ratingBefore = None))
+      else if g.gameId == numeric(1).gameId then g.copy(black = g.black.copy(ratingAfter = None))
+      else g
+    )
+    val outcomes = replay(crafted, lenientConfig)
+    assertEquals(summarize(outcomes, participants, lenientConfig).integrity.oneSidedNumeric, 2L)
+    numeric.foreach(n => assertEquals(outcomes.find(_.game.gameId == n.gameId).get.verdict, Verdict.Mismatch))
+
+  test("the runner's options are validated as values: explicit nonsense is refused, absent knobs take defaults"):
+    val ok = RatingReplayMain.parseOptions(
+      List(
+        "corpus=c.jsonl.gz",
+        "out=o",
+        "participants=p.jsonl",
+        "ledger=true",
+        "order=finished",
+        "scale=single-until:2026-08-16T15:15:00Z:blitz",
+        "resolution=lenient",
+        "eligibility=recorded",
+        "tau=0.3",
+        "tau-before=0.5",
+        "tau-switch-at=2026-08-16T15:15:00Z",
+        "tolerance=1e-6",
+        "inactive-days=10",
+        "revision=abc123"
+      )
+    )
+    val options = ok.fold(problem => fail(problem), identity)
+    assertEquals(options.config.order, Order.Finished)
+    assertEquals(
+      options.config.scale,
+      Scale.SingleUntil(Instant.parse("2026-08-16T15:15:00Z"), Set(RatingCategory.Blitz))
+    )
+    assertEquals(options.config.resolution, Resolution.Lenient)
+    assert(options.config.followRecorded && options.ledger)
+    assertEquals(options.config.tau, Tau(0.3, 0.5, Some(Instant.parse("2026-08-16T15:15:00Z"))))
+    assertEquals(options.config.inactiveAfterDays, 10)
+    assertEquals(options.revision, Some("abc123"))
+    val defaults = RatingReplayMain.parseOptions(List("corpus=c.jsonl", "out=o")).fold(fail(_), identity)
+    assertEquals(defaults.config, Config())
+    assertEquals((defaults.participants, defaults.ledger, defaults.revision), (None, false, None))
+    // Every refusal names the offending option; none of these silently becomes a default.
+    val refused = List(
+      List("out=o"),
+      List("corpus=c", "out=o", "order=finishd"),
+      List("corpus=c", "out=o", "resolution=strict"),
+      List("corpus=c", "out=o", "eligibility=whatever"),
+      List("corpus=c", "out=o", "scale=single-until:yesterday"),
+      List("corpus=c", "out=o", "scale=single-until:2026-08-16T15:15:00Z:bullet,turbo"),
+      List("corpus=c", "out=o", "tau=-1"),
+      List("corpus=c", "out=o", "tau-switch-at=2026-08-16"),
+      List("corpus=c", "out=o", "tolerance=abc"),
+      List("corpus=c", "out=o", "inactive-days=0"),
+      List("corpus=c", "out=o", "ledger=yes"),
+      List("corpus=c", "out=o", "colour=blue"),
+      List("corpus=c", "out=o", "out=p"),
+      List("corpus=c", "out=o", "bare")
+    )
+    refused.foreach(args => assert(RatingReplayMain.parseOptions(args).isLeft, s"must refuse $args"))
+    assert(RatingReplayMain.parseOptions(List("corpus=c", "out=o", "order=finishd")).swap.exists(_.contains("finishd")))
+
+  test("a summary carries the provenance the runner attaches, and render prints it"):
+    val provenance = Provenance(
+      corpusFile = "games.jsonl.gz",
+      corpusSha256 = "f8d86bf4",
+      participantsFile = Some("participants.jsonl"),
+      participantsSha256 = Some("8fa76bcd"),
+      codeRevision = Some("5104d7b"),
+      javaRuntime = "Temurin 25",
+      osArch = "Mac OS X aarch64",
+      scalaVersion = "3.9.0",
+      ranAt = Instant.parse("2026-09-11T20:00:00Z")
+    )
+    val text = render(summary.copy(provenance = Some(provenance)))
+    assert(text.contains("inputs: games.jsonl.gz sha256 f8d86bf4"))
+    assert(text.contains("run: revision 5104d7b; Temurin 25"))
+    assert(!render(summary).contains("inputs:"), "the pure summary has no provenance to print")
 
   test("render is stable text with the headline tallies"):
     val text = render(summary)

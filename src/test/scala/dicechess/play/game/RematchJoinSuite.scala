@@ -40,9 +40,8 @@ class RematchJoinSuite extends CatsEffectSuite:
         made  <- GameRoom.restore(
           initial,
           dice,
-          seedGrace = 20.millis,
-          disconnectGrace = 20.millis,
-          durability = Durability.required(_ => IO.unit),
+          tuning = GameRoom.RoomTuning(seedGrace = 20.millis, disconnectGrace = 20.millis),
+          persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
           initialJoin = Some(
             GameRoom.InitialJoinGate(
               epoch.plusSeconds(15),
@@ -168,7 +167,7 @@ class RematchJoinSuite extends CatsEffectSuite:
       made    <- GameRoom.restore(
         initial,
         dice,
-        durability = Durability.required(_ => IO.unit),
+        persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
         initialJoin = Some(
           GameRoom.InitialJoinGate(
             epoch.plusSeconds(15),
@@ -204,7 +203,7 @@ class RematchJoinSuite extends CatsEffectSuite:
       made           <- GameRoom.restore(
         initial,
         dice,
-        durability = Durability.required(_ => IO.unit),
+        persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
         initialJoin = Some(
           GameRoom.InitialJoinGate(
             epoch.plusSeconds(15),
@@ -243,7 +242,7 @@ class RematchJoinSuite extends CatsEffectSuite:
       made       <- GameRoom.restore(
         initial,
         dice,
-        durability = Durability.required(_ => IO.unit),
+        persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
         initialJoin = Some(
           GameRoom.InitialJoinGate(
             epoch.plusSeconds(15),
@@ -273,7 +272,7 @@ class RematchJoinSuite extends CatsEffectSuite:
         made    <- GameRoom.restore(
           initial,
           dice,
-          durability = Durability.required(_ => IO.unit),
+          persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
           initialJoin = Some(
             GameRoom.InitialJoinGate(
               epoch.plusSeconds(15),
@@ -341,7 +340,7 @@ class RematchJoinSuite extends CatsEffectSuite:
         made      <- GameRoom.restore(
           initial,
           dice,
-          durability = Durability.required(_ => IO.unit),
+          persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
           initialJoin = Some(
             GameRoom.InitialJoinGate(
               epoch.plusSeconds(15),

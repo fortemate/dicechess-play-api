@@ -67,7 +67,12 @@ class RequiredDurabilitySuite extends munit.CatsEffectSuite:
 
   private def create(st: Store, durability: Durability): IO[GameRoom] =
     GameRoom
-      .create(seats, dice, seedGrace = 50.millis, persist = st.persist, durability = durability)
+      .create(
+        seats,
+        dice,
+        tuning = GameRoom.RoomTuning(seedGrace = 50.millis),
+        persistence = GameRoom.RoomPersistence(st.persist, durability)
+      )
       .flatMap:
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) => IO.pure(room)
@@ -94,9 +99,12 @@ class RequiredDurabilitySuite extends munit.CatsEffectSuite:
   test("the creation snapshot is fail-closed in required mode: a failed first write yields no room"):
     store.flatMap { st =>
       st.failWhen(_.version == 0L) *>
-        GameRoom.create(seats, dice, persist = st.persist, durability = st.required()).attempt.map { outcome =>
-          assert(outcome.isLeft, "a room whose creation row never committed must not be handed to its caller")
-        }
+        GameRoom
+          .create(seats, dice, persistence = GameRoom.RoomPersistence(st.persist, st.required()))
+          .attempt
+          .map { outcome =>
+            assert(outcome.isLeft, "a room whose creation row never committed must not be handed to its caller")
+          }
     }
 
   test("an intermediate write is retried and nothing is published until it commits"):
@@ -224,7 +232,11 @@ class RequiredDurabilitySuite extends munit.CatsEffectSuite:
       st2          <- store
       restoredDice <- IO.fromEither(DiceSource.fromHexSeed(v1.serverSeed).left.map(RuntimeException(_)))
       restored     <- GameRoom
-        .restore(v1, restoredDice, persist = st2.persist, durability = st2.required())
+        .restore(
+          v1,
+          restoredDice,
+          persistence = GameRoom.RoomPersistence(st2.persist, st2.required())
+        )
         .flatMap(_.fold(e => IO.raiseError(RuntimeException(e)), IO.pure))
       state <- restored.snapshot
       _     <- restored.submit(Seat.White, GameCommand.Resign)
@@ -249,7 +261,12 @@ class RequiredDurabilitySuite extends munit.CatsEffectSuite:
       st2          <- store
       restoredDice <- IO.fromEither(DiceSource.fromHexSeed(creation.serverSeed).left.map(RuntimeException(_)))
       restored     <- GameRoom
-        .restore(creation, restoredDice, seedGrace = 50.millis, persist = st2.persist, durability = st2.required())
+        .restore(
+          creation,
+          restoredDice,
+          tuning = GameRoom.RoomTuning(seedGrace = 50.millis),
+          persistence = GameRoom.RoomPersistence(st2.persist, st2.required())
+        )
         .flatMap(_.fold(e => IO.raiseError(RuntimeException(e)), IO.pure))
       _        <- restored.start
       rerolled <- await(st2.written)(_.exists(_.version == 1L)).map(_.find(_.version == 1L).get)

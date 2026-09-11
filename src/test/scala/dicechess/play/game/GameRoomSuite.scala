@@ -101,7 +101,11 @@ class GameRoomSuite extends munit.CatsEffectSuite:
     GameRoom
       // Small fan-out buffer so the stalled subscriber overflows well within one game; the two bots
       // never lag (the writer waits for the side to move), so they are unaffected.
-      .create(Map(Seat.White -> white.principal, Seat.Black -> black.principal), dice, fanOutBuffer = 16)
+      .create(
+        Map(Seat.White -> white.principal, Seat.Black -> black.principal),
+        dice,
+        tuning = GameRoom.RoomTuning(fanOutBuffer = 16)
+      )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -128,7 +132,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
     GameRoom
       // Tiny seed grace so the opening roll (which throws) is reached promptly without anyone submitting a seed.
-      .create(seats, boom, seedGrace = 50.millis)
+      .create(seats, boom, tuning = GameRoom.RoomTuning(seedGrace = 50.millis))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -141,14 +145,14 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       .map: (over, _) =>
         assertEquals(over.termination, Termination.Aborted)
 
-  test("a seat left with no connection past the grace window forfeits"):
+  test("a disconnected player forfeits after the disconnect-grace window"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
 
     GameRoom
       .create(
         Map(Seat.White -> Principal.Guest("white"), Seat.Black -> Principal.Guest("black")),
         dice,
-        disconnectGrace = 200.millis
+        tuning = GameRoom.RoomTuning(disconnectGrace = 200.millis)
       )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
@@ -168,7 +172,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       .create(
         Map(Seat.White -> Principal.Guest("white"), Seat.Black -> Principal.Guest("black")),
         dice,
-        disconnectGrace = 300.millis
+        tuning = GameRoom.RoomTuning(disconnectGrace = 300.millis)
       )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
@@ -188,8 +192,10 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       .create(
         seats,
         dice,
-        idleCheck = 200.millis,
-        seedGrace = 50.millis // force-start quickly (no seeds), then the turn deadline applies
+        tuning = GameRoom.RoomTuning(
+          idleCheck = 200.millis,
+          seedGrace = 50.millis // force-start quickly (no seeds), then the turn deadline applies
+        )
       )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
@@ -208,7 +214,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
       // A long grace so only the seeds (never a timeout) can open the gate within the test window.
-      .create(seats, dice, seedGrace = 10.seconds)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -232,7 +238,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
   test("a game whose clients never seed still force-starts after the grace"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, seedGrace = 100.millis)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 100.millis))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -246,7 +252,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
   test("the game-end event reveals the client seeds folded into the dice"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, seedGrace = 10.seconds)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -301,7 +307,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
   test("DiceRolled carries the legal-move tree, and submits validate against the cached paths"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -339,7 +345,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
       // Cap 0: every movable roll's tree is elided (a forced pass — zero paths — would still ride inline).
-      .create(seats, dice, seedGrace = 10.seconds, maxInlinePaths = 0)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = 0))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -375,7 +381,12 @@ class GameRoomSuite extends munit.CatsEffectSuite:
     for
       stored <- Ref.of[IO, Option[GameSnapshot]](None)
       room   <- GameRoom
-        .create(seats, dice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue, persist = s => stored.set(Some(s)))
+        .create(
+          seats,
+          dice,
+          tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue),
+          persistence = GameRoom.RoomPersistence(s => stored.set(Some(s)))
+        )
         .flatMap(made => IO.fromEither(made.left.map(e => RuntimeException(s"room creation failed: $e"))))
       roll <- firstMovableRoll(room)
       // The latest persisted snapshot is the pending movable roll (persist-before-broadcast).
@@ -407,7 +418,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
   test("submitTurn answers the writer's verdict synchronously: refusals, then the applied version"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -435,7 +446,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
   test("resign on a finished game answers 'game is over' instead of hanging"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, seedGrace = 10.seconds)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -454,7 +465,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
   test("submitTurn on a finished game answers 'game is over' instead of hanging"):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, seedGrace = 10.seconds)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -471,7 +482,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
   ):
     val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      .create(seats, dice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -632,7 +643,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         .create(
           Map(Seat.White -> white.principal, Seat.Black -> black.principal),
           dice,
-          persist = s => stored.set(Some(s))
+          persistence = GameRoom.RoomPersistence(s => stored.set(Some(s)))
         )
         .flatMap(made => IO.fromEither(made.left.map(e => RuntimeException(s"room creation failed: $e"))))
       play = (white.run(room).background, black.run(room).background).tupled.use: _ =>
@@ -659,7 +670,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
     "draw offer: piggybacked on a completed turn enters pre-roll gate, emits DrawOffered and sets drawOffer in PublicGameState"
   ):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -690,7 +701,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer: opponent can accept draw via RespondDraw(accept = true) ending game in Draw agreement"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -712,7 +723,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer: opponent can decline draw explicitly via RespondDraw(accept = false), revealing dice"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -748,7 +759,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer: while an offer is pending, dice are unrevealed; accepting after reveal is rejected"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -775,7 +786,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer: submitting moves during pre-roll gate before dice reveal is rejected"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -798,7 +809,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer: opponent declining explicitly and moving enforces alternation anti-spam"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -835,7 +846,12 @@ class GameRoomSuite extends munit.CatsEffectSuite:
     for
       stored <- Ref.of[IO, Option[GameSnapshot]](None)
       room   <- GameRoom
-        .create(seats, dice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue, persist = s => stored.set(Some(s)))
+        .create(
+          seats,
+          dice,
+          tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue),
+          persistence = GameRoom.RoomPersistence(s => stored.set(Some(s)))
+        )
         .flatMap(made => IO.fromEither(made.left.map(e => RuntimeException(s"room creation failed: $e"))))
       roll1 <- firstMovableRoll(room)
       path1 = leafPath(roll1.legalMoves.get)
@@ -876,7 +892,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         .flatMap(v => if v.sizeIs >= n then IO.pure(v) else IO.sleep(20.millis) *> awaitRolls(n))
         .timeoutTo(5.seconds, IO.raiseError(RuntimeException(s"roll #$n never happened")))
     GameRoom
-      .create(seats, recordingDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, recordingDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -899,7 +915,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: rider and flag both set deliver exactly one offer"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -920,7 +936,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: arm during opponent's turn then forced pass delivers the offer"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -946,7 +962,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: arm then king capture discards the offer"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -965,7 +981,11 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: cooldown counting and reset by opponent offer"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue, drawReofferTurns = 3)
+      .create(
+        seats,
+        movableDice,
+        tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue, drawReofferTurns = 3)
+      )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -997,7 +1017,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: toggle limit enforced (10 changes per seat per turn)"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1024,7 +1044,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: responder decline clears responder's own flag"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1048,7 +1068,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: by default the right passes to the decliner and does not return on its own"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1078,7 +1098,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: re-arming the value a seat already holds is free"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1096,7 +1116,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("draw offer standing flag: the toggle budget is reset for the seat whose turn begins"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1116,7 +1136,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("armDrawOffer and disarmDrawOffer on a finished game answer 'game is over' (#106)"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap:
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1131,7 +1151,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("armDrawOffer and disarmDrawOffer lifecycle and noop on active game (#106)"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap:
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1152,7 +1172,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("activeBotGame derives row atomically and returns None when game ends (#106)"):
     GameRoom
-      .create(seats, movableDice, seedGrace = 10.seconds)
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap:
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -1166,4 +1186,41 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             _        <- room.result
             afterEnd <- room.activeBotGame(Seat.White)
             _ = assertEquals(afterEnd, None)
+          yield ()
+
+  test("spectator cannot submit seed, resign, or respond to draw offer"):
+    GameRoom
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
+      .flatMap:
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            // Spectator seed submission emits a Rejected event
+            seedRejFiber <- room.subscribe
+              .collectFirst { case e: GameEvent.Rejected => e }
+              .compile
+              .lastOrError
+              .start
+            _       <- room.submit(Seat.Spectator, GameCommand.SubmitSeed("some-valid-client-seed-1234"))
+            seedRej <- seedRejFiber.joinWithNever
+            _ = assertEquals(seedRej.reason, "spectator cannot submit a seed")
+            // Spectator resign is refused synchronously
+            resignRes <- room.resign(Seat.Spectator)
+            _ = assertEquals(resignRes, GameRoom.TurnVerdict.Refused("spectator cannot resign"))
+            // Spectator draw response is refused synchronously
+            drawRes <- room.respondDraw(Seat.Spectator, accept = true)
+            _ = assertEquals(drawRes, GameRoom.TurnVerdict.Refused("spectator cannot respond to draw offer"))
+          yield ()
+
+  test("respondDraw refuses 'not your turn' when off-turn or dice not pending"):
+    GameRoom
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
+      .flatMap:
+        case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
+        case Right(room) =>
+          for
+            roll <- firstMovableRoll(room)
+            other = if roll.seat == Seat.White then Seat.Black else Seat.White
+            verdict <- room.respondDraw(other, accept = false)
+            _ = assertEquals(verdict, GameRoom.TurnVerdict.Refused("not your turn"))
           yield ()

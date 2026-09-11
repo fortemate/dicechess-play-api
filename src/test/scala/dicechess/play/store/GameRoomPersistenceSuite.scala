@@ -33,7 +33,7 @@ class GameRoomPersistenceSuite extends munit.CatsEffectSuite:
   test("the creation row is durable before anyone plays: tokens, seed and version 0 are in the first snapshot"):
     Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
       GameRoom
-        .create(seats, dice, persist = snap => written.update(_ :+ snap))
+        .create(seats, dice, persistence = GameRoom.RoomPersistence(snap => written.update(_ :+ snap)))
         .flatMap {
           case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
           case Right(room) =>
@@ -50,7 +50,12 @@ class GameRoomPersistenceSuite extends munit.CatsEffectSuite:
   test("every published event is persisted, versions are monotonic, and the pending roll is durable"):
     Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
       GameRoom
-        .create(seats, dice, seedGrace = 50.millis, persist = snap => written.update(_ :+ snap))
+        .create(
+          seats,
+          dice,
+          tuning = GameRoom.RoomTuning(seedGrace = 50.millis),
+          persistence = GameRoom.RoomPersistence(snap => written.update(_ :+ snap))
+        )
         .flatMap {
           case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
           case Right(room) =>
@@ -76,7 +81,7 @@ class GameRoomPersistenceSuite extends munit.CatsEffectSuite:
     val black = BotConnection(Principal.Bot("acme", "greedy"), Seat.Black, greedy)
     Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
       GameRoom
-        .create(seats, dice, persist = snap => written.update(_ :+ snap))
+        .create(seats, dice, persistence = GameRoom.RoomPersistence(snap => written.update(_ :+ snap)))
         .flatMap {
           case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
           case Right(room) =>
@@ -98,7 +103,12 @@ class GameRoomPersistenceSuite extends munit.CatsEffectSuite:
   test("create with rated=true persists a rated creation snapshot"):
     Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
       GameRoom
-        .create(seats, dice, rated = true, persist = snap => written.update(_ :+ snap))
+        .create(
+          seats,
+          dice,
+          config = GameRoom.GameConfig(rated = true),
+          persistence = GameRoom.RoomPersistence(snap => written.update(_ :+ snap))
+        )
         .flatMap {
           case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
           case Right(_)    =>
@@ -111,7 +121,7 @@ class GameRoomPersistenceSuite extends munit.CatsEffectSuite:
   test("create without rated defaults to a casual creation snapshot"):
     Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
       GameRoom
-        .create(seats, dice, persist = snap => written.update(_ :+ snap))
+        .create(seats, dice, persistence = GameRoom.RoomPersistence(snap => written.update(_ :+ snap)))
         .flatMap {
           case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
           case Right(_)    =>
@@ -127,7 +137,13 @@ class GameRoomPersistenceSuite extends munit.CatsEffectSuite:
   test("restore carries the rated flag from a persisted snapshot into the rebuilt room"):
     Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
       GameRoom
-        .create(seats, dice, rated = true, seedGrace = 50.millis, persist = snap => written.update(_ :+ snap))
+        .create(
+          seats,
+          dice,
+          config = GameRoom.GameConfig(rated = true),
+          tuning = GameRoom.RoomTuning(seedGrace = 50.millis),
+          persistence = GameRoom.RoomPersistence(snap => written.update(_ :+ snap))
+        )
         .flatMap {
           case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
           case Right(room) =>
@@ -138,7 +154,11 @@ class GameRoomPersistenceSuite extends munit.CatsEffectSuite:
               restoredDice <- IO.fromEither(DiceSource.fromHexSeed(snap.serverSeed).left.map(RuntimeException(_)))
               afterRestore <- Ref.of[IO, Vector[GameSnapshot]](Vector.empty)
               restored     <- GameRoom
-                .restore(snap, restoredDice, persist = snap2 => afterRestore.update(_ :+ snap2))
+                .restore(
+                  snap,
+                  restoredDice,
+                  persistence = GameRoom.RoomPersistence(snap2 => afterRestore.update(_ :+ snap2))
+                )
                 .flatMap {
                   case Left(error) => IO.raiseError(RuntimeException(s"restore failed: $error"))
                   case Right(r)    => IO.pure(r)

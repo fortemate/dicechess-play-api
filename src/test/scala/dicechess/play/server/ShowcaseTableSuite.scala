@@ -542,8 +542,8 @@ class ShowcaseTableSuite extends munit.CatsEffectSuite:
           roomRes <- GameRoom.create(
             botVsHuman,
             diceSource,
-            timeControl = TimeControl.SuddenDeath(1),
-            seedGrace = 20.millis
+            config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(1)),
+            tuning = GameRoom.RoomTuning(seedGrace = 20.millis)
           )
           room <- IO.fromEither(roomRes.left.map(e => RuntimeException(s"room creation failed: $e")))
           liveGame = ShowcaseTable.LiveGame(id, room, Side.White)

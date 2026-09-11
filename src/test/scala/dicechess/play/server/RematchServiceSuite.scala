@@ -377,8 +377,10 @@ class RematchServiceSuite extends CatsEffectSuite with TestContainerForAll:
           made <- GameRoom.restore(
             game.initialSnapshot,
             dice,
-            initialJoin = Some(gate),
-            durability = Durability.required(_ => IO.unit).copy(intermediate = RetryPolicy(Some(2), 5.millis, 5.millis))
+            persistence = GameRoom.RoomPersistence(durability =
+              Durability.required(_ => IO.unit).copy(intermediate = RetryPolicy(Some(2), 5.millis, 5.millis))
+            ),
+            initialJoin = Some(gate)
           )
           r = made.toOption.get
           _ <- r

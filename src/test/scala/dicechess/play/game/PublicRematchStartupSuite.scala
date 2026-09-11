@@ -38,7 +38,7 @@ class PublicRematchStartupSuite extends CatsEffectSuite:
       made <- GameRoom.restore(
         initial,
         dice,
-        durability = Durability.required(_ => IO.unit),
+        persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
         initialJoin = Some(
           GameRoom.InitialJoinGate(
             epoch.plusSeconds(15),
@@ -98,7 +98,7 @@ class PublicRematchStartupSuite extends CatsEffectSuite:
         .restore(
           initial.copy(players = Map(Seat.White -> Principal.Guest("w"), Seat.Black -> Principal.User("b"))),
           ordinaryDice,
-          durability = Durability.BestEffort
+          persistence = GameRoom.RoomPersistence(durability = Durability.BestEffort)
         )
         .flatMap(_.left.map(error => new RuntimeException(error.toString)).liftTo[IO])
         .flatMap(_.snapshot)
@@ -134,8 +134,8 @@ class PublicRematchStartupSuite extends CatsEffectSuite:
       made        <- GameRoom.restore(
         initial,
         dice,
-        seedGrace = 1.minute,
-        durability = Durability.required(_ => IO.unit),
+        tuning = GameRoom.RoomTuning(seedGrace = 1.minute),
+        persistence = GameRoom.RoomPersistence(durability = Durability.required(_ => IO.unit)),
         initialJoin = Some(
           GameRoom.InitialJoinGate(
             epoch.plusSeconds(15),

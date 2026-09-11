@@ -50,11 +50,14 @@ final class GameRegistry private (
         .restore(
           snapshot,
           dice,
-          displayNames = names,
-          ratings = ratings,
-          disconnectGrace = disconnectGrace,
-          drawReofferTurns = drawReofferTurns,
-          durability = Durability.required(GameRegistry.logPersistence(game.gameId)),
+          metadata = GameRoom.SeatMetadata(displayNames = names, ratings = ratings),
+          tuning = GameRoom.RoomTuning(
+            disconnectGrace = disconnectGrace,
+            drawReofferTurns = drawReofferTurns
+          ),
+          persistence = GameRoom.RoomPersistence(
+            durability = Durability.required(GameRegistry.logPersistence(game.gameId))
+          ),
           initialJoin = Some(
             GameRoom.InitialJoinGate(
               game.joinDeadlineAt,
@@ -235,16 +238,21 @@ final class GameRegistry private (
         made             <- GameRoom.create(
           players,
           dice,
-          displayNames = names,
-          ratings = ratings,
-          disconnectGrace = disconnectGrace,
-          drawReofferTurns = drawReofferTurns,
-          timeControl = timeControl,
-          rated = rated,
-          ladder = ladder,
-          origin = origin,
-          persist = store.save(id, _),
-          durability = durabilityFor(id, origin)
+          config = GameRoom.GameConfig(
+            timeControl = timeControl,
+            rated = rated,
+            ladder = ladder,
+            origin = origin
+          ),
+          metadata = GameRoom.SeatMetadata(displayNames = names, ratings = ratings),
+          tuning = GameRoom.RoomTuning(
+            disconnectGrace = disconnectGrace,
+            drawReofferTurns = drawReofferTurns
+          ),
+          persistence = GameRoom.RoomPersistence(
+            save = store.save(id, _),
+            durability = durabilityFor(id, origin)
+          )
         )
         result <- made.traverse: room =>
           val cleanup = room.abort *> abortAndDeregister(id)
@@ -298,14 +306,20 @@ final class GameRegistry private (
                   GameRoom.restore(
                     snapshot,
                     dice,
-                    displayNames = names,
-                    ratings = RatingCategory.of(snapshot.timeControl).flatMap(byCategory.get).getOrElse(Map.empty),
-                    disconnectGrace = disconnectGrace,
-                    drawReofferTurns = drawReofferTurns,
-                    persist = store.save(id, _),
-                    // A resumed showcase game is as fail-closed as it was before the restart: the origin travels in the
-                    // snapshot precisely so the discipline can be re-derived from it.
-                    durability = durabilityFor(id, snapshot.effectiveOrigin),
+                    metadata = GameRoom.SeatMetadata(
+                      displayNames = names,
+                      ratings = RatingCategory.of(snapshot.timeControl).flatMap(byCategory.get).getOrElse(Map.empty)
+                    ),
+                    tuning = GameRoom.RoomTuning(
+                      disconnectGrace = disconnectGrace,
+                      drawReofferTurns = drawReofferTurns
+                    ),
+                    persistence = GameRoom.RoomPersistence(
+                      save = store.save(id, _),
+                      // A resumed showcase game is as fail-closed as it was before the restart: the origin travels in the
+                      // snapshot precisely so the discipline can be re-derived from it.
+                      durability = durabilityFor(id, snapshot.effectiveOrigin)
+                    ),
                     resumedActiveRematch = isRematch
                   )
             }

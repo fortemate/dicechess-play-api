@@ -21,9 +21,9 @@ import scala.io.Source
   *
   * Run: `mise run rating:replay -- corpus=<games.jsonl[.gz]> participants=<participants.jsonl> out=<dir> [ledger=true]
   * [order=applied|finished] [scale=per-category|single-until:<instant>[:blitz,rapid]] [resolution=current|lenient]
-  * [eligibility=rules|recorded] [tau=0.3]
-  * [tau-before=0.5 tau-switch-at=<instant>] [tolerance=1e-6] [inactive-days=7]`. All the logic lives in the separately
-  * unit-tested [[RatingReplay]]; this file is a thin shell, name-excluded from coverage like `Main.scala`.
+  * [eligibility=rules|recorded] [tau=0.3] [tau-before=0.5 tau-switch-at=<instant>] [tolerance=1e-6] [inactive-days=7]`.
+  * All the logic lives in the separately unit-tested [[RatingReplay]]; this file is a thin shell, name-excluded from
+  * coverage like `Main.scala`.
   */
 object RatingReplayMain extends IOApp:
 
@@ -39,17 +39,20 @@ object RatingReplayMain extends IOApp:
         val config = configFrom(options)
         for
           games        <- IO.blocking(readAll[RatingReplay.Game](Paths.get(corpus)))
-          participants <- options.get("participants").fold(IO.pure(List.empty[RatingReplay.Participant]))(p =>
-            IO.blocking(readAll[RatingReplay.Participant](Paths.get(p)))
-          )
+          participants <- options
+            .get("participants")
+            .fold(IO.pure(List.empty[RatingReplay.Participant]))(p =>
+              IO.blocking(readAll[RatingReplay.Participant](Paths.get(p)))
+            )
           _        <- IO.println(s"[replay] ${games.size} rows, ${participants.size} participants; replaying")
           outcomes <- IO.blocking(RatingReplay.replay(games, config))
           summary  <- IO.blocking(RatingReplay.summarize(outcomes, participants, config))
           outDir   <- IO.blocking(Files.createDirectories(Paths.get(out)))
           _        <- IO.blocking(Files.writeString(outDir.resolve("summary.json"), summary.asJson.spaces2, UTF_8))
-          rendered  = RatingReplay.render(summary)
-          _        <- IO.blocking(Files.writeString(outDir.resolve("summary.txt"), rendered + "\n", UTF_8))
-          _        <- IO.blocking(writeLedger(outDir.resolve("ledger.jsonl"), outcomes))
+          rendered = RatingReplay.render(summary)
+          _ <- IO.blocking(Files.writeString(outDir.resolve("summary.txt"), rendered + "\n", UTF_8))
+          _ <- IO
+            .blocking(writeLedger(outDir.resolve("ledger.jsonl"), outcomes))
             .whenA(options.get("ledger").exists(v => v == "true" || v == "1"))
           _ <- IO.println(rendered)
           _ <- IO.println(s"[replay] wrote ${outDir.toAbsolutePath}")
@@ -71,7 +74,8 @@ object RatingReplayMain extends IOApp:
     val scale = options.get("scale") match
       case Some(s) if s.startsWith("single-until:") =>
         val spec = s.stripPrefix("single-until:")
-        val zEnd = spec.indexOf('Z') + 1 // the instant is UTC and ends in `Z`; anything after a following `:` is the list
+        val zEnd =
+          spec.indexOf('Z') + 1 // the instant is UTC and ends in `Z`; anything after a following `:` is the list
         val (at, categories) =
           if zEnd > 0 && zEnd < spec.length && spec(zEnd) == ':' then (spec.take(zEnd), Some(spec.drop(zEnd + 1)))
           else (spec, None)

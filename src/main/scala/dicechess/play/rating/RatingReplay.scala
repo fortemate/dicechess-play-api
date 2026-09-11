@@ -7,8 +7,8 @@ import java.time.{Instant, LocalDate, ZoneOffset}
 import scala.collection.mutable
 
 /** Chronological replay of the CURRENT rating implementation over an exported `game_results` corpus (#145) — the
-  * evidence step of the stable-rating epic (fortemate-internal#168, ADR 008) that has to come before any model choice or
-  * migration: it re-applies [[Glicko2.update]] game by game exactly as [[RatingBatch]] does, then tallies where the
+  * evidence step of the stable-rating epic (fortemate-internal#168, ADR 008) that has to come before any model choice
+  * or migration: it re-applies [[Glicko2.update]] game by game exactly as [[RatingBatch]] does, then tallies where the
   * replayed numbers agree with what production recorded on each row and where they do not. Pure: corpus in, ledger and
   * summary out; [[RatingReplayMain]] is the file-reading shell.
   *
@@ -26,13 +26,12 @@ import scala.collection.mutable
   * [[Tau]] models the τ = 0.5 → 0.3 change (#169). Neither is inferred from the data by this code — they are inputs,
   * and the report says which were used.
   *
-  * '''Verdicts, per game.''' A row that recorded both seats' before/after ratings is compared against the replayed
-  * pair at `tolerance`: [[Verdict.Match]] when the levels agree, [[Verdict.MatchStepOnly]] when only the step
-  * (after − before) does — a whole pool sitting a constant away from the replay reproduces every step, since a
-  * Glicko-2 update depends on rating differences — and [[Verdict.Mismatch]] otherwise. A row the batch stamped
-  * without numbers is either
-  * [[Verdict.UnverifiablePreNumeric]] — it predates the row-level recording (#296), so nothing can be checked — or a
-  * skip, which is [[Verdict.SkipConsistent]] when the replay skips it too and
+  * '''Verdicts, per game.''' A row that recorded both seats' before/after ratings is compared against the replayed pair
+  * at `tolerance`: [[Verdict.Match]] when the levels agree, [[Verdict.MatchStepOnly]] when only the step (after −
+  * before) does — a whole pool sitting a constant away from the replay reproduces every step, since a Glicko-2 update
+  * depends on rating differences — and [[Verdict.Mismatch]] otherwise. A row the batch stamped without numbers is
+  * either [[Verdict.UnverifiablePreNumeric]] — it predates the row-level recording (#296), so nothing can be checked —
+  * or a skip, which is [[Verdict.SkipConsistent]] when the replay skips it too and
   * [[Verdict.ReplayAppliedRecordedSkipped]] otherwise. A recorded update the replay refuses is
   * [[Verdict.ReplaySkippedRecordedApplied]]; a rated row the batch had not reached at the cutoff is
   * [[Verdict.Pending]]; a casual row never enters the queue and is [[Verdict.Casual]]. The report distinguishes
@@ -98,8 +97,8 @@ object RatingReplay:
   object GlickoSnapshot:
     def of(g: Glicko): GlickoSnapshot = GlickoSnapshot(g.rating, g.deviation, g.volatility)
 
-  /** One participant as exported: the identity, its kind, and the rating state the tables held at the cutoff — what
-    * the replayed final state is compared against. Bots carry more (team, name, ladder flag, owner pseudonym); the
+  /** One participant as exported: the identity, its kind, and the rating state the tables held at the cutoff — what the
+    * replayed final state is compared against. Bots carry more (team, name, ladder flag, owner pseudonym); the
     * comparison needs only these.
     */
   final case class Participant(
@@ -131,16 +130,21 @@ object RatingReplay:
 
   /** How a seat's identity is resolved. `Current` is what today's batch would do — a bot or account no longer in the
     * tables has no rating state and its game is skipped. `Lenient` treats every `bot:team:` id as the registered bot it
-    * was when the game was played, which is how the batch of the day saw it; it cannot fabricate an account, so
-    * humans still need to resolve.
+    * was when the game was played, which is how the batch of the day saw it; it cannot fabricate an account, so humans
+    * still need to resolve.
     */
   enum Resolution:
     case Current, Lenient
 
   /** The volatility constant per era: `before` until `switchAt`, `after` from then on (both `after` when there is no
-    * switch). #169 moved τ from 0.5 to 0.3 for future updates only, so a faithful replay of the early corpus needs both.
+    * switch). #169 moved τ from 0.5 to 0.3 for future updates only, so a faithful replay of the early corpus needs
+    * both.
     */
-  final case class Tau(after: Double = Glicko2.DefaultTau, before: Double = Glicko2.DefaultTau, switchAt: Option[Instant] = None):
+  final case class Tau(
+      after: Double = Glicko2.DefaultTau,
+      before: Double = Glicko2.DefaultTau,
+      switchAt: Option[Instant] = None
+  ):
     def at(instant: Instant): Double = switchAt match
       case Some(switch) if instant.isBefore(switch) => before
       case _                                        => after
@@ -151,8 +155,8 @@ object RatingReplay:
       resolution: Resolution = Resolution.Current,
       tau: Tau = Tau(),
       /** Absolute rating difference at or below which a replayed value counts as reproducing the recorded one. The
-        * recorded columns are `double precision` written from the same arithmetic, so agreement is exact up to
-        * platform ulps; 1e-6 leaves room for an aarch64/x86 `exp`/`log` disagreement without hiding a real drift.
+        * recorded columns are `double precision` written from the same arithmetic, so agreement is exact up to platform
+        * ulps; 1e-6 leaves room for an aarch64/x86 `exp`/`log` disagreement without hiding a real drift.
         */
       tolerance: Double = 1e-6,
       /** Days without a game after which an identity counts as inactive for the drift and offset tables. */
@@ -173,16 +177,20 @@ object RatingReplay:
     val NoResult      = "no definite result"
     val OwnBot        = "a player's game against their own bot is never rated"
     val Uncategorised = "uncategorised time control belongs to no rating scale"
+
     /** `followRecorded` only: the batch of the day stamped the row without numbers, so the replay skips it too. */
     val RecordedSkip = "stamped without a rating movement by the batch of the day (followed as recorded)"
+
     /** `followRecorded` only: numbers were recorded on a row that has no result or no scale — nothing to replay. */
     val RecordedWithoutOutcome = "numbers recorded on a row without a definite result or a rating scale"
 
   enum Decision:
     /** Both seats updated. */
     case Applied
+
     /** `rated = false`: never enters the batch's queue. */
     case Casual
+
     /** Queued and stamped, but no rating moved. */
     case Skipped(why: String)
 
@@ -212,8 +220,8 @@ object RatingReplay:
 
   final case class SeatOutcome(id: String, before: Glicko, after: Glicko, score: Double, expected: Double)
 
-  /** One replayed row: the decision, both seats' replayed step when applied, the verdict against the recorded
-    * numbers, and — for a numeric row — how far the replayed pre-game and post-game ratings sit from the recorded ones
+  /** One replayed row: the decision, both seats' replayed step when applied, the verdict against the recorded numbers,
+    * and — for a numeric row — how far the replayed pre-game and post-game ratings sit from the recorded ones
     * (`beforeDiff`/`afterDiff`, max over both seats), how far the replayed STEP (after − before) sits from the recorded
     * step (`stepDiff`), and whether the recorded step itself is reproduced by the formula from the recorded pre-game
     * ratings (`formulaHolds`, `None` when there was nothing to check). A Glicko-2 step depends on rating DIFFERENCES,
@@ -254,7 +262,7 @@ object RatingReplay:
     else if game.white.id == game.black.id then Left(SkipReason.SelfPlay)
     else
       game.result.flatMap(RatingBatch.scores) match
-        case None => Left(SkipReason.NoResult)
+        case None                           => Left(SkipReason.NoResult)
         case Some((whiteScore, blackScore)) =>
           if game.ownerRelation.isDefined then Left(SkipReason.OwnBot)
           else
@@ -312,13 +320,17 @@ object RatingReplay:
   /** The decision for one queued row under `config`: the batch of the day's own, when following the record inside the
     * numeric era, and today's rules ([[decide]]) everywhere else.
     */
-  private def decideUnder(game: Game, config: Config, numericSince: Option[Instant]): Either[String, (RatingCategory, Double, Double)] =
+  private def decideUnder(
+      game: Game,
+      config: Config,
+      numericSince: Option[Instant]
+  ): Either[String, (RatingCategory, Double, Double)] =
     val numericEra = numericSince.exists(since => !game.finishedAt.isBefore(since))
     if config.followRecorded && numericEra && game.applied then
       if game.numericRecorded then
         (categoryOf(game), game.result.flatMap(RatingBatch.scores)) match
           case (Some(cat), Some((whiteScore, blackScore))) => Right((cat, whiteScore, blackScore))
-          case _                                          => Left(SkipReason.RecordedWithoutOutcome)
+          case _                                           => Left(SkipReason.RecordedWithoutOutcome)
       else Left(SkipReason.RecordedSkip)
     else decide(game, config.resolution)
 
@@ -329,7 +341,18 @@ object RatingReplay:
       decideUnder(game, config, numericSince) match
         case Left(reason) =>
           val decision = Decision.Skipped(reason)
-          Outcome(game, category, decision, None, None, verdictFor(game, decision, numericSince), None, None, None, None)
+          Outcome(
+            game,
+            category,
+            decision,
+            None,
+            None,
+            verdictFor(game, decision, numericSince),
+            None,
+            None,
+            None,
+            None
+          )
         case Right((cat, whiteScore, blackScore)) =>
           val at          = game.processedAt
           val tau         = config.tau.at(at)
@@ -339,8 +362,10 @@ object RatingReplay:
           val blackAfter  = Glicko2.update(blackBefore, List(Glicko2.Result(whiteBefore, blackScore)), tau)
           state.write(game.white.id, cat, at, whiteAfter)
           state.write(game.black.id, cat, at, blackAfter)
-          val white = SeatOutcome(game.white.id, whiteBefore, whiteAfter, whiteScore, expected(whiteBefore, blackBefore))
-          val black = SeatOutcome(game.black.id, blackBefore, blackAfter, blackScore, expected(blackBefore, whiteBefore))
+          val white =
+            SeatOutcome(game.white.id, whiteBefore, whiteAfter, whiteScore, expected(whiteBefore, blackBefore))
+          val black =
+            SeatOutcome(game.black.id, blackBefore, blackAfter, blackScore, expected(blackBefore, whiteBefore))
           val (beforeDiff, afterDiff, stepDiff, formula) =
             if game.numericRecorded then
               val diffs = for
@@ -351,7 +376,7 @@ object RatingReplay:
               yield
                 val before = math.max(math.abs(rwb - whiteBefore.rating), math.abs(rbb - blackBefore.rating))
                 val after  = math.max(math.abs(rwa - whiteAfter.rating), math.abs(rba - blackAfter.rating))
-                val step = math.max(
+                val step   = math.max(
                   math.abs((rwa - rwb) - (whiteAfter.rating - whiteBefore.rating)),
                   math.abs((rba - rbb) - (blackAfter.rating - blackBefore.rating))
                 )
@@ -377,7 +402,8 @@ object RatingReplay:
             else (None, None, None, None)
           val verdict =
             if game.numericRecorded then
-              val worst = math.max(beforeDiff.getOrElse(Double.PositiveInfinity), afterDiff.getOrElse(Double.PositiveInfinity))
+              val worst =
+                math.max(beforeDiff.getOrElse(Double.PositiveInfinity), afterDiff.getOrElse(Double.PositiveInfinity))
               if worst <= config.tolerance then Verdict.Match
               else if stepDiff.exists(_ <= config.tolerance) then Verdict.MatchStepOnly
               else Verdict.Mismatch
@@ -435,8 +461,8 @@ object RatingReplay:
   final case class ClassCount(category: String, verdict: String, count: Long) derives ConfiguredCodec
   final case class SkipCount(reason: String, count: Long, recordedNumeric: Long) derives ConfiguredCodec
 
-  /** The rows whose level the replay did not reproduce, per category and verdict (`mismatch` or `match_step_only`):
-    * how far off, whether the per-row arithmetic still held, and when they start and end.
+  /** The rows whose level the replay did not reproduce, per category and verdict (`mismatch` or `match_step_only`): how
+    * far off, whether the per-row arithmetic still held, and when they start and end.
     */
   final case class MismatchStat(
       category: String,
@@ -481,8 +507,8 @@ object RatingReplay:
       allMean: Double
   ) derives ConfiguredCodec
 
-  /** An identity that stopped playing on a scale: its frozen rating, the active pool's mean the day it last played,
-    * and the active pool's mean at the cutoff — `offset` is how far the live scale moved after it left.
+  /** An identity that stopped playing on a scale: its frozen rating, the active pool's mean the day it last played, and
+    * the active pool's mean at the cutoff — `offset` is how far the live scale moved after it left.
     */
   final case class InactiveOffset(
       id: String,
@@ -515,8 +541,8 @@ object RatingReplay:
       surplus: Double
   ) derives ConfiguredCodec
 
-  /** Replayed final state versus the table snapshot at the cutoff, per identity and scale — over the rows the batch
-    * had stamped by then; a pending row is replayed but cannot be in the snapshot, so it is left out here.
+  /** Replayed final state versus the table snapshot at the cutoff, per identity and scale — over the rows the batch had
+    * stamped by then; a pending row is replayed but cannot be in the snapshot, so it is left out here.
     */
   final case class FinalDiff(
       id: String,
@@ -527,12 +553,13 @@ object RatingReplay:
       ratingDiff: Option[Double]
   ) derives ConfiguredCodec
 
-  /** How far the replayed numbers sit from the recorded ones on numeric rows the replay applied, per category:
-    * `level` is max(|before|, |after|) over both seats, `step` is the max |Δ| difference. Bins are cumulative-exclusive
-    * upper bounds (a row lands in the first bin whose `upTo` it does not exceed), so the same row appears once.
+  /** How far the replayed numbers sit from the recorded ones on numeric rows the replay applied, per category: `level`
+    * is max(|before|, |after|) over both seats, `step` is the max |Δ| difference. Bins are cumulative-exclusive upper
+    * bounds (a row lands in the first bin whose `upTo` it does not exceed), so the same row appears once.
     */
   final case class DiffBin(upTo: Double, count: Long) derives ConfiguredCodec
-  final case class DiffHistogram(category: String, kind: String, rows: Long, bins: List[DiffBin]) derives ConfiguredCodec
+  final case class DiffHistogram(category: String, kind: String, rows: Long, bins: List[DiffBin])
+      derives ConfiguredCodec
 
   /** Structural checks that need no rating arithmetic. `displacedRows` counts applied rated rows whose position in
     * apply order differs from their position in finish order; `formulaMismatches` counts numeric rows whose recorded
@@ -671,7 +698,8 @@ object RatingReplay:
       def histogram(cat: String, kind: String, values: Vector[Double]): DiffHistogram =
         val counts = bounds.map(upTo => DiffBin(upTo, values.count(v => v <= upTo).toLong))
         // Cumulative counts → per-bin counts, so each row is in exactly one bin.
-        val perBin = counts.zip(0L +: counts.map(_.count)).map { case (bin, below) => bin.copy(count = bin.count - below) }
+        val perBin =
+          counts.zip(0L +: counts.map(_.count)).map { case (bin, below) => bin.copy(count = bin.count - below) }
         DiffHistogram(cat, kind, values.size.toLong, perBin)
       applied
         .filter(o => o.game.numericRecorded && o.beforeDiff.isDefined)
@@ -695,11 +723,12 @@ object RatingReplay:
         bb <- g.black.ratingBefore; ba <- g.black.ratingAfter
       yield (wa - wb) + (ba - bb)
 
-    val deltaSums = (applied.map(o => categoryLabel(o.category)) ++ games.filter(_.numericRecorded).map(g =>
-      categoryLabel(categoryOf(g))
-    )).distinct.sorted.map { cat =>
+    val deltaSums = (applied.map(o => categoryLabel(o.category)) ++ games
+      .filter(_.numericRecorded)
+      .map(g => categoryLabel(categoryOf(g)))).distinct.sorted.map { cat =>
       val replayed = applied.filter(o => categoryLabel(o.category) == cat)
-      val recorded = games.filter(g => g.numericRecorded && categoryLabel(categoryOf(g)) == cat).flatMap(recordedPairDelta)
+      val recorded =
+        games.filter(g => g.numericRecorded && categoryLabel(categoryOf(g)) == cat).flatMap(recordedPairDelta)
       DeltaSums(
         cat,
         replayed.size.toLong,
@@ -717,12 +746,12 @@ object RatingReplay:
     val current     = mutable.HashMap.empty[(String, RatingCategory), Glicko]
     // The state the tables could hold at the cutoff: everything the batch had stamped. Rows it had not reached
     // (pending) are replayed for the ledger but cannot be in the snapshot, so they stay out of this map.
-    val settled     = mutable.HashMap.empty[(String, RatingCategory), Glicko]
-    val settledGames = mutable.HashMap.empty[(String, RatingCategory), Long]
-    val lastPlayed  = mutable.HashMap.empty[(String, RatingCategory), Instant]
-    val gamesCount  = mutable.HashMap.empty[(String, RatingCategory), Long]
-    val playedToday = mutable.HashSet.empty[(String, RatingCategory)]
-    val activeMeanByDay = mutable.HashMap.empty[(String, String), Option[Double]] // (day, category) -> active mean
+    val settled             = mutable.HashMap.empty[(String, RatingCategory), Glicko]
+    val settledGames        = mutable.HashMap.empty[(String, RatingCategory), Long]
+    val lastPlayed          = mutable.HashMap.empty[(String, RatingCategory), Instant]
+    val gamesCount          = mutable.HashMap.empty[(String, RatingCategory), Long]
+    val playedToday         = mutable.HashSet.empty[(String, RatingCategory)]
+    val activeMeanByDay     = mutable.HashMap.empty[(String, String), Option[Double]] // (day, category) -> active mean
     var day: Option[String] = None
 
     def closeDay(d: String): Unit =
@@ -807,13 +836,13 @@ object RatingReplay:
     }
     day.foreach(closeDay)
 
-    val cutoff = games.map(_.finishedAt).maxOption
+    val cutoff          = games.map(_.finishedAt).maxOption
     val inactiveOffsets = current.toList
       .filter { case (k, _) =>
         cutoff.exists(c => lastPlayed(k).plusSeconds(config.inactiveAfterDays.toLong * 86400L).isBefore(c))
       }
       .map { case ((id, cat), g) =>
-        val last = lastPlayed((id, cat))
+        val last     = lastPlayed((id, cat))
         val thenMean = activeMeanByDay.get((dayOf(last), cat.wireName)).flatten
         val nowMean  = day.flatMap(d => activeMeanByDay.get((d, cat.wireName)).flatten)
         InactiveOffset(
@@ -830,35 +859,46 @@ object RatingReplay:
       }
       .sortBy(o => (o.category, o.lastFinishedAt))
 
-    val humanLags = humans.toList.map { case ((id, cat), acc) =>
-      HumanLag(
-        id,
-        cat.wireName,
-        acc.games,
-        acc.first,
-        acc.last,
-        acc.finalState.rating,
-        acc.finalState.deviation,
-        acc.converged,
-        acc.opponentSum / acc.games,
-        acc.actual,
-        acc.expected,
-        acc.actual - acc.expected
-      )
-    }.sortBy(h => (h.id, h.category))
+    val humanLags = humans.toList
+      .map { case ((id, cat), acc) =>
+        HumanLag(
+          id,
+          cat.wireName,
+          acc.games,
+          acc.first,
+          acc.last,
+          acc.finalState.rating,
+          acc.finalState.deviation,
+          acc.converged,
+          acc.opponentSum / acc.games,
+          acc.actual,
+          acc.expected,
+          acc.actual - acc.expected
+        )
+      }
+      .sortBy(h => (h.id, h.category))
 
     val snapshotByKey = participants.flatMap(p => p.ratings.map { case (cat, s) => (p.id, cat) -> s }).toMap
-    val finals = settled.toList.map { case ((id, cat), g) =>
-      val snap = snapshotByKey.get((id, cat.wireName))
-      FinalDiff(id, cat.wireName, settledGames((id, cat)), GlickoSnapshot.of(g), snap, snap.map(s => g.rating - s.rating))
-    }.sortBy(f => (f.category, -f.replayed.rating))
+    val finals        = settled.toList
+      .map { case ((id, cat), g) =>
+        val snap = snapshotByKey.get((id, cat.wireName))
+        FinalDiff(
+          id,
+          cat.wireName,
+          settledGames((id, cat)),
+          GlickoSnapshot.of(g),
+          snap,
+          snap.map(s => g.rating - s.rating)
+        )
+      }
+      .sortBy(f => (f.category, -f.replayed.rating))
 
     val appliedRated = games.filter(g => g.rated && g.applied)
     val byApplied    = appliedRated.sortBy(g => (g.seqApplied.getOrElse(Long.MaxValue), g.seqFinished)).map(_.gameId)
     val byFinished   = appliedRated.sortBy(_.seqFinished).map(_.gameId)
     val displaced    = byApplied.iterator.zip(byFinished.iterator).count { case (a, b) => a != b }
     val checked      = outcomes.flatMap(_.formulaHolds)
-    val integrity = Integrity(
+    val integrity    = Integrity(
       rows = games.size.toLong,
       duplicateGameIds = (games.size - games.map(_.gameId).distinct.size).toLong,
       oneSidedNumeric = games.count(g => g.white.ratingAfter.isDefined != g.black.ratingAfter.isDefined).toLong,
@@ -874,7 +914,7 @@ object RatingReplay:
       config = ConfigSummary(
         order = config.order.toString.toLowerCase,
         scale = config.scale match
-          case Scale.PerCategory => "per-category"
+          case Scale.PerCategory             => "per-category"
           case Scale.SingleUntil(at, seeded) =>
             s"single-until:$at:${seeded.toList.map(_.wireName).sorted.mkString(",")}",
         resolution = config.resolution.toString.toLowerCase,
@@ -930,9 +970,8 @@ object RatingReplay:
       ),
       ""
     )
-    val classLines = "--- verdicts by category ---" :: summary.classes.map(c =>
-      line("%-8s %-34s %8d", c.category, c.verdict, c.count)
-    )
+    val classLines =
+      "--- verdicts by category ---" :: summary.classes.map(c => line("%-8s %-34s %8d", c.category, c.verdict, c.count))
     val skipLines = "" :: "--- replay skips (numeric rows among them) ---" :: summary.skips.map(s =>
       line("%8d (%d)  %s", s.count, s.recordedNumeric, s.reason)
     )
@@ -1006,7 +1045,7 @@ object RatingReplay:
         f.ratingDiff.map(d => line("%+.4f", d)).getOrElse("-")
       )
     )
-    val i = summary.integrity
+    val i              = summary.integrity
     val integrityLines = List(
       "",
       "--- integrity ---",

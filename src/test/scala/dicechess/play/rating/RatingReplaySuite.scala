@@ -13,8 +13,8 @@ import java.time.Instant
   * skip reason the ledger distinguishes is reached by at least one row.
   *
   * Two resolutions are exercised throughout. `Lenient` sees the corpus as the batch of the day did (every bot
-  * registered) and is the reproduction baseline; `Current` refuses the since-deleted bot and shows how one refused
-  * seat cascades into its opponents' chains — which is the very effect the production report has to separate from
+  * registered) and is the reproduction baseline; `Current` refuses the since-deleted bot and shows how one refused seat
+  * cascades into its opponents' chains — which is the very effect the production report has to separate from
   * arithmetic.
   *
   * Regenerating the fixture on purpose: run with `RATING_REPLAY_WRITE_FIXTURE=1` once, then update the hashes below.
@@ -36,7 +36,11 @@ class RatingReplaySuite extends munit.FunSuite:
     if sys.env.get("RATING_REPLAY_WRITE_FIXTURE").contains("1") then
       Files.createDirectories(resources)
       Files.writeString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), gamesJsonl, UTF_8)
-      Files.writeString(resources.resolve(s"${RatingReplayFixture.Version}.participants.jsonl"), participantsJsonl, UTF_8)
+      Files.writeString(
+        resources.resolve(s"${RatingReplayFixture.Version}.participants.jsonl"),
+        participantsJsonl,
+        UTF_8
+      )
       Files.writeString(
         resources.resolve(s"${RatingReplayFixture.Version}.sha256"),
         s"${RatingReplayFixture.sha256(gamesJsonl)}  ${RatingReplayFixture.Version}.games.jsonl\n" +
@@ -56,7 +60,7 @@ class RatingReplaySuite extends munit.FunSuite:
   private def count(outcomes: Vector[Outcome], verdict: Verdict): Int = outcomes.count(_.verdict == verdict)
 
   test("the committed fixture files are the generator's output and hash to the published digests"):
-    val committedGames        = Files.readString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), UTF_8)
+    val committedGames = Files.readString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), UTF_8)
     val committedParticipants =
       Files.readString(resources.resolve(s"${RatingReplayFixture.Version}.participants.jsonl"), UTF_8)
     assertEquals(committedGames, gamesJsonl, "games fixture drifted from the generator")
@@ -100,21 +104,22 @@ class RatingReplaySuite extends munit.FunSuite:
     assertEquals(count(lenient, Verdict.ReplaySkippedRecordedApplied), 0)
     // … and every later game of the opponent that DID get those updates in production now starts from a different
     // pre-game rating, so the chain mismatches from there on although the arithmetic per row still holds.
-    val cascade = current.filter(o => o.verdict == Verdict.Mismatch && o.game.seqFinished != RatingReplayFixture.CorruptedIndex + 1)
+    val cascade =
+      current.filter(o => o.verdict == Verdict.Mismatch && o.game.seqFinished != RatingReplayFixture.CorruptedIndex + 1)
     assert(cascade.nonEmpty, "the refused seat must break its opponent's chain")
     assert(cascade.forall(_.beforeDiff.exists(_ > 0.0)), "cascade rows are lineage breaks: the pre-game rating differs")
     // The lenient baseline has no such breaks: its only formula failure is the corrupted row.
     assert(lenient.filter(_.verdict == Verdict.Mismatch).forall(_.beforeDiff.contains(0.0)))
     val currentSummary = summarize(current, participants, Config())
     // Glicko-2 forgets: hundreds of later games shrink the trace, but the final state still carries it.
-    assert(currentSummary.finals.exists(f => f.id == "bot:team:fx:beta" && f.ratingDiff.exists(d => math.abs(d) > 1e-6)))
+    assert(
+      currentSummary.finals.exists(f => f.id == "bot:team:fx:beta" && f.ratingDiff.exists(d => math.abs(d) > 1e-6))
+    )
 
   test("every ledger class and every skip reason is reached"):
     // Coverage across both resolutions: the refused deleted bot exists only under `Current`, while the uniformly
     // shifted block reads as step-only just under `Lenient` (under `Current` the refusal's cascade moves its steps too).
-    Verdict.values.foreach(v =>
-      assert(count(current, v) + count(lenient, v) > 0, s"no row reached verdict ${v.label}")
-    )
+    Verdict.values.foreach(v => assert(count(current, v) + count(lenient, v) > 0, s"no row reached verdict ${v.label}"))
     val reasons = current.flatMap(_.decision.reason).toSet
     // Unlimited is casual by construction (`GameRegistry.isRated`) and the aborted row is casual too, so neither the
     // uncategorised nor the no-result skip can reach the queue in this corpus; `decide` still has them (next test).
@@ -133,7 +138,10 @@ class RatingReplaySuite extends munit.FunSuite:
     assertEquals(decide(base.copy(result = None), Resolution.Current), Left(SkipReason.NoResult))
     assertEquals(decide(base.copy(timeControl = "Unlimited"), Resolution.Current), Left(SkipReason.Uncategorised))
     assertEquals(decide(base.copy(black = base.white), Resolution.Current), Left(SkipReason.SelfPlay))
-    assertEquals(decide(base.copy(ownerRelation = Some("white_owns_black")), Resolution.Current), Left(SkipReason.OwnBot))
+    assertEquals(
+      decide(base.copy(ownerRelation = Some("white_owns_black")), Resolution.Current),
+      Left(SkipReason.OwnBot)
+    )
     assertEquals(
       decide(base.copy(white = base.white.copy(kind = "guest")), Resolution.Lenient),
       Left(SkipReason.Unresolvable),
@@ -154,7 +162,9 @@ class RatingReplaySuite extends munit.FunSuite:
     assertEquals(count(followed, Verdict.Mismatch), 1)
     assertEquals(followed.flatMap(_.decision.reason).toSet -- Set(SkipReason.SelfPlay), Set(SkipReason.RecordedSkip))
     val followedSummary = summarize(followed, participants, Config(followRecorded = true))
-    followedSummary.finals.filter(_.snapshot.isDefined).foreach(f => assertEqualsDouble(f.ratingDiff.get, 0.0, 1e-9, f.id))
+    followedSummary.finals
+      .filter(_.snapshot.isDefined)
+      .foreach(f => assertEqualsDouble(f.ratingDiff.get, 0.0, 1e-9, f.id))
     assert(followedSummary.histograms.exists(h => h.category == "blitz" && h.kind == "step"))
     val step = followedSummary.histograms.find(h => h.category == "blitz" && h.kind == "step").get
     assertEquals(step.bins.map(_.count).sum, step.rows)
@@ -198,8 +208,14 @@ class RatingReplaySuite extends munit.FunSuite:
     val delta = summary.inactiveOffsets.find(o => o.id == Delta && o.category == "blitz")
     assert(delta.isDefined, "delta retired early and must appear as inactive")
     assert(delta.get.offset.isDefined)
-    assert(!summary.inactiveOffsets.exists(o => o.id == "bot:team:fx:alpha" && o.category == "blitz"), "alpha plays blitz to the end")
-    assert(summary.inactiveOffsets.exists(o => o.id == "bot:team:fx:alpha" && o.category == "rapid"), "the rapid strand ends early")
+    assert(
+      !summary.inactiveOffsets.exists(o => o.id == "bot:team:fx:alpha" && o.category == "blitz"),
+      "alpha plays blitz to the end"
+    )
+    assert(
+      summary.inactiveOffsets.exists(o => o.id == "bot:team:fx:alpha" && o.category == "rapid"),
+      "the rapid strand ends early"
+    )
 
   test("the human identity's lag record is present per category"):
     val human = summary.humans.filter(_.id == Human)

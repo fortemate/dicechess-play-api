@@ -53,7 +53,15 @@ object RatingReplayFixture:
   private val Guest = "guest:fedcba9876543210"
 
   private val strength =
-    Map(Alpha -> 1800.0, Beta -> 1600.0, Gamma -> 1400.0, Delta -> 1600.0, Ghost -> 1500.0, Human -> 1700.0, Guest -> 1500.0)
+    Map(
+      Alpha -> 1800.0,
+      Beta  -> 1600.0,
+      Gamma -> 1400.0,
+      Delta -> 1600.0,
+      Ghost -> 1500.0,
+      Human -> 1700.0,
+      Guest -> 1500.0
+    )
 
   final private case class Spec(
       white: String,
@@ -82,13 +90,17 @@ object RatingReplayFixture:
       else
         rounds += Spec(a, b, termination = if rnd.nextInt(40) == 0 then "timeout" else "king_captured")
         i += 1
-    val base = rounds.result()
+    val base                            = rounds.result()
     val special: Map[Int, Vector[Spec]] = Map(
-      20  -> Vector(Spec(Alpha, Alpha)),                                            // rated self-play (pre-numeric era)
-      30  -> Vector(Spec(Guest, Alpha, rated = false), Spec(Alpha, Guest, rated = false)), // guest casual
-      70  -> (0 until 6).toVector.map(k => Spec(if k % 2 == 0 then Ghost else Beta, if k % 2 == 0 then Beta else Ghost)), // deleted bot, numeric era
+      20 -> Vector(Spec(Alpha, Alpha)), // rated self-play (pre-numeric era)
+      30 -> Vector(Spec(Guest, Alpha, rated = false), Spec(Alpha, Guest, rated = false)), // guest casual
+      70 -> (0 until 6).toVector.map(k =>
+        Spec(if k % 2 == 0 then Ghost else Beta, if k % 2 == 0 then Beta else Ghost)
+      ), // deleted bot, numeric era
       90  -> Vector(Spec(Alpha, Beta, result = Some(0), termination = "draw_agreement")),
-      100 -> (0 until 10).toVector.map(k => Spec(if k % 2 == 0 then Human else Alpha, if k % 2 == 0 then Alpha else Human)),
+      100 -> (0 until 10).toVector.map(k =>
+        Spec(if k % 2 == 0 then Human else Alpha, if k % 2 == 0 then Alpha else Human)
+      ),
       110 -> Vector(
         Spec(Human, Beta, ownerRelation = Some("white_owns_black")),
         Spec(Beta, Human, ownerRelation = Some("black_owns_white")),
@@ -99,9 +111,13 @@ object RatingReplayFixture:
       // rules would apply: `replay_applied_recorded_skipped`. Against delta, so no later game of either seat on this
       // scale is disturbed.
       121 -> Vector(Spec(Human, Delta, recordedSkipped = true), Spec(Delta, Human, recordedSkipped = true)),
-      130 -> (0 until 12).toVector.map(k => Spec(if k % 2 == 0 then Alpha else Gamma, if k % 2 == 0 then Gamma else Alpha, timeControl = "Fischer(600,10)")),
+      130 -> (0 until 12).toVector.map(k =>
+        Spec(if k % 2 == 0 then Alpha else Gamma, if k % 2 == 0 then Gamma else Alpha, timeControl = "Fischer(600,10)")
+      ),
       140 -> Vector(Spec(Beta, Gamma, rated = false, result = Some(0), termination = "aborted")),
-      200 -> (0 until 4).toVector.map(k => Spec(if k % 2 == 0 then Human else Gamma, if k % 2 == 0 then Gamma else Human, timeControl = "Fischer(600,10)"))
+      200 -> (0 until 4).toVector.map(k =>
+        Spec(if k % 2 == 0 then Human else Gamma, if k % 2 == 0 then Gamma else Human, timeControl = "Fischer(600,10)")
+      )
     )
     val out = Vector.newBuilder[Spec]
     base.zipWithIndex.foreach { case (spec, idx) =>
@@ -121,10 +137,10 @@ object RatingReplayFixture:
 
   /** The corpus rows and the participant snapshot, both deterministic for `seed`. */
   def generate(seed: Long = 20260911L): (Vector[Game], Vector[Participant]) =
-    val rnd   = new Random(seed)
-    val plan  = specs(rnd)
-    val state = scala.collection.mutable.HashMap.empty[(String, RatingCategory), Glicko]
-    val games = Vector.newBuilder[Game]
+    val rnd        = new Random(seed)
+    val plan       = specs(rnd)
+    val state      = scala.collection.mutable.HashMap.empty[(String, RatingCategory), Glicko]
+    val games      = Vector.newBuilder[Game]
     var appliedSeq = 0L
     plan.zipWithIndex.foreach { case (spec, idx) =>
       val finishedAt = start.plusSeconds(idx.toLong * 3600L) // one game an hour: ~19 days, so inactivity is reachable
@@ -138,7 +154,7 @@ object RatingReplayFixture:
       // The batch of the day: both seats resolvable (ghost still registered then), own-bot and self-play skipped.
       val eligible = applied && !spec.recordedSkipped && spec.white != spec.black && spec.ownerRelation.isEmpty &&
         category.isDefined && kindOf(spec.white) != "guest" && kindOf(spec.black) != "guest"
-      val numeric = eligible && idx >= RecordedFrom
+      val numeric          = eligible && idx >= RecordedFrom
       val (wb, wa, bb, ba) =
         if eligible then
           val cat    = category.get
@@ -204,8 +220,8 @@ object RatingReplayFixture:
     )
     (games.result(), participants)
 
-  def gamesJsonl(games: Vector[Game]): String              = games.map(_.asJson.noSpaces).mkString("", "\n", "\n")
-  def participantsJsonl(ps: Vector[Participant]): String   = ps.map(_.asJson.noSpaces).mkString("", "\n", "\n")
+  def gamesJsonl(games: Vector[Game]): String            = games.map(_.asJson.noSpaces).mkString("", "\n", "\n")
+  def participantsJsonl(ps: Vector[Participant]): String = ps.map(_.asJson.noSpaces).mkString("", "\n", "\n")
 
   def sha256(text: String): String =
     MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map(b => f"$b%02x").mkString

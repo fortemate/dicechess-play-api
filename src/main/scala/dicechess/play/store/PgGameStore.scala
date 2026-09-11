@@ -105,20 +105,14 @@ final class PgGameStore private (xa: HikariTransactor[IO])
     yield ()
 
     (step.handleErrorWith { err =>
-      Console[IO].errorln(s"[play][db][pool] telemetry error: $err")
+      Console[IO].errorln(s"[play][db][pool] telemetry error: $err").handleErrorWith(_ => IO.unit)
     } *> IO.sleep(interval)).foreverM
-
-  private[store] def attributeDelay(stats: PgGameStore.PoolStats, timeout: Boolean): String =
-    if stats.waiting > 0 then s"pool exhaustion (waiting=${stats.waiting})"
-    else if stats.active >= stats.total && stats.total > 0 then s"pool saturated (active=${stats.active})"
-    else if timeout then "slow statement, db contention or connectEC starvation"
-    else "slow statement or db contention"
 
   /** Bounded query wrapper with timing and pool attribution telemetry (#120).
     *
     * If execution exceeds [[SlowStatementThreshold]] (1s), logs a `WARN` with the operation name, elapsed time, and
-    * current pool stats. If the operation times out, logs a `WARN` with pool diagnostics before propagating
-    * `TimeoutException`.
+    * current pool stats. If the operation times out or connection acquisition fails, logs a `WARN` with pool
+    * diagnostics before propagating the exception.
     */
   private[store] def timedOp[A](op: String, timeout: FiniteDuration = SaveTimeout)(action: IO[A]): IO[A] =
     IO.monotonic.flatMap { start =>
@@ -127,26 +121,34 @@ final class PgGameStore private (xa: HikariTransactor[IO])
         .timed
         .flatMap { (elapsed, res) =>
           if elapsed >= SlowStatementThreshold then
-            currentPoolStats(sampleAcquire = false).flatMap { stats =>
-              val attribution = attributeDelay(stats, timeout = false)
-              Console[IO]
-                .errorln(
+            currentPoolStats(sampleAcquire = false)
+              .flatMap { stats =>
+                val attribution = PgGameStore.attributeDelay(stats, timeout = false)
+                Console[IO].errorln(
                   s"[play][db][warn] operation '$op' slow: took ${elapsed.toMillis}ms (threshold: ${SlowStatementThreshold.toMillis}ms, attribution: $attribution, pool: $stats)"
                 )
-                .as(res)
-            }
+              }
+              .handleErrorWith(err =>
+                Console[IO]
+                  .errorln(s"[play][db][warn] operation '$op' slow diagnostic failed: $err")
+                  .handleErrorWith(_ => IO.unit)
+              )
+              .as(res)
           else IO.pure(res)
         }
         .handleErrorWith {
-          case ex: java.util.concurrent.TimeoutException =>
+          case ex @ (_: java.util.concurrent.TimeoutException | _: java.sql.SQLTransientConnectionException) =>
             for
               now <- IO.monotonic
               elapsed = now - start
               stats <- currentPoolStats(sampleAcquire = false)
-              attribution = attributeDelay(stats, timeout = true)
-              _ <- Console[IO].errorln(
-                s"[play][db][warn] operation '$op' timed out after ${elapsed.toMillis}ms (timeout: ${timeout.toMillis}ms, attribution: $attribution, pool: $stats)"
-              )
+                .handleErrorWith(_ => IO.pure(PgGameStore.PoolStats(0, 0, 0, 0)))
+              attribution = PgGameStore.attributeDelay(stats, timeout = true)
+              _ <- Console[IO]
+                .errorln(
+                  s"[play][db][warn] operation '$op' timed out after ${elapsed.toMillis}ms (timeout: ${timeout.toMillis}ms, attribution: $attribution, pool: $stats)"
+                )
+                .handleErrorWith(_ => IO.unit)
               res <- IO.raiseError[A](ex)
             yield res
           case other =>
@@ -3585,6 +3587,12 @@ object PgGameStore:
     override def toString: String =
       s"active=$active, idle=$idle, waiting=$waiting, total=$total" +
         acquireTimeMs.fold("")(ms => s", acquire=${ms}ms")
+
+  private[store] def attributeDelay(stats: PgGameStore.PoolStats, timeout: Boolean): String =
+    if stats.waiting > 0 then s"pool exhaustion (waiting=${stats.waiting})"
+    else if stats.active >= stats.total && stats.total > 0 then s"pool saturated (active=${stats.active})"
+    else if timeout then "slow statement, db contention or connectEC starvation"
+    else "slow statement or db contention"
 
   /** SQLSTATE values the user-account writes branch on (#232). Named string constants rather than doobie's `sqlstate`
     * catalogue because the recovery runs at the `IO` level, after `transact` — a unique violation aborts the

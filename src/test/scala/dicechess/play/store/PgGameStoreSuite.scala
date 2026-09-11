@@ -4974,21 +4974,15 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
     val saturatedStats = PgGameStore.PoolStats(active = 5, idle = 0, waiting = 0, total = 5)
     val normalStats    = PgGameStore.PoolStats(active = 2, idle = 3, waiting = 0, total = 5)
 
-    withContainers { pg =>
-      store(pg).use { db =>
-        IO {
-          assertEquals(db.attributeDelay(waitingStats, timeout = false), "pool exhaustion (waiting=2)")
-          assertEquals(db.attributeDelay(waitingStats, timeout = true), "pool exhaustion (waiting=2)")
-          assertEquals(db.attributeDelay(saturatedStats, timeout = false), "pool saturated (active=5)")
-          assertEquals(db.attributeDelay(saturatedStats, timeout = true), "pool saturated (active=5)")
-          assertEquals(db.attributeDelay(normalStats, timeout = false), "slow statement or db contention")
-          assertEquals(
-            db.attributeDelay(normalStats, timeout = true),
-            "slow statement, db contention or connectEC starvation"
-          )
-        }
-      }
-    }
+    assertEquals(PgGameStore.attributeDelay(waitingStats, timeout = false), "pool exhaustion (waiting=2)")
+    assertEquals(PgGameStore.attributeDelay(waitingStats, timeout = true), "pool exhaustion (waiting=2)")
+    assertEquals(PgGameStore.attributeDelay(saturatedStats, timeout = false), "pool saturated (active=5)")
+    assertEquals(PgGameStore.attributeDelay(saturatedStats, timeout = true), "pool saturated (active=5)")
+    assertEquals(PgGameStore.attributeDelay(normalStats, timeout = false), "slow statement or db contention")
+    assertEquals(
+      PgGameStore.attributeDelay(normalStats, timeout = true),
+      "slow statement, db contention or connectEC starvation"
+    )
 
   test("PoolStats format with and without acquireTimeMs (#120)"):
     val s1 = PgGameStore.PoolStats(1, 2, 0, 3, Some(15L))

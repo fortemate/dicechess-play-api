@@ -71,9 +71,11 @@ class RatingReplaySuite extends munit.FunSuite:
     assert(manifest.contains(GamesSha256) && manifest.contains(ParticipantsSha256), "sha256 manifest out of date")
 
   test("the committed fixture files are the generator's output, up to floating-point ulps across architectures"):
-    // `Math.exp`/`log` are 1-ulp-tolerant intrinsics, so an aarch64 machine and an x86-64 runner print the last digit
-    // or two of a rating differently (the same reason `BradleyTerrySuite` compares its golden vector within 1e-9).
-    // Every non-numeric field must be identical; every rating within 1e-9.
+    // `Math.exp`/`log` are 1-ulp-tolerant intrinsics, so an aarch64 machine and an x86-64 runner print the last digits
+    // of a rating differently (the same reason `BradleyTerrySuite` compares its golden vector within 1e-9), and over a
+    // chain of hundreds of dependent updates the gap grows to ~1e-9 (row 325 of this fixture: 1.0e-9 on the CI runner).
+    // Every non-numeric field must be identical; every rating within 1e-6 — the replay's own tolerance, six orders of
+    // magnitude below anything a rating means.
     val committedGames = Files
       .readString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), UTF_8)
       .linesIterator
@@ -87,7 +89,7 @@ class RatingReplaySuite extends munit.FunSuite:
       )
       assertEquals(strip(committed), strip(generated), s"row ${generated.seqFinished}")
       def close(a: Option[Double], b: Option[Double], what: String): Unit = (a, b) match
-        case (Some(x), Some(y)) => assertEqualsDouble(x, y, 1e-9, s"row ${generated.seqFinished} $what")
+        case (Some(x), Some(y)) => assertEqualsDouble(x, y, 1e-6, s"row ${generated.seqFinished} $what")
         case _                  => assertEquals(a, b, s"row ${generated.seqFinished} $what")
       close(committed.white.ratingBefore, generated.white.ratingBefore, "white before")
       close(committed.white.ratingAfter, generated.white.ratingAfter, "white after")
@@ -104,9 +106,9 @@ class RatingReplaySuite extends munit.FunSuite:
       assertEquals(committed.ratings.keySet, generated.ratings.keySet, committed.id)
       committed.ratings.foreach { (cat, snap) =>
         val other = generated.ratings(cat)
-        assertEqualsDouble(snap.rating, other.rating, 1e-9, s"${committed.id} $cat rating")
-        assertEqualsDouble(snap.rd, other.rd, 1e-9, s"${committed.id} $cat rd")
-        assertEqualsDouble(snap.vol, other.vol, 1e-9, s"${committed.id} $cat vol")
+        assertEqualsDouble(snap.rating, other.rating, 1e-6, s"${committed.id} $cat rating")
+        assertEqualsDouble(snap.rd, other.rd, 1e-6, s"${committed.id} $cat rd")
+        assertEqualsDouble(snap.vol, other.vol, 1e-6, s"${committed.id} $cat vol")
       }
     }
 

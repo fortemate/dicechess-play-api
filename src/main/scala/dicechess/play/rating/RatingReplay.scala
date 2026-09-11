@@ -91,8 +91,7 @@ object RatingReplay:
     def processedAt: Instant = ratingAppliedAt.getOrElse(finishedAt)
 
   /** A stored Glicko-2 triple, as the per-category tables hold it (`rating`, `rd`, `vol`). */
-  final case class GlickoSnapshot(rating: Double, rd: Double, vol: Double) derives ConfiguredCodec:
-    def toGlicko: Glicko = Glicko(rating, rd, vol)
+  final case class GlickoSnapshot(rating: Double, rd: Double, vol: Double) derives ConfiguredCodec
 
   object GlickoSnapshot:
     def of(g: Glicko): GlickoSnapshot = GlickoSnapshot(g.rating, g.deviation, g.volatility)
@@ -315,8 +314,6 @@ object RatingReplay:
     def write(id: String, category: RatingCategory, at: Instant, glicko: Glicko): Unit =
       ratings.update(key(id, category, at), glicko)
 
-    def snapshot: Map[(String, Option[RatingCategory]), Glicko] = ratings.toMap
-
   /** The decision for one queued row under `config`: the batch of the day's own, when following the record inside the
     * numeric era, and today's rules ([[decide]]) everywhere else.
     */
@@ -341,85 +338,84 @@ object RatingReplay:
       decideUnder(game, config, numericSince) match
         case Left(reason) =>
           val decision = Decision.Skipped(reason)
-          Outcome(
-            game,
-            category,
-            decision,
-            None,
-            None,
-            verdictFor(game, decision, numericSince),
-            None,
-            None,
-            None,
-            None
-          )
+          val verdict  = verdictFor(game, decision, numericSince)
+          Outcome(game, category, decision, None, None, verdict, None, None, None, None)
         case Right((cat, whiteScore, blackScore)) =>
-          val at          = game.processedAt
-          val tau         = config.tau.at(at)
-          val whiteBefore = state.read(game.white.id, cat, at)
-          val blackBefore = state.read(game.black.id, cat, at)
-          val whiteAfter  = Glicko2.update(whiteBefore, List(Glicko2.Result(blackBefore, whiteScore)), tau)
-          val blackAfter  = Glicko2.update(blackBefore, List(Glicko2.Result(whiteBefore, blackScore)), tau)
-          state.write(game.white.id, cat, at, whiteAfter)
-          state.write(game.black.id, cat, at, blackAfter)
-          val white =
-            SeatOutcome(game.white.id, whiteBefore, whiteAfter, whiteScore, expected(whiteBefore, blackBefore))
-          val black =
-            SeatOutcome(game.black.id, blackBefore, blackAfter, blackScore, expected(blackBefore, whiteBefore))
-          val (beforeDiff, afterDiff, stepDiff, formula) =
-            if game.numericRecorded then
-              val diffs = for
-                rwb <- game.white.ratingBefore
-                rwa <- game.white.ratingAfter
-                rbb <- game.black.ratingBefore
-                rba <- game.black.ratingAfter
-              yield
-                val before = math.max(math.abs(rwb - whiteBefore.rating), math.abs(rbb - blackBefore.rating))
-                val after  = math.max(math.abs(rwa - whiteAfter.rating), math.abs(rba - blackAfter.rating))
-                val step   = math.max(
-                  math.abs((rwa - rwb) - (whiteAfter.rating - whiteBefore.rating)),
-                  math.abs((rba - rbb) - (blackAfter.rating - blackBefore.rating))
-                )
-                // The formula check: the recorded step from the RECORDED pre-game ratings, with the replay's RD and
-                // volatility (the row never stored those). Holding while `before` differs means the arithmetic is
-                // right and the lineage is not; failing while `before` matches means the opposite.
-                val fw = Glicko2.update(
-                  Glicko(rwb, whiteBefore.deviation, whiteBefore.volatility),
-                  List(Glicko2.Result(Glicko(rbb, blackBefore.deviation, blackBefore.volatility), whiteScore)),
-                  tau
-                )
-                val fb = Glicko2.update(
-                  Glicko(rbb, blackBefore.deviation, blackBefore.volatility),
-                  List(Glicko2.Result(Glicko(rwb, whiteBefore.deviation, whiteBefore.volatility), blackScore)),
-                  tau
-                )
-                val holds =
-                  math.abs(fw.rating - rwa) <= config.tolerance && math.abs(fb.rating - rba) <= config.tolerance
-                (before, after, step, holds)
-              diffs match
-                case Some((b, a, st, h)) => (Some(b), Some(a), Some(st), Some(h))
-                case None                => (None, None, None, None)
-            else (None, None, None, None)
-          val verdict =
-            if game.numericRecorded then
-              val worst =
-                math.max(beforeDiff.getOrElse(Double.PositiveInfinity), afterDiff.getOrElse(Double.PositiveInfinity))
-              if worst <= config.tolerance then Verdict.Match
-              else if stepDiff.exists(_ <= config.tolerance) then Verdict.MatchStepOnly
-              else Verdict.Mismatch
-            else verdictFor(game, Decision.Applied, numericSince)
-          Outcome(
-            game,
-            category,
-            Decision.Applied,
-            Some(white),
-            Some(black),
-            verdict,
-            beforeDiff,
-            afterDiff,
-            stepDiff,
-            formula
-          )
+          apply(game, cat, whiteScore, blackScore, state, config, numericSince)
+
+  /** Update both seats from their PRE-game states — the batch's simultaneous treatment — and judge the row. */
+  private def apply(
+      game: Game,
+      category: RatingCategory,
+      whiteScore: Double,
+      blackScore: Double,
+      state: State,
+      config: Config,
+      numericSince: Option[Instant]
+  ): Outcome =
+    val at          = game.processedAt
+    val tau         = config.tau.at(at)
+    val whiteBefore = state.read(game.white.id, category, at)
+    val blackBefore = state.read(game.black.id, category, at)
+    val whiteAfter  = Glicko2.update(whiteBefore, List(Glicko2.Result(blackBefore, whiteScore)), tau)
+    val blackAfter  = Glicko2.update(blackBefore, List(Glicko2.Result(whiteBefore, blackScore)), tau)
+    state.write(game.white.id, category, at, whiteAfter)
+    state.write(game.black.id, category, at, blackAfter)
+    val white      = SeatOutcome(game.white.id, whiteBefore, whiteAfter, whiteScore, expected(whiteBefore, blackBefore))
+    val black      = SeatOutcome(game.black.id, blackBefore, blackAfter, blackScore, expected(blackBefore, whiteBefore))
+    val comparison = if game.numericRecorded then compare(game, white, black, tau, config.tolerance) else None
+    val verdict    =
+      if !game.numericRecorded then verdictFor(game, Decision.Applied, numericSince)
+      // A numeric row that cannot be compared (a recorded value missing on one side) is a data inconsistency, not a
+      // reproduction — `Integrity.oneSidedNumeric` counts it too.
+      else comparison.fold(Verdict.Mismatch)(_.verdict(config.tolerance))
+    Outcome(
+      game,
+      Some(category),
+      Decision.Applied,
+      Some(white),
+      Some(black),
+      verdict,
+      comparison.map(_.before),
+      comparison.map(_.after),
+      comparison.map(_.step),
+      comparison.map(_.formulaHolds)
+    )
+
+  /** The replayed step of one numeric row held against the recorded one — see [[Outcome]] for the three distances. */
+  final private case class Comparison(before: Double, after: Double, step: Double, formulaHolds: Boolean):
+    def verdict(tolerance: Double): Verdict =
+      if math.max(before, after) <= tolerance then Verdict.Match
+      else if step <= tolerance then Verdict.MatchStepOnly
+      else Verdict.Mismatch
+
+  private def compare(
+      game: Game,
+      white: SeatOutcome,
+      black: SeatOutcome,
+      tau: Double,
+      tolerance: Double
+  ): Option[Comparison] =
+    for
+      rwb <- game.white.ratingBefore
+      rwa <- game.white.ratingAfter
+      rbb <- game.black.ratingBefore
+      rba <- game.black.ratingAfter
+    yield
+      val before = math.max(math.abs(rwb - white.before.rating), math.abs(rbb - black.before.rating))
+      val after  = math.max(math.abs(rwa - white.after.rating), math.abs(rba - black.after.rating))
+      val step   = math.max(
+        math.abs((rwa - rwb) - (white.after.rating - white.before.rating)),
+        math.abs((rba - rbb) - (black.after.rating - black.before.rating))
+      )
+      // The formula check: the recorded step from the RECORDED pre-game ratings, with the replay's RD and volatility
+      // (the row never stored those). Holding while `before` differs means the arithmetic is right and the lineage
+      // is not; failing while `before` matches means the opposite.
+      val recordedWhite = Glicko(rwb, white.before.deviation, white.before.volatility)
+      val recordedBlack = Glicko(rbb, black.before.deviation, black.before.volatility)
+      val fw            = Glicko2.update(recordedWhite, List(Glicko2.Result(recordedBlack, white.score)), tau)
+      val fb            = Glicko2.update(recordedBlack, List(Glicko2.Result(recordedWhite, black.score)), tau)
+      Comparison(before, after, step, math.abs(fw.rating - rwa) <= tolerance && math.abs(fb.rating - rba) <= tolerance)
 
   /** The verdict for a rated row WITHOUT a full numeric comparison (skips, pre-numeric rows, pending rows). */
   private def verdictFor(game: Game, decision: Decision, numericSince: Option[Instant]): Verdict =

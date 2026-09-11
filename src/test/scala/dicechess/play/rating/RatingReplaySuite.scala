@@ -285,6 +285,75 @@ class RatingReplaySuite extends munit.FunSuite:
     val early = replay(games, lenientConfig.copy(tau = tau))
     assert(count(early, Verdict.Mismatch) > 1, "a different τ before the switch must move recorded-era numbers")
 
+  test("a seeded-category list restarts every other category at 1500 after the switch"):
+    val switchAt        = games(RatingReplayFixture.RecordedFrom).finishedAt
+    val blitzOnlyConfig = lenientConfig.copy(scale = Scale.SingleUntil(switchAt, Set(RatingCategory.Blitz)))
+    val blitzOnly       = replay(games, blitzOnlyConfig)
+    val firstRapid      =
+      blitzOnly.find(o => o.decision == Decision.Applied && o.category.contains(RatingCategory.Rapid)).get
+    assertEqualsDouble(firstRapid.white.get.before.rating, 1500.0, 1e-12, "rapid restarts fresh")
+    assertEqualsDouble(firstRapid.black.get.before.rating, 1500.0, 1e-12, "rapid restarts fresh")
+    val firstBlitzAfter =
+      blitzOnly
+        .find(o =>
+          o.decision == Decision.Applied && o.game.processedAt.isAfter(switchAt) && o.category
+            .contains(RatingCategory.Blitz)
+        )
+        .get
+    assertNotEquals(firstBlitzAfter.white.get.before.rating, 1500.0, "blitz carries the shared state over")
+    val blitzSummary = summarize(blitzOnly, participants, blitzOnlyConfig)
+    assert(blitzSummary.config.scale.endsWith(":blitz"), blitzSummary.config.scale)
+
+  test("following the record skips a numeric row that has no result or no scale, with its own reason"):
+    val numeric = games.find(g => g.numericRecorded && g.white.kind == "bot" && g.black.kind == "bot").get
+    val crafted =
+      games.map(g => if g.gameId == numeric.gameId then g.copy(result = None, termination = "aborted") else g)
+    val followed = replay(crafted, Config(followRecorded = true))
+    val outcome  = followed.find(_.game.gameId == numeric.gameId).get
+    assertEquals(outcome.decision, Decision.Skipped(SkipReason.RecordedWithoutOutcome))
+    assertEquals(outcome.verdict, Verdict.ReplaySkippedRecordedApplied)
+
+  test("a numeric row with one side missing is a mismatch and an integrity finding, never a match"):
+    val numeric = games.find(g => g.numericRecorded && g.white.kind == "bot" && g.black.kind == "bot").get
+    val crafted =
+      games.map(g => if g.gameId == numeric.gameId then g.copy(black = g.black.copy(ratingAfter = None)) else g)
+    val outcomes = replay(crafted, lenientConfig)
+    assertEquals(outcomes.find(_.game.gameId == numeric.gameId).get.verdict, Verdict.Mismatch)
+    assertEquals(summarize(outcomes, participants, lenientConfig).integrity.oneSidedNumeric, 1L)
+
+  test("ledger entries carry the decision, the reason, both seats' states and the recorded numbers"):
+    val applied = lenient.find(_.verdict == Verdict.Match).get
+    val entry   = ledgerEntry(applied)
+    assertEquals(entry.decision, "applied")
+    assertEquals(entry.reason, None)
+    assertEquals(entry.verdict, "match")
+    assertEquals(entry.whiteBefore.map(_.rating), applied.white.map(_.before.rating))
+    assertEquals(entry.recordedWhiteAfter, applied.game.white.ratingAfter)
+    assertEquals(entry.stepDiff, applied.stepDiff)
+    val skipped = ledgerEntry(current.find(_.decision.reason.contains(SkipReason.Unresolvable)).get)
+    assertEquals(skipped.decision, "skipped")
+    assertEquals(skipped.reason, Some(SkipReason.Unresolvable))
+    assertEquals(skipped.whiteBefore, None)
+    val casual = ledgerEntry(lenient.find(_.verdict == Verdict.Casual).get)
+    assertEquals((casual.decision, casual.verdict, casual.formulaHolds), ("casual", "casual", None))
+    // Every entry encodes to one JSON object per line, the ledger's file format.
+    assert(!io.circe.syntax.EncoderOps(entry).asJson.noSpaces.contains("\n"))
+
+  test("render names the history knobs it ran with"):
+    val config = Config(
+      followRecorded = true,
+      tau = Tau(after = 0.3, before = 0.5, switchAt = Some(Instant.parse("2026-07-02T00:00:00Z")))
+    )
+    val text = render(summarize(replay(games, config), participants, config))
+    assert(text.contains("eligibility=recorded"))
+    assert(text.contains("switch=2026-07-02T00:00:00Z"))
+
+  test("render copes with an empty corpus and spells out the absences"):
+    val empty = render(summarize(Vector.empty, Nil, Config()))
+    assert(empty.contains("corpus: 0 rows"))
+    assert(empty.contains("none"), "empty mismatch and human sections read 'none'")
+    assert(empty.contains("integrity"))
+
   test("render is stable text with the headline tallies"):
     val text = render(summary)
     assert(text.startsWith("=== Rating replay (#145) ==="))

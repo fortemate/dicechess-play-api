@@ -8,9 +8,9 @@ import java.nio.file.{Files, Paths}
 import java.time.Instant
 
 /** Pure — no IO, no Docker: the synthetic corpus in, ledger and summary out. Three things are pinned: the committed
-  * fixture files are exactly what [[RatingReplayFixture.generate]] produces (and hash to the published SHA-256), the
-  * replay reproduces the fixture's own recorded numbers except for the one corrupted row, and every verdict class and
-  * skip reason the ledger distinguishes is reached by at least one row.
+  * fixture files hash to the published SHA-256 and agree with [[RatingReplayFixture.generate]] up to floating-point
+  * ulps, the replay reproduces the fixture's own recorded numbers except for the one corrupted row, and every verdict
+  * class and skip reason the ledger distinguishes is reached by at least one row.
   *
   * Two resolutions are exercised throughout. `Lenient` sees the corpus as the batch of the day did (every bot
   * registered) and is the reproduction baseline; `Current` refuses the since-deleted bot and shows how one refused seat
@@ -59,16 +59,56 @@ class RatingReplaySuite extends munit.FunSuite:
 
   private def count(outcomes: Vector[Outcome], verdict: Verdict): Int = outcomes.count(_.verdict == verdict)
 
-  test("the committed fixture files are the generator's output and hash to the published digests"):
+  test("the committed fixture files hash to the published digests"):
+    // The digests pin the COMMITTED bytes, so they hold on every platform; whether those bytes still say what the
+    // generator says is the next test's job.
     val committedGames = Files.readString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), UTF_8)
     val committedParticipants =
       Files.readString(resources.resolve(s"${RatingReplayFixture.Version}.participants.jsonl"), UTF_8)
-    assertEquals(committedGames, gamesJsonl, "games fixture drifted from the generator")
-    assertEquals(committedParticipants, participantsJsonl, "participants fixture drifted from the generator")
-    assertEquals(RatingReplayFixture.sha256(gamesJsonl), GamesSha256)
-    assertEquals(RatingReplayFixture.sha256(participantsJsonl), ParticipantsSha256)
+    assertEquals(RatingReplayFixture.sha256(committedGames), GamesSha256)
+    assertEquals(RatingReplayFixture.sha256(committedParticipants), ParticipantsSha256)
     val manifest = Files.readString(resources.resolve(s"${RatingReplayFixture.Version}.sha256"), UTF_8)
     assert(manifest.contains(GamesSha256) && manifest.contains(ParticipantsSha256), "sha256 manifest out of date")
+
+  test("the committed fixture files are the generator's output, up to floating-point ulps across architectures"):
+    // `Math.exp`/`log` are 1-ulp-tolerant intrinsics, so an aarch64 machine and an x86-64 runner print the last digit
+    // or two of a rating differently (the same reason `BradleyTerrySuite` compares its golden vector within 1e-9).
+    // Every non-numeric field must be identical; every rating within 1e-9.
+    val committedGames = Files
+      .readString(resources.resolve(s"${RatingReplayFixture.Version}.games.jsonl"), UTF_8)
+      .linesIterator
+      .map(line => io.circe.parser.decode[Game](line).fold(throw _, identity))
+      .toVector
+    assertEquals(committedGames.size, games.size)
+    committedGames.zip(games).foreach { (committed, generated) =>
+      def strip(g: Game) = g.copy(
+        white = g.white.copy(ratingBefore = None, ratingAfter = None),
+        black = g.black.copy(ratingBefore = None, ratingAfter = None)
+      )
+      assertEquals(strip(committed), strip(generated), s"row ${generated.seqFinished}")
+      def close(a: Option[Double], b: Option[Double], what: String): Unit = (a, b) match
+        case (Some(x), Some(y)) => assertEqualsDouble(x, y, 1e-9, s"row ${generated.seqFinished} $what")
+        case _                  => assertEquals(a, b, s"row ${generated.seqFinished} $what")
+      close(committed.white.ratingBefore, generated.white.ratingBefore, "white before")
+      close(committed.white.ratingAfter, generated.white.ratingAfter, "white after")
+      close(committed.black.ratingBefore, generated.black.ratingBefore, "black before")
+      close(committed.black.ratingAfter, generated.black.ratingAfter, "black after")
+    }
+    val committedParticipants = Files
+      .readString(resources.resolve(s"${RatingReplayFixture.Version}.participants.jsonl"), UTF_8)
+      .linesIterator
+      .map(line => io.circe.parser.decode[Participant](line).fold(throw _, identity))
+      .toVector
+    assertEquals(committedParticipants.map(_.copy(ratings = Map.empty)), participants.map(_.copy(ratings = Map.empty)))
+    committedParticipants.zip(participants).foreach { (committed, generated) =>
+      assertEquals(committed.ratings.keySet, generated.ratings.keySet, committed.id)
+      committed.ratings.foreach { (cat, snap) =>
+        val other = generated.ratings(cat)
+        assertEqualsDouble(snap.rating, other.rating, 1e-9, s"${committed.id} $cat rating")
+        assertEqualsDouble(snap.rd, other.rd, 1e-9, s"${committed.id} $cat rd")
+        assertEqualsDouble(snap.vol, other.vol, 1e-9, s"${committed.id} $cat vol")
+      }
+    }
 
   test("the fixture round-trips through the JSONL codecs"):
     val decoded = gamesJsonl.linesIterator.map(line => io.circe.parser.decode[Game](line)).toList

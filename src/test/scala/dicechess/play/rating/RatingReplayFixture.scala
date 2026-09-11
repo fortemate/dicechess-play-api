@@ -10,8 +10,9 @@ import scala.util.Random
 
 /** The synthetic replay corpus (#145): a deterministic, self-consistent stand-in for the production export with the
   * same JSONL shape, every row class the ledger distinguishes, and NO production data. `generate` is the single source
-  * of truth; the committed files under `src/test/resources/rating-replay/` are its output and `RatingReplaySuite` pins
-  * both their content and their SHA-256, so a change here is a deliberate fixture version bump.
+  * of truth; the committed files under `src/test/resources/rating-replay/` are its output (written on one machine —
+  * ratings differ in their last ulps across architectures) and `RatingReplaySuite` pins both their SHA-256 and their
+  * agreement with the generator, so a change here is a deliberate fixture version bump.
   *
   * What the corpus contains, by design:
   *   - five bots of fixed true strength on one scale (Blitz 5+3), one of which (`fx/delta`) stops playing early

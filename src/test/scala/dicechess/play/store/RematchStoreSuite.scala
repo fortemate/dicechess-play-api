@@ -478,9 +478,11 @@ class RematchStoreSuite extends CatsEffectSuite with TestContainerForAll:
                 .create(
                   s.players,
                   dice,
-                  timeControl = control,
-                  origin = GameOrigin.Direct,
-                  persist = snapshot => captured.update(_.orElse(Some(snapshot)))
+                  config = GameRoom.GameConfig(
+                    timeControl = control,
+                    origin = GameOrigin.Direct
+                  ),
+                  persistence = GameRoom.RoomPersistence(snapshot => captured.update(_.orElse(Some(snapshot))))
                 )
                 .map(_.fold(error => fail(error), identity))
               _ <- (for

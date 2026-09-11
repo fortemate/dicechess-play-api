@@ -25,7 +25,12 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
   private def flagFall(timeControl: TimeControl): IO[GameOver] =
     GameRoom
       // No one seeds here, so force-start almost immediately; the (tiny) chess clock is what must flag.
-      .create(seats, dice, timeControl = timeControl, seedGrace = 50.millis)
+      .create(
+        seats,
+        dice,
+        config = GameRoom.GameConfig(timeControl = timeControl),
+        tuning = GameRoom.RoomTuning(seedGrace = 50.millis)
+      )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -55,7 +60,7 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
     val white = BotConnection(Principal.Guest("white"), Seat.White, greedy)
     val black = BotConnection(Principal.Bot("acme", "greedy"), Seat.Black, greedy)
     GameRoom
-      .create(seats, dice, timeControl = timeControl)
+      .create(seats, dice, config = GameRoom.GameConfig(timeControl = timeControl))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -84,7 +89,12 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
   test("a timed game's snapshot shows live clocks — the mover's ticks down, the other side's stays full"):
     GameRoom
       // Force-start quickly (no one seeds), so the clock is already ticking when we snapshot at 400ms.
-      .create(seats, dice, timeControl = TimeControl.SuddenDeath(60), seedGrace = 50.millis)
+      .create(
+        seats,
+        dice,
+        config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(60)),
+        tuning = GameRoom.RoomTuning(seedGrace = 50.millis)
+      )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) => room.start *> IO.sleep(400.millis) *> room.snapshot
@@ -216,7 +226,12 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
     val white = BotConnection(Principal.Bot("acme", "greedy"), Seat.White, greedy)
     GameRoom
       // SuddenDeath(1): human only has 1s total bank!
-      .create(botVsHuman, dice, timeControl = TimeControl.SuddenDeath(1), seedGrace = 50.millis)
+      .create(
+        botVsHuman,
+        dice,
+        config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(1)),
+        tuning = GameRoom.RoomTuning(seedGrace = 50.millis)
+      )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -248,7 +263,12 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
     )
     val white = BotConnection(Principal.Bot("acme", "alpha"), Seat.White, greedy)
     GameRoom
-      .create(botVsBot, dice, timeControl = TimeControl.SuddenDeath(1), seedGrace = 50.millis)
+      .create(
+        botVsBot,
+        dice,
+        config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(1)),
+        tuning = GameRoom.RoomTuning(seedGrace = 50.millis)
+      )
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -292,8 +312,8 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
       roomRes <- GameRoom.create(
         seats,
         fixedDice,
-        timeControl = TimeControl.SuddenDeath(60),
-        seedGrace = 50.millis
+        config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(60)),
+        tuning = GameRoom.RoomTuning(seedGrace = 50.millis)
       )
       room   <- IO.fromEither(roomRes.left.map(e => RuntimeException(s"room creation failed: $e")))
       _      <- room.start
@@ -346,9 +366,9 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
       roomRes <- GameRoom.create(
         seats,
         passDice,
-        timeControl = TimeControl.SuddenDeath(60),
-        seedGrace = 50.millis,
-        persist = s => stored.set(Some(s))
+        config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(60)),
+        tuning = GameRoom.RoomTuning(seedGrace = 50.millis),
+        persistence = GameRoom.RoomPersistence(save = s => stored.set(Some(s)))
       )
       room   <- IO.fromEither(roomRes.left.map(e => RuntimeException(s"room creation failed: $e")))
       _      <- room.start

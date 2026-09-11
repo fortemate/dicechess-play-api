@@ -83,21 +83,37 @@ object RatingReplayMain extends IOApp:
       "[resolution=current|lenient] [eligibility=rules|recorded] " +
       "[tau=0.3] [tau-before=0.5 tau-switch-at=<instant>] [tolerance=1e-6] [inactive-days=7] [revision=<git sha>]"
 
+  // Option keys, named once so the vocabulary, the parser and the messages cannot drift.
+  private val Corpus        = "corpus"
+  private val Out           = "out"
+  private val Participants  = "participants"
+  private val Ledger        = "ledger"
+  private val OrderKey      = "order"
+  private val ScaleKey      = "scale"
+  private val ResolutionKey = "resolution"
+  private val Eligibility   = "eligibility"
+  private val TauKey        = "tau"
+  private val TauBefore     = "tau-before"
+  private val TauSwitchAt   = "tau-switch-at"
+  private val Tolerance     = "tolerance"
+  private val InactiveDays  = "inactive-days"
+  private val Revision      = "revision"
+
   private val Known: Set[String] = Set(
-    "corpus",
-    "out",
-    "participants",
-    "ledger",
-    "order",
-    "scale",
-    "resolution",
-    "eligibility",
-    "tau",
-    "tau-before",
-    "tau-switch-at",
-    "tolerance",
-    "inactive-days",
-    "revision"
+    Corpus,
+    Out,
+    Participants,
+    Ledger,
+    OrderKey,
+    ScaleKey,
+    ResolutionKey,
+    Eligibility,
+    TauKey,
+    TauBefore,
+    TauSwitchAt,
+    Tolerance,
+    InactiveDays,
+    Revision
   )
 
   /** `key=value` arguments to validated [[Options]]. Pure, so the refusals are testable without running anything: an
@@ -119,38 +135,38 @@ object RatingReplayMain extends IOApp:
         .left
         .map(k => s"option '$k' given more than once")
       options = pairs.toMap
-      corpus <- options.get("corpus").filter(_.nonEmpty).toRight("corpus=<games.jsonl[.gz]> is required")
-      out    <- options.get("out").filter(_.nonEmpty).toRight("out=<dir> is required")
-      ledger <- options.get("ledger").fold(Right(false))(flag)
-      order  <- options.get("order").fold(Right(RatingReplay.Order.Applied)) {
+      corpus <- options.get(Corpus).filter(_.nonEmpty).toRight(s"$Corpus=<games.jsonl[.gz]> is required")
+      out    <- options.get(Out).filter(_.nonEmpty).toRight(s"$Out=<dir> is required")
+      ledger <- options.get(Ledger).fold(Right(false))(flag)
+      order  <- options.get(OrderKey).fold(Right(RatingReplay.Order.Applied)) {
         case "applied"  => Right(RatingReplay.Order.Applied)
         case "finished" => Right(RatingReplay.Order.Finished)
         case other      => Left(s"order must be applied or finished, got '$other'")
       }
-      scale      <- options.get("scale").fold(Right(RatingReplay.Scale.PerCategory))(scaleOf)
-      resolution <- options.get("resolution").fold(Right(RatingReplay.Resolution.Current)) {
+      scale      <- options.get(ScaleKey).fold(Right(RatingReplay.Scale.PerCategory))(scaleOf)
+      resolution <- options.get(ResolutionKey).fold(Right(RatingReplay.Resolution.Current)) {
         case "current" => Right(RatingReplay.Resolution.Current)
         case "lenient" => Right(RatingReplay.Resolution.Lenient)
         case other     => Left(s"resolution must be current or lenient, got '$other'")
       }
-      followRecorded <- options.get("eligibility").fold(Right(false)) {
+      followRecorded <- options.get(Eligibility).fold(Right(false)) {
         case "rules"    => Right(false)
         case "recorded" => Right(true)
         case other      => Left(s"eligibility must be rules or recorded, got '$other'")
       }
-      tauAfter  <- options.get("tau").fold(Right(Glicko2.DefaultTau))(positive("tau"))
-      tauBefore <- options.get("tau-before").fold(Right(tauAfter))(positive("tau-before"))
-      tauSwitch <- options.get("tau-switch-at").traverse(instant("tau-switch-at"))
-      tolerance <- options.get("tolerance").fold(Right(1e-6))(positive("tolerance"))
-      inactive  <- options.get("inactive-days").fold(Right(7)) { raw =>
-        raw.toIntOption.filter(_ > 0).toRight(s"inactive-days must be a positive integer, got '$raw'")
+      tauAfter  <- options.get(TauKey).fold(Right(Glicko2.DefaultTau))(positive(TauKey))
+      tauBefore <- options.get(TauBefore).fold(Right(tauAfter))(positive(TauBefore))
+      tauSwitch <- options.get(TauSwitchAt).traverse(instant(TauSwitchAt))
+      tolerance <- options.get(Tolerance).fold(Right(1e-6))(positive(Tolerance))
+      inactive  <- options.get(InactiveDays).fold(Right(7)) { raw =>
+        raw.toIntOption.filter(_ > 0).toRight(s"$InactiveDays must be a positive integer, got '$raw'")
       }
     yield Options(
       corpus = Paths.get(corpus),
       out = Paths.get(out),
-      participants = options.get("participants").filter(_.nonEmpty).map(Paths.get(_)),
+      participants = options.get(Participants).filter(_.nonEmpty).map(Paths.get(_)),
       ledger = ledger,
-      revision = options.get("revision").filter(_.nonEmpty),
+      revision = options.get(Revision).filter(_.nonEmpty),
       config = RatingReplay.Config(
         order = order,
         scale = scale,

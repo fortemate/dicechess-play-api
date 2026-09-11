@@ -673,6 +673,126 @@ object RatingReplay:
   private def mean(values: Iterable[Double]): Option[Double] =
     if values.isEmpty then None else Some(values.sum / values.size)
 
+  /** Per-human accumulator behind [[HumanLag]]. */
+  final private class HumanAcc(
+      var games: Long,
+      var first: Instant,
+      var last: Instant,
+      var actual: Double,
+      var expected: Double,
+      var opponentSum: Double,
+      var converged: Option[Int],
+      var finalState: Glicko
+  )
+
+  /** The pool as the fold sees it, day by day: current and settled state per identity and scale, activity, the
+    * cumulative pair-delta sums and the daily drift/delta series, plus the human accumulators. Mutable and private to
+    * one [[summarize]] call, like [[State]] is to [[replay]].
+    *
+    * The day cursor only ever advances. Under `Order.Applied` the fold order is the batch's, and a displaced row
+    * (`Integrity.displacedRows`) can carry a `finishedAt` from a day already closed; it is attributed to the latest
+    * open day rather than reopening a closed one, so every `(day, category)` appears once and in order.
+    */
+  final private class PoolLedger(inactiveAfterDays: Int):
+    private val deltaPoints = List.newBuilder[DeltaPoint]
+    private val driftPoints = List.newBuilder[DriftPoint]
+    private val cumulative  = mutable.HashMap.empty[String, (Long, Double)]
+    val current             = mutable.HashMap.empty[(String, RatingCategory), Glicko]
+    // The state the tables could hold at the cutoff: everything the batch had stamped. Rows it had not reached
+    // (pending) are replayed for the ledger but cannot be in the snapshot, so they stay out of this map.
+    val settled             = mutable.HashMap.empty[(String, RatingCategory), Glicko]
+    val settledGames        = mutable.HashMap.empty[(String, RatingCategory), Long]
+    val lastPlayed          = mutable.HashMap.empty[(String, RatingCategory), Instant]
+    val gamesCount          = mutable.HashMap.empty[(String, RatingCategory), Long]
+    val activeMeanByDay     = mutable.HashMap.empty[(String, String), Option[Double]] // (day, category) -> active mean
+    val humans              = mutable.HashMap.empty[(String, RatingCategory), HumanAcc]
+    private val playedToday = mutable.HashSet.empty[(String, RatingCategory)]
+    private var day: Option[String] = None
+
+    def lastDay: Option[String]       = day
+    def drift: List[DriftPoint]       = driftPoints.result()
+    def deltaSeries: List[DeltaPoint] = deltaPoints.result()
+
+    /** Fold one applied outcome: advance the day, add its pair delta, update both seats. */
+    def record(o: Outcome, cat: RatingCategory, delta: Double): Unit =
+      advanceTo(dayOf(o.game.finishedAt))
+      val (n, sum) = cumulative.getOrElse(cat.wireName, (0L, 0.0))
+      cumulative.update(cat.wireName, (n + 1, sum + delta))
+      List((o.white, o.game.white, o.black), (o.black, o.game.black, o.white)).foreach {
+        case (Some(seat), exported, Some(opponent)) => seatPlayed(o, cat, seat, exported, opponent)
+        case _                                      => ()
+      }
+
+    /** Close the last open day; call once after the fold. */
+    def close(): Unit = day.foreach(closeDay)
+
+    private def advanceTo(d: String): Unit = day match
+      case Some(prev) if LocalDate.parse(prev).isBefore(LocalDate.parse(d)) =>
+        // Close every day between prev and d that had no games too, so the series has no gaps.
+        var cursor = LocalDate.parse(prev)
+        val target = LocalDate.parse(d)
+        while cursor.isBefore(target) do
+          closeDay(cursor.toString)
+          cursor = cursor.plusDays(1)
+        day = Some(d)
+      case None => day = Some(d)
+      case _    => ()
+
+    private def seatPlayed(
+        o: Outcome,
+        cat: RatingCategory,
+        seat: SeatOutcome,
+        exported: Seat,
+        opponent: SeatOutcome
+    ): Unit =
+      val k = (seat.id, cat)
+      current.update(k, seat.after)
+      if o.game.applied then
+        settled.update(k, seat.after)
+        settledGames.update(k, settledGames.getOrElse(k, 0L) + 1)
+      lastPlayed.update(k, o.game.finishedAt)
+      gamesCount.update(k, gamesCount.getOrElse(k, 0L) + 1)
+      playedToday += k
+      if exported.kind == "human" then
+        val acc = humans.getOrElseUpdate(
+          k,
+          new HumanAcc(0L, o.game.finishedAt, o.game.finishedAt, 0.0, 0.0, 0.0, None, seat.after)
+        )
+        acc.games += 1
+        acc.last = o.game.finishedAt
+        acc.actual += seat.score
+        acc.expected += seat.expected
+        acc.opponentSum += opponent.before.rating
+        acc.finalState = seat.after
+        if acc.converged.isEmpty && seat.after.deviation <= Glicko2.ProvisionalDeviationThreshold then
+          acc.converged = Some(acc.games.toInt)
+
+    private def closeDay(d: String): Unit =
+      val cats = current.keysIterator.map(_._2).toSet
+      cats.toList.sortBy(_.wireName).foreach { cat =>
+        val all      = current.iterator.filter(_._1._2 == cat).toList
+        val active   = all.filter(kv => playedToday.contains(kv._1)).map(_._2.rating)
+        val dayEnd   = LocalDate.parse(d).plusDays(1).atStartOfDay(ZoneOffset.UTC).toInstant
+        val inactive = all
+          .filter(kv => lastPlayed(kv._1).plusSeconds(inactiveAfterDays.toLong * 86400L).isBefore(dayEnd))
+          .map(_._2.rating)
+        val activeMean = mean(active)
+        activeMeanByDay.update((d, cat.wireName), activeMean)
+        driftPoints += DriftPoint(
+          d,
+          cat.wireName,
+          active.size,
+          activeMean,
+          inactive.size,
+          mean(inactive),
+          all.size,
+          all.map(_._2.rating).sum / all.size
+        )
+        val (n, sum) = cumulative.getOrElse(cat.wireName, (0L, 0.0))
+        deltaPoints += DeltaPoint(d, cat.wireName, n, sum)
+      }
+      playedToday.clear()
+
   /** Build the report from replayed outcomes (in fold order) and the participant snapshot. */
   def summarize(outcomes: Vector[Outcome], participants: Seq[Participant], config: Config): Summary =
     val games = outcomes.map(_.game)
@@ -757,106 +877,19 @@ object RatingReplay:
       )
     }
 
-    // Daily series: cumulative pair-delta sum and the pool drift, per category, at the end of each UTC day.
-    val deltaSeries = List.newBuilder[DeltaPoint]
-    val drift       = List.newBuilder[DriftPoint]
-    val cumulative  = mutable.HashMap.empty[String, (Long, Double)]
-    val current     = mutable.HashMap.empty[(String, RatingCategory), Glicko]
-    // The state the tables could hold at the cutoff: everything the batch had stamped. Rows it had not reached
-    // (pending) are replayed for the ledger but cannot be in the snapshot, so they stay out of this map.
-    val settled             = mutable.HashMap.empty[(String, RatingCategory), Glicko]
-    val settledGames        = mutable.HashMap.empty[(String, RatingCategory), Long]
-    val lastPlayed          = mutable.HashMap.empty[(String, RatingCategory), Instant]
-    val gamesCount          = mutable.HashMap.empty[(String, RatingCategory), Long]
-    val playedToday         = mutable.HashSet.empty[(String, RatingCategory)]
-    val activeMeanByDay     = mutable.HashMap.empty[(String, String), Option[Double]] // (day, category) -> active mean
-    var day: Option[String] = None
-
-    def closeDay(d: String): Unit =
-      val cats = current.keysIterator.map(_._2).toSet
-      cats.toList.sortBy(_.wireName).foreach { cat =>
-        val all      = current.iterator.filter(_._1._2 == cat).toList
-        val active   = all.filter(kv => playedToday.contains(kv._1)).map(_._2.rating)
-        val dayEnd   = LocalDate.parse(d).plusDays(1).atStartOfDay(ZoneOffset.UTC).toInstant
-        val inactive = all
-          .filter(kv => lastPlayed(kv._1).plusSeconds(config.inactiveAfterDays.toLong * 86400L).isBefore(dayEnd))
-          .map(_._2.rating)
-        val activeMean = mean(active)
-        activeMeanByDay.update((d, cat.wireName), activeMean)
-        drift += DriftPoint(
-          d,
-          cat.wireName,
-          active.size,
-          activeMean,
-          inactive.size,
-          mean(inactive),
-          all.size,
-          all.map(_._2.rating).sum / all.size
-        )
-        val (n, sum) = cumulative.getOrElse(cat.wireName, (0L, 0.0))
-        deltaSeries += DeltaPoint(d, cat.wireName, n, sum)
-      }
-      playedToday.clear()
-
-    // Human lag accumulators.
-    final case class HumanAcc(
-        var games: Long,
-        var first: Instant,
-        var last: Instant,
-        var actual: Double,
-        var expected: Double,
-        var opponentSum: Double,
-        var converged: Option[Int],
-        var finalState: Glicko
-    )
-    val humans = mutable.HashMap.empty[(String, RatingCategory), HumanAcc]
-
-    applied.foreach { o =>
-      val cat = o.category.get
-      val d   = dayOf(o.game.finishedAt)
-      // The day cursor only ever advances. Under `Order.Applied` the fold order is the batch's, and a displaced row
-      // (`Integrity.displacedRows`) can carry a `finishedAt` from a day already closed; it is attributed to the latest
-      // open day rather than reopening a closed one, so every `(day, category)` appears once and in order.
-      day match
-        case Some(prev) if LocalDate.parse(prev).isBefore(LocalDate.parse(d)) =>
-          // Close every day between prev and d that had no games too, so the series has no gaps.
-          var cursor = LocalDate.parse(prev)
-          val target = LocalDate.parse(d)
-          while cursor.isBefore(target) do
-            closeDay(cursor.toString)
-            cursor = cursor.plusDays(1)
-          day = Some(d)
-        case None => day = Some(d)
-        case _    => ()
-      val (n, sum) = cumulative.getOrElse(cat.wireName, (0L, 0.0))
-      cumulative.update(cat.wireName, (n + 1, sum + pairDelta(o)))
-      List((o.white, o.game.white, o.black), (o.black, o.game.black, o.white)).foreach {
-        case (Some(seat), exported, Some(opponent)) =>
-          val k = (seat.id, cat)
-          current.update(k, seat.after)
-          if o.game.applied then
-            settled.update(k, seat.after)
-            settledGames.update(k, settledGames.getOrElse(k, 0L) + 1)
-          lastPlayed.update(k, o.game.finishedAt)
-          gamesCount.update(k, gamesCount.getOrElse(k, 0L) + 1)
-          playedToday += k
-          if exported.kind == "human" then
-            val acc = humans.getOrElseUpdate(
-              k,
-              HumanAcc(0L, o.game.finishedAt, o.game.finishedAt, 0.0, 0.0, 0.0, None, seat.after)
-            )
-            acc.games += 1
-            acc.last = o.game.finishedAt
-            acc.actual += seat.score
-            acc.expected += seat.expected
-            acc.opponentSum += opponent.before.rating
-            acc.finalState = seat.after
-            if acc.converged.isEmpty && seat.after.deviation <= Glicko2.ProvisionalDeviationThreshold then
-              acc.converged = Some(acc.games.toInt)
-        case _ => ()
-      }
-    }
-    day.foreach(closeDay)
+    // Daily series, pool state and human accumulators, folded in order by the ledger (extracted so `summarize` stays
+    // a sequence of aggregations rather than one long loop).
+    val ledger = new PoolLedger(config.inactiveAfterDays)
+    applied.foreach(o => ledger.record(o, o.category.get, pairDelta(o)))
+    ledger.close()
+    val current         = ledger.current
+    val settled         = ledger.settled
+    val settledGames    = ledger.settledGames
+    val lastPlayed      = ledger.lastPlayed
+    val gamesCount      = ledger.gamesCount
+    val activeMeanByDay = ledger.activeMeanByDay
+    val day             = ledger.lastDay
+    val humans          = ledger.humans
 
     val cutoff          = games.map(_.finishedAt).maxOption
     val inactiveOffsets = current.toList
@@ -961,8 +994,8 @@ object RatingReplay:
       mismatches = mismatches,
       histograms = histograms,
       deltaSums = deltaSums.toList,
-      deltaSeries = deltaSeries.result(),
-      drift = drift.result(),
+      deltaSeries = ledger.deltaSeries,
+      drift = ledger.drift,
       inactiveOffsets = inactiveOffsets,
       humans = humanLags,
       finals = finals,

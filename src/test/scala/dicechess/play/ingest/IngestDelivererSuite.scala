@@ -211,3 +211,29 @@ class IngestDelivererSuite extends CatsEffectSuite with TestContainerForAll:
         }
       }
     }
+
+  test("loop survives poll failure and continues polling (#120)"):
+    for
+      calls   <- Ref.of[IO, Int](0)
+      resumed <- cats.effect.Deferred[IO, Unit]
+      failingStore = new OutboxStore:
+        def due(limit: Int): IO[List[dicechess.play.store.OutboxRow]] =
+          calls
+            .modify { c =>
+              (c + 1, c)
+            }
+            .flatMap {
+              case 0 => IO.raiseError(new java.util.concurrent.TimeoutException("due timed out"))
+              case _ => resumed.complete(()).as(Nil)
+            }
+        def markDelivered(gameId: GameId): IO[Unit]                                                    = IO.unit
+        def markRetry(gameId: GameId, attempts: Int, retryIn: FiniteDuration, error: String): IO[Unit] = IO.unit
+        def markParked(gameId: GameId, error: String): IO[Unit]                                        = IO.unit
+      config = IngestDeliverer.Config(Uri.unsafeFromString("http://127.0.0.1:8080"), "token", pollEvery = 20.millis)
+      dummyClient = org.http4s.client.Client[IO](_ => Resource.pure(org.http4s.Response[IO]()))
+      deliverer   = IngestDeliverer(failingStore, dummyClient, config)
+      _ <- deliverer.loop.background.use { _ =>
+        resumed.get.timeout(2.seconds)
+      }
+      totalCalls <- calls.get
+    yield assert(totalCalls >= 2, s"expected at least 2 poll attempts after recovery, got $totalCalls")

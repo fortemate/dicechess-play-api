@@ -3,6 +3,8 @@ package dicechess.play.server
 import cats.effect.{Deferred, IO}
 import cats.syntax.all.*
 import dicechess.play.core.*
+import dicechess.play.dice.DiceSource
+import dicechess.play.game.GameRoom
 import dicechess.play.server.ShowcaseHarness.*
 import dicechess.play.server.ShowcaseTable.{ClaimOutcome, Phase, SpectatingReason, Status, UnavailableReason}
 import dicechess.play.store.{ShowcaseClaimOutcome, ShowcaseTableRecord}
@@ -32,6 +34,14 @@ class ShowcaseTableSuite extends munit.CatsEffectSuite:
       .flatMap:
         case None       => IO.raiseError(RuntimeException(s"game ${gameId.value} not in the registry"))
         case Some(room) => room.submit(ShowcaseTable.seatOf(humanColor), GameCommand.Resign)
+
+  private def captureStderr[A](io: IO[A]): IO[(A, String)] =
+    for
+      baos   <- IO(new java.io.ByteArrayOutputStream())
+      ps     <- IO(new java.io.PrintStream(baos, true, "UTF-8"))
+      oldErr <- IO(System.err)
+      res    <- (IO(System.setErr(ps)) *> io).guarantee(IO(System.setErr(oldErr)) *> IO(ps.close()))
+    yield (res, baos.toString("UTF-8"))
 
   test("the table starts unavailable and opens with White as the first human colour once reconciled"):
     fixture.flatMap { f =>
@@ -507,5 +517,58 @@ class ShowcaseTableSuite extends munit.CatsEffectSuite:
           won    <- t.claim(guest1, k, "h", Some("fedcba9876543210fedcba9876543210")).map(claimed)
           seeded <- await(f.games.snapshots.get.map(_(won.gameId)))(_.clientSeeds.contains(Seat.White))
         yield assertEquals(seeded.clientSeeds.get(Seat.White), Some("fedcba9876543210fedcba9876543210"))
+      }
+    }
+
+  private def leafPath(tree: MoveTree): List[String] =
+    tree.children.headOption match
+      case None              => Nil
+      case Some((uci, next)) => uci :: leafPath(next)
+
+  test("featured bot clock forfeit emits featured bot delivery failed warning (#120)"):
+    val botVsHuman = Map[Seat, Principal](
+      Seat.White -> guest1,
+      Seat.Black -> FeaturedBot
+    )
+    val diceSource = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 1, 1)
+      def commit: String                                                       = "c"
+      def reveal: String                                                       = "r"
+    fixture.flatMap { f =>
+      f.table().use { t =>
+        val run: IO[GameOver] = for
+          _       <- t.reconcile
+          id      <- GameId.random
+          roomRes <- GameRoom.create(
+            botVsHuman,
+            diceSource,
+            timeControl = TimeControl.SuddenDeath(1),
+            seedGrace = 20.millis
+          )
+          room <- IO.fromEither(roomRes.left.map(e => RuntimeException(s"room creation failed: $e")))
+          liveGame = ShowcaseTable.LiveGame(id, room, Side.White)
+          _      <- t.watch(liveGame)
+          _      <- room.start
+          _      <- IO.sleep(100.millis)
+          moves0 <- room.legalMoves
+          path = leafPath(moves0.legalMoves)
+          verdict <- room.submitTurn(Seat.White, path)
+          _ = assert(verdict.isInstanceOf[GameRoom.TurnVerdict.Applied], s"turn applied: $verdict")
+          over <- room.result.timeoutTo(5.seconds, IO.raiseError(RuntimeException("featured bot did not flag")))
+          _    <- IO.sleep(200.millis)
+        yield over
+
+        captureStderr(run).map { case (over, err) =>
+          assertEquals(over.termination, Termination.Timeout)
+          assertEquals(over.result, GameResult.Win(Side.White))
+          assert(
+            err.contains("[play][showcase] featured bot delivery failed"),
+            s"expected featured bot delivery failed warning, got: $err"
+          )
+          assert(
+            err.contains("forfeited on the clock"),
+            s"expected forfeited on the clock, got: $err"
+          )
+        }
       }
     }

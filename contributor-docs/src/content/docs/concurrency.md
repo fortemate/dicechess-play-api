@@ -164,6 +164,18 @@ returned as values (`GameRegistry.create` returns a `Left`, for instance). Lifec
 `Resource`; background fibers are scoped with `.background` / `.surround` so a failure surfaces
 instead of vanishing.
 
+### Supervisor failure isolation and background loops (#120)
+
+Background loops that run indefinitely (such as `IngestDeliverer.loop`, `RatingSupervisor.loop`, and the database pool telemetry loop) are composed with the HTTP/WebSocket server in `Main.scala` using `parTupled`.
+
+In Cats Effect, an unhandled error in **any** branch of `parTupled` triggers cooperative cancellation across **all** parallel branches. If an outbox polling cycle or telemetry tick raises an uncaught exception (such as a database query timeout or pool exhaustion error), that single exception will immediately tear down the Ember server, abruptly terminating active WebSocket connections and forfeiting live games.
+
+Therefore, background polling loops must observe the following resilience doctrine:
+- **Never allow transient failures to bubble to the supervisor**: Catch transient I/O, database timeouts, and network exceptions locally using `.handleErrorWith`.
+- **Log with diagnostic context**: Emit a clear warning with operation details (e.g. `[play][ingest] poll cycle failed: ...`).
+- **Preserve cadence**: Sleep for the regular polling backoff interval and continue the loop cleanly.
+- See [Database Schema](/dicechess-play-api/database/#connection-pool-sizing-connectec-and-game-end-starvation-120) for the post-mortem on the 60-second outbox timeouts and pool starvation.
+
 ## The dice path is a public promise
 
 `dice/DiceSource.scala` implements commit-reveal fairness: a SHA-256 commitment published up

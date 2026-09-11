@@ -376,7 +376,8 @@ object Main extends IOApp.Simple:
                 httpClient,
                 webhookConfig,
                 stats = stats,
-                transport = Some(webhookTransport)
+                transport = Some(webhookTransport),
+                featuredBot = showcaseConfig.featuredBot
               )
             }
             .map(Some(_))
@@ -530,6 +531,7 @@ object Main extends IOApp.Simple:
                 webhookService.fold(IO.unit)(_.statsLoop.void),
                 adminAuthorityLoop,
                 showcase.fold(IO.unit)(_.supervise.void),
+                pgStore.fold(IO.unit)(_.poolTelemetryLoop().void),
                 IO.never
               ).parTupled.void
             }

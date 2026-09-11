@@ -44,7 +44,7 @@ import scala.concurrent.duration.*
   * Every round trip is bounded by a timeout: the caller treats store trouble as a degradation, and a *hung* query —
   * unlike a failed one — would otherwise stall the game's writer fiber in a way `handleErrorWith` can't catch.
   */
-final class PgGameStore private (xa: Transactor[IO])
+final class PgGameStore private (xa: HikariTransactor[IO])
     extends GameStore
     with OutboxStore
     with ClientReportStore
@@ -68,8 +68,97 @@ final class PgGameStore private (xa: Transactor[IO])
     NicknameRetries,
     RenameCooldown,
     SaveTimeout,
+    SlowStatementThreshold,
     UniqueViolation
   }
+
+  /** Pool telemetry and diagnostics (#120). */
+  def currentPoolStats(sampleAcquire: Boolean = false): IO[PgGameStore.PoolStats] =
+    for
+      bean <- IO.delay(Option(xa.kernel.getHikariPoolMXBean))
+      (active, idle, waiting, total) = bean.fold((0, 0, 0, 0)) { b =>
+        (b.getActiveConnections, b.getIdleConnections, b.getThreadsAwaitingConnection, b.getTotalConnections)
+      }
+      acquireMs <-
+        if sampleAcquire then sampleAcquireTime.map(_.map(_.toMillis))
+        else IO.pure(None)
+    yield PgGameStore.PoolStats(active, idle, waiting, total, acquireMs)
+
+  /** Sample connection acquisition latency by borrowing and returning a connection with a 1-second timeout. */
+  def sampleAcquireTime: IO[Option[FiniteDuration]] =
+    IO.blocking {
+      val start = System.nanoTime()
+      val conn  = xa.kernel.getConnection()
+      try Some((System.nanoTime() - start).nanos)
+      finally conn.close()
+    }.timeout(1.second)
+      .handleError(_ => None)
+
+  /** Periodic pool telemetry loop supervised in Main (#120). */
+  def poolTelemetryLoop(interval: FiniteDuration = 60.seconds): IO[Nothing] =
+    val step = for
+      stats <- currentPoolStats(sampleAcquire = true)
+      _     <-
+        if stats.waiting > 0 || stats.acquireTimeMs.exists(_ > 1000) then
+          Console[IO].errorln(s"[play][db][pool][warn] pool under pressure: $stats")
+        else Console[IO].println(s"[play][db][pool] $stats")
+    yield ()
+
+    (step.handleErrorWith { err =>
+      Console[IO].errorln(s"[play][db][pool] telemetry error: $err").handleErrorWith(_ => IO.unit)
+    } *> IO.sleep(interval)).foreverM
+
+  /** Bounded query wrapper with timing and pool attribution telemetry (#120).
+    *
+    * If execution exceeds [[SlowStatementThreshold]] (1s), logs a `WARN` with the operation name, elapsed time, and
+    * current pool stats. If the operation times out or connection acquisition fails, logs a `WARN` with pool
+    * diagnostics before propagating the exception.
+    */
+  private[store] def timedOp[A](op: String, timeout: FiniteDuration = SaveTimeout)(action: IO[A]): IO[A] =
+    IO.monotonic.flatMap { start =>
+      action
+        .timeout(timeout)
+        .timed
+        .flatMap { (elapsed, res) =>
+          if elapsed >= SlowStatementThreshold then
+            currentPoolStats(sampleAcquire = false)
+              .flatMap { stats =>
+                val attribution = PgGameStore.attributeDelay(stats, timeout = false)
+                Console[IO].errorln(
+                  s"[play][db][warn] operation '$op' slow: took ${elapsed.toMillis}ms (threshold: ${SlowStatementThreshold.toMillis}ms, attribution: $attribution, pool: $stats)"
+                )
+              }
+              .handleErrorWith(err =>
+                Console[IO]
+                  .errorln(s"[play][db][warn] operation '$op' slow diagnostic failed: $err")
+                  .handleErrorWith(_ => IO.unit)
+              )
+              .as(res)
+          else IO.pure(res)
+        }
+        .handleErrorWith {
+          case ex @ (_: java.util.concurrent.TimeoutException | _: java.sql.SQLTransientConnectionException) =>
+            for
+              now <- IO.monotonic
+              elapsed = now - start
+              stats <- currentPoolStats(sampleAcquire = false)
+                .handleErrorWith(_ => IO.pure(PgGameStore.PoolStats(0, 0, 0, 0)))
+              attribution = PgGameStore.attributeDelay(stats, timeout = true)
+              _ <- Console[IO]
+                .errorln(
+                  s"[play][db][warn] operation '$op' timed out after ${elapsed.toMillis}ms (timeout: ${timeout.toMillis}ms, attribution: $attribution, pool: $stats)"
+                )
+                .handleErrorWith(_ => IO.unit)
+              res <- IO.raiseError[A](ex)
+            yield res
+          case other =>
+            IO.raiseError(other)
+        }
+    }
+
+  extension [A](io: IO[A])
+    private def timed(op: String, timeout: FiniteDuration = SaveTimeout): IO[A] =
+      timedOp(op, timeout)(io)
 
   /** Decode the constrained `bot_webhooks.capabilities` column at the persistence boundary. Flyway V3 guarantees that
     * only the canonical selectable arrays reach this point; failing loudly here keeps a hand-edited or partially
@@ -134,7 +223,7 @@ final class PgGameStore private (xa: Transactor[IO])
     Console[IO]
       .errorln(s"[play][store] ended game ${id.value} produced no game_results row: players=${snapshot.players.keySet}")
       .whenA(snapshot.ended && PgGameStore.finishedGameOf(snapshot).isEmpty) *>
-      saveTransaction(id, snapshot).transact(xa).timeout(SaveTimeout)
+      saveTransaction(id, snapshot).transact(xa).timed("save")
 
   private def saveTransaction(
       id: GameId,
@@ -265,23 +354,23 @@ final class PgGameStore private (xa: Transactor[IO])
       .query[(String, Json, Int)]
       .to[List]
       .transact(xa)
-      .timeout(SaveTimeout)
+      .timed("outbox.due")
       .map(_.map((id, payload, attempts) => OutboxRow(GameId(id), payload, attempts)))
 
   def markDelivered(gameId: GameId): IO[Unit] =
     sql"""UPDATE play.outbox SET delivered_at = now(), last_error = NULL
-          WHERE game_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timeout(SaveTimeout)
+          WHERE game_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timed("outbox.markDelivered")
 
   def markRetry(gameId: GameId, attempts: Int, retryIn: FiniteDuration, error: String): IO[Unit] =
     sql"""UPDATE play.outbox
           SET attempts = $attempts, next_attempt_at = now() + make_interval(secs => ${retryIn.toSeconds.toDouble}),
               last_error = $error
-          WHERE game_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timeout(SaveTimeout)
+          WHERE game_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timed("outbox.markRetry")
 
   def markParked(gameId: GameId, error: String): IO[Unit] =
     sql"""UPDATE play.outbox
           SET failed_permanently = true, attempts = attempts + 1, last_error = $error
-          WHERE game_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timeout(SaveTimeout)
+          WHERE game_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timed("outbox.markParked")
 
   // ── ClientReportStore ───────────────────────────────────────────────────────
 
@@ -293,7 +382,7 @@ final class PgGameStore private (xa: Transactor[IO])
           VALUES (${id.value}::uuid, $payload)
           ON CONFLICT (report_id) DO NOTHING""".update.run
       .transact(xa)
-      .timeout(SaveTimeout)
+      .timed("insertClientReport")
       .map(_ == 1)
 
   /** See [[ClientReportStore.clientReports]] — a mirror of the OutboxStore methods above over `client_reports`, so one
@@ -308,23 +397,23 @@ final class PgGameStore private (xa: Transactor[IO])
         .query[(String, Json, Int)]
         .to[List]
         .transact(xa)
-        .timeout(SaveTimeout)
+        .timed("clientReports.due")
         .map(_.map((id, payload, attempts) => OutboxRow(GameId(id), payload, attempts)))
 
     def markDelivered(gameId: GameId): IO[Unit] =
       sql"""UPDATE play.client_reports SET delivered_at = now(), last_error = NULL
-            WHERE report_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timeout(SaveTimeout)
+            WHERE report_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timed("clientReports.markDelivered")
 
     def markRetry(gameId: GameId, attempts: Int, retryIn: FiniteDuration, error: String): IO[Unit] =
       sql"""UPDATE play.client_reports
             SET attempts = $attempts, next_attempt_at = now() + make_interval(secs => ${retryIn.toSeconds.toDouble}),
                 last_error = $error
-            WHERE report_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timeout(SaveTimeout)
+            WHERE report_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timed("clientReports.markRetry")
 
     def markParked(gameId: GameId, error: String): IO[Unit] =
       sql"""UPDATE play.client_reports
             SET failed_permanently = true, attempts = attempts + 1, last_error = $error
-            WHERE report_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timeout(SaveTimeout)
+            WHERE report_id = ${gameId.value}::uuid""".update.run.transact(xa).void.timed("clientReports.markParked")
 
   // ── GameArchiveStore ────────────────────────────────────────────────────────
 
@@ -2309,7 +2398,7 @@ final class PgGameStore private (xa: Transactor[IO])
       .query[(String, Json)]
       .to[List]
       .transact(xa)
-      .timeout(BootTimeout)
+      .timed("loadActive", BootTimeout)
       .flatMap {
         _.flatTraverse { case (id, json) =>
           json.as[GameSnapshot] match
@@ -2330,7 +2419,7 @@ final class PgGameStore private (xa: Transactor[IO])
       .query[String]
       .to[List]
       .transact(xa)
-      .timeout(BootTimeout)
+      .timed("activeShowcaseGameIds", BootTimeout)
       .map(_.map(GameId(_)))
 
   // ── ShowcaseStore (ADR-005 §5–§7, #46) ─────────────────────────────────────
@@ -2350,7 +2439,7 @@ final class PgGameStore private (xa: Transactor[IO])
       .unique
 
   def showcaseTable: IO[ShowcaseTableRecord] =
-    readTableRow.transact(xa).timeout(SaveTimeout).map(decodeTableRow)
+    readTableRow.transact(xa).timed("showcaseTable").map(decodeTableRow)
 
   /** Bounded, opportunistic prune of expired claim records, run inside every claim write so the table never needs a
     * sweeper of its own: at most 128 rows per write, by primary key, so it can never block a live claim for long.
@@ -2465,7 +2554,7 @@ final class PgGameStore private (xa: Transactor[IO])
     sql"""UPDATE play.showcase_table SET current_game_id = NULL, updated_at = now()
           WHERE id = 1 AND current_game_id = ${gameId.value}::uuid""".update.run
       .transact(xa)
-      .timeout(SaveTimeout)
+      .timed("clearShowcaseGame")
       .map(_ == 1)
 
   // ── GameResultsStore ──────────────────────────────────────────────────────
@@ -2497,7 +2586,7 @@ final class PgGameStore private (xa: Transactor[IO])
       .query[PgGameStore.ResultTuple]
       .to[List]
       .transact(xa)
-      .timeout(SaveTimeout)
+      .timed("recentResultsFor")
       .map(_.map(PgGameStore.toRow))
 
   def finishedRatedSince(since: Instant): IO[List[GameResultRow]] =
@@ -2509,7 +2598,7 @@ final class PgGameStore private (xa: Transactor[IO])
       .query[PgGameStore.ResultTuple]
       .to[List]
       .transact(xa)
-      .timeout(SaveTimeout)
+      .timed("finishedRatedSince")
       .map(_.map(PgGameStore.toRow))
 
   /** One side's `WHERE` clause: the participant match plus whichever optional filters are present, folded from a list
@@ -3484,6 +3573,27 @@ object PgGameStore:
   /** Bound on the boot-time resume scan (one query for all live games). */
   private val BootTimeout: FiniteDuration = 30.seconds
 
+  /** Queries exceeding this threshold log a WARN with execution duration and pool diagnostics (#120). */
+  private val SlowStatementThreshold: FiniteDuration = 1.second
+
+  /** Snapshot of Hikari pool utilization and connection acquisition latency (#120). */
+  final case class PoolStats(
+      active: Int,
+      idle: Int,
+      waiting: Int,
+      total: Int,
+      acquireTimeMs: Option[Long] = None
+  ):
+    override def toString: String =
+      s"active=$active, idle=$idle, waiting=$waiting, total=$total" +
+        acquireTimeMs.fold("")(ms => s", acquire=${ms}ms")
+
+  private[store] def attributeDelay(stats: PgGameStore.PoolStats, timeout: Boolean): String =
+    if stats.waiting > 0 then s"pool exhaustion (waiting=${stats.waiting})"
+    else if stats.active >= stats.total && stats.total > 0 then s"pool saturated (active=${stats.active})"
+    else if timeout then "slow statement, db contention or connectEC starvation"
+    else "slow statement or db contention"
+
   /** SQLSTATE values the user-account writes branch on (#232). Named string constants rather than doobie's `sqlstate`
     * catalogue because the recovery runs at the `IO` level, after `transact` — a unique violation aborts the
     * transaction, so nothing useful can be handled inside `ConnectionIO` anyway.
@@ -3514,24 +3624,35 @@ object PgGameStore:
     */
   private val ZeroUuid: String = "00000000-0000-0000-0000-000000000000"
 
-  /** Connection settings, from the environment. Persistence is opt-in: with `PLAY_DB_URL` unset the server runs
-    * in-memory exactly as before (games do not survive a restart).
+  /** Connection and pool settings, from the environment (#120). Persistence is opt-in: with `PLAY_DB_URL` unset the
+    * server runs in-memory exactly as before (games do not survive a restart).
+    *
+    * `poolSize` configures maximum pool size in Hikari and sizes the dedicated `connectEC` pool to match, preventing
+    * thread starvation where waiting tasks block all compute/connect threads.
     */
-  final case class Config(url: String, user: String, password: String)
+  final case class Config(url: String, user: String, password: String, poolSize: Int = 10)
 
-  def configFromEnv: Option[Config] =
-    sys.env.get("PLAY_DB_URL").filter(_.nonEmpty).map { url =>
-      Config(url, sys.env.getOrElse("PLAY_DB_USER", "play"), sys.env.getOrElse("PLAY_DB_PASSWORD", ""))
+  def parseConfig(env: Map[String, String]): Option[Config] =
+    env.get("PLAY_DB_URL").filter(_.nonEmpty).map { url =>
+      val poolSize = env.get("PLAY_DB_POOL_SIZE").flatMap(_.toIntOption).filter(_ > 0).getOrElse(10)
+      Config(url, env.getOrElse("PLAY_DB_USER", "play"), env.getOrElse("PLAY_DB_PASSWORD", ""), poolSize)
     }
+
+  def configFromEnv: Option[Config] = parseConfig(sys.env)
 
   /** Migrate (Flyway owns schema `play`, creating it if absent) and open a pooled transactor. Returns the concrete
     * type: the caller wires it as the registry's `GameStore` and the deliverer's `OutboxStore`.
+    *
+    * Sizing reasoning (#120): `connectEC` must match `maximumPoolSize`. If `connectEC` has fewer threads than the pool
+    * (or fewer than concurrent tasks seeking connections), all `connectEC` threads block waiting for Hikari
+    * connections, preventing subsequent queries from even queueing in Hikari. Additionally, `connectionTimeout` is
+    * capped at 5 seconds (matching `SaveTimeout`) so acquisition stalls fail fast with telemetry rather than stalling
+    * for Hikari's 30s default.
     */
   def resource(config: Config): Resource[IO, PgGameStore] =
     for
-      _ <- Resource.eval(migrate(config))
-      // A small dedicated pool for awaiting connections, so blocking waits never land on the compute pool.
-      connectEC <- ExecutionContexts.fixedThreadPool[IO](4)
+      _         <- Resource.eval(migrate(config))
+      connectEC <- ExecutionContexts.fixedThreadPool[IO](config.poolSize)
       xa        <- HikariTransactor.newHikariTransactor[IO](
         driverClassName = "org.postgresql.Driver",
         url = config.url,
@@ -3539,6 +3660,13 @@ object PgGameStore:
         pass = config.password,
         connectEC = connectEC
       )
+      _ <- Resource.eval(xa.configure { ds =>
+        IO.delay {
+          ds.setPoolName("play-pool")
+          ds.setMaximumPoolSize(config.poolSize)
+          ds.setConnectionTimeout(5000)
+        }
+      })
     yield new PgGameStore(xa)
 
   /** Boot-time connect races are normal (compose may start the app before Postgres accepts connections; the

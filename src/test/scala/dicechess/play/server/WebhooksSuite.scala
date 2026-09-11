@@ -49,6 +49,14 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       checkUrl: String => IO[Either[String, Uri]] = allowAll
   ): cats.effect.Resource[IO, Webhooks] = Webhooks.create(registry, store, client, config, checkUrl)
 
+  private def captureStderr[A](io: IO[A]): IO[(A, String)] =
+    for
+      baos   <- IO(new java.io.ByteArrayOutputStream())
+      ps     <- IO(new java.io.PrintStream(baos, true, "UTF-8"))
+      oldErr <- IO(System.err)
+      res    <- (IO(System.setErr(ps)) *> io).guarantee(IO(System.setErr(oldErr)) *> IO(ps.close()))
+    yield (res, baos.toString("UTF-8"))
+
   private val seed = "0123456789abcdef" // the 16-char minimum a seat must contribute
 
   /** Root-to-leaf walk of the legal-move tree: any such path is a complete legal turn (max-micro-moves rule). */
@@ -1499,3 +1507,40 @@ class WebhooksSuite extends munit.CatsEffectSuite:
     yield
       assertEquals(over.termination, Termination.Resign)
       assert(recorded.exists(_._3 == DeliveryOutcome.Refused))
+
+  test("delivery failure for featured bot emits featured bot delivery failed warning (#120)"):
+    val dead = Client[IO](_ => cats.effect.Resource.eval(IO.raiseError(new java.net.ConnectException("refused"))))
+    val scriptedDice = new DiceSource:
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] =
+        ply match
+          case 0L => List(3, 4, 5)
+          case 1L => List(2, 2, 2)
+          case _  => List(1, 1, 1)
+      def commit: String = "dead-commit"
+      def reveal: String = "dead-seed"
+    val silent: Principal.Bot = Principal.Bot("hooks", "silent")
+    for
+      registry <- GameRegistry.create(store = GameStore.noop)
+      store    <- WebhookStore.inMemory
+      _        <- store.put(BotWebhook("hooks", "silent", "https://gone.example/hook", "s" * 64, Instant.EPOCH))
+      opponent = Principal.Bot("acme", "greedy")
+      made <- registry.createWithDice(silent, opponent, scriptedDice, TimeControl.SuddenDeath(2))
+      (_, room) = made.toOption.get
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      driver = BotConnection(opponent, Seat.Black, BotRegistry.getAlgorithm("greedy").get)
+      (_, err) <- captureStderr {
+        Webhooks.create(registry, store, dead, config, allowAll, featuredBot = Some(silent)).use { webhooks =>
+          driver
+            .run(room)
+            .background
+            .use { _ =>
+              webhooks.attachSweep *>
+                room.result.timeoutTo(
+                  20.seconds,
+                  IO.raiseError(new RuntimeException("the room hung instead of flagging the dead webhook"))
+                )
+            }
+        }
+      }
+    yield assert(err.contains("[play][showcase] featured bot delivery failed"), s"expected alert in stderr, got: $err")

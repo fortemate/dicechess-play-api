@@ -1,6 +1,6 @@
 package dicechess.play.game
 
-import cats.effect.{IO, Ref}
+import cats.effect.{Deferred, IO, Ref}
 import cats.syntax.all.*
 import dicechess.engine.search.BotRegistry
 import dicechess.play.core.*
@@ -1196,11 +1196,14 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         case Right(room) =>
           for
             // Spectator seed submission emits a Rejected event
+            ready        <- Deferred[IO, Unit]
             seedRejFiber <- room.subscribe
+              .evalTap(_ => ready.complete(()).attempt.void)
               .collectFirst { case e: GameEvent.Rejected => e }
               .compile
               .lastOrError
               .start
+            _       <- ready.get
             _       <- room.submit(Seat.Spectator, GameCommand.SubmitSeed("some-valid-client-seed-1234"))
             seedRej <- seedRejFiber.joinWithNever
             _ = assertEquals(seedRej.reason, "spectator cannot submit a seed")

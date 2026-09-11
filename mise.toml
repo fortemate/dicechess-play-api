@@ -38,6 +38,10 @@ run = 'sbt "testOnly *"'
 description = "🏆 Print the E.1 strength report (pairwise SPRT + Bradley-Terry pool) — needs PLAY_DB_URL, read-only"
 run = 'sbt "runMain dicechess.play.rating.LadderReportMain"'
 
+[tasks."rating:replay"]
+description = "🔁 Replay the current Glicko-2 implementation over a rating corpus export (#145) — file in, report out, no database"
+run = "scripts/rating-replay.sh"
+
 [tasks."archive:backfill"]
 description = "🗄️  One-off: write game_archive rows for ended games that predate #177 — needs PLAY_DB_URL, WRITES"
 run = 'sbt "runMain dicechess.play.store.ArchiveBackfillMain"'

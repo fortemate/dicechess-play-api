@@ -22,8 +22,9 @@ class RatingPolicySuite extends munit.FunSuite:
       black: Principal,
       requested: Boolean = true,
       control: TimeControl = Blitz,
-      ladder: Boolean = false
-  ) = RatingPolicy.classify(policy, white, black, requested, control, ladder)
+      ladder: Boolean = false,
+      origin: GameOrigin = GameOrigin.Direct
+  ) = RatingPolicy.classify(policy, white, black, requested, control, origin, ladder)
 
   test("participant kinds come from the identity shape, never from a name"):
     assertEquals(ParticipantKind.of(alice), ParticipantKind.Human)
@@ -59,13 +60,16 @@ class RatingPolicySuite extends munit.FunSuite:
     assertEquals(c.policy.version, 2)
 
   test("matrix: two bots compete only when the ladder scheduler paired them; a direct game is casual"):
-    val scheduled = under(Matrix, bot, rival, ladder = true)
+    val scheduled = under(Matrix, bot, rival, ladder = true, origin = GameOrigin.Ladder)
     assert(scheduled.rated)
     assertEquals(scheduled.domain, Competitive)
     val direct = under(Matrix, bot, rival)
     assert(!direct.rated, "a direct bot challenge or seek does not move the canonical bot rating")
     assertEquals(direct.domain, Casual)
     assert(direct.requestedRated, "the request is still recorded as what it was")
+    // The flag alone is not authorization: only the scheduler creates games with the ladder origin.
+    assertEquals(under(Matrix, bot, rival, ladder = true, origin = GameOrigin.Direct).domain, Casual)
+    assertEquals(under(Matrix, bot, rival, ladder = false, origin = GameOrigin.Ladder).domain, Casual)
 
   test("matrix: a human against a bot is a training game — rated:false, domain training, whichever seat"):
     for (w, b) <- List((alice, bot), (bot, alice)) do
@@ -75,7 +79,7 @@ class RatingPolicySuite extends munit.FunSuite:
     // …but only when it was asked for: an unrequested human-bot game is plain casual, not training.
     assertEquals(under(Matrix, alice, bot, requested = false).domain, Casual)
     // and the ladder flag changes nothing for a mixed pairing.
-    assertEquals(under(Matrix, alice, bot, ladder = true).domain, Training)
+    assertEquals(under(Matrix, alice, bot, ladder = true, origin = GameOrigin.Ladder).domain, Training)
 
   test("legacy is what every game before the policy existed was classified under — version 1"):
     assertEquals(Legacy.version, 1)
@@ -83,6 +87,7 @@ class RatingPolicySuite extends munit.FunSuite:
     assertEquals(RatingPolicy.parse(None), None)
     assertEquals(RatingPolicy.parse(Some("matrix")), Some(Matrix))
     assertEquals(RatingPolicy.parse(Some(" Legacy ")), Some(Legacy))
+    assertEquals(RatingPolicy.parse(Some("MATRIX")), Some(Matrix), "case-insensitive, and locale-independent")
     assertEquals(RatingPolicy.parse(Some("v2")), None, "an unknown value is not a policy; the caller falls back")
 
   test("the wire vocabularies round-trip"):

@@ -186,7 +186,7 @@ final class GameRegistry private (
         Map(Seat.White -> white, Seat.Black -> black),
         dice,
         timeControl,
-        classify(white, black, requestedRated, timeControl, ladder),
+        classify(white, black, requestedRated, timeControl, origin, ladder),
         ladder = ladder,
         origin = origin
       )
@@ -207,7 +207,7 @@ final class GameRegistry private (
         Map(Seat.White -> white, Seat.Black -> black),
         dice,
         timeControl,
-        classify(white, black, requestedRated, timeControl, ladder),
+        classify(white, black, requestedRated, timeControl, origin, ladder),
         ladder = ladder,
         origin = origin
       )
@@ -218,9 +218,10 @@ final class GameRegistry private (
       black: Principal,
       requestedRated: Boolean,
       timeControl: TimeControl,
+      origin: GameOrigin,
       ladder: Boolean
   ): GameClassification =
-    RatingPolicy.classify(ratingPolicy, white, black, requestedRated, timeControl, ladder)
+    RatingPolicy.classify(ratingPolicy, white, black, requestedRated, timeControl, origin, ladder)
 
   /** Shared room-creation seam behind `create`: build the room, register it, start it.
     *
@@ -566,4 +567,6 @@ object GameRegistry:
       requested: Boolean,
       timeControl: TimeControl
   ): Boolean =
-    RatingPolicy.classify(RatingPolicy.Legacy, white, black, requested, timeControl, ladder = false).rated
+    RatingPolicy
+      .classify(RatingPolicy.Legacy, white, black, requested, timeControl, GameOrigin.Legacy, ladder = false)
+      .rated

@@ -94,7 +94,9 @@ object RatingPolicy:
   val EnvVar: String = "RATING_POLICY"
 
   def parse(raw: Option[String]): Option[RatingPolicy] =
-    raw.map(_.trim.toLowerCase).flatMap(name => values.find(_.wireName == name))
+    // `Locale.ROOT`: under a Turkish default locale `MATRIX`.toLowerCase is `matrıx`, which would silently fall back
+    // to `Legacy` — the wrong eligibility matrix for every new game.
+    raw.map(_.trim.toLowerCase(java.util.Locale.ROOT)).flatMap(name => values.find(_.wireName == name))
 
   def fromEnv: RatingPolicy = parse(sys.env.get(EnvVar)).getOrElse(Legacy)
 
@@ -118,8 +120,15 @@ object RatingPolicy:
     * | bot vs bot, direct/seek/challenge | rated, competitive | casual — no canonical rating            |
     * | account vs bot                    | rated, competitive | training — rated=false, domain training |
     *
-    * A `Training` classification is the only case where `rated` and `domain` disagree with "rated means some rating":
-    * the row is kept for the training estimate (#149) while no canonical rating moves.
+    * "Ladder-scheduled" is `ladder && origin == Ladder`: the scheduler is the only caller that creates games with the
+    * ladder origin, so a caller passing the `ladder` flag alone (which auto-park reads) cannot buy a competitive bot
+    * game for a direct challenge. A `Training` classification is the only case where `rated` and `domain` disagree with
+    * "rated means some rating": the row is kept for the training estimate (#149) while no canonical rating moves.
+    *
+    * The kinds describe the seats AS CREATED. A friend-by-link seat can later be claimed by another principal
+    * (`GameRegistry.claimSeat`), but only in a game whose seats were the same principal — casual by construction — so
+    * the domain and `rated` decided here never go stale; the stored `white_kind`/`black_kind` follow the recorded
+    * external ids, i.e. the seats that actually played.
     */
   def classify(
       policy: RatingPolicy,
@@ -127,10 +136,12 @@ object RatingPolicy:
       black: Principal,
       requestedRated: Boolean,
       timeControl: TimeControl,
+      origin: GameOrigin,
       ladder: Boolean
   ): GameClassification =
     val whiteKind = ParticipantKind.of(white)
     val blackKind = ParticipantKind.of(black)
+    val scheduled = ladder && origin == GameOrigin.Ladder
     val ratable   =
       requestedRated && !isAnonymous(white) && !isAnonymous(black) && white != black &&
         RatingCategory.of(timeControl).isDefined
@@ -143,6 +154,6 @@ object RatingPolicy:
             (whiteKind, blackKind) match
               case (ParticipantKind.Human, ParticipantKind.Human) => (true, RatingDomain.Competitive)
               case (ParticipantKind.Bot, ParticipantKind.Bot)     =>
-                if ladder then (true, RatingDomain.Competitive) else (false, RatingDomain.Casual)
+                if scheduled then (true, RatingDomain.Competitive) else (false, RatingDomain.Casual)
               case _ => (false, RatingDomain.Training)
     GameClassification(whiteKind, blackKind, requestedRated, rated, domain, policy)

@@ -131,13 +131,43 @@ class GameRegistrySuite extends munit.CatsEffectSuite:
     Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
       GameRegistry.create(store = capturingStore(written), ratingPolicy = RatingPolicy.Matrix).flatMap { registry =>
         for
-          _     <- registry.create(alice, bob, Blitz, requestedRated = true) // a direct challenge
-          _     <- registry.create(alice, bob, Blitz, requestedRated = true, ladder = true)
+          _ <- registry.create(alice, bob, Blitz, requestedRated = true, origin = GameOrigin.Direct) // a challenge
+          _ <- registry.create(alice, bob, Blitz, requestedRated = true, ladder = true, origin = GameOrigin.Ladder)
+          // The flag without the scheduler's origin buys nothing: a caller cannot self-authorize a competitive game.
+          _     <- registry.create(alice, bob, Blitz, requestedRated = true, ladder = true, origin = GameOrigin.Direct)
           snaps <- written.get
         yield
-          val (direct, scheduled) = (snaps.head, snaps.find(_.ladder.contains(true)).get)
+          val byOrigin  = snaps.groupBy(s => (s.origin, s.ladder))
+          val direct    = byOrigin((Some(GameOrigin.Direct), Some(false))).head
+          val scheduled = byOrigin((Some(GameOrigin.Ladder), Some(true))).head
+          val forged    = byOrigin((Some(GameOrigin.Direct), Some(true))).head
           assertEquals((direct.rated, direct.ratingDomain), (Some(false), Some(RatingDomain.Casual)))
           assertEquals((scheduled.rated, scheduled.ratingDomain), (Some(true), Some(RatingDomain.Competitive)))
+          assertEquals((forged.rated, forged.ratingDomain), (Some(false), Some(RatingDomain.Casual)))
+      }
+    }
+
+  test("a claimed friend-by-link seat changes who played, never the classification decided at creation (#146)"):
+    // `POST /games` seats the creator on both sides; a friend claims a seat by token. The game was classified casual
+    // (self-play, no rated request) and stays so; the recorded seats — and hence the stored kinds — follow who played.
+    Ref.of[IO, Vector[GameSnapshot]](Vector.empty).flatMap { written =>
+      GameRegistry.create(store = capturingStore(written), ratingPolicy = RatingPolicy.Matrix).flatMap { registry =>
+        val guest = Principal.Guest("55555555-5555-5555-5555-555555555555")
+        val user  = Principal.User("u-claimer")
+        registry.create(guest, guest, Blitz, requestedRated = true).flatMap {
+          case Left(error)    => IO.raiseError(RuntimeException(s"create failed: $error"))
+          case Right((id, _)) =>
+            for
+              claimed <- registry.claimSeat(id, Seat.Black, user)
+              snaps   <- written.get
+            yield
+              assert(claimed, "the friend claims the free seat")
+              val last = snaps.last
+              assertEquals(last.players.get(Seat.Black), Some(user), "the seat now records who played")
+              assertEquals(last.rated, Some(false))
+              assertEquals(last.ratingDomain, Some(RatingDomain.Casual), "classification is a creation-time fact")
+              assertEquals(last.ratedRequested, Some(true), "…and the request is remembered as it was")
+        }
       }
     }
 

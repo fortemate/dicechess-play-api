@@ -263,7 +263,9 @@ all. Together with the stamp they make a `game_results` row write-**twice** rath
 write-once: one bookkeeping UPDATE, by a single writer, never revisited.
 
 V9 (#146) separates the three facts `rated` used to stand for. `white_kind`/`black_kind` say who sat
-in the seat (`human`, `bot`, `guest` — from the external id's shape, never a name); `rated_requested`
+in the seat (`human`, `bot`, `guest` — from the recorded external id's shape, never a name, so they
+always agree with `white_external_id`/`black_external_id`; a friend-by-link seat claimed after
+creation records the claimer, while the domain below stays what creation decided); `rated_requested`
 is what the caller asked for; `rating_domain` is the namespace the game may move (`competitive`,
 `training`, `casual`) as decided at creation by `RatingPolicy.classify` under the
 `rating_policy_version` that was in force (1 legacy, 2 matrix); `rating_outcome` is what the batch

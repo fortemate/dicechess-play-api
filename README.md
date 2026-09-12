@@ -2,7 +2,7 @@
 
 [![CI Pipeline](https://github.com/fortemate/dicechess-play-api/actions/workflows/ci.yaml/badge.svg)](https://github.com/fortemate/dicechess-play-api/actions/workflows/ci.yaml)
 [![Play Live](https://img.shields.io/badge/Play-Live-success)](https://fortemate.com/)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-lightgrey)](./LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-lightgrey)](./LICENSE)
 
 Authoritative real-time server for **Dice Chess** — human-vs-human play, a third-party **Bot API**, and an automatic **Glicko-2 rating ladder**.
 

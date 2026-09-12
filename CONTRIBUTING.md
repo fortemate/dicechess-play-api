@@ -12,9 +12,9 @@ array in [`.github/cla-signatures.json`](.github/cla-signatures.json) in the sam
 entry is present. Repository-owner and bot pull requests are exempt.
 
 Why a CLA: the project follows an open-core model. The public repositories are
-AGPL-3.0, and the project owner retains the ability to combine the code with
+AGPL-3.0-only, and the project owner retains the ability to combine the code with
 closed-source modules and to offer it under additional licenses. The CLA preserves
-that option while your contribution always remains available under AGPL-3.0 — and
+that option while your contribution always remains available under AGPL-3.0-only — and
 you keep the copyright to your work. A plain DCO (`Signed-off-by`) would not grant
 relicensing rights, which is why a CLA is used instead.
 

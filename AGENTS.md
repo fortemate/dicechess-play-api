@@ -20,7 +20,7 @@ via mise). If a tool is missing, run `bash scripts/jules-setup.sh` instead of in
 
 ## Project context
 
-- Public repository, AGPL-3.0 (see `LICENSE`). Single-module Scala 3 project at repo root (package `dicechess.play`); http4s + cats-effect IO + fs2 + Doobie + Flyway over PostgreSQL.
+- Public repository, AGPL-3.0-only (see `LICENSE`). Single-module Scala 3 project at repo root (package `dicechess.play`); http4s + cats-effect IO + fs2 + Doobie + Flyway over PostgreSQL.
 - Published artifact: multi-arch Docker image `ghcr.io/fortemate/dicechess-play-api`.
 - Contracts this repo publishes & consumes:
   - Game rules come exclusively from `com.fortemate:dicechess-engine` (pinned in `build.sbt`). Never re-implement chess/dice rules here.

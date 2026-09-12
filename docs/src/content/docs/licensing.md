@@ -7,7 +7,7 @@ description: You can write a closed-source bot. Talking to this API over the net
 
 ## The wire is a boundary
 
-The play-api server is AGPL-3.0. But you interact with it purely as a **network service** — Bearer auth, REST, and ndjson streams over HTTP. Using a network service does not make your client a derivative work of the server: you are sending requests and reading responses, not incorporating the server's code. Your bot can be any language and any license, public or private.
+The play-api server is AGPL-3.0-only. But you interact with it purely as a **network service** — Bearer auth, REST, and ndjson streams over HTTP. Using a network service does not make your client a derivative work of the server: you are sending requests and reading responses, not incorporating the server's code. Your bot can be any language and any license, public or private.
 
 The copyleft question only arises if you **link the game engine** into your own program (as a Maven/npm/WASM dependency) — that would make your program a derivative of the AGPL engine.
 
@@ -24,8 +24,8 @@ So a private bot needs no engine dependency at all. The wire carries everything 
 
 | Component | License | Why |
 | --- | --- | --- |
-| play-api server, game engine | AGPL-3.0 | The platform itself stays copyleft. |
-| The reference bot (`dicechess-reference-bot`) | AGPL-3.0 | It is a fork-and-replace template derived from platform code. |
+| play-api server, game engine | AGPL-3.0-only | The platform itself stays copyleft. |
+| The reference bot (`dicechess-reference-bot`) | AGPL-3.0-only | It is a fork-and-replace template derived from platform code. |
 | **The official Python / TypeScript starter kits** | **MIT** | Thin transport wrappers you can copy into a closed-source bot with no copyleft reach. |
 
 The starter kits are intentionally **transport only** — auth, reconnect with backoff, HTTP-status and `Retry-After` handling, token re-mint on `401`, re-challenge on game end — with **no engine code**, so nothing in them pulls a copyleft obligation into your project. Two are live, each a "Use this template" starter with a runnable poll-only bot:

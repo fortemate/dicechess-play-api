@@ -81,6 +81,26 @@ mise run coverage   # Run tests with scoverage and generate report
 - Some external integrations, including Jules, control the published branch name. Their generated names are accepted by PR Policy when the pull request body contains `Closes #<id>`, `Fixes #<id>`, or `Resolves #<id>`.
 - Do not modify `.github/workflows/**` or `.github/labeler.yml` as part of an unrelated task merely to make that task's checks pass. Repository automation changes belong in a dedicated pull request.
 
+## Publication boundary
+
+<!-- dc-shared:publication v1 — keep identical across Fortemate repositories -->
+
+- Fortemate is open-core. Public by nature: code, rules, search, feature definitions and extractors,
+  serving contracts, mechanics, and the programme numbers already published in the project READMEs.
+  Private: trained weights, opening books, labelled corpora, production parameter **values** (search
+  profiles, candidate limits, table sizes, blend weights, time budgets), experiment **verdicts** (win
+  rates, feature importance, cost ratios, negative results) and the names of private repositories,
+  artifacts and hosts.
+- Before writing to a public repository — code, docs, scaladoc, commit messages, Issues, pull requests,
+  review replies — check the text against that list. Values and verdicts go to the private knowledge
+  base (`fortemate-internal`) and are referenced from public text by page title only; examples use
+  placeholders such as `<candidate-limit>` instead of real values.
+- The rule is forward-only (ADR 009): nothing already published is retracted and history is never
+  rewritten. When unsure whether something is a definition or a verdict, ask the owner before
+  publishing.
+
+<!-- /dc-shared:publication -->
+
 ## Issue management
 <!-- dc-shared:issue-management v7 — keep identical across Fortemate repositories -->
 

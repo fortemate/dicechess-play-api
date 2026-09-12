@@ -7,7 +7,7 @@ ThisBuild / version              := "0.1.0-SNAPSHOT"
 ThisBuild / scalaVersion         := "3.9.0"
 
 ThisBuild / description := "Authoritative real-time server for Dice Chess (human-vs-human + Bot API + Glicko-2 rating ladder)."
-ThisBuild / licenses := List(License("AGPL-3.0", uri("https://www.gnu.org/licenses/agpl-3.0.txt")))
+ThisBuild / licenses := List(License("AGPL-3.0-only", uri("https://www.gnu.org/licenses/agpl-3.0.txt")))
 
 ThisBuild / scmInfo := Some(
   ScmInfo(

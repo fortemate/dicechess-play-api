@@ -42,6 +42,10 @@ run = 'sbt "runMain dicechess.play.rating.LadderReportMain"'
 description = "🔁 Replay the current Glicko-2 implementation over a rating corpus export (#145) — file in, report out, no database"
 run = "scripts/rating-replay.sh"
 
+[tasks."rating:evaluate"]
+description = "📈 Chronological, leakage-free comparison of rating models over a corpus export (#148) — file in, report out, no database"
+run = "scripts/rating-evaluate.sh"
+
 [tasks."archive:backfill"]
 description = "🗄️  One-off: write game_archive rows for ended games that predate #177 — needs PLAY_DB_URL, WRITES"
 run = 'sbt "runMain dicechess.play.store.ArchiveBackfillMain"'

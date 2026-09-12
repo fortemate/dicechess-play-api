@@ -35,7 +35,6 @@ final class BotConnection(
           .modify(last => if version > last then (version, true) else (last, false))
           .flatMap(fresh => if fresh then chooseAndSubmit(room, dfen) else IO.unit)
 
-  /** Extracts (version, dfen-with-dice) when it is this seat's turn to move. */
   private def turnFor(event: GameEvent): Option[(Long, String)] = event match
     case GameEvent.DiceRolled(v, s, _, dfen, _, _) if s == seat                  => Some((v, dfen))
     case GameEvent.Snapshot(v, ps, _) if ps.dicePending && ps.activeSeat == seat => Some((v, ps.dfen))

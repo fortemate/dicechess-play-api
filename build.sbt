@@ -26,9 +26,12 @@ ThisBuild / developers := List(
 )
 
 // The engine artifact is published on Maven Central
-ThisBuild / resolvers += Resolver.mavenCentral
+ThisBuild / resolvers := Seq(
+  "Google Maven Central Mirror" at "https://maven-central.storage-download.googleapis.com/maven2/",
+  Resolver.mavenCentral
+)
 
-val DiceChessEngineVersion    = "0.9.0"
+val DiceChessEngineVersion    = "0.9.2"
 val CatsEffectVersion         = "3.7.1"
 val Fs2Version                = "3.14.0"
 val Http4sVersion             = "0.23.30"
@@ -103,5 +106,5 @@ lazy val root = (project in file("."))
     coverageFailOnMinimum    := false,
     Test / fork              := true,
     Test / parallelExecution := false,
-    Test / javaOptions += "-Dapi.version=1.43"
+    Test / javaOptions += "-Dapi.version=1.44"
   )

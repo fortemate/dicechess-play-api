@@ -38,7 +38,7 @@ via mise). If a tool is missing, run `bash scripts/jules-setup.sh` instead of in
   - `core/` — domain models (`Protocol.scala`, `Identity.scala`, `RatingCategory.scala`, `RatingPolicy.scala` (eligibility matrix, rating domains and outcomes, #146), `Seek.scala`, `BotEvent.scala`, `GameId.scala`).
   - `game/` — `GameRoom.scala` (authoritative room fiber, turn clocks, move validation), `EngineOps.scala` (bridge to engine), `PlayerConnection.scala`.
   - `dice/` — `DiceSource.scala` (CSPRNG with commit-reveal).
-  - `rating/` — `Glicko2.scala`, `BradleyTerry.scala`, `Sprt.scala`, `RatingBatch.scala`, `StrengthCache.scala`, `StrengthReport.scala`, `RatingReplay.scala` (offline chronological replay over a corpus export, #145; runner `RatingReplayMain`).
+  - `rating/` — `Glicko2.scala`, `BradleyTerry.scala`, `Sprt.scala`, `RatingBatch.scala`, `StrengthCache.scala`, `StrengthReport.scala`, `RatingReplay.scala` (offline chronological replay over a corpus export, #145; runner `RatingReplayMain`), `RatingEvaluation.scala` + `RatingModels.scala` (leakage-free chronological comparison of forecasting models — Glicko-2 variants, daily Bradley–Terry, WHR — with metrics, segments, day-block bootstrap and a synthetic coverage fixture, #148; runner `RatingEvaluationMain`, task `mise run rating:evaluate`).
   - `server/` — http4s routes (`PlayRoutes`, `BotRoutes`, `LobbyRoutes`, `AuthRoutes`, `AdminBotRoutes`, `WebhookRoutes`, `LeaderboardRoutes`, `MeRoutes`, `HealthRoutes`, `Cors.scala`, `GoogleAuth.scala`, `BotAuth.scala`, `WebhookSecurity.scala`).
   - `store/` — Doobie PostgreSQL storage (`GameStore`, `PgGameStore`, `UserStore`, `GameArchive`, `AdminBotStore`, `WebhookStats`).
   - `ingest/` — `IngestDeliverer.scala` (outbox publisher), `PlaysiteIngest.scala`.

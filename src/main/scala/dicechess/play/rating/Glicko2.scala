@@ -102,6 +102,18 @@ object Glicko2:
       // Step 8: back to the public scale.
       Glicko(rating = muPrime * Scale + 1500.0, deviation = phiPrime * Scale, volatility = sigmaPrime)
 
+  /** The forecast probability that `player` scores against `opponent` from both PRE-game states (#148): the Glicko
+    * predictive formula with the two deviations pooled, `E = 1 / (1 + exp(−g(√(φ² + φj²)) · (μ − μj)))`, so an
+    * uncertain player is pulled toward an even game exactly as an uncertain opponent is. Symmetric: the two seats'
+    * forecasts sum to one. This is the number the chronological evaluation scores with log loss; the update itself
+    * ([[update]]) keeps Glickman's asymmetric `E(μ, μj, φj)`, as the paper specifies.
+    */
+  def expectedScore(player: Glicko, opponent: Glicko): Double =
+    val mu     = (player.rating - 1500.0) / Scale
+    val muJ    = (opponent.rating - 1500.0) / Scale
+    val pooled = math.sqrt(player.deviation * player.deviation + opponent.deviation * opponent.deviation) / Scale
+    1.0 / (1.0 + math.exp(-g(pooled) * (mu - muJ)))
+
   /** g(φ): dampens an opponent's influence by the uncertainty of their own rating. */
   private def g(phi: Double): Double = 1.0 / math.sqrt(1.0 + 3.0 * phi * phi / (math.Pi * math.Pi))
 

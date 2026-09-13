@@ -23,7 +23,7 @@ via mise). If a tool is missing, run `bash scripts/jules-setup.sh` instead of in
 - Public repository, AGPL-3.0-only (see `LICENSE`). Single-module Scala 3 project at repo root (package `dicechess.play`); http4s + cats-effect IO + fs2 + Doobie + Flyway over PostgreSQL.
 - Published artifact: multi-arch Docker image `ghcr.io/fortemate/dicechess-play-api`.
 - Contracts this repo publishes & consumes:
-  - Game rules come exclusively from `com.fortemate:dicechess-engine` (pinned in `build.sbt`). Never re-implement chess/dice rules here.
+  - Game rules come exclusively from `com.fortemate:dicechess-rules` (pinned in `build.sbt`) — the rules half of the engine: domain model, DFEN, move generation, turn enumeration. Never re-implement chess/dice rules here. `dicechess-engine` (search, bots, optional ONNX) is a `Test`-only dependency for bot opponents and must never enter `Compile`.
   - WebSocket API: live human-vs-human and human-vs-bot game state protocol consumed by `dicechess-play` (SvelteKit SPA).
   - Bot API: REST, ndjson event streams, and webhooks consumed by house bots (`dicechess-house-bots`) and third-party bots.
   - Ingest handoff: finished games delivered to `dicechess-analytics` (`POST /api/games`).

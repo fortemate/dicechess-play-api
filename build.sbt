@@ -31,7 +31,8 @@ ThisBuild / resolvers := Seq(
   Resolver.mavenCentral
 )
 
-val DiceChessEngineVersion    = "0.9.2"
+val DiceChessRulesVersion     = "0.11.0"
+val DiceChessEngineVersion    = "0.11.0"
 val CatsEffectVersion         = "3.7.1"
 val Fs2Version                = "3.14.0"
 val Http4sVersion             = "0.23.30"
@@ -56,8 +57,9 @@ lazy val root = (project in file("."))
     name                := "dicechess-play-api",
     Compile / mainClass := Some("dicechess.play.Main"),
     libraryDependencies ++= Seq(
-      // Game rules: official Fortemate Dice Chess engine
-      "com.fortemate" %% "dicechess-engine" % DiceChessEngineVersion,
+      // Game rules: the rules half of the official Fortemate Dice Chess engine — domain model, DFEN, move
+      // generation and legal turn enumeration. No search layer, and therefore no ONNX runtime.
+      "com.fortemate" %% "dicechess-rules" % DiceChessRulesVersion,
       // Effect system + streaming/concurrency primitives (Ref, Queue, Topic)
       "org.typelevel" %% "cats-effect" % CatsEffectVersion,
       "co.fs2"        %% "fs2-core"    % Fs2Version,
@@ -82,6 +84,8 @@ lazy val root = (project in file("."))
       // Logging backend for Ember
       "ch.qos.logback" % "logback-classic" % LogbackVersion % Runtime,
       // Testing
+      // Bot opponents for the game-room suites (`BotRegistry`, `SearchAlgorithm`); brings the same rules version.
+      "com.fortemate"   %% "dicechess-engine"       % DiceChessEngineVersion % Test,
       "org.scalameta"   %% "munit"                  % MunitVersion           % Test,
       "org.typelevel"   %% "munit-cats-effect"      % MunitCatsEffectVersion % Test,
       "org.http4s"      %% "http4s-jdk-http-client" % Http4sJdkClientVersion % Test,

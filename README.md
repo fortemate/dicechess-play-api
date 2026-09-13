@@ -10,7 +10,7 @@ Authoritative real-time server for **Dice Chess** — human-vs-human play, a thi
 
 ## Architecture
 
-Scala 3 · cats-effect · http4s, reusing the **dice-chess engine on the JVM** (`com.fortemate:dicechess-engine`) so move legality and rules never drift from the client.
+Scala 3 · cats-effect · http4s, reusing the **dice-chess rules on the JVM** (`com.fortemate:dicechess-rules`, the rules half of the engine) so move legality and rules never drift from the client.
 
 ```
   browser SPA (dicechess-play) ──WebSocket──┐

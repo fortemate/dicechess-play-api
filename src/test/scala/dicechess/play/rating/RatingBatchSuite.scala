@@ -28,15 +28,12 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
     PgGameStore.resource(PgGameStore.Config(pg.jdbcUrl, pg.username, pg.password))
 
   private def batch(db: PgGameStore): IO[RatingBatch] =
-    StrengthCache.create.flatMap(cache =>
-      RatingBatch.create(
-        botStore = db,
-        userStore = db,
-        ratingStore = db,
-        resultsStore = db,
-        config = RatingBatch.Config.Default,
-        strengthCache = cache
-      )
+    RatingBatch.create(
+      botStore = db,
+      userStore = db,
+      ratingStore = db,
+      resultsStore = db,
+      config = RatingBatch.Config.Default
     )
 
   private def endedFixture(
@@ -352,21 +349,11 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
     withContainers { pg =>
       store(pg).use { db =>
         for
-          winner        <- db.upsertOnLogin("google", "sub-rb-uvu-w", None, IO.pure("RbWinner"))
-          loser         <- db.upsertOnLogin("google", "sub-rb-uvu-l", None, IO.pure("RbLoser"))
-          id            <- GameId.random
-          _             <- db.save(id, endedFixture(Principal.User(winner.id), Principal.User(loser.id), rated = true))
-          strengthCache <- StrengthCache.create
-          _             <- RatingBatch
-            .create(
-              botStore = db,
-              userStore = db,
-              ratingStore = db,
-              resultsStore = db,
-              config = RatingBatch.Config.Default,
-              strengthCache = strengthCache
-            )
-            .flatMap(_.tick)
+          winner       <- db.upsertOnLogin("google", "sub-rb-uvu-w", None, IO.pure("RbWinner"))
+          loser        <- db.upsertOnLogin("google", "sub-rb-uvu-l", None, IO.pure("RbLoser"))
+          id           <- GameId.random
+          _            <- db.save(id, endedFixture(Principal.User(winner.id), Principal.User(loser.id), rated = true))
+          _            <- batch(db).flatMap(_.tick)
           winnerRating <- db.categoryRatingOf(RatedIdentity.User(winner.id), RatingCategory.Blitz)
           loserRating  <- db.categoryRatingOf(RatedIdentity.User(loser.id), RatingCategory.Blitz)
           queued       <- stillQueued(db, id)
@@ -483,19 +470,9 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           firstGame  <- GameId.random
           secondGame <- GameId.random
           me = Principal.User(player.id)
-          _             <- db.save(firstGame, endedFixture(me, Principal.Bot("rb-mixed", "first"), rated = true))
-          _             <- db.save(secondGame, endedFixture(me, Principal.Bot("rb-mixed", "second"), rated = true))
-          strengthCache <- StrengthCache.create
-          _             <- RatingBatch
-            .create(
-              botStore = db,
-              userStore = db,
-              ratingStore = db,
-              resultsStore = db,
-              config = RatingBatch.Config.Default,
-              strengthCache = strengthCache
-            )
-            .flatMap(_.tick)
+          _            <- db.save(firstGame, endedFixture(me, Principal.Bot("rb-mixed", "first"), rated = true))
+          _            <- db.save(secondGame, endedFixture(me, Principal.Bot("rb-mixed", "second"), rated = true))
+          _            <- batch(db).flatMap(_.tick)
           playerRating <- db.categoryRatingOf(RatedIdentity.User(player.id), RatingCategory.Blitz)
           first        <- db.categoryRatingOf(RatedIdentity.Bot("rb-mixed", "first"), RatingCategory.Blitz)
           second       <- db.categoryRatingOf(RatedIdentity.Bot("rb-mixed", "second"), RatingCategory.Blitz)
@@ -529,18 +506,8 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           )
           _ <- db.save(ghostGame, endedFixture(Principal.User(ghost.id), bot, rated = true))
           // The account plays a rated game and is then deleted: its user: id lingers in game_results forever (#237).
-          _             <- db.deleteUser(ghost.id)
-          strengthCache <- StrengthCache.create
-          _             <- RatingBatch
-            .create(
-              botStore = db,
-              userStore = db,
-              ratingStore = db,
-              resultsStore = db,
-              config = RatingBatch.Config.Default,
-              strengthCache = strengthCache
-            )
-            .flatMap(_.tick)
+          _           <- db.deleteUser(ghost.id)
+          _           <- batch(db).flatMap(_.tick)
           botRating   <- db.categoryRatingOf(RatedIdentity.Bot("rb-guest", "opponent"), RatingCategory.Blitz)
           guestQueued <- stillQueued(db, guestGame)
           ghostQueued <- stillQueued(db, ghostGame)
@@ -566,19 +533,9 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
           ownGame <- GameId.random
           strangerGame <- GameId.random
           me = Principal.User(owner.id)
-          _             <- db.save(ownGame, endedFixture(me, Principal.Bot("rb-own", "mine"), rated = true))
-          _             <- db.save(strangerGame, endedFixture(me, Principal.Bot("rb-own", "theirs"), rated = true))
-          strengthCache <- StrengthCache.create
-          _             <- RatingBatch
-            .create(
-              botStore = db,
-              userStore = db,
-              ratingStore = db,
-              resultsStore = db,
-              config = RatingBatch.Config.Default,
-              strengthCache = strengthCache
-            )
-            .flatMap(_.tick)
+          _        <- db.save(ownGame, endedFixture(me, Principal.Bot("rb-own", "mine"), rated = true))
+          _        <- db.save(strangerGame, endedFixture(me, Principal.Bot("rb-own", "theirs"), rated = true))
+          _        <- batch(db).flatMap(_.tick)
           mine     <- db.categoryRatingOf(RatedIdentity.Bot("rb-own", "mine"), RatingCategory.Blitz)
           theirs   <- db.categoryRatingOf(RatedIdentity.Bot("rb-own", "theirs"), RatingCategory.Blitz)
           player   <- db.categoryRatingOf(RatedIdentity.User(owner.id), RatingCategory.Blitz)
@@ -633,50 +590,18 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  test("a tick that applies a rated game also warms the strength cache with a report that includes it (#181)"):
-    withContainers { pg =>
-      store(pg).use { db =>
-        for
-          (alice, bob)  <- registerPair(db, "rb11")
-          id            <- GameId.random
-          _             <- db.save(id, endedFixture(alice, bob, rated = true)) // alice (White) wins
-          strengthCache <- StrengthCache.create
-          before        <- strengthCache.get
-          _             <- RatingBatch
-            .create(
-              botStore = db,
-              userStore = db,
-              ratingStore = db,
-              resultsStore = db,
-              config = RatingBatch.Config.Default,
-              strengthCache = strengthCache
-            )
-            .flatMap(_.tick)
-          after <- strengthCache.get
-        yield
-          assertEquals(before, None, "the cache starts cold")
-          assert(after.isDefined, "a tick that applied a game must warm the cache")
-          assert(
-            after.exists(_.pairwise.exists(p => p.perspective == "rb11/alice" || p.opponent == "rb11/alice")),
-            "the refreshed report must include the game the same tick just applied"
-          )
-      }
-    }
-
   test(
-    "a batchSize of 1 forces drainQueue's multi-page recursion, and one outer tick still applies every page " +
-      "and warms the cache with all of them (#181)"
+    "a batchSize of 1 forces drainQueue's multi-page recursion, and one outer tick still applies every page"
   ):
     withContainers { pg =>
       store(pg).use { db =>
         for
-          (alice, bob)  <- registerPair(db, "rb12")
-          id1           <- GameId.random
-          id2           <- GameId.random
-          _             <- db.save(id1, endedFixture(alice, bob, rated = true))
-          _             <- IO.sleep(20.millis) // distinguishable finished_at (DB-generated), same as the rb7 test
-          _             <- db.save(id2, endedFixture(bob, alice, rated = true))
-          strengthCache <- StrengthCache.create
+          (alice, bob) <- registerPair(db, "rb12")
+          id1          <- GameId.random
+          id2          <- GameId.random
+          _            <- db.save(id1, endedFixture(alice, bob, rated = true))
+          _            <- IO.sleep(20.millis) // distinguishable finished_at (DB-generated), same as the rb7 test
+          _            <- db.save(id2, endedFixture(bob, alice, rated = true))
           onePerPage = RatingBatch.Config.Default.copy(batchSize = 1)
           _ <- RatingBatch
             .create(
@@ -684,19 +609,12 @@ class RatingBatchSuite extends CatsEffectSuite with TestContainerForAll:
               userStore = db,
               ratingStore = db,
               resultsStore = db,
-              config = onePerPage,
-              strengthCache = strengthCache
+              config = onePerPage
             )
             .flatMap(_.tick)
           queued1 <- stillQueued(db, id1)
           queued2 <- stillQueued(db, id2)
-          report  <- strengthCache.get
-        yield
-          assert(!queued1 && !queued2, "one outer tick must drain every page, not just the first")
-          assert(
-            report.exists(_.pairwise.exists(p => p.perspective == "rb12/alice" || p.opponent == "rb12/alice")),
-            "the cache refresh must run once at the end, after every page's games are already applied"
-          )
+        yield assert(!queued1 && !queued2, "one outer tick must drain every page, not just the first")
       }
     }
 
@@ -745,20 +663,18 @@ class RatingBatchResilienceSuite extends CatsEffectSuite:
 
   test("a history query that fails mid-check is logged and never aborts the tick around it"):
     for
-      bots          <- BotStore.inMemory
-      _             <- bots.register("acme", "alice", "hash-alice")
-      _             <- bots.register("acme", "bob", "hash-bob")
-      _             <- bots.setOnLadder("acme", "alice", onLadder = true)
-      _             <- bots.setOnLadder("acme", "bob", onLadder = true)
-      queue         <- Ref.of[IO, List[GameResultRow]](List(aliceTimedOut))
-      strengthCache <- StrengthCache.create
-      batch         <- RatingBatch.create(
+      bots  <- BotStore.inMemory
+      _     <- bots.register("acme", "alice", "hash-alice")
+      _     <- bots.register("acme", "bob", "hash-bob")
+      _     <- bots.setOnLadder("acme", "alice", onLadder = true)
+      _     <- bots.setOnLadder("acme", "bob", onLadder = true)
+      queue <- Ref.of[IO, List[GameResultRow]](List(aliceTimedOut))
+      batch <- RatingBatch.create(
         botStore = bots,
         userStore = noUsers,
         ratingStore = oneGameQueue(queue),
         resultsStore = unreachableResults,
-        config = RatingBatch.Config.Default,
-        strengthCache = strengthCache
+        config = RatingBatch.Config.Default
       )
       // The rating for this row has already committed by the time the check runs, so raising here would abort the rest
       // of the page for unrelated bots and buy nothing — the row is stamped and never returns to the queue.
@@ -776,79 +692,6 @@ class RatingBatchResilienceSuite extends CatsEffectSuite:
     def linkGuest(userId: String, guestId: String): IO[GuestLink]            = IO.raiseError(AssertionError("unused"))
     def guestsOf(userId: String): IO[List[String]]                           = IO.pure(Nil)
     def deleteUser(userId: String): IO[Boolean]                              = IO.raiseError(AssertionError("unused"))
-
-  /** Counts calls to `finishedRatedSince` rather than serving real rows — the strength refresh's own cost the cache
-    * exists to bound, made observable without a container (#181).
-    */
-  private def countingResults(counter: Ref[IO, Int]): GameResultsStore = new GameResultsStore:
-    def recentResultsFor(externalId: String, limit: Int): IO[List[GameResultRow]] = IO.pure(Nil)
-    def finishedRatedSince(since: java.time.Instant): IO[List[GameResultRow]]     = counter.update(_ + 1).as(Nil)
-    def playerGamesPage(
-        externalIds: List[String],
-        before: Option[java.time.Instant],
-        opponent: Option[OpponentFilter],
-        result: Option[PovResultFilter],
-        limit: Int
-    ): IO[GameResultsStore.Page] = IO.pure(GameResultsStore.Page(Nil, hasMore = false))
-    def opponentsFor(externalIds: List[String]): IO[List[OpponentAggregateRow]] = IO.pure(Nil)
-
-  test("a cold cache is warmed even with nothing to apply, but a warm one is not refreshed again for free (#181)"):
-    for
-      bots          <- BotStore.inMemory
-      refreshCount  <- Ref.of[IO, Int](0)
-      emptyQueue    <- Ref.of[IO, List[GameResultRow]](Nil)
-      strengthCache <- StrengthCache.create
-      batch         <- RatingBatch.create(
-        botStore = bots,
-        userStore = noUsers,
-        ratingStore = oneGameQueue(emptyQueue),
-        resultsStore = countingResults(refreshCount),
-        config = RatingBatch.Config.Default,
-        strengthCache = strengthCache
-      )
-      _      <- batch.tick
-      countA <- refreshCount.get
-      _      <- batch.tick
-      countB <- refreshCount.get
-    yield
-      assertEquals(countA, 1, "a cold cache must be warmed even when the drain applied nothing")
-      assertEquals(countB, 1, "a warm cache must not be refreshed again by a tick that applied nothing new")
-
-  /** The two ends of the #215 knob, both without a clock: the default interval is far longer than the test, so the
-    * second rebuild is unreachable; a zero interval is always elapsed, so every applying tick rebuilds.
-    */
-  private def countedRebuilds(config: RatingBatch.Config, ticks: Int): IO[Int] =
-    for
-      bots          <- BotStore.inMemory
-      _             <- bots.register("acme", "alice", "hash-alice")
-      _             <- bots.register("acme", "bob", "hash-bob")
-      refreshCount  <- Ref.of[IO, Int](0)
-      queue         <- Ref.of[IO, List[GameResultRow]](Nil)
-      strengthCache <- StrengthCache.create
-      batch         <- RatingBatch.create(
-        bots,
-        noUsers,
-        oneGameQueue(queue),
-        countingResults(refreshCount),
-        config,
-        strengthCache
-      )
-      // Refilled before each tick, so every tick genuinely applies a game — the pre-#215 trigger, fired repeatedly.
-      _     <- (queue.set(List(aliceTimedOut)) *> batch.tick).replicateA_(ticks)
-      count <- refreshCount.get
-    yield count
-
-  test("games landing inside the refresh interval do not each trigger a full-corpus rebuild (#215)"):
-    countedRebuilds(RatingBatch.Config.Default, ticks = 4).map: count =>
-      assertEquals(
-        count,
-        1,
-        "only the cold-cache warm-up may rebuild; the other three ticks are inside the 15-minute interval"
-      )
-
-  test("a zero refresh interval asks for the pre-#215 cadence back: every applying tick rebuilds (#215)"):
-    countedRebuilds(RatingBatch.Config.Default.copy(strengthRefreshInterval = Duration.Zero), ticks = 4).map: count =>
-      assertEquals(count, 4, "with no interval to wait out, every tick that applied a game must rebuild")
 
 /** Pure parsing/config/streak logic — no container. */
 class RatingBatchPureSuite extends munit.FunSuite:
@@ -970,64 +813,8 @@ class RatingBatchPureSuite extends munit.FunSuite:
     )
     assertEquals(
       RatingBatch.Config.fromValues(Some("45"), Some("7"), Some("3")),
-      Some(RatingBatch.Config(45.seconds, 7, 3, RatingBatch.Config.DefaultStrengthRefreshInterval))
+      Some(RatingBatch.Config(45.seconds, 7, 3))
     )
-
-  test("the strength refresh interval parses, defaults when absent or negative, and accepts an explicit zero (#215)"):
-    assertEquals(
-      RatingBatch.Config.fromValues(Some("60"), None, None, Some("300")).map(_.strengthRefreshInterval),
-      Some(300.seconds)
-    )
-    assertEquals(
-      RatingBatch.Config.fromValues(Some("60"), None, None, None).map(_.strengthRefreshInterval),
-      Some(RatingBatch.Config.DefaultStrengthRefreshInterval)
-    )
-    assertEquals(
-      RatingBatch.Config.fromValues(Some("60"), None, None, Some("junk")).map(_.strengthRefreshInterval),
-      Some(RatingBatch.Config.DefaultStrengthRefreshInterval)
-    )
-    assertEquals(
-      RatingBatch.Config.fromValues(Some("60"), None, None, Some("-1")).map(_.strengthRefreshInterval),
-      Some(RatingBatch.Config.DefaultStrengthRefreshInterval),
-      "a negative interval is meaningless; unlike zero it cannot be read as a deliberate 'every tick'"
-    )
-    assertEquals(
-      RatingBatch.Config.fromValues(Some("60"), None, None, Some("0")).map(_.strengthRefreshInterval),
-      Some(Duration.Zero),
-      "zero is the one way back to the pre-#215 cadence and must survive parsing"
-    )
-
-  test("planRefresh holds a rebuild back until the interval has passed, without forgetting the games that landed"):
-    val cold  = RatingBatch.RefreshState.Initial
-    val fresh = RatingBatch.planRefresh(appliedAny = true, cold = true, now = 10.seconds, interval = 15.minutes)(cold)
-    assertEquals(fresh, (RatingBatch.RefreshState(Some(10.seconds), pending = false), true))
-
-    val (deferred, rebuildNow) =
-      RatingBatch.planRefresh(appliedAny = true, cold = false, now = 70.seconds, interval = 15.minutes)(fresh._1)
-    assertEquals(rebuildNow, false, "a game landing a minute after the last rebuild must not trigger another")
-    assertEquals(deferred.pending, true, "but the batch must remember that the report is now stale")
-    assertEquals(deferred.lastRefreshAt, Some(10.seconds), "a deferred rebuild must not restart the interval")
-
-  test("planRefresh rebuilds a stale report on a later idle tick, so a quiet ladder cannot strand the last games"):
-    val stale              = RatingBatch.RefreshState(Some(10.seconds), pending = true)
-    val (next, rebuildNow) =
-      RatingBatch.planRefresh(appliedAny = false, cold = false, now = 16.minutes, interval = 15.minutes)(stale)
-    assertEquals(rebuildNow, true, "the interval has passed and games are waiting — applying nothing this tick is fine")
-    assertEquals(next, RatingBatch.RefreshState(Some(16.minutes), pending = false))
-
-  test("planRefresh leaves a clean report alone forever: an elapsed interval alone is not a reason to rebuild"):
-    val clean              = RatingBatch.RefreshState(Some(10.seconds), pending = false)
-    val (next, rebuildNow) =
-      RatingBatch.planRefresh(appliedAny = false, cold = false, now = 3.hours, interval = 15.minutes)(clean)
-    assertEquals(rebuildNow, false, "nothing has changed the corpus, so the cached report is still exactly right")
-    assertEquals(next, clean)
-
-  test("planRefresh always warms a cold cache, whatever the interval says (#181)"):
-    val warm               = RatingBatch.RefreshState(Some(10.seconds), pending = false)
-    val (next, rebuildNow) =
-      RatingBatch.planRefresh(appliedAny = false, cold = true, now = 11.seconds, interval = 15.minutes)(warm)
-    assertEquals(rebuildNow, true, "an empty cache answers /strength with nothing at all — that outranks the interval")
-    assertEquals(next, RatingBatch.RefreshState(Some(11.seconds), pending = false))
 
 /** The eligibility matrix for human ratings (#279, ADR-0017) — pure, so every rule is pinned without a database.
   *

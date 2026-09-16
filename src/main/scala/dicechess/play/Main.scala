@@ -37,7 +37,6 @@ import dicechess.play.server.{
   ShowcaseConfig,
   ShowcaseRoutes,
   ShowcaseTable,
-  StrengthRoutes,
   ManagedWebhookVerifier,
   WebhookManagement,
   WebhookRoutes,
@@ -46,7 +45,7 @@ import dicechess.play.server.{
   Webhooks
 }
 import dicechess.play.ingest.IngestDeliverer
-import dicechess.play.rating.{Glicko2, RatingBatch, StrengthCache, StrengthReport}
+import dicechess.play.rating.{Glicko2, RatingBatch}
 import dicechess.play.store.{
   BotStore,
   GameStore,
@@ -275,13 +274,9 @@ object Main extends IOApp.Simple:
           LadderScheduler
             .create(botStore, registry, botEvents, ladderConfig, guard = Some(seatGuard))
             .map(_.scheduler())
-      // The strength cache (#181) is created unconditionally: StrengthRoutes below is mounted whenever persistence
-      // is configured at all, independent of whether the rating batch (its only writer) ever actually runs.
-      strengthCache <- StrengthCache.create
-      // The rating batch (#119) is opt-in the same way (RATING_INTERVAL_SECONDS) — and additionally needs the
+      // The rating batch (#119) is opt-in (RATING_INTERVAL_SECONDS) — and additionally needs the
       // database: without PLAY_DB_URL there is no game_results queue to drain, so a set-but-useless env var gets a
-      // loud warning instead of a silent no-op. It also owns refreshing `strengthCache` (#181): with the batch off,
-      // GET /strength stays "not ready" forever — the same coupling rating updates and ladder auto-park already have.
+      // loud warning instead of a silent no-op.
       // Which eligibility matrix this deployment classifies new games under (#146) — logged once so the population a
       // deployment produces is on record next to its other rating settings.
       _ <- IO.println(
@@ -297,20 +292,16 @@ object Main extends IOApp.Simple:
             .errorln("[play][rating] RATING_INTERVAL_SECONDS set but PLAY_DB_URL unset: rating batch disabled")
             .as(IO.never: IO[Unit])
         case (Some(ratingConfig), Some(pg)) =>
-          IO.println(
-            s"[play][rating] enabled: polling every ${ratingConfig.interval}, strength report rebuilt at most " +
-              s"every ${ratingConfig.strengthRefreshInterval}"
-          ) *> RatingBatch
-            .create(
-              botStore = botStore,
-              userStore = pg,
-              ratingStore = pg,
-              resultsStore = pg,
-              config = ratingConfig,
-              strengthCache = strengthCache,
-              strengthConfig = StrengthReport.Config.configFromEnv
-            )
-            .map(_.scheduler())
+          IO.println(s"[play][rating] enabled: polling every ${ratingConfig.interval}") *>
+            RatingBatch
+              .create(
+                botStore = botStore,
+                userStore = pg,
+                ratingStore = pg,
+                resultsStore = pg,
+                config = ratingConfig
+              )
+              .map(_.scheduler())
       // Retention (#179) follows the same opt-in shape, and for this one the shape is a safety property, not just
       // consistency: it is the only scheduled task that DELETES, so leaving RETENTION_INTERVAL_SECONDS unset must be
       // the state that does nothing. It also needs the database for the obvious reason — nothing to prune in memory.
@@ -416,9 +407,6 @@ object Main extends IOApp.Simple:
         // A visitor's own finished games (#151) — same DB-only-seam idiom: no game_results projection without a
         // database, so the route is simply not mounted.
         val playerGames = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => PlayerRoutes(pg, pg))
-        // Same DB-only gating again (#181): `strengthCache` exists either way, but with no persistence there is no
-        // rating batch to ever populate it, so mounting the route would just mean an eternal 503 instead of a 404.
-        val strength = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(_ => StrengthRoutes(botStore, strengthCache))
         // The durable replay endpoint (#178) reads game_archive — DB-only seam again, same idiom as every route
         // above.
         val history = pgStore.fold(org.http4s.HttpRoutes.empty[IO])(pg => HistoryRoutes(pg, pg))
@@ -512,7 +500,7 @@ object Main extends IOApp.Simple:
                   authSession
                 ) <+>
                   leaderboard <+>
-                  catalog <+> playerGames <+> strength <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
+                  catalog <+> playerGames <+> history <+> gameRating <+> ingest <+> auth <+> me <+>
                   ownerBots <+> adminBots <+> managedWebhooks <+> showcaseRoutes <+> rematchRoutes <+>
                   WebhookRoutes(botAuth, webhookService, webhookLimit, pgStore) <+>
                   BotRoutes(

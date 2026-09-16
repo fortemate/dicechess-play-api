@@ -45,13 +45,16 @@ object LadderReportMain extends IOApp:
       val beta                = pairs.get("beta").flatMap(_.toDoubleOption).getOrElse(0.05)
       val bootstrapIterations =
         pairs.get("iterations").orElse(pairs.get("bootstrap")).flatMap(_.toIntOption).getOrElse(1000)
+      val windowDays =
+        pairs.get("window").orElse(pairs.get("windowdays")).flatMap(_.toIntOption)
 
       val config = StrengthReport.Config(
         elo0 = elo0,
         elo1 = elo1,
         alpha = alpha,
         beta = beta,
-        bootstrapIterations = bootstrapIterations
+        bootstrapIterations = bootstrapIterations,
+        windowDays = windowDays
       )
 
       val category = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)

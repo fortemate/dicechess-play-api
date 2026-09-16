@@ -3,6 +3,7 @@ package dicechess.play.rating
 import dicechess.play.core.{GameId, RatingCategory}
 import dicechess.play.store.GameResultRow
 
+import java.nio.file.Paths
 import java.time.Instant
 
 /** Pure — no IO, no Docker: rows in, report out. Anchors: a complete CRN pair becomes ONE pentanomial observation
@@ -175,3 +176,57 @@ class StrengthReportSuite extends munit.FunSuite:
     // A non-finite value (parseable by toDoubleOption, useless as a hypothesis bound).
     val nonFinite = StrengthReport.Config.fromValues(Some("Infinity"), None, None, None, None)
     assertEquals((nonFinite.elo0, nonFinite.elo1), (default.elo0, default.elo1))
+
+  test("renderMarkdown produces valid Quartz frontmatter, summary, and Markdown tables"):
+    val report    = StrengthReport.build(pair("p1", secondResult = -1), RatingCategory.Default)
+    val config    = StrengthReport.Config()
+    val fixedTime = Instant.parse("2026-09-16T12:00:00Z")
+    val md        = StrengthReport.renderMarkdown(report, config, fixedTime)
+
+    assert(md.contains("title: Bot Strength Report"), "contains frontmatter title")
+    assert(md.contains("draft: false"), "contains draft: false")
+    assert(md.contains("- **Observations:** 1 complete pairs, 0 singles"), "contains observations")
+    assert(md.contains("## Pool Ranking (Bradley-Terry)"), "contains ranking table header")
+    assert(
+      md.contains("| Rank | Bot | Relative Elo | 95% Confidence Interval | LOS vs Next |"),
+      "contains ranking columns"
+    )
+    assert(md.contains("`oracle/v1`"), "contains bot names in ranking")
+    assert(md.contains("## Pairwise Matchups (SPRT)"), "contains pairwise table header")
+    assert(
+      md.contains("| Matchup | Verdict | Pairs [0..4] | Singles (W/D/L) | LLR | Bounds |"),
+      "contains pairwise columns"
+    )
+    assert(md.contains("| `oracle/v1` vs `oracle/v3` |"), "contains matchup row")
+    assert(md.contains("2026-09-16T12:00:00Z"), "contains generated timestamp")
+
+  test("LadderReportMain.parseOptions parses key-value options and falls back to positional"):
+    // Key-value parsing
+    val kvArgs = List(
+      "out=content/reports/bot-strength.md",
+      "category=blitz",
+      "iterations=2000",
+      "elo0=5.0",
+      "elo1=25.0",
+      "alpha=0.01",
+      "beta=0.02"
+    )
+    val kvOptions = LadderReportMain.parseOptions(kvArgs)
+    assertEquals(kvOptions.out, Some(Paths.get("content/reports/bot-strength.md")))
+    assertEquals(kvOptions.format, LadderReportMain.Format.Markdown)
+    assertEquals(kvOptions.category, RatingCategory.Blitz)
+    assertEquals(kvOptions.config.bootstrapIterations, 2000)
+    assertEquals(kvOptions.config.elo0, 5.0)
+    assertEquals(kvOptions.config.elo1, 25.0)
+    assertEquals(kvOptions.config.alpha, 0.01)
+    assertEquals(kvOptions.config.beta, 0.02)
+
+    // Positional fallback
+    val posArgs    = List("10.0", "30.0", "0.02", "0.03")
+    val posOptions = LadderReportMain.parseOptions(posArgs)
+    assertEquals(posOptions.out, None)
+    assertEquals(posOptions.format, LadderReportMain.Format.Text)
+    assertEquals(posOptions.config.elo0, 10.0)
+    assertEquals(posOptions.config.elo1, 30.0)
+    assertEquals(posOptions.config.alpha, 0.02)
+    assertEquals(posOptions.config.beta, 0.03)

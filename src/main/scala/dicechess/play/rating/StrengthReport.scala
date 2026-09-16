@@ -3,6 +3,8 @@ package dicechess.play.rating
 import dicechess.play.core.{Principal, RatingCategory}
 import dicechess.play.store.GameResultRow
 
+import java.time.Instant
+
 /** The E.1 (#120) strength report over `game_results`: pairwise SPRT verdicts on CRN pairs plus a Bradley-Terry pool
   * ranking — assembled purely from rows, so the whole pipeline is unit-testable without a database. The thin
   * `LadderReportMain` runner just loads rows and prints [[StrengthReport.render]].
@@ -258,4 +260,85 @@ object StrengthReport:
     }
     (header ++ List("--- Pairwise SPRT (pentanomial on CRN pairs) ---") ++ pairLines ++
       List("", "--- Pool ranking (Bradley-Terry, relative elo, bootstrap 95% CI) ---") ++ rankLines)
+      .mkString("\n")
+
+  /** Owner-facing Markdown rendering formatted for the internal knowledge base (Quartz / GitHub Flavored Markdown). */
+  def renderMarkdown(report: StrengthReport, config: Config, generatedAt: Instant = Instant.now()): String =
+    val frontmatter = List(
+      "---",
+      "title: Bot Strength Report",
+      s"description: Retrospective Bradley-Terry pool ranking and pairwise SPRT verdicts (${report.category.wireName})",
+      "draft: false",
+      "tags:",
+      "  - bots",
+      "  - ratings",
+      "  - reports",
+      "---",
+      ""
+    )
+
+    val summary = List(
+      "# Bot Strength Report",
+      "",
+      "> Retrospective statistical strength report across all registered bots on the Dice Chess ladder.",
+      "> Uses the Bradley-Terry model with bootstrap confidence intervals and Sequential Probability Ratio Tests (SPRT).",
+      "",
+      s"- **Rating scale:** `${report.category.wireName}`",
+      line(
+        "- **Observations:** %d complete pairs, %d singles (excluded rows: %d)",
+        report.completePairs,
+        report.singles,
+        report.excludedRows
+      ),
+      line(
+        "- **SPRT hypotheses:** H0 \"stronger by <= %.0f elo\" vs H1 \">= %.0f elo\" (alpha = beta = %.2f)",
+        config.elo0,
+        config.elo1,
+        config.alpha
+      ),
+      line("- **Bootstrap resampling:** %d iterations", config.bootstrapIterations),
+      s"- **Generated at:** `${generatedAt.toString}`",
+      ""
+    )
+
+    val rankingHeader = List(
+      "## Pool Ranking (Bradley-Terry)",
+      "",
+      "| Rank | Bot | Relative Elo | 95% Confidence Interval | LOS vs Next |",
+      "|:---:|:---|:---:|:---:|:---:|"
+    )
+    val rankingRows = report.ranking.zipWithIndex.map { (r, i) =>
+      val los = r.losVsNext.map(v => line("%.1f%%", v * 100)).getOrElse("—")
+      line("| %d | `%s` | %+.1f | [%+.1f, %+.1f] | %s |", i + 1, r.player, r.elo, r.ciLow, r.ciHigh, los)
+    }
+
+    val sprtHeader = List(
+      "",
+      "## Pairwise Matchups (SPRT)",
+      "",
+      "| Matchup | Verdict | Pairs [0..4] | Singles (W/D/L) | LLR | Bounds |",
+      "|:---|:---|:---:|:---:|:---:|:---:|"
+    )
+    val sprtRows = report.pairwise.map { p =>
+      val verdict = p.result.verdict match
+        case Sprt.Verdict.AcceptH1 => s"✅ **Accept H1** (`${p.perspective}` is stronger)"
+        case Sprt.Verdict.AcceptH0 => s"❌ **Accept H0** (`${p.perspective}` is not stronger)"
+        case Sprt.Verdict.Continue => "⏳ **Continue** (need more games)"
+      val pen        = p.pairs
+      val pairsStr   = s"[${pen.n0}, ${pen.n1}, ${pen.n2}, ${pen.n3}, ${pen.n4}]"
+      val singlesStr = s"${p.singles.wins} / ${p.singles.draws} / ${p.singles.losses}"
+      val boundsStr  = line("[%.2f, %.2f]", p.result.lower, p.result.upper)
+      line(
+        "| `%s` vs `%s` | %s | %s | %s | %+.2f | %s |",
+        p.perspective,
+        p.opponent,
+        verdict,
+        pairsStr,
+        singlesStr,
+        p.result.llr,
+        boundsStr
+      )
+    }
+
+    (frontmatter ++ summary ++ rankingHeader ++ rankingRows ++ sprtHeader ++ sprtRows)
       .mkString("\n")

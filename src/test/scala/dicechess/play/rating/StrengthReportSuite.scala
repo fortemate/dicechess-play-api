@@ -230,3 +230,52 @@ class StrengthReportSuite extends munit.FunSuite:
     assertEquals(posOptions.config.elo1, 30.0)
     assertEquals(posOptions.config.alpha, 0.02)
     assertEquals(posOptions.config.beta, 0.03)
+
+  test("LadderReportMain.parseOptions filters non-positive window values"):
+    val zeroWindow = LadderReportMain.parseOptions(List("window=0"))
+    assertEquals(zeroWindow.config.windowDays, None)
+
+    val negWindow = LadderReportMain.parseOptions(List("window=-5"))
+    assertEquals(negWindow.config.windowDays, None)
+
+    val validWindow = LadderReportMain.parseOptions(List("window=14"))
+    assertEquals(validWindow.config.windowDays, Some(14))
+
+  test("StrengthReport.build validates category and handles default fallback vs mismatched custom set"):
+    val games = pair("p1", -1)
+
+    // Default config (AnchorSet.Default has category="blitz") with Rapid category falls back to unanchored
+    val rapidReport = StrengthReport.build(games, RatingCategory.Rapid)
+    assertEquals(rapidReport.anchored.anchorSetVersion, "unanchored-rapid")
+    assert(!rapidReport.anchored.isCalibrated)
+
+    // Explicit custom anchor set with mismatched category throws IllegalArgumentException
+    val mismatchedSet = AnchorSet("custom-blitz", 1, "blitz", Nil)
+    intercept[IllegalArgumentException] {
+      StrengthReport.build(games, RatingCategory.Rapid, StrengthReport.Config(anchorSet = mismatchedSet))
+    }
+
+  test("Provisional bots render caveats and badges when no bots reach admission thresholds"):
+    // Under-threshold games: only 2 games between two provisional bots
+    val games  = pair("p1", -1)
+    val report = StrengthReport.build(
+      games,
+      RatingCategory.Default,
+      StrengthReport.Config(minGamesForAdmission = 50, minOpponentsForAdmission = 5)
+    )
+
+    assertEquals(report.anchored.admitted, Nil)
+    assert(report.anchored.provisional.nonEmpty)
+
+    val text =
+      StrengthReport.render(report, StrengthReport.Config(minGamesForAdmission = 50, minOpponentsForAdmission = 5))
+    assert(text.contains("--- Provisional bots (< 50 games or < 5 opponents) ---"))
+    assert(text.contains("[Provisional]"))
+
+    val md = StrengthReport.renderMarkdown(
+      report,
+      StrengthReport.Config(minGamesForAdmission = 50, minOpponentsForAdmission = 5)
+    )
+    assert(md.contains("### Provisional Bots"))
+    assert(md.contains("fewer than 50 games or fewer than 5 distinct opponents"))
+    assert(md.contains("`[Provisional]`"))

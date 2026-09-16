@@ -1,6 +1,7 @@
 package dicechess.play.rating
 
 import dicechess.play.core.{Principal, RatingCategory}
+import dicechess.play.rating.GraphConnectivity.AdmissionStatus
 import dicechess.play.store.GameResultRow
 
 import java.time.Instant
@@ -20,11 +21,36 @@ final case class StrengthReport(
       */
     category: RatingCategory,
     pairwise: List[StrengthReport.Pairwise],
-    ranking: List[BradleyTerry.Ranked],
+    ranking: List[AnchoredStrength.RankedBot],
     completePairs: Int,
     singles: Int,
-    excludedRows: Int
-)
+    excludedRows: Int,
+    anchored: AnchoredStrength.Result
+) {
+  def this(
+      category: RatingCategory,
+      pairwise: List[StrengthReport.Pairwise],
+      ranking: List[AnchoredStrength.RankedBot],
+      completePairs: Int,
+      singles: Int,
+      excludedRows: Int
+  ) = this(
+    category,
+    pairwise,
+    ranking,
+    completePairs,
+    singles,
+    excludedRows,
+    AnchoredStrength.Result(
+      epoch = 1,
+      anchorSetVersion = "v1.0",
+      admitted = ranking,
+      provisional = Nil,
+      disconnected = Nil,
+      connectivity = GraphConnectivity.Result(Map.empty, Map.empty, Map.empty, Set.empty, Set.empty, Nil)
+    )
+  )
+}
 
 object StrengthReport:
 
@@ -45,7 +71,11 @@ object StrengthReport:
       alpha: Double = 0.05,
       beta: Double = 0.05,
       bootstrapIterations: Int = 1000,
-      seed: Long = 42L
+      seed: Long = 42L,
+      anchorSet: AnchorSet = AnchorSet.Default,
+      windowDays: Option[Int] = None,
+      minGamesForAdmission: Int = GraphConnectivity.DefaultMinGames,
+      minOpponentsForAdmission: Int = GraphConnectivity.DefaultMinOpponents
   )
 
   object Config:
@@ -66,7 +96,8 @@ object StrengthReport:
         elo1Raw: Option[String],
         alphaRaw: Option[String],
         betaRaw: Option[String],
-        bootstrapIterationsRaw: Option[String]
+        bootstrapIterationsRaw: Option[String],
+        windowDaysRaw: Option[String] = None
     ): Config =
       val (elo0, elo1) = eloPair(elo0Raw, elo1Raw)
       Config(
@@ -75,7 +106,8 @@ object StrengthReport:
         alpha = alphaRaw.flatMap(_.toDoubleOption).filter(a => a > 0.0 && a < 1.0).getOrElse(Default.alpha),
         beta = betaRaw.flatMap(_.toDoubleOption).filter(b => b > 0.0 && b < 1.0).getOrElse(Default.beta),
         bootstrapIterations =
-          bootstrapIterationsRaw.flatMap(_.toIntOption).filter(_ > 0).getOrElse(Default.bootstrapIterations)
+          bootstrapIterationsRaw.flatMap(_.toIntOption).filter(_ > 0).getOrElse(Default.bootstrapIterations),
+        windowDays = windowDaysRaw.flatMap(_.toIntOption).filter(_ > 0)
       )
 
     /** `elo0`/`elo1` are [[Sprt.test]]'s ordered H0/H1 bounds ("stronger by <= elo0" vs "stronger by >= elo1"): parsing
@@ -100,7 +132,8 @@ object StrengthReport:
         sys.env.get("STRENGTH_ELO1"),
         sys.env.get("STRENGTH_ALPHA"),
         sys.env.get("STRENGTH_BETA"),
-        sys.env.get("STRENGTH_BOOTSTRAP_ITERATIONS")
+        sys.env.get("STRENGTH_BOOTSTRAP_ITERATIONS"),
+        sys.env.get("STRENGTH_WINDOW_DAYS")
       )
 
   /** A usable observation: both seats are registered-bot ids and the game is decided. */
@@ -119,7 +152,18 @@ object StrengthReport:
       category: RatingCategory,
       config: Config = Config()
   ): StrengthReport =
-    val (usable, excluded) = rows.partitionMap { row =>
+    // If windowDays is specified, filter rows to trailing window from the latest game
+    val (activeRows, windowExcluded) = config.windowDays match
+      case Some(days) =>
+        val latest = rows.flatMap(r => Option(r.finishedAt)).maxOption
+        latest match
+          case Some(maxTime) =>
+            val cutoff = maxTime.minus(java.time.Duration.ofDays(days.toLong))
+            rows.partition(r => Option(r.finishedAt).exists(!_.isBefore(cutoff)))
+          case None => (rows, Nil)
+      case None => (rows, Nil)
+
+    val (usable, excluded) = activeRows.partitionMap { row =>
       (
         Principal.fromBotExternalId(row.whiteExternalId),
         Principal.fromBotExternalId(row.blackExternalId),
@@ -192,13 +236,32 @@ object StrengthReport:
     val bootstrapGroups: Seq[Seq[BradleyTerry.Game]] =
       completePairs.map(_.map(toBtGame)) ++ singleGames.map(g => List(toBtGame(g)))
 
+    val effectiveAnchorSet =
+      if config.anchorSet.category == category.wireName then config.anchorSet
+      else if config.anchorSet == AnchorSet.Default then AnchorSet.unanchored(category.wireName)
+      else
+        throw new IllegalArgumentException(
+          s"AnchorSet category '${config.anchorSet.category}' does not match report category '${category.wireName}'"
+        )
+
+    val anchoredConfig = AnchoredStrength.Config(
+      anchorSet = effectiveAnchorSet,
+      minGamesForAdmission = config.minGamesForAdmission,
+      minOpponentsForAdmission = config.minOpponentsForAdmission,
+      bootstrapIterations = config.bootstrapIterations,
+      seed = config.seed
+    )
+
+    val anchoredResult = AnchoredStrength.evaluate(bootstrapGroups, anchoredConfig)
+
     StrengthReport(
       category = category,
       pairwise = pairwise,
-      ranking = BradleyTerry.rankedWithBootstrap(bootstrapGroups, config.bootstrapIterations, config.seed),
+      ranking = anchoredResult.allConnected,
       completePairs = completePairs.size,
       singles = singleGames.size,
-      excludedRows = excluded.size
+      excludedRows = excluded.size + windowExcluded.size,
+      anchored = anchoredResult
     )
 
   private def toBtGame(game: BotGame): BradleyTerry.Game =
@@ -254,12 +317,53 @@ object StrengthReport:
         verdict
       )
     }
-    val rankLines = report.ranking.zipWithIndex.map { (r, i) =>
+
+    val poolHeader = if report.anchored.admitted.nonEmpty then
+      val calib = if report.anchored.isCalibrated then "" else " (uncalibrated scale)"
+      List(
+        "",
+        s"--- Pool ranking (Bradley-Terry, anchor set ${report.anchored.anchorSetVersion}, epoch ${report.anchored.epoch}$calib) ---"
+      )
+    else List("", "--- Pool ranking (Bradley-Terry, relative elo, bootstrap 95% CI) ---")
+
+    val rankRows  = if report.anchored.admitted.nonEmpty then report.anchored.admitted else report.ranking
+    val rankLines = rankRows.zipWithIndex.map { (r, i) =>
+      val badge =
+        if r.isAnchor then " [Anchor]"
+        else if report.anchored.admitted.isEmpty && r.status.isInstanceOf[AdmissionStatus.Provisional] then
+          " [Provisional]"
+        else ""
       val los = r.losVsNext.map(v => line("  LOS vs next %.1f%%", v * 100)).getOrElse("")
-      line("%2d. %-18s %+7.1f  [%+7.1f, %+7.1f]%s", i + 1, r.player, r.elo, r.ciLow, r.ciHigh, los)
+      line("%2d. %-18s%-15s %+7.1f  [%+7.1f, %+7.1f]%s", i + 1, r.player, badge, r.elo, r.ciLow, r.ciHigh, los)
     }
+
+    val provisionalLines = if report.anchored.provisional.nonEmpty then
+      List(
+        "",
+        s"--- Provisional bots (< ${config.minGamesForAdmission} games or < ${config.minOpponentsForAdmission} opponents) ---"
+      ) ++
+        report.anchored.provisional.map { r =>
+          line(
+            " -  %-18s %+7.1f  [%+7.1f, %+7.1f]  (%d games, %d opponents)",
+            r.player,
+            r.elo,
+            r.ciLow,
+            r.ciHigh,
+            r.games,
+            r.opponents
+          )
+        }
+    else Nil
+
+    val disconnectedLines = if report.anchored.disconnected.nonEmpty then
+      List("", "--- Disconnected bots (no path to anchor set) ---") ++
+        report.anchored.disconnected.map { r =>
+          line(" ?  %-18s (%d games, %d opponents)", r.player, r.games, r.opponents)
+        }
+    else Nil
+
     (header ++ List("--- Pairwise SPRT (pentanomial on CRN pairs) ---") ++ pairLines ++
-      List("", "--- Pool ranking (Bradley-Terry, relative elo, bootstrap 95% CI) ---") ++ rankLines)
+      poolHeader ++ rankLines ++ provisionalLines ++ disconnectedLines)
       .mkString("\n")
 
   /** Owner-facing Markdown rendering formatted for the internal knowledge base (Quartz / GitHub Flavored Markdown). */
@@ -277,6 +381,13 @@ object StrengthReport:
       ""
     )
 
+    val windowInfo =
+      config.windowDays.fold("- **Window:** All history (static control)")(w => s"- **Window:** Trailing $w days")
+    val scaleInfo =
+      if report.anchored.isCalibrated then
+        s"- **Scale epoch:** `${report.anchored.epoch}` (Anchor Set `${report.anchored.anchorSetVersion}`)"
+      else
+        s"- **Scale epoch:** `${report.anchored.epoch}` (Anchor Set `${report.anchored.anchorSetVersion}`, uncalibrated)"
     val summary = List(
       "# Bot Strength Report",
       "",
@@ -284,6 +395,8 @@ object StrengthReport:
       "> Uses the Bradley-Terry model with bootstrap confidence intervals and Sequential Probability Ratio Tests (SPRT).",
       "",
       s"- **Rating scale:** `${report.category.wireName}`",
+      scaleInfo,
+      windowInfo,
       line(
         "- **Observations:** %d complete pairs, %d singles (excluded rows: %d)",
         report.completePairs,
@@ -307,10 +420,46 @@ object StrengthReport:
       "| Rank | Bot | Relative Elo | 95% Confidence Interval | LOS vs Next |",
       "|:---:|:---|:---:|:---:|:---:|"
     )
-    val rankingRows = report.ranking.zipWithIndex.map { (r, i) =>
+    val rankEntries = if report.anchored.admitted.nonEmpty then report.anchored.admitted else report.ranking
+    val rankingRows = rankEntries.zipWithIndex.map { (r, i) =>
+      val anchorBadge =
+        if r.isAnchor then " `[Anchor]`"
+        else if report.anchored.admitted.isEmpty && r.status.isInstanceOf[AdmissionStatus.Provisional] then
+          " `[Provisional]`"
+        else ""
       val los = r.losVsNext.map(v => line("%.1f%%", v * 100)).getOrElse("—")
-      line("| %d | `%s` | %+.1f | [%+.1f, %+.1f] | %s |", i + 1, r.player, r.elo, r.ciLow, r.ciHigh, los)
+      line("| %d | `%s`%s | %+.1f | [%+.1f, %+.1f] | %s |", i + 1, r.player, anchorBadge, r.elo, r.ciLow, r.ciHigh, los)
     }
+
+    val provisionalSection = if report.anchored.provisional.nonEmpty then
+      List(
+        "",
+        "### Provisional Bots",
+        "",
+        "> [!note]",
+        s"> These bots have fewer than ${config.minGamesForAdmission} games or fewer than ${config.minOpponentsForAdmission} distinct opponents. Their estimates are provisional.",
+        "",
+        "| Bot | Relative Elo | 95% Confidence Interval | Games | Opponents |",
+        "|:---|:---:|:---:|:---:|:---:|"
+      ) ++ report.anchored.provisional.map { r =>
+        line("| `%s` | %+.1f | [%+.1f, %+.1f] | %d | %d |", r.player, r.elo, r.ciLow, r.ciHigh, r.games, r.opponents)
+      }
+    else Nil
+
+    val disconnectedSection = if report.anchored.disconnected.nonEmpty then
+      List(
+        "",
+        "### Disconnected Bots",
+        "",
+        "> [!warning]",
+        "> These bots do not have a comparison path to the anchor set and do not receive a global ladder rank.",
+        "",
+        "| Bot | Games | Opponents |",
+        "|:---|:---:|:---:|"
+      ) ++ report.anchored.disconnected.map { r =>
+        line("| `%s` | %d | %d |", r.player, r.games, r.opponents)
+      }
+    else Nil
 
     val sprtHeader = List(
       "",
@@ -340,5 +489,5 @@ object StrengthReport:
       )
     }
 
-    (frontmatter ++ summary ++ rankingHeader ++ rankingRows ++ sprtHeader ++ sprtRows)
+    (frontmatter ++ summary ++ rankingHeader ++ rankingRows ++ provisionalSection ++ disconnectedSection ++ sprtHeader ++ sprtRows)
       .mkString("\n")

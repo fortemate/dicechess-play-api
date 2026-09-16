@@ -3,7 +3,7 @@ package dicechess.play.rating
 import cats.effect.IO
 import cats.effect.std.Console
 import cats.syntax.all.*
-import dicechess.play.core.{Principal, RatingCategory, Termination}
+import dicechess.play.core.{Principal, RatingCategory, RatingDomain, RatingPolicy, Seat, Termination}
 import dicechess.play.ingest.PlaysiteIngest
 import dicechess.play.store.{
   BotRating,
@@ -49,7 +49,9 @@ final class RatingBatch private (
     userStore: UserStore,
     ratingStore: RatingStore,
     resultsStore: GameResultsStore,
-    config: RatingBatch.Config
+    config: RatingBatch.Config,
+    policy: RatingPolicy,
+    anchorSet: AnchorSet
 ):
 
   /** One batch tick: drain the queue page by page until a short page says it is drained. */
@@ -100,21 +102,112 @@ final class RatingBatch private (
             case (None, None) =>
               skip(row, s"uncategorised time control '${row.timeControl}' belongs to no rating scale")
             case (None, Some(category)) =>
-              ratingUpdates(category, w, b, whiteScore, blackScore).flatMap: (whiteUpdate, blackUpdate) =>
-                // Both states travel to the store, not just the new one (#296): the movement is recorded on the
-                // game's own row, and `before` is only knowable here — the moment after this write, the tables carry
-                // `after`.
-                ratingStore.applyRatingUpdate(
-                  row.gameId,
-                  whiteUpdate,
-                  blackUpdate
-                ) *>
-                  parkIfOnLadder(w, row) *> parkIfOnLadder(b, row)
+              val isTraining = policy match
+                case RatingPolicy.Legacy => false
+                case RatingPolicy.Matrix =>
+                  row.ratingDomain match
+                    case Some(RatingDomain.Training)    => true
+                    case Some(RatingDomain.Competitive) => false
+                    case _                              =>
+                      (w, b) match
+                        case (_: RatingBatch.Participant.OfUser, _: RatingBatch.Participant.OfBot) => true
+                        case (_: RatingBatch.Participant.OfBot, _: RatingBatch.Participant.OfUser) => true
+                        case _                                                                     => false
+
+              if isTraining then applyTrainingGame(row, category, w, b, whiteScore)
+              else applyCompetitiveGame(row, category, w, b, whiteScore, blackScore)
         case (Some(_), Some(_), None) => skip(row, "no definite result")
         case _                        =>
           // All three causes named: an operator reading this for a deleted account (#237 makes that reachable — the
           // user: id outlives the row) must not be told it was a guest.
           skip(row, "a participant has no rating state (a guest, an unregistered bot, or a deleted account)")
+    }
+
+  private def applyCompetitiveGame(
+      row: GameResultRow,
+      category: RatingCategory,
+      white: RatingBatch.Participant,
+      black: RatingBatch.Participant,
+      whiteScore: Double,
+      blackScore: Double
+  ): IO[Unit] =
+    val botChallengeUnderMatrix = policy == RatingPolicy.Matrix && ((white, black) match
+      case (_: RatingBatch.Participant.OfBot, _: RatingBatch.Participant.OfBot) => !row.ladder
+      case _                                                                    => false)
+
+    if botChallengeUnderMatrix then
+      skip(row, "unpaired bot-vs-bot challenge carries no canonical rating under matrix policy")
+    else
+      ratingUpdates(category, white, black, whiteScore, blackScore).flatMap: (whiteUpdate, blackUpdate) =>
+        // Both states travel to the store, not just the new one (#296): the movement is recorded on the
+        // game's own row, and `before` is only knowable here — the moment after this write, the tables carry
+        // `after`.
+        ratingStore.applyRatingUpdate(
+          row.gameId,
+          whiteUpdate,
+          blackUpdate
+        ) *>
+          parkIfOnLadder(white, row) *> parkIfOnLadder(black, row)
+
+  private def applyTrainingGame(
+      row: GameResultRow,
+      category: RatingCategory,
+      white: RatingBatch.Participant,
+      black: RatingBatch.Participant,
+      whiteScore: Double
+  ): IO[Unit] =
+    (white, black) match
+      case (user: RatingBatch.Participant.OfUser, bot: RatingBatch.Participant.OfBot) =>
+        applyTraining(row, category, user, bot, humanIsWhite = true, humanScore = whiteScore)
+      case (bot: RatingBatch.Participant.OfBot, user: RatingBatch.Participant.OfUser) =>
+        applyTraining(row, category, user, bot, humanIsWhite = false, humanScore = 1.0 - whiteScore)
+      case _ =>
+        skip(row, "training domain requires exactly one human and one bot participant")
+
+  private def applyTraining(
+      row: GameResultRow,
+      category: RatingCategory,
+      user: RatingBatch.Participant.OfUser,
+      bot: RatingBatch.Participant.OfBot,
+      humanIsWhite: Boolean,
+      humanScore: Double
+  ): IO[Unit] =
+    ratingStore.categoryRatingsOf(bot.identity).flatMap { storedRatings =>
+      val botKey    = s"${bot.bot.team}/${bot.bot.name}"
+      val botRefOpt = TrainingEstimate.resolveBotReference(
+        botKey = botKey,
+        category = category,
+        anchorSet = anchorSet,
+        storedBotRating = storedRatings.get(category)
+      )
+      botRefOpt match
+        case None =>
+          skip(row, s"no reference bot rating for $botKey in category '${category.wireName}'")
+        case Some(botRef) =>
+          ratingStore.trainingStateOf(user.userId, category).flatMap { currentTrainingState =>
+            val nextState = TrainingEstimate.update(
+              current = currentTrainingState,
+              botReference = botRef,
+              humanIsWhite = humanIsWhite,
+              score = humanScore,
+              gameTime = row.finishedAt
+            )
+            val userUpdate = RatingUpdate(
+              identity = user.identity,
+              category = category,
+              before = currentTrainingState.glicko,
+              after = nextState.glicko
+            )
+            val botSeat = if humanIsWhite then Seat.Black else Seat.White
+            ratingStore.applyTrainingUpdate(
+              gameId = row.gameId,
+              userUpdate = userUpdate,
+              botSeat = botSeat,
+              botRefRating = botRef.rating,
+              score = humanScore,
+              finishedAt = row.finishedAt
+            )
+          }
     }
 
   /** The Glicko-2 rating update for one game (#280) on the scale the game's own time control belongs to, against both
@@ -242,9 +335,11 @@ object RatingBatch:
       userStore: UserStore,
       ratingStore: RatingStore,
       resultsStore: GameResultsStore,
-      config: Config
+      config: Config,
+      policy: RatingPolicy = RatingPolicy.fromEnv,
+      anchorSet: AnchorSet = AnchorSet.Default
   ): IO[RatingBatch] =
-    IO.pure(new RatingBatch(botStore, userStore, ratingStore, resultsStore, config))
+    IO.pure(new RatingBatch(botStore, userStore, ratingStore, resultsStore, config, policy, anchorSet))
 
   /** The stored `termination` value that counts towards a park streak, taken from the same mapping that WROTE the
     * column (`PgGameStore.finishedGameOf`) rather than spelled out again here: a literal would let the two drift, and

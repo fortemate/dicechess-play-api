@@ -59,12 +59,51 @@ object Glicko2:
     */
   val ConservativeOrderingK: Double = 2.0
 
+  /** First-move White advantage adjustment (+25.0 Elo) approved by comparison gate #148 / ADR 008 / #170. */
+  val DefaultWhiteAdvantage: Double = 25.0
+
+  /** Default inactivity inflation constant c (10.0 Elo / sqrt(day)) approved in gate #148 evaluation. */
+  val DefaultIdleEloPerSqrtDay: Double = 10.0
+
+  /** Standard normal multiplier z for a 95% two-sided confidence interval (approx 1.96). */
+  val ConfidenceLevel95Z: Double = 1.96
+
   /** The board's ordering key: the conservative estimate `rating − k·RD`. In ONE place (shared by the SQL `ORDER BY`s
     * through interpolation of [[ConservativeOrderingK]] and by the routes' merged re-sort through this function) so the
     * two orderings cannot drift.
     */
   def conservativeRating(rating: Double, deviation: Double): Double =
     rating - ConservativeOrderingK * deviation
+
+  /** Symmetric 95% confidence interval [rating - 1.96*RD, rating + 1.96*RD]. */
+  def confidenceInterval95(rating: Double, deviation: Double): (Double, Double) =
+    (rating - ConfidenceLevel95Z * deviation, rating + ConfidenceLevel95Z * deviation)
+
+  /** Adjusts opponent state for directional first-move White advantage (+25.0 Elo). When player is White: opponent
+    * effective reference rating is shifted by -whiteAdvantage. When player is Black: opponent effective reference
+    * rating is shifted by +whiteAdvantage.
+    */
+  def withWhiteAdvantage(
+      opponent: Glicko,
+      playerIsWhite: Boolean,
+      whiteAdvantage: Double = DefaultWhiteAdvantage
+  ): Glicko =
+    val shift = if playerIsWhite then -whiteAdvantage else whiteAdvantage
+    opponent.copy(rating = opponent.rating + shift)
+
+  /** Inflates rating deviation (RD) for an inactive player given elapsed idle days: RD' = min(RD_0, sqrt(RD^2 + c^2 *
+    * idleDays)) where RD_0 = Glicko.Initial.deviation (350.0).
+    */
+  def inflateIdleDeviation(
+      deviation: Double,
+      idleDays: Double,
+      idleEloPerSqrtDay: Double = DefaultIdleEloPerSqrtDay,
+      maxDeviation: Double = Glicko.Initial.deviation
+  ): Double =
+    if idleDays <= 0.0 || idleEloPerSqrtDay <= 0.0 then deviation
+    else
+      val variance = deviation * deviation + idleEloPerSqrtDay * idleEloPerSqrtDay * idleDays
+      math.min(maxDeviation, math.sqrt(variance))
 
   /** One game from the updating player's point of view: the opponent's PRE-game state and the score (1.0 win, 0.5 draw,
     * 0.0 loss).

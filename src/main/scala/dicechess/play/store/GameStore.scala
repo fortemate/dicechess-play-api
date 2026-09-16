@@ -4,6 +4,7 @@ import cats.effect.IO
 import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.ingest.PlaysiteIngest
+import scala.annotation.unused
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.syntax.*
 import io.circe.{Codec, Decoder, Encoder, Json, JsonObject, KeyDecoder, KeyEncoder}
@@ -604,7 +605,8 @@ final case class GameResultRow(
     // The surface the game was created from (ADR-005, #47) — `Showcase` for the singleton table, `Legacy` for every
     // row that predates origin tracking. Alongside `ladder`, never instead of it: the flag keeps its exact meaning and
     // every reader of it is untouched. Defaulted so the pre-#47 positional constructors still compile.
-    origin: GameOrigin = GameOrigin.Legacy
+    origin: GameOrigin = GameOrigin.Legacy,
+    ratingDomain: Option[RatingDomain] = None
 ):
   /** Whether this row is a sporting result — one a win/draw/loss score may count (ADR-005 §8). A technical abort is
     * recorded here for the operational record but has no outcome (`result = None`, `termination = "aborted"`), and that
@@ -807,6 +809,30 @@ trait RatingStore:
     * — the client asks about the game it just played, so this is keyed by game, never by player.
     */
   def ratingChangeFor(gameId: GameId): IO[Option[GameRatingChange]]
+
+  /** A user's training state in one category (#149), or `TrainingState.Initial` if unrated. */
+  def trainingStateOf(
+      @unused userId: String,
+      @unused category: RatingCategory
+  ): IO[dicechess.play.rating.TrainingState] =
+    IO.pure(dicechess.play.rating.TrainingState.Initial)
+
+  /** All categories a user has trained in (#149). Sparse map: unplayed categories are absent. */
+  def trainingStatesOf(@unused userId: String): IO[Map[RatingCategory, dicechess.play.rating.TrainingState]] =
+    IO.pure(Map.empty)
+
+  /** Atomically write human participant's post-game training state into `user_training_ratings`, record the movement
+    * and bot reference on the game's own row in `game_results`, and stamp the game as applied (#149). Bot ratings and
+    * human competitive ratings are untouched.
+    */
+  def applyTrainingUpdate(
+      @unused gameId: GameId,
+      @unused userUpdate: RatingUpdate,
+      @unused botSeat: Seat,
+      @unused botRefRating: Double,
+      @unused score: Double,
+      @unused finishedAt: java.time.Instant
+  ): IO[Unit] = IO.unit
 
 /** A bot's rated, decided W-D-L record from `game_results` (undecided/casual games are excluded — this is the ladder
   * record, not a lifetime activity counter).

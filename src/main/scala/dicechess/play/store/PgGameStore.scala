@@ -27,7 +27,7 @@ import dicechess.play.core.{
   WebhookCapability
 }
 import dicechess.play.ingest.PlaysiteIngest
-import dicechess.play.rating.{Glicko, Glicko2}
+import dicechess.play.rating.{Glicko, Glicko2, TrainingState}
 import io.circe.Json
 import io.circe.syntax.*
 import org.flywaydb.core.Flyway
@@ -2575,14 +2575,14 @@ final class PgGameStore private (xa: HikariTransactor[IO])
     */
   def recentResultsFor(externalId: String, limit: Int): IO[List[GameResultRow]] =
     sql"""(SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                  server_seed, pairing_id::text, ladder, finished_at, origin
+                  server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
            FROM play.game_results
            WHERE white_external_id = $externalId
            ORDER BY finished_at DESC
            LIMIT ${limit.toLong})
           UNION
           (SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                  server_seed, pairing_id::text, ladder, finished_at, origin
+                  server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
            FROM play.game_results
            WHERE black_external_id = $externalId
            ORDER BY finished_at DESC
@@ -2597,7 +2597,7 @@ final class PgGameStore private (xa: HikariTransactor[IO])
 
   def finishedRatedSince(since: Instant): IO[List[GameResultRow]] =
     sql"""SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                 server_seed, pairing_id::text, ladder, finished_at, origin
+                 server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
           FROM play.game_results
           WHERE rated = true AND finished_at > $since
           ORDER BY finished_at ASC"""
@@ -2641,7 +2641,7 @@ final class PgGameStore private (xa: HikariTransactor[IO])
     // checking parameter types altogether, which is the only way doobie reports a genuinely wrong binding too. The
     // store's own API keeps `limit: Int`, because a page size is not a Long; only the binding speaks the schema's type.
     fr"""SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                server_seed, pairing_id::text, ladder, finished_at, origin
+                server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
          FROM play.game_results
           WHERE""" ++ where ++ fr" ORDER BY finished_at DESC LIMIT ${fetchLimit.toLong}"
 
@@ -2776,9 +2776,9 @@ final class PgGameStore private (xa: HikariTransactor[IO])
 
   def unappliedRatedGames(limit: Int): IO[List[GameResultRow]] =
     sql"""SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
-                 server_seed, pairing_id::text, ladder, finished_at, origin
+                 server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
           FROM play.game_results
-          WHERE rated = true AND rating_applied_at IS NULL
+          WHERE (rated = true OR rating_domain = 'training') AND rating_applied_at IS NULL
           ORDER BY finished_at ASC
           LIMIT ${limit.toLong}"""
       .query[PgGameStore.ResultTuple]
@@ -2858,6 +2858,83 @@ final class PgGameStore private (xa: HikariTransactor[IO])
       .map(_.flatMap { case (category, rating, rd, vol) =>
         RatingCategory.fromWireName(category).map(_ -> Glicko(rating, rd, vol))
       }.toMap)
+
+  override def trainingStateOf(userId: String, category: RatingCategory): IO[TrainingState] =
+    sql"""SELECT rating, rd, vol, games, wins, draws, losses, updated_at
+          FROM play.user_training_ratings
+          WHERE user_id = $userId::uuid AND category = ${category.wireName}"""
+      .query[(Double, Double, Double, Int, Int, Int, Int, Instant)]
+      .option
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.fold(TrainingState.Initial) { case (r, rd, v, g, w, d, l, u) =>
+        TrainingState(r, rd, v, g, w, d, l, Some(u))
+      })
+
+  override def trainingStatesOf(userId: String): IO[Map[RatingCategory, TrainingState]] =
+    sql"""SELECT category, rating, rd, vol, games, wins, draws, losses, updated_at
+          FROM play.user_training_ratings
+          WHERE user_id = $userId::uuid"""
+      .query[(String, Double, Double, Double, Int, Int, Int, Int, Instant)]
+      .to[List]
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.flatMap { case (catStr, r, rd, v, g, w, d, l, u) =>
+        RatingCategory.fromWireName(catStr).map(_ -> TrainingState(r, rd, v, g, w, d, l, Some(u)))
+      }.toMap)
+
+  override def applyTrainingUpdate(
+      gameId: GameId,
+      userUpdate: RatingUpdate,
+      botSeat: Seat,
+      botRefRating: Double,
+      score: Double,
+      finishedAt: Instant
+  ): IO[Unit] =
+    val userId = userUpdate.identity match
+      case RatedIdentity.User(id) => id
+      case other => throw new IllegalArgumentException(s"training update requires user identity, got: $other")
+    val glicko = userUpdate.after
+    val isWin  = if score > 0.75 then 1 else 0
+    val isDraw = if score >= 0.25 && score <= 0.75 then 1 else 0
+    val isLoss = if score < 0.25 then 1 else 0
+
+    val updateTrainingState: ConnectionIO[Unit] =
+      sql"""INSERT INTO play.user_training_ratings (user_id, category, rating, rd, vol, games, wins, draws, losses, updated_at)
+            SELECT u.id, ${userUpdate.category.wireName},
+                   ${glicko.rating}, ${glicko.deviation}, ${glicko.volatility},
+                   1, $isWin, $isDraw, $isLoss, $finishedAt
+            FROM play.users u WHERE u.id = $userId::uuid
+            ON CONFLICT (user_id, category)
+            DO UPDATE SET rating = EXCLUDED.rating,
+                          rd = EXCLUDED.rd,
+                          vol = EXCLUDED.vol,
+                          games = play.user_training_ratings.games + 1,
+                          wins = play.user_training_ratings.wins + EXCLUDED.wins,
+                          draws = play.user_training_ratings.draws + EXCLUDED.draws,
+                          losses = play.user_training_ratings.losses + EXCLUDED.losses,
+                          updated_at = EXCLUDED.updated_at""".update.run.void
+
+    val (wBefore, wAfter, bBefore, bAfter) = botSeat match
+      case Seat.White =>
+        (Some(botRefRating), Some(botRefRating), Some(userUpdate.before.rating), Some(userUpdate.after.rating))
+      case Seat.Black =>
+        (Some(userUpdate.before.rating), Some(userUpdate.after.rating), Some(botRefRating), Some(botRefRating))
+      case other =>
+        throw new IllegalArgumentException(s"botSeat must be White or Black, got: $other")
+
+    val stampRow: ConnectionIO[Unit] =
+      sql"""UPDATE play.game_results
+            SET rating_applied_at = now(),
+                white_rating_before = $wBefore,
+                white_rating_after = $wAfter,
+                black_rating_before = $bBefore,
+                black_rating_after = $bAfter,
+                rating_outcome = ${RatingOutcome.Applied.wireName},
+                rating_skip_reason = NULL
+            WHERE game_id = ${gameId.value}::uuid""".update.run.void
+
+    (updateTrainingState *> stampRow).transact(xa).timeout(SaveTimeout)
 
   /** One participant's rating write (#280), an upsert because the tables are sparse: the first rated game a participant
     * plays in a category creates its row, every later one updates it.
@@ -3560,6 +3637,7 @@ object PgGameStore:
         Option[String],
         Boolean,
         Instant,
+        String,
         String
     )
 
@@ -3576,11 +3654,12 @@ object PgGameStore:
       pairingId,
       ladder,
       finishedAt,
-      origin
+      origin,
+      ratingDomain
     ) = t
     // `game_results.result` is a smallint, read as such so the checker holds every query to the schema's own types;
     // the domain row exposes the Int the rest of the server reasons in.
-    // Named, not positional: twelve arguments of which five are String and two Boolean, so a field reorder in
+    // Named, not positional: thirteen arguments of which six are String and two Boolean, so a field reorder in
     // `GameResultRow` would bind the wrong values here and still compile.
     GameResultRow(
       gameId = GameId(gameId),
@@ -3594,7 +3673,8 @@ object PgGameStore:
       pairingId = pairingId,
       ladder = ladder,
       finishedAt = finishedAt,
-      origin = storedOrigin(origin)
+      origin = storedOrigin(origin),
+      ratingDomain = RatingDomain.fromWireName(ratingDomain)
     )
 
   /** Decode an `origin` column at the persistence boundary. The V5 CHECK constraints pin the column to

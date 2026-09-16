@@ -51,8 +51,11 @@ object AnchoredStrength:
       admitted: List[RankedBot],
       provisional: List[RankedBot],
       disconnected: List[RankedBot],
-      connectivity: GraphConnectivity.Result
+      connectivity: GraphConnectivity.Result,
+      appliedOffset: Option[Double] = None
   ):
+    val isCalibrated: Boolean = appliedOffset.isDefined
+
     /** Combined ranking of admitted followed by provisional bots. */
     val allConnected: List[RankedBot] = admitted ++ provisional
 
@@ -101,14 +104,16 @@ object AnchoredStrength:
             opponents = connectivity.opponentCounts.getOrElse(p, 0)
           )
         },
-        connectivity = connectivity
+        connectivity = connectivity,
+        appliedOffset = None
       )
     else
       // 1. Raw Bradley-Terry fit over the connected component
       val rawBaseRatings = BradleyTerry.ratings(connectedGroups.flatten)
 
       // 2. Compute anchor calibration offset
-      val scaleOffset = config.anchorSet.scaleOffset(rawBaseRatings).getOrElse(0.0)
+      val scaleOffsetOpt = config.anchorSet.scaleOffset(rawBaseRatings)
+      val scaleOffset    = scaleOffsetOpt.getOrElse(0.0)
 
       val anchoredBase = rawBaseRatings.map { case (player, rawElo) =>
         player -> (rawElo - scaleOffset)
@@ -119,16 +124,27 @@ object AnchoredStrength:
 
       // 4. Build RankedBot entries
       def makeRanked(player: String, nextPlayer: Option[String]): RankedBot =
-        val elo     = anchoredBase.getOrElse(player, 0.0)
-        val ciLow   = ciLows.getOrElse(player, elo)
-        val ciHigh  = ciHighs.getOrElse(player, elo)
-        val samples = sampleValues.getOrElse(player, Vector.empty)
+        val elo    = anchoredBase.getOrElse(player, 0.0)
+        val ciLow  = ciLows.getOrElse(player, elo)
+        val ciHigh = ciHighs.getOrElse(player, elo)
 
         val los = nextPlayer.flatMap { next =>
-          val nextSamples = sampleValues.getOrElse(next, Vector.empty)
-          val pairs       = samples.zip(nextSamples)
-          if pairs.isEmpty then None
-          else Some(pairs.count((a, b) => a > b).toDouble / pairs.size)
+          (sampleValues.get(player), sampleValues.get(next)) match
+            case (Some(repA), Some(repB)) =>
+              val n     = math.min(repA.length, repB.length)
+              var wins  = 0
+              var total = 0
+              var i     = 0
+              while i < n do
+                val a = repA(i)
+                val b = repB(i)
+                if !a.isNaN && !b.isNaN then
+                  total += 1
+                  if a > b then wins += 1
+                i += 1
+              if total == 0 then None
+              else Some(wins.toDouble / total)
+            case _ => None
         }
 
         RankedBot(
@@ -182,7 +198,8 @@ object AnchoredStrength:
         admitted = admittedRanked,
         provisional = provisionalRanked,
         disconnected = disconnectedRanked,
-        connectivity = connectivity
+        connectivity = connectivity,
+        appliedOffset = scaleOffsetOpt
       )
 
   /** Runs bootstrap resampling over the observation units. */
@@ -190,7 +207,7 @@ object AnchoredStrength:
       groups: Seq[Seq[Game]],
       config: Config,
       baseOffset: Double
-  ): (Map[String, Double], Map[String, Double], Map[String, Vector[Double]]) =
+  ): (Map[String, Double], Map[String, Double], Map[String, Array[Double]]) =
     val groupArray = groups.toArray
     val groupCount = groupArray.length
     if groupCount == 0 || config.bootstrapIterations <= 0 then (Map.empty, Map.empty, Map.empty)
@@ -198,9 +215,10 @@ object AnchoredStrength:
       val rng     = new Random(config.seed)
       val players = groups.flatten.flatMap(g => List(g._1, g._2)).distinct.sorted
 
-      // Reusable accumulator per player for bootstrap samples
-      val playerSamples = mutable.Map.empty[String, mutable.ArrayBuffer[Double]]
-      players.foreach(p => playerSamples(p) = new mutable.ArrayBuffer[Double](config.bootstrapIterations))
+      // Reusable accumulator per player for bootstrap samples:
+      // Replicate order is load-bearing: LOS pairs player samples by iteration index.
+      val playerReplicates = mutable.Map.empty[String, Array[Double]]
+      players.foreach(p => playerReplicates(p) = Array.fill(config.bootstrapIterations)(Double.NaN))
 
       var b = 0
       while b < config.bootstrapIterations do
@@ -216,24 +234,24 @@ object AnchoredStrength:
         val sampleOffset = config.anchorSet.scaleOffset(rawSample).getOrElse(baseOffset)
 
         rawSample.foreach { case (player, rawElo) =>
-          playerSamples.get(player).foreach(_ += (rawElo - sampleOffset))
+          val arr = playerReplicates.get(player)
+          if arr.isDefined then arr.get(b) = rawElo - sampleOffset
         }
         b += 1
 
-      def percentile(sorted: Vector[Double], p: Double): Double =
+      def percentile(sorted: Array[Double], p: Double): Double =
         if sorted.isEmpty then 0.0
-        else sorted(math.min(sorted.size - 1, math.max(0, math.round(p * (sorted.size - 1)).toInt)))
+        else sorted(math.min(sorted.length - 1, math.max(0, math.round(p * (sorted.length - 1)).toInt)))
 
-      val lowsMap    = mutable.Map.empty[String, Double]
-      val highsMap   = mutable.Map.empty[String, Double]
-      val sortedVals = mutable.Map.empty[String, Vector[Double]]
+      val lowsMap  = mutable.Map.empty[String, Double]
+      val highsMap = mutable.Map.empty[String, Double]
 
       players.foreach { p =>
-        val vals = playerSamples(p).toVector.sorted
-        sortedVals(p) = vals
-        if vals.nonEmpty then
-          lowsMap(p) = percentile(vals, 0.025)
-          highsMap(p) = percentile(vals, 0.975)
+        val present = playerReplicates(p).filterNot(_.isNaN)
+        val sorted  = present.sorted
+        if sorted.nonEmpty then
+          lowsMap(p) = percentile(sorted, 0.025)
+          highsMap(p) = percentile(sorted, 0.975)
       }
 
-      (lowsMap.toMap, highsMap.toMap, sortedVals.toMap)
+      (lowsMap.toMap, highsMap.toMap, playerReplicates.toMap)

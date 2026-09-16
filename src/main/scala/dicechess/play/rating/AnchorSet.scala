@@ -26,10 +26,10 @@ final case class AnchorSet(
     *
     * For a set of raw fitted Elos, the anchor offset aligns the weighted average of present anchors to their target
     * Elos:
-    * {{{
-    *   offset = sum(w_a * (rawElo(a) - targetElo(a))) / sum(w_a)
-    *   anchoredElo(p) = rawElo(p) - offset
-    * }}}
+    * ```scala
+    * offset = sum(w_a * (rawElo(a) - targetElo(a))) / sum(w_a)
+    * anchoredElo(p) = rawElo(p) - offset
+    * ```
     * Returns `None` if no anchors from this set are present.
     */
   def scaleOffset(rawElos: Map[String, Double]): Option[Double] =
@@ -64,3 +64,12 @@ object AnchorSet:
 
   /** Default active anchor set across the ladder. */
   val Default: AnchorSet = V1_0
+
+  /** Fallback unanchored anchor set for categories without a pinned baseline. */
+  def unanchored(category: String): AnchorSet =
+    AnchorSet(
+      version = s"unanchored-$category",
+      epoch = 0,
+      category = category,
+      anchors = Nil
+    )

@@ -46,7 +46,7 @@ object LadderReportMain extends IOApp:
       val bootstrapIterations =
         pairs.get("iterations").orElse(pairs.get("bootstrap")).flatMap(_.toIntOption).getOrElse(1000)
       val windowDays =
-        pairs.get("window").orElse(pairs.get("windowdays")).flatMap(_.toIntOption)
+        pairs.get("window").orElse(pairs.get("windowdays")).flatMap(_.toIntOption).filter(_ > 0)
 
       val config = StrengthReport.Config(
         elo0 = elo0,

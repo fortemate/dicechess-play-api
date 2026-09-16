@@ -232,3 +232,31 @@ class AnchoredStrengthSuite extends munit.FunSuite:
       s"Windowed Elo ($windowLearnerElo) should be much higher than lifetime average ($staticLearnerElo)"
     )
     assertEquals(windowReport.excludedRows, oldGames.size, "Old games must be counted as excluded by window")
+
+  test("isCalibrated correctly reflects presence of anchors in the connected component"):
+    // Unanchored games: only custom bots playing each other
+    val unanchoredGames = (1 to 20).map(_ => Seq(game("bot/alpha", "bot/beta", 0.6)))
+    val resUnanchored   = AnchoredStrength.evaluate(unanchoredGames, AnchoredStrength.Config(bootstrapIterations = 20))
+
+    assertEquals(resUnanchored.appliedOffset, None)
+    assert(!resUnanchored.isCalibrated, "Should not be calibrated without anchors in the component")
+
+    // Anchored games: anchorGreedy plays against bot/alpha
+    val anchoredGames = unanchoredGames ++ (1 to 20).map(_ => Seq(game("bot/alpha", anchorGreedy, 0.5)))
+    val resAnchored   = AnchoredStrength.evaluate(anchoredGames, AnchoredStrength.Config(bootstrapIterations = 20))
+
+    assert(resAnchored.appliedOffset.isDefined)
+    assert(resAnchored.isCalibrated, "Should be calibrated when an anchor is present")
+
+  test("Bootstrap LOS pairs replicates without index shifting and reflects superiority"):
+    // bot/strong clearly beats bot/weak (80% score over 40 games)
+    val games = (1 to 40).map(_ => Seq(game("bot/strong", "bot/weak", 0.8)))
+    val res   =
+      AnchoredStrength.evaluate(
+        games,
+        AnchoredStrength.Config(bootstrapIterations = 100, seed = 42L, minGamesForAdmission = 10)
+      )
+
+    val strong = res.allConnected.find(_.player == "bot/strong").get
+    assert(strong.losVsNext.isDefined)
+    assert(strong.losVsNext.get > 0.95, s"Strong bot LOS should be > 0.95, got ${strong.losVsNext.get}")

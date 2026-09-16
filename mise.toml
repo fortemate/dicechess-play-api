@@ -36,7 +36,7 @@ run = 'sbt "testOnly *"'
 
 [tasks."ladder:report"]
 description = "🏆 Print the E.1 strength report (pairwise SPRT + Bradley-Terry pool) — needs PLAY_DB_URL, read-only"
-run = 'sbt "runMain dicechess.play.rating.LadderReportMain"'
+run = "scripts/ladder-report.sh"
 
 [tasks."rating:replay"]
 description = "🔁 Replay the current Glicko-2 implementation over a rating corpus export (#145) — file in, report out, no database"

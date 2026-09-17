@@ -15,6 +15,14 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "chore"
+    groups:
+      # `dicechess-rules` and `dicechess-engine` are published from one repository and
+      # move in lockstep until 1.0: the engine depends on the rules artifact of the same
+      # version, so bumping one alone makes sbt's eviction check fail the build. One PR
+      # keeps the pair aligned.
+      dicechess:
+        patterns:
+          - "com.fortemate:*"
     ignore:
       # sbt 2.x -> 3.x is a breaking major requiring a deliberate, manual migration
       # (plugin compatibility, build definition changes) — not an automated bump.

@@ -49,7 +49,7 @@ val PostgresDriverVersion     = "42.7.13"
 val TestcontainersVersion     = "0.43.0"
 val TestcontainersJavaVersion = "1.21.3"
 val DockerJavaVersion         = "3.7.1"
-val BouncyCastleVersion       = "1.78.1"
+val BouncyCastleVersion       = "1.86"
 
 lazy val root = (project in file("."))
   .enablePlugins(JavaAppPackaging)

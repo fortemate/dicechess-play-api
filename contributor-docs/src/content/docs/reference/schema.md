@@ -46,6 +46,7 @@ erDiagram
     user_guest_links
     user_identities
     user_ratings
+    user_training_ratings
     users
     webhook_admin_authority_generations
     webhook_verification_budgets
@@ -60,6 +61,7 @@ erDiagram
     users ||--o{ user_guest_links : ""
     users ||--o{ user_identities : ""
     users ||--o{ user_ratings : ""
+    users ||--o{ user_training_ratings : ""
 ```
 
 Only foreign keys appear as edges. Thirteen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `nickname_history` and `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
@@ -315,6 +317,7 @@ Indexes:
 - `game_results_pkey` — `CREATE UNIQUE INDEX game_results_pkey ON public.game_results USING btree (game_id)`
 - `game_results_rated_finished_idx` — `CREATE INDEX game_results_rated_finished_idx ON public.game_results USING btree (rated, finished_at)`
 - `game_results_rating_queue_idx` — `CREATE INDEX game_results_rating_queue_idx ON public.game_results USING btree (finished_at) WHERE (rated AND (rating_applied_at IS NULL))`
+- `game_results_training_queue_idx` — `CREATE INDEX game_results_training_queue_idx ON public.game_results USING btree (finished_at) WHERE ((rating_domain = 'training'::text) AND (rating_applied_at IS NULL))`
 - `game_results_white_finished_idx` — `CREATE INDEX game_results_white_finished_idx ON public.game_results USING btree (white_external_id, finished_at DESC)`
 
 ### `games`
@@ -562,6 +565,29 @@ Check constraints:
 Indexes:
 
 - `user_ratings_pkey` — `CREATE UNIQUE INDEX user_ratings_pkey ON public.user_ratings USING btree (user_id, category)`
+
+### `user_training_ratings`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `user_id` | `uuid` | no | — | FK → users(id), PK |
+| `category` | `text` | no | — | PK |
+| `rating` | `double precision` | no | `1500` | — |
+| `rd` | `double precision` | no | `350` | — |
+| `vol` | `double precision` | no | `0.06` | — |
+| `games` | `integer` | no | `0` | — |
+| `wins` | `integer` | no | `0` | — |
+| `draws` | `integer` | no | `0` | — |
+| `losses` | `integer` | no | `0` | — |
+| `updated_at` | `timestamp with time zone` | no | `now()` | — |
+
+Check constraints:
+
+- `CHECK ((category = ANY (ARRAY['bullet'::text, 'blitz'::text, 'rapid'::text])))`
+
+Indexes:
+
+- `user_training_ratings_pkey` — `CREATE UNIQUE INDEX user_training_ratings_pkey ON public.user_training_ratings USING btree (user_id, category)`
 
 ### `users`
 

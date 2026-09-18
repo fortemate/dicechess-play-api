@@ -3,7 +3,7 @@ package dicechess.play.rating
 /** Versioned multi-anchor calibration contract for bot strength (#147, ADR 008, #170).
   *
   * Centering Bradley–Terry on the pool mean (mean = 0) shifts the scale when participants join, leave, or improve. An
-  * anchor set defines a stationary reference frame over immutable, house-hosted baseline strategies with fixed
+  * anchor set defines a stationary reference frame over immutable, operator-hosted baseline strategies with fixed
   * depth/node budgets, no opening books, and pinned engine releases.
   */
 final case class Anchor(
@@ -45,20 +45,29 @@ object AnchorSet:
   /** Anchor Set Version 1.0 for Blitz (#170 specification).
     *
     * Contains 4 immutable benchmark identities spanning beginner to strong amateur:
-    *   1. `house/random` (~ -610 Elo): minimal baseline of legal moves (RandomSearch).
+    *   1. `anchor/random` (~ -610 Elo): minimal baseline of legal moves (RandomSearch).
     *   2. `rabestro/java-baseline` (~ -280 Elo): simple 1-ply ONNX model (dicechess-bot-java).
-    *   3. `house/greedy` (~ -125 Elo): 1-ply static material heuristic (GreedySearch).
-    *   4. `house/aggressive` (~ -35 Elo): 1-ply attack-oriented heuristic without book (AggressiveSearch).
+    *   3. `anchor/greedy` (~ -125 Elo): 1-ply static material heuristic (GreedySearch).
+    *   4. `anchor/aggressive` (~ -35 Elo): 1-ply attack-oriented heuristic without book (AggressiveSearch).
+    *
+    * The team is `anchor`, not `house`, because `house` is a RESERVED team ([[dicechess.play.server.BotAuth]]
+    * `ReservedTeams`) held by the static `PLAY_BOT_TOKENS` roster. Those identities have no `bots` row, so they carry
+    * no rating and no declared capacity and can never be ladder candidates — an anchor that cannot be scheduled cannot
+    * anchor anything. The `anchor` team is self-registrable, which is all these need.
+    *
+    * `rabestro/java-baseline` deliberately keeps its own team: it is already registered and playing, and renaming it
+    * would mint a new identity and throw away the history that makes it an anchor in the first place. An anchor set is
+    * a list of identities, not a team prefix.
     */
   val V1_0: AnchorSet = AnchorSet(
     version = "v1.0",
     epoch = 1,
     category = "blitz",
     anchors = List(
-      Anchor("house/random", -610.0, 0.25, "Built-in RandomSearch (lower boundary of legal play)"),
+      Anchor("anchor/random", -610.0, 0.25, "Built-in RandomSearch (lower boundary of legal play)"),
       Anchor("rabestro/java-baseline", -280.0, 0.25, "1-ply simple ONNX value model (dicechess-bot-java)"),
-      Anchor("house/greedy", -125.0, 0.25, "1-ply static material heuristic (GreedySearch)"),
-      Anchor("house/aggressive", -35.0, 0.25, "1-ply attack heuristic without book (AggressiveSearch)")
+      Anchor("anchor/greedy", -125.0, 0.25, "1-ply static material heuristic (GreedySearch)"),
+      Anchor("anchor/aggressive", -35.0, 0.25, "1-ply attack heuristic without book (AggressiveSearch)")
     )
   )
 

@@ -28,13 +28,13 @@ class TrainingEstimateSuite extends FunSuite:
     val storedNone: Option[Glicko] = None
 
     // Blitz matches anchor set
-    val randomBlitz = TrainingEstimate.resolveBotReference("house/random", RatingCategory.Blitz, anchorSet, storedNone)
+    val randomBlitz = TrainingEstimate.resolveBotReference("anchor/random", RatingCategory.Blitz, anchorSet, storedNone)
     assert(randomBlitz.isDefined)
     assertEquals(randomBlitz.get.rating, 1500.0 - 610.0)                      // 890.0
     assertEquals(randomBlitz.get.deviation, TrainingEstimate.AnchorDeviation) // 50.0
 
     // Rapid does NOT match anchor set V1.0 category (Blitz)
-    val randomRapid = TrainingEstimate.resolveBotReference("house/random", RatingCategory.Rapid, anchorSet, storedNone)
+    val randomRapid = TrainingEstimate.resolveBotReference("anchor/random", RatingCategory.Rapid, anchorSet, storedNone)
     assertEquals(randomRapid, None, "Must never borrow Blitz anchor for Rapid game")
 
     // Stored category rating is used when category matches

@@ -102,20 +102,22 @@ final class RatingBatch private (
             case (None, None) =>
               skip(row, s"uncategorised time control '${row.timeControl}' belongs to no rating scale")
             case (None, Some(category)) =>
-              val isTraining = policy match
-                case RatingPolicy.Legacy => false
-                case RatingPolicy.Matrix =>
-                  row.ratingDomain match
-                    case Some(RatingDomain.Training)    => true
-                    case Some(RatingDomain.Competitive) => false
-                    case _                              =>
-                      (w, b) match
-                        case (_: RatingBatch.Participant.OfUser, _: RatingBatch.Participant.OfBot) => true
-                        case (_: RatingBatch.Participant.OfBot, _: RatingBatch.Participant.OfUser) => true
-                        case _                                                                     => false
-
-              if isTraining then applyTrainingGame(row, category, w, b, whiteScore)
-              else applyCompetitiveGame(row, category, w, b, whiteScore, blackScore)
+              // The STORED domain decides, never the seats' kinds. A row classified before #146 carries
+              // `rating_domain = 'legacy'`, which decodes to `None`, and V9 promised such rows are never
+              // reinterpreted: inferring "human versus bot means training" from the participants would break exactly
+              // that promise, because a legacy human-vs-bot game moved canonical ratings when it was played and that
+              // is what it stays.
+              (policy, row.ratingDomain) match
+                case (RatingPolicy.Matrix, Some(RatingDomain.Training)) =>
+                  applyTrainingGame(row, category, w, b, whiteScore)
+                // A training row reaching the queue under the legacy policy means the epoch was rolled back (#151).
+                // Applying it competitively would move the very ratings the matrix epoch deliberately kept still.
+                case (RatingPolicy.Legacy, Some(RatingDomain.Training)) =>
+                  skip(row, "training-domain row is not applied under the legacy policy")
+                case (_, Some(RatingDomain.Casual)) =>
+                  skip(row, "casual row carries no rating in any domain")
+                case _ =>
+                  applyCompetitiveGame(row, category, w, b, whiteScore, blackScore)
         case (Some(_), Some(_), None) => skip(row, "no definite result")
         case _                        =>
           // All three causes named: an operator reading this for a deleted account (#237 makes that reachable — the

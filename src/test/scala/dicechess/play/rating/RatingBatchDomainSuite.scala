@@ -121,14 +121,14 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
         for
           player <- db.upsertOnLogin("google", "sub-dom-training-1", None, IO.pure("DomTrainer"))
           human = Principal.User(player.id)
-          _ <- db.register("house", "random", "hash-house-random")
-          bot = Principal.Bot("house", "random")
+          _ <- db.register("anchor", "random", "hash-anchor-random")
+          bot = Principal.Bot("anchor", "random")
           gameId <- GameId.random
           _ <- db.save(gameId, trainingFixture(human, bot, result = GameResult.Win(Side.White), humanIsWhite = true))
           _ <- matrixBatch(db).flatMap(_.tick)
           trainingState   <- db.trainingStateOf(player.id, RatingCategory.Blitz)
           userCompRatings <- db.categoryRatingsOf(RatedIdentity.User(player.id))
-          botCompRatings  <- db.categoryRatingsOf(RatedIdentity.Bot("house", "random"))
+          botCompRatings  <- db.categoryRatingsOf(RatedIdentity.Bot("anchor", "random"))
           changeOpt       <- db.ratingChangeFor(gameId)
         yield
           assertEquals(trainingState.games, 1)
@@ -233,8 +233,8 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
         for
           player <- db.upsertOnLogin("google", "sub-dom-rapid-1", None, IO.pure("RapidTrainer"))
           human = Principal.User(player.id)
-          _ <- db.register("house", "random", "hash-house-random")
-          bot = Principal.Bot("house", "random")
+          _ <- db.register("anchor", "random", "hash-anchor-random")
+          bot = Principal.Bot("anchor", "random")
           gameId <- GameId.random
           // Fischer 900+10 is Rapid
           rapidTc = TimeControl.Fischer(900, 10)
@@ -246,7 +246,7 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(train.games, 0, "Rapid game with no Rapid bot reference must not update training state")
           assert(change.isDefined)
           assertEquals(change.get.outcome, RatingOutcome.Skipped)
-          assertEquals(change.get.reason, Some("no reference bot rating for house/random in category 'rapid'"))
+          assertEquals(change.get.reason, Some("no reference bot rating for anchor/random in category 'rapid'"))
       }
     }
 
@@ -256,14 +256,14 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
         for
           player <- db.upsertOnLogin("google", "sub-dom-legacy-1", None, IO.pure("LegacyPlayer"))
           human = Principal.User(player.id)
-          _ <- db.register("house", "random", "hash-house-random")
-          bot = Principal.Bot("house", "random")
+          _ <- db.register("anchor", "random", "hash-anchor-random")
+          bot = Principal.Bot("anchor", "random")
           gameId   <- GameId.random
           _        <- db.save(gameId, preClassificationFixture(human, bot))
           _        <- matrixBatch(db).flatMap(_.tick)
           training <- db.trainingStateOf(player.id, RatingCategory.Blitz)
           userComp <- db.categoryRatingsOf(RatedIdentity.User(player.id))
-          botComp  <- db.categoryRatingsOf(RatedIdentity.Bot("house", "random"))
+          botComp  <- db.categoryRatingsOf(RatedIdentity.Bot("anchor", "random"))
           change   <- db.ratingChangeFor(gameId)
         yield
           assertEquals(training.games, 0, "a legacy row must not be reinterpreted as a training game")
@@ -280,14 +280,14 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
         for
           player <- db.upsertOnLogin("google", "sub-dom-rollback-1", None, IO.pure("RollbackPlayer"))
           human = Principal.User(player.id)
-          _ <- db.register("house", "greedy", "hash-house-greedy")
-          bot = Principal.Bot("house", "greedy")
+          _ <- db.register("anchor", "greedy", "hash-anchor-greedy")
+          bot = Principal.Bot("anchor", "greedy")
           gameId   <- GameId.random
           _        <- db.save(gameId, trainingFixture(human, bot))
           _        <- legacyBatch(db).flatMap(_.tick)
           training <- db.trainingStateOf(player.id, RatingCategory.Blitz)
           userComp <- db.categoryRatingsOf(RatedIdentity.User(player.id))
-          botComp  <- db.categoryRatingsOf(RatedIdentity.Bot("house", "greedy"))
+          botComp  <- db.categoryRatingsOf(RatedIdentity.Bot("anchor", "greedy"))
           change   <- db.ratingChangeFor(gameId)
         yield
           assertEquals(userComp, Map.empty[RatingCategory, Glicko], "a rollback must not move competitive ratings")
@@ -304,8 +304,8 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
         for
           player <- db.upsertOnLogin("google", "sub-dom-replay-1", None, IO.pure("ReplayPlayer"))
           human = Principal.User(player.id)
-          _ <- db.register("house", "random", "hash-house-random")
-          bot = Principal.Bot("house", "random")
+          _ <- db.register("anchor", "random", "hash-anchor-random")
+          bot = Principal.Bot("anchor", "random")
           gameId <- GameId.random
           _      <- db.save(gameId, trainingFixture(human, bot))
           _      <- matrixBatch(db).flatMap(_.tick)
@@ -334,8 +334,8 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
         for
           player <- db.upsertOnLogin("google", "sub-dom-record-1", None, IO.pure("RecordPlayer"))
           human = Principal.User(player.id)
-          _ <- db.register("house", "aggressive", "hash-house-aggressive")
-          bot = Principal.Bot("house", "aggressive")
+          _ <- db.register("anchor", "aggressive", "hash-anchor-aggressive")
+          bot = Principal.Bot("anchor", "aggressive")
           gameId     <- GameId.random
           _          <- db.save(gameId, trainingFixture(human, bot))
           _          <- matrixBatch(db).flatMap(_.tick)

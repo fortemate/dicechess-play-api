@@ -20,8 +20,8 @@ import java.time.temporal.ChronoUnit
   */
 class AnchoredStrengthSuite extends munit.FunSuite:
 
-  private val anchorGreedy = "house/greedy"
-  private val anchorAggr   = "house/aggressive"
+  private val anchorGreedy = "anchor/greedy"
+  private val anchorAggr   = "anchor/aggressive"
 
   private val fixedEpochTime = Instant.parse("2026-09-16T12:00:00Z")
 

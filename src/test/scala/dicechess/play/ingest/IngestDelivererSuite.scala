@@ -174,7 +174,7 @@ class IngestDelivererSuite extends CatsEffectSuite with TestContainerForAll:
     withContainers { pg =>
       store(pg).use { db =>
         (for
-          status <- Resource.eval(Ref.of[IO, Status](Status.UnprocessableEntity))
+          status <- Resource.eval(Ref.of[IO, Status](Status.UnprocessableContent))
           tokens <- Resource.eval(Ref.of[IO, List[String]](Nil))
           server <- stubIngest(status, tokens)
           d      <- deliverer(db.clientReports, Uri.unsafeFromString(s"http://127.0.0.1:${server.address.getPort}"))
@@ -195,7 +195,7 @@ class IngestDelivererSuite extends CatsEffectSuite with TestContainerForAll:
     withContainers { pg =>
       store(pg).use { db =>
         (for
-          status <- Resource.eval(Ref.of[IO, Status](Status.UnprocessableEntity))
+          status <- Resource.eval(Ref.of[IO, Status](Status.UnprocessableContent))
           tokens <- Resource.eval(Ref.of[IO, List[String]](Nil))
           server <- stubIngest(status, tokens)
           d      <- deliverer(db, Uri.unsafeFromString(s"http://127.0.0.1:${server.address.getPort}"))

@@ -72,35 +72,35 @@ class IngestRoutesSuite extends munit.CatsEffectSuite:
       assert(stored.isEmpty)
 
   test("a JSON array body is structurally rejected with 422"):
-    run(Json.arr(validReport()).noSpaces).map((status, _) => assertEquals(status, Status.UnprocessableEntity))
+    run(Json.arr(validReport()).noSpaces).map((status, _) => assertEquals(status, Status.UnprocessableContent))
 
   test("a missing id is rejected with 422"):
     run(validReport().mapObject(_.remove("id")).noSpaces)
-      .map((status, _) => assertEquals(status, Status.UnprocessableEntity))
+      .map((status, _) => assertEquals(status, Status.UnprocessableContent))
 
   test("a non-UUID id is rejected with 422 — it becomes the client_reports primary key"):
     run(validReport(id = "not-a-uuid").noSpaces)
-      .map((status, _) => assertEquals(status, Status.UnprocessableEntity))
+      .map((status, _) => assertEquals(status, Status.UnprocessableContent))
 
   test("a source other than playsite is rejected with 422 — the endpoint is not an open relay"):
     run(validReport().deepMerge(Json.obj("source" -> "dicechess.com".asJson)).noSpaces)
-      .map((status, _) => assertEquals(status, Status.UnprocessableEntity))
+      .map((status, _) => assertEquals(status, Status.UnprocessableContent))
 
   test("a missing or empty initial_fen is rejected with 422"):
     for
       missing <- run(validReport().mapObject(_.remove("initial_fen")).noSpaces)
       empty   <- run(validReport().deepMerge(Json.obj("initial_fen" -> "".asJson)).noSpaces)
     yield
-      assertEquals(missing(0), Status.UnprocessableEntity)
-      assertEquals(empty(0), Status.UnprocessableEntity)
+      assertEquals(missing(0), Status.UnprocessableContent)
+      assertEquals(empty(0), Status.UnprocessableContent)
 
   test("missing turns are rejected with 422"):
     run(validReport().mapObject(_.remove("turns")).noSpaces)
-      .map((status, _) => assertEquals(status, Status.UnprocessableEntity))
+      .map((status, _) => assertEquals(status, Status.UnprocessableContent))
 
   test("a non-array events field is rejected with 422, while an absent one is fine"):
     run(validReport().deepMerge(Json.obj("events" -> "nope".asJson)).noSpaces)
-      .map((status, _) => assertEquals(status, Status.UnprocessableEntity))
+      .map((status, _) => assertEquals(status, Status.UnprocessableContent))
 
   test("a body over the size cap answers 413"):
     val oversized = validReport()

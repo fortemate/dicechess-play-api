@@ -120,7 +120,7 @@ object WebhookRoutes:
                         case Left(failure) => BadRequest(failure.message)
                         case Right(body)   =>
                           WebhookCapability.parseSelection(body.capabilities.getOrElse(Nil)) match
-                            case Left(reason)        => UnprocessableEntity(reason)
+                            case Left(reason)        => UnprocessableContent(reason)
                             case Right(capabilities) =>
                               service
                                 .register(bot, body.url, capabilities)
@@ -128,7 +128,7 @@ object WebhookRoutes:
                                   case Right(hook) =>
                                     val outCaps = Option.when(hook.capabilities.nonEmpty)(hook.capabilities)
                                     Created(WebhookCreated(hook.url, hook.secret, outCaps))
-                                  case Left(reason) => UnprocessableEntity(reason)
+                                  case Left(reason) => UnprocessableContent(reason)
 
       case req @ GET -> Root / "bot" / "webhook" =>
         withService(webhooks): service =>

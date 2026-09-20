@@ -557,7 +557,7 @@ class WebhookManagementSuite extends CatsEffectSuite:
         stored     <- f.store.observed.get
         checks     <- authorized.get
       yield
-        assertFailure(result, Status.UnprocessableEntity, "webhook_verification_failed")
+        assertFailure(result, Status.UnprocessableContent, "webhook_verification_failed")
         assertEquals(stored.failureReasons, List("proof_mismatch"))
         assertEquals(stored.completeCount, 0)
         assertEquals(checks, 0, "authority must be rechecked only after a valid proof")
@@ -570,15 +570,15 @@ class WebhookManagementSuite extends CatsEffectSuite:
         result <- activate(f.management)
         stored <- f.store.observed.get
       yield
-        assertFailure(result, Status.UnprocessableEntity, "webhook_verification_failed")
+        assertFailure(result, Status.UnprocessableContent, "webhook_verification_failed")
         assertEquals(stored.failureReasons, List(transportFailure.auditReason.wireName))
         assertEquals(stored.completeCount, 0)
     }
 
   test("a failed activation returns terminal 410 only when that failure exhausts the setup"):
     List(
-      false -> (Status.UnprocessableEntity -> "webhook_verification_failed"),
-      true  -> (Status.Gone                -> "setup_attempts_exhausted")
+      false -> (Status.UnprocessableContent -> "webhook_verification_failed"),
+      true  -> (Status.Gone                 -> "setup_attempts_exhausted")
     ).traverse_ { case (attemptsExhausted, (expectedStatus, expectedCode)) =>
       val failed = WebhookManagementResult.Applied(
         WebhookActivationFailure(CurrentSlot, attemptsExhausted)
@@ -658,9 +658,9 @@ class WebhookManagementSuite extends CatsEffectSuite:
     yield
       assert(created.isRight)
       assert(updated.isRight)
-      val reservedFailure = assertFailure(reserved, Status.UnprocessableEntity, "capability_rejected")
+      val reservedFailure = assertFailure(reserved, Status.UnprocessableContent, "capability_rejected")
       assertEquals(reservedFailure.detail, "webhook capability is not available: doubling")
-      val unknownFailure = assertFailure(unknown, Status.UnprocessableEntity, "capability_rejected")
+      val unknownFailure = assertFailure(unknown, Status.UnprocessableContent, "capability_rejected")
       assertEquals(unknownFailure.detail, "unknown webhook capability: future-capability")
       assertEquals(stored.creates.map(_.capabilities), List(List(WebhookCapability.Draws)))
       assertEquals(stored.capabilityUpdates, List(List(WebhookCapability.Draws)))

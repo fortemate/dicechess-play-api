@@ -57,7 +57,7 @@ object IngestRoutes:
             case Left(_)        => BadRequest("invalid JSON body")
             case Right(payload) =>
               validate(payload) match
-                case Left(reason) => UnprocessableEntity(reason)
+                case Left(reason) => UnprocessableContent(reason)
                 case Right(id)    =>
                   reports
                     .insertClientReport(id, payload)

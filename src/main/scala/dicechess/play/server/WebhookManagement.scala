@@ -667,20 +667,20 @@ object WebhookManagement:
     )
   private val urlRejected =
     ManagedWebhookFailure(
-      Status.UnprocessableEntity,
+      Status.UnprocessableContent,
       "webhook_url_rejected",
       "Webhook URL rejected",
       "The URL did not pass the public HTTPS policy."
     )
   private val verificationFailed =
     ManagedWebhookFailure(
-      Status.UnprocessableEntity,
+      Status.UnprocessableContent,
       "webhook_verification_failed",
       "Webhook verification failed",
       "The endpoint did not return a valid verification-v2 proof."
     )
   private def capabilityRejected(reason: String) =
-    ManagedWebhookFailure(Status.UnprocessableEntity, "capability_rejected", "Capability rejected", reason)
+    ManagedWebhookFailure(Status.UnprocessableContent, "capability_rejected", "Capability rejected", reason)
   private def stale(current: ManagedWebhookSlot) =
     ManagedWebhookFailure(
       Status.PreconditionFailed,

@@ -48,7 +48,11 @@ current. Replacement/deletion wins cleanly: the late response is recorded as
 The network half is fenced too. URL policy resolution produces the public IP address that the
 client actually connects to; the request URI, HTTP Host, and TLS SNI retain the validated hostname.
 Never replace this with "resolve, inspect, then let the normal client resolve again" — that
-reopens DNS rebinding between policy and connect.
+reopens DNS rebinding between policy and connect. Since http4s 0.23.34 Ember offers no builder hook
+for this (`withSocketGroup` is a documented no-op), so the pinning is the `Network[IO]` handed to
+Ember: `WebhookPinnedNetwork`, deliberately declared in package `fs2.io.net` to reach fs2's sealed
+extension point. `WebhookTransportSuite` keeps a control test that fails if the pinning stops being
+load-bearing.
 
 ## Staged webhook activation is a leased two-phase operation
 

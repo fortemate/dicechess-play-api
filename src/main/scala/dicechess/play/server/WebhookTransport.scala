@@ -1,10 +1,8 @@
 package dicechess.play.server
 
-import cats.effect.{IO, Resource}
-import com.comcast.ip4s.{Host, IpAddress, Port, SocketAddress}
-import fs2.Stream
+import cats.effect.{Async, IO, Resource}
 import fs2.io.net.tls.TLSContext
-import fs2.io.net.{Network, Socket, SocketGroup, SocketOption}
+import fs2.io.net.{Network, WebhookPinnedNetwork}
 import org.http4s.client.Client
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.headers.`Content-Type`
@@ -18,7 +16,9 @@ import scala.util.control.NoStackTrace
 
 /** Rebinding-safe outbound webhook HTTP. One call performs one fresh policy/DNS resolution and connects to an IP from
   * that exact result. The request URI is never rewritten, so Ember keeps the original hostname for HTTP Host, TLS SNI,
-  * and certificate endpoint verification while [[PinnedSocketGroup]] changes only the TCP destination.
+  * and certificate endpoint verification while [[fs2.io.net.WebhookPinnedNetwork]] changes only the TCP destination.
+  * (Ember 0.23.34+ takes its connections from the implicit `Network`; the former `withSocketGroup` hook is a documented
+  * no-op there, see #193.)
   *
   * A new one-request Ember pool is scoped to each call. This intentionally gives DNS pinning an obvious lifetime and
   * rules out connection reuse across independently validated results. The system TLS context is shared by the
@@ -87,16 +87,12 @@ object WebhookTransport:
       tlsContext: TLSContext[IO],
       target: ResolvedWebhookTarget
   ): Resource[IO, Client[IO]] =
-    val sockets = PinnedSocketGroup(
-      target.originalHost,
-      target.port,
-      target.selectedAddress,
-      (address, options) => connectExact(network, address, options)
-    )
+    // The pinned network is passed explicitly rather than left to implicit resolution: the ambient `Network[IO]` in
+    // fs2's companion would type-check just as well, and that silent fallback is exactly the failure this guards.
+    val pinned = WebhookPinnedNetwork(network, target.originalHost, target.port, target.selectedAddress)
     EmberClientBuilder
-      .default[IO]
+      .default[IO](using Async[IO], pinned)
       .withTLSContext(tlsContext)
-      .withSocketGroup(sockets)
       // The outer timeout is the single end-to-end deadline. Ember's narrower defaults must not undercut a gameplay
       // delivery timeout, nor leave DNS and body consumption outside a different timer.
       .withTimeout(Duration.Inf)
@@ -104,16 +100,6 @@ object WebhookTransport:
       .withMaxTotal(1)
       .withMaxPerKey(_ => 1)
       .build
-
-  /** http4s 0.23.30 currently resolves fs2-io 3.12, whose exact-IP operation still has the legacy `client` name. The
-    * destination is already an `IpAddress`, so this performs no DNS lookup. Use `Network.connect` when fs2-io itself is
-    * upgraded to 3.13.
-    */
-  private def connectExact(
-      network: Network[IO],
-      address: SocketAddress[IpAddress],
-      options: List[SocketOption]
-  ): Resource[IO, Socket[IO]] = network.client(address, options)
 
   final private class Live(resolver: Resolver, clientFactory: ClientFactory) extends WebhookTransport:
     def postSigned(
@@ -154,55 +140,3 @@ object WebhookTransport:
           if bytes.length > MaxResponseBytes then IO.raiseError(OversizedResponse)
           else if response.status.code == 200 then IO.pure(Outcome.Ok(bytes))
           else IO.pure(Outcome.HttpStatus(response.status.code))
-
-/** Socket group used by one request only. Ember derives TLS parameters from the original request key after this method
-  * returns its socket; consequently, connecting to `pinnedAddress` does not replace the hostname used by SNI or
-  * endpoint verification.
-  */
-final private[server] class PinnedSocketGroup private (
-    originalHost: String,
-    originalPort: Port,
-    pinnedAddress: IpAddress,
-    connect: (SocketAddress[IpAddress], List[SocketOption]) => Resource[IO, Socket[IO]]
-) extends SocketGroup[IO]:
-
-  /** Non-deprecated test seam; Ember invokes the deprecated SocketGroup method because that is the API exposed by
-    * http4s 0.23.30.
-    */
-  private[server] def connectPinned(
-      requested: SocketAddress[Host],
-      options: List[SocketOption]
-  ): Resource[IO, Socket[IO]] =
-    if requested.port == originalPort && requested.host.toString.equalsIgnoreCase(originalHost) then
-      connect(SocketAddress(pinnedAddress, originalPort), options)
-    else Resource.eval(IO.raiseError(new IllegalArgumentException("webhook transport request target changed")))
-
-  override def client(
-      to: SocketAddress[Host],
-      options: List[SocketOption]
-  ): Resource[IO, Socket[IO]] = connectPinned(to, options)
-
-  override def server(
-      address: Option[Host],
-      port: Option[Port],
-      options: List[SocketOption]
-  ): Stream[IO, Socket[IO]] = Stream.raiseError(unsupported)
-
-  override def serverResource(
-      address: Option[Host],
-      port: Option[Port],
-      options: List[SocketOption]
-  ): Resource[IO, (SocketAddress[IpAddress], Stream[IO, Socket[IO]])] =
-    Resource.eval(IO.raiseError(unsupported))
-
-  private def unsupported: UnsupportedOperationException =
-    new UnsupportedOperationException("webhook transport is client-only")
-
-private[server] object PinnedSocketGroup:
-  def apply(
-      originalHost: String,
-      originalPort: Port,
-      pinnedAddress: IpAddress,
-      connect: (SocketAddress[IpAddress], List[SocketOption]) => Resource[IO, Socket[IO]]
-  ): PinnedSocketGroup =
-    new PinnedSocketGroup(originalHost, originalPort, pinnedAddress, connect)

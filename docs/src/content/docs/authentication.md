@@ -63,7 +63,7 @@ Encode a bot's **version in its name** (`smaug-v3`), not anywhere else — the p
 
 ### Static (house)
 
-Built-in bots the operator configures in the server environment — the `house/greedy` sparring partner you meet in the [Quickstart](../quickstart/) is one. You cannot create these; you only play against them. They authenticate via a fixed token and cannot rotate or join the ladder.
+Built-in bots the operator configures in the server environment — the `house/oracle-1` sparring partner you meet in the [Quickstart](../quickstart/) is one. You cannot create these; you only play against them. They authenticate via a fixed token and cannot rotate or join the ladder.
 
 ## Rotating a token
 

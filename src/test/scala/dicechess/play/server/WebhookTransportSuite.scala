@@ -34,6 +34,7 @@ import javax.net.ssl.{
   SSLSocket,
   TrustManagerFactory
 }
+import scala.annotation.nowarn
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
@@ -80,14 +81,25 @@ class WebhookTransportSuite extends CatsEffectSuite:
       .map: result =>
         assert(result.left.exists(_.isInstanceOf[IllegalArgumentException]), s"unexpected: $result")
 
+  // fs2 3.13 deprecated the socket-group entry points; they still exist on `Network`, so Ember (or a future caller)
+  // could still reach them. The pinned network must refuse them like every other non-connect capability, and proving
+  // that means calling the deprecated methods on purpose. The suppression is scoped to this one test.
+  @nowarn("cat=deprecation")
+  private def serverSideCapabilities(pinned: Network[IO]): List[(String, Resource[IO, Any])] =
+    List(
+      "bind"                -> pinned.bind(),
+      "bindDatagramSocket"  -> pinned.bindDatagramSocket(),
+      "socketGroup"         -> pinned.socketGroup(),
+      "datagramSocketGroup" -> pinned.datagramSocketGroup()
+    )
+
   test("the pinned network is client-only"):
     val pinned = WebhookPinnedNetwork(Network[IO], hostname, port, loopback)
-    pinned
-      .bind()
-      .use_
-      .attempt
-      .map: result =>
-        assert(result.left.exists(_.isInstanceOf[UnsupportedOperationException]), s"unexpected: $result")
+    serverSideCapabilities(pinned).traverse_ { (name, capability) =>
+      capability.use_.attempt.map { result =>
+        assert(result.left.exists(_.isInstanceOf[UnsupportedOperationException]), s"$name: unexpected $result")
+      }
+    }
 
   test("one delivery resolves once and cannot switch to a later rebinding answer"):
     val rebound = target.copy(addresses = NonEmptyList.one(IpAddress.fromString("127.0.0.1").getOrElse(fail("IP"))))

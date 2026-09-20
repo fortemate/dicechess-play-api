@@ -6,20 +6,21 @@ import cats.syntax.all.*
 import com.comcast.ip4s.{Host, IpAddress, Port, SocketAddress}
 import fs2.Stream
 import fs2.io.net.tls.TLSContext
-import fs2.io.net.{Network, Socket, SocketOption}
+import fs2.io.net.{Network, WebhookPinnedNetwork}
 import munit.CatsEffectSuite
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.asn1.x509.{Extension, GeneralName, GeneralNames}
 import org.bouncycastle.cert.jcajce.{JcaX509CertificateConverter, JcaX509v3CertificateBuilder}
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import org.http4s.client.Client
+import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.headers.Location
 import org.http4s.{Request, Response, Status, Uri}
 import org.typelevel.ci.CIString
 
 import java.io.{BufferedReader, InputStreamReader, OutputStreamWriter}
 import java.math.BigInteger
-import java.net.InetAddress
+import java.net.{InetAddress, ServerSocket}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.security.{KeyPairGenerator, KeyStore, SecureRandom}
 import java.time.Instant
@@ -33,17 +34,25 @@ import javax.net.ssl.{
   SSLSocket,
   TrustManagerFactory
 }
+import scala.annotation.nowarn
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
 class WebhookTransportSuite extends CatsEffectSuite:
   import WebhookTransport.Outcome
 
+  /** `.invalid` is reserved by RFC 6761 to never resolve. The network-level tests below pin such a name to loopback: a
+    * delivery can reach the fixture ONLY through the pinning, so a pinning that silently degrades into ordinary DNS
+    * (the http4s 0.23.34 `withSocketGroup` no-op, #193) fails these tests instead of passing them.
+    */
+  private val hostname = "bot.invalid"
+  private val loopback = IpAddress.fromString("127.0.0.1").getOrElse(fail("loopback IP"))
+
   private val port   = Port.fromInt(8443).getOrElse(fail("test port must be valid"))
   private val ip     = IpAddress.fromString("1.1.1.1").getOrElse(fail("test IP must be valid"))
   private val target = ResolvedWebhookTarget(
-    Uri.unsafeFromString("https://bot.example:8443/hook?opaque=value"),
-    "bot.example",
+    Uri.unsafeFromString(s"https://$hostname:8443/hook?opaque=value"),
+    hostname,
     port,
     NonEmptyList.one(ip)
   )
@@ -53,38 +62,44 @@ class WebhookTransportSuite extends CatsEffectSuite:
   private def withClient(client: Client[IO], resolver: WebhookTransport.Resolver = resolved): WebhookTransport =
     WebhookTransport.from(resolver, _ => Resource.pure(client))
 
-  test("the pinned socket group connects to the validated IP, never the original hostname"):
-    for
-      connected <- Ref.of[IO, Option[SocketAddress[IpAddress]]](None)
-      group = PinnedSocketGroup(
-        target.originalHost,
-        target.port,
-        target.selectedAddress,
-        (address, _: List[SocketOption]) =>
-          Resource.eval(
-            connected.set(Some(address)) *> IO.raiseError[Socket[IO]](RuntimeException("stop after capture"))
-          )
-      )
-      original = SocketAddress(Host.fromString(target.originalHost).getOrElse(fail("valid host")), target.port)
-      _       <- group.connectPinned(original, Nil).use(_ => IO.unit).attempt
-      address <- connected.get
-    yield assertEquals(address, Some(SocketAddress(ip, port)))
+  test("the pinned network connects to the validated IP, never the original hostname"):
+    loopbackListener.use: listenerPort =>
+      val pinned    = WebhookPinnedNetwork(Network[IO], hostname, listenerPort, loopback)
+      val requested = SocketAddress(Host.fromString(hostname).getOrElse(fail("valid host")), listenerPort)
+      pinned
+        .connect(requested)
+        .use(socket => IO.pure(socket.peerAddress))
+        .map(peer => assertEquals(peer, SocketAddress(loopback, listenerPort)))
 
-  test("the pinned socket group refuses a request whose original authority changed"):
-    val group = PinnedSocketGroup(
-      target.originalHost,
-      target.port,
-      target.selectedAddress,
-      (_: SocketAddress[IpAddress], _: List[SocketOption]) =>
-        Resource.eval(IO.raiseError[Socket[IO]](RuntimeException("must not connect")))
-    )
-    val changed = SocketAddress(Host.fromString("other.example").getOrElse(fail("valid host")), target.port)
-    group
-      .connectPinned(changed, Nil)
-      .use(_ => IO.unit)
+  test("the pinned network refuses a request whose original authority changed"):
+    val pinned  = WebhookPinnedNetwork(Network[IO], hostname, port, loopback)
+    val changed = SocketAddress(Host.fromString("other.invalid").getOrElse(fail("valid host")), port)
+    pinned
+      .connect(changed)
+      .use_
       .attempt
       .map: result =>
-        assert(result.isLeft)
+        assert(result.left.exists(_.isInstanceOf[IllegalArgumentException]), s"unexpected: $result")
+
+  // fs2 3.13 deprecated the socket-group entry points; they still exist on `Network`, so Ember (or a future caller)
+  // could still reach them. The pinned network must refuse them like every other non-connect capability, and proving
+  // that means calling the deprecated methods on purpose. The suppression is scoped to this one test.
+  @nowarn("cat=deprecation")
+  private def serverSideCapabilities(pinned: Network[IO]): List[(String, Resource[IO, Any])] =
+    List(
+      "bind"                -> pinned.bind(),
+      "bindDatagramSocket"  -> pinned.bindDatagramSocket(),
+      "socketGroup"         -> pinned.socketGroup(),
+      "datagramSocketGroup" -> pinned.datagramSocketGroup()
+    )
+
+  test("the pinned network is client-only"):
+    val pinned = WebhookPinnedNetwork(Network[IO], hostname, port, loopback)
+    serverSideCapabilities(pinned).traverse_ { (name, capability) =>
+      capability.use_.attempt.map { result =>
+        assert(result.left.exists(_.isInstanceOf[UnsupportedOperationException]), s"$name: unexpected $result")
+      }
+    }
 
   test("one delivery resolves once and cannot switch to a later rebinding answer"):
     val rebound = target.copy(addresses = NonEmptyList.one(IpAddress.fromString("127.0.0.1").getOrElse(fail("IP"))))
@@ -107,44 +122,47 @@ class WebhookTransportSuite extends CatsEffectSuite:
       assertEquals(address, Some(ip), "the connection must use the address from that exact result")
 
   test("real TLS keeps the original hostname for SNI, Host, and certificate verification"):
-    val hostname = "bot.example"
     val contexts = tlsContexts(hostname)
     tlsFixture(contexts.server).use: fixture =>
-      val pinnedIp       = IpAddress.fromString("127.0.0.1").getOrElse(fail("loopback IP"))
-      val pinnedPort     = Port.fromInt(fixture.port).getOrElse(fail("fixture port"))
-      val resolvedTarget = ResolvedWebhookTarget(
-        Uri.unsafeFromString(s"https://$hostname:${fixture.port}/hook"),
-        hostname,
-        pinnedPort,
-        NonEmptyList.one(pinnedIp)
-      )
-      val tls       = TLSContext.Builder.forAsync[IO].fromSSLContext(contexts.client)
-      val transport = WebhookTransport.from(
+      val resolvedTarget = loopbackTarget(hostname, fixture.port)
+      val tls            = TLSContext.Builder.forAsync[IO].fromSSLContext(contexts.client)
+      val transport      = WebhookTransport.from(
         _ => IO.pure(Right(resolvedTarget)),
         target => WebhookTransport.pinnedClient(Network[IO], tls, target)
       )
       for
-        outcome  <- transport.postSigned(resolvedTarget.uri.renderString, "secret", "{}", 2.seconds)
+        outcome <- transport.postSigned(resolvedTarget.uri.renderString, "secret", "{}", 2.seconds)
+        // Assert the delivery before waiting on the fixture: an unpinned client never reaches loopback, and the
+        // outcome names that failure more precisely than the fixture's timeout would.
+        _        <- IO(assert(outcome.isInstanceOf[Outcome.Ok], s"pinned delivery must reach the fixture: $outcome"))
         observed <- fixture.observed.timeout(2.seconds)
       yield
-        assert(outcome.isInstanceOf[Outcome.Ok], s"trusted hostname certificate must succeed: $outcome")
         assertEquals(observed.sni, List(hostname))
         assertEquals(observed.host, s"$hostname:${fixture.port}")
 
-  test("real TLS rejects a certificate that does not match the original hostname"):
-    val contexts = tlsContexts("bot.example")
+  test("control: the same delivery through an unpinned Ember client cannot reach the fixture"):
+    // Proves the previous test is load-bearing: with Ember left to resolve `bot.invalid` itself, the fixture is never
+    // reached. If this test ever starts passing with Ok, the hostname resolves and the pinning tests prove nothing.
+    val contexts = tlsContexts(hostname)
     tlsFixture(contexts.server).use: fixture =>
-      val hostname       = "other.example"
-      val pinnedIp       = IpAddress.fromString("127.0.0.1").getOrElse(fail("loopback IP"))
-      val pinnedPort     = Port.fromInt(fixture.port).getOrElse(fail("fixture port"))
-      val resolvedTarget = ResolvedWebhookTarget(
-        Uri.unsafeFromString(s"https://$hostname:${fixture.port}/hook"),
-        hostname,
-        pinnedPort,
-        NonEmptyList.one(pinnedIp)
+      val resolvedTarget = loopbackTarget(hostname, fixture.port)
+      val tls            = TLSContext.Builder.forAsync[IO].fromSSLContext(contexts.client)
+      val transport      = WebhookTransport.from(
+        _ => IO.pure(Right(resolvedTarget)),
+        _ => EmberClientBuilder.default[IO].withTLSContext(tls).build
       )
-      val tls       = TLSContext.Builder.forAsync[IO].fromSSLContext(contexts.client)
-      val transport = WebhookTransport.from(
+      transport
+        .postSigned(resolvedTarget.uri.renderString, "secret", "{}", 2.seconds)
+        .map(outcome =>
+          assert(!outcome.isInstanceOf[Outcome.Ok], s"unpinned delivery must not reach loopback: $outcome")
+        )
+
+  test("real TLS rejects a certificate that does not match the original hostname"):
+    val contexts = tlsContexts(hostname)
+    tlsFixture(contexts.server).use: fixture =>
+      val resolvedTarget = loopbackTarget("other.invalid", fixture.port)
+      val tls            = TLSContext.Builder.forAsync[IO].fromSSLContext(contexts.client)
+      val transport      = WebhookTransport.from(
         _ => IO.pure(Right(resolvedTarget)),
         target => WebhookTransport.pinnedClient(Network[IO], tls, target)
       )
@@ -238,6 +256,22 @@ class WebhookTransportSuite extends CatsEffectSuite:
       .postSigned("https://bot.example/hook", "secret", "{}", 1.second)
       .map(outcome => assertEquals(outcome, Outcome.Unreachable))
 
+  /** A policy result that names `host` but was validated to loopback — the shape a rebinding-safe delivery must honour.
+    */
+  private def loopbackTarget(host: String, fixturePort: Int): ResolvedWebhookTarget =
+    ResolvedWebhookTarget(
+      Uri.unsafeFromString(s"https://$host:$fixturePort/hook"),
+      host,
+      Port.fromInt(fixturePort).getOrElse(fail("fixture port")),
+      NonEmptyList.one(loopback)
+    )
+
+  /** A bare loopback listener; connecting to it proves the TCP destination without any HTTP or TLS in the way. */
+  private def loopbackListener: Resource[IO, Port] =
+    Resource
+      .make(IO.blocking(new ServerSocket(0, 1, InetAddress.getLoopbackAddress)))(s => IO.blocking(s.close()))
+      .map(s => Port.fromInt(s.getLocalPort).getOrElse(fail("listener port")))
+
   private def header(request: Request[IO], name: String): String =
     request.headers.get(CIString(name)).map(_.head.value).getOrElse(fail(s"missing $name"))
 
@@ -320,6 +354,11 @@ class WebhookTransportSuite extends CatsEffectSuite:
                 writer.flush()
                 ObservedTls(sni.toList, host)
               finally socket.close()
+            // Close the listener BEFORE cancelling: `accept()` is a blocking call that only returns when a client
+            // connects or the socket closes, and a cancelled fiber waits for it. A test in which nothing connects
+            // (the unpinned control) would otherwise hang the fixture's release until munit's timeout.
             Resource
-              .make(serve.flatMap(observed.complete).handleError(_ => ()).start)(_.cancel)
+              .make(serve.flatMap(observed.complete).handleError(_ => ()).start)(fiber =>
+                IO.blocking(server.close()).handleError(_ => ()) *> fiber.cancel
+              )
               .as(TlsFixture(server.getLocalPort, observed.get))

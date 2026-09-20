@@ -208,12 +208,12 @@ class WebhookRoutesSuite extends CatsEffectSuite:
         yield
           assertEquals(created.status, Status.Created)
           assertEquals(createdBody.hcursor.get[List[String]]("capabilities"), Right(List("draws")))
-          assertEquals(unknown.status, Status.UnprocessableEntity)
+          assertEquals(unknown.status, Status.UnprocessableContent)
           assert(unknownReason.contains("unknown webhook capability: unknown"), unknownReason)
-          assertEquals(reserved.status, Status.UnprocessableEntity)
+          assertEquals(reserved.status, Status.UnprocessableContent)
           assert(reservedReason.contains("webhook capability is not available: doubling"), reservedReason)
-          assertEquals(wrongCase.status, Status.UnprocessableEntity)
-          assertEquals(whitespace.status, Status.UnprocessableEntity)
+          assertEquals(wrongCase.status, Status.UnprocessableContent)
+          assertEquals(whitespace.status, Status.UnprocessableContent)
           assertEquals(calls, 1, "invalid selections must not perform an ownership handshake")
           assertEquals(got.status, Status.Ok)
           assertEquals(info.hcursor.get[String]("url"), Right("https://fn.example/original"))
@@ -229,7 +229,7 @@ class WebhookRoutesSuite extends CatsEffectSuite:
         reason  <- refused.bodyText.compile.string
         bad     <- routes.orNotFound.run(request(Method.POST, Some(token), Some(Json.obj("nope" -> 1.asJson))))
       yield
-        assertEquals(refused.status, Status.UnprocessableEntity)
+        assertEquals(refused.status, Status.UnprocessableContent)
         assert(reason.contains("verification failed"), reason)
         assertEquals(bad.status, Status.BadRequest)
     }
@@ -241,7 +241,7 @@ class WebhookRoutesSuite extends CatsEffectSuite:
         refused <- routes.orNotFound.run(request(Method.POST, Some(token), Some(privateTarget)))
         reason  <- refused.bodyText.compile.string
       yield
-        assertEquals(refused.status, Status.UnprocessableEntity)
+        assertEquals(refused.status, Status.UnprocessableContent)
         assertEquals(reason, "\"host resolves to a non-public address\"")
     }
 

@@ -38,13 +38,13 @@ export TOKEN="bearer-token-string"
 
 ## 2. Challenge the house bot
 
-The platform ships a built-in sparring partner at `house/greedy`. Challenge it to an unlimited-time game:
+The platform ships a built-in sparring partner at `house/oracle-1`. Challenge it to an unlimited-time game:
 
 ```bash
 curl -X POST "https://api.fortemate.com/bot/challenge" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"team": "house", "name": "greedy", "timeControl": {"Unlimited": {}}}'
+  -d '{"team": "house", "name": "oracle-1", "timeControl": {"Unlimited": {}}}'
 ```
 
 The house bot accepts immediately. Find the resulting game:

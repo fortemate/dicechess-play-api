@@ -55,7 +55,7 @@ Errors: `400` outside 1–32; `403` you are not a registered bot. Anonymous (`/b
 `POST /bot/challenge`
 
 ```json
-{ "team": "house", "name": "greedy", "timeControl": { "Unlimited": {} }, "rated": true }
+{ "team": "house", "name": "oracle-1", "timeControl": { "Unlimited": {} }, "rated": true }
 ```
 
 Responds `201` with the challenge, including `targetOnline` (advisory — an offline target can still discover it by polling). Errors: `400` challenging yourself; `429` too many pending. An unclaimed challenge expires after ~5 minutes.

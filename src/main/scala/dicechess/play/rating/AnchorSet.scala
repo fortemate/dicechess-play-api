@@ -47,7 +47,7 @@ object AnchorSet:
     * Contains 4 immutable benchmark identities spanning beginner to strong amateur:
     *   1. `anchor/random` (~ -610 Elo): minimal baseline of legal moves (RandomSearch).
     *   2. `rabestro/java-baseline` (~ -280 Elo): simple 1-ply ONNX model (dicechess-bot-java).
-    *   3. `anchor/greedy` (~ -125 Elo): 1-ply static material heuristic (GreedySearch).
+    *   3. `cloudflare/greedy` (~ -125 Elo): 1-ply static material heuristic (GreedySearch).
     *   4. `anchor/aggressive` (~ -35 Elo): 1-ply attack-oriented heuristic without book (AggressiveSearch).
     *
     * The team is `anchor`, not `house`, because `house` is a RESERVED team ([[dicechess.play.server.BotAuth]]
@@ -55,9 +55,14 @@ object AnchorSet:
     * no rating and no declared capacity and can never be ladder candidates — an anchor that cannot be scheduled cannot
     * anchor anything. The `anchor` team is self-registrable, which is all these need.
     *
-    * `rabestro/java-baseline` deliberately keeps its own team: it is already registered and playing, and renaming it
-    * would mint a new identity and throw away the history that makes it an anchor in the first place. An anchor set is
-    * a list of identities, not a team prefix.
+    * `rabestro/java-baseline` and `cloudflare/greedy` deliberately keep their own teams: both are already registered
+    * and playing, and renaming either would mint a new identity and throw away the history that makes it an anchor in
+    * the first place — `cloudflare/greedy` alone carries over 63k games. An anchor set is a list of identities, not a
+    * team prefix.
+    *
+    * The DEPLOYED roster decides which identity fills which role (`fortemate/dicechess-bots-deno`, `src/bots.ts`). An
+    * identity named here that nobody runs matches nothing in `scaleOffset` and is not recognised by
+    * `TrainingEstimate.resolveBotReference`, so it silently shrinks the anchor set rather than failing.
     */
   val V1_0: AnchorSet = AnchorSet(
     version = "v1.0",
@@ -66,7 +71,7 @@ object AnchorSet:
     anchors = List(
       Anchor("anchor/random", -610.0, 0.25, "Built-in RandomSearch (lower boundary of legal play)"),
       Anchor("rabestro/java-baseline", -280.0, 0.25, "1-ply simple ONNX value model (dicechess-bot-java)"),
-      Anchor("anchor/greedy", -125.0, 0.25, "1-ply static material heuristic (GreedySearch)"),
+      Anchor("cloudflare/greedy", -125.0, 0.25, "1-ply static material heuristic (GreedySearch)"),
       Anchor("anchor/aggressive", -35.0, 0.25, "1-ply attack heuristic without book (AggressiveSearch)")
     )
   )

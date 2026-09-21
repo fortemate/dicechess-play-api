@@ -10,16 +10,21 @@ Authoritative real-time server for **Dice Chess** — human-vs-human play, a thi
 
 ## Architecture
 
-Scala 3 · cats-effect · http4s, reusing the **dice-chess rules on the JVM** (`com.fortemate:dicechess-rules`, the rules half of the engine) so move legality and rules never drift from the client.
+Scala 3 · cats-effect · http4s (Ember), reusing the **dice-chess rules on the JVM** (`com.fortemate:dicechess-rules`, the rules half of the engine) so move legality and rules never drift from the client. The search half of the engine is a test-only dependency: it plays the sparring opponents in the suites and never enters the server.
 
-```
-  browser SPA (dicechess-play) ──WebSocket──┐
-                                            ▼
-  third-party bot ──HTTP (ndjson + REST)──► play-api (AUTHORITY)
-                                            │  per-game fiber + Ref + Topic + Queue
-                                            │  engine (JVM) · server clocks · DiceSource
-                                            ▼  on game end: POST /api/games (Bearer)
-                                       dicechess-analytics (read-only + token write)
+```mermaid
+flowchart LR
+    spa["browser SPA<br/><i>dicechess-play</i>"]
+    bot["third-party bot"]
+    api["<b>play-api — the authority</b><br/>per-game fiber · Ref · Topic · Queue<br/>rules on the JVM · server clocks · DiceSource"]
+    pg[("PostgreSQL")]
+    analytics["dicechess-analytics"]
+
+    spa -- WebSocket --> api
+    bot -- "REST · ndjson stream" --> api
+    api -- "webhook: POST each turn,<br/>the response is the move" --> bot
+    api --- pg
+    api -- "on game end: POST /api/games (Bearer)" --> analytics
 ```
 
 **Transport-agnostic player — the core principle.** A `GameRoom` does not know whether a player is a human over WebSocket or a bot over HTTP. A player is *something that receives game events and submits commands*, identified by a `Principal` and seated at a `Seat`. The website WS and the Bot API are two thin adapters over the same room — the game logic is written once and is identical for human-vs-human, human-vs-bot, and bot-vs-bot.
@@ -31,6 +36,12 @@ The **server** generates dice (CSPRNG), wrapped in **commit-reveal** so every ro
 ### Bot API
 
 Third-party bots connect via a dedicated API — a token plus any of three connection modes: REST polling, an ndjson event stream, or a single serverless **webhook** (the server POSTs each turn, the HTTP response is the move). Language-agnostic and reconnect-safe.
+
+## Documentation
+
+- **[Bot API](https://bots.fortemate.com/)** — connect a bot in minutes: REST, streaming, or one serverless webhook; OpenAPI reference included.
+- **[Contributor docs](https://fortemate.github.io/dicechess-play-api/)** — how the server is built: architecture, database schema, concurrency doctrine, testing conventions.
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the pull-request workflow and [`SECURITY.md`](./SECURITY.md) for reporting vulnerabilities.
 
 ## Quick Start
 

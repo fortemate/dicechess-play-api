@@ -78,8 +78,15 @@ class WebhooksSuite extends munit.CatsEffectSuite:
     * endpoint response has already arrived and decoded; the test then changes the registration before allowing the
     * current-generation check to continue. A second gate pauses the stale retry before its fresh `get`, making the
     * absence of any old-generation room mutation directly observable rather than timing-dependent.
+    *
+    * Like the real stores, it keys the registration by bot identity: only the webhook bot's `(team, name)` has one, so
+    * the opponent's seat gets no runner. It used to answer every identity with the webhook bot's registration; the
+    * sweep then attached a runner to the opponent too, and that seat's own current-generation delivery raced the exact
+    * assertions below (#188).
     */
   final private class ControlledWebhookStore(
+      ownerTeam: String,
+      ownerName: String,
       current: Ref[IO, Option[BotWebhook]],
       staleSeen: Ref[IO, Boolean],
       val reads: Ref[IO, List[Option[UUID]]],
@@ -90,29 +97,38 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       val releaseReread: Deferred[IO, Unit],
       val rereadReturned: Deferred[IO, Unit]
   ) extends WebhookStore:
-    def put(webhook: BotWebhook): IO[Unit] = current.set(Some(webhook))
+    private def owns(team: String, name: String): Boolean = team == ownerTeam && name == ownerName
+
+    def put(webhook: BotWebhook): IO[Unit] =
+      if owns(webhook.team, webhook.name) then current.set(Some(webhook))
+      else IO.raiseError(new IllegalArgumentException(s"this store holds $ownerTeam/$ownerName only"))
 
     def get(team: String, name: String): IO[Option[BotWebhook]] =
-      staleSeen.get.flatMap { afterStale =>
-        val pause =
-          (rereadReached.complete(()).attempt.void *> releaseReread.get).whenA(afterStale)
-        pause *> current.get.flatTap { hook =>
-          reads.update(_ :+ hook.map(_.registrationId)) *>
-            rereadReturned.complete(()).attempt.void.whenA(afterStale)
+      if !owns(team, name) then IO.pure(None)
+      else
+        staleSeen.get.flatMap { afterStale =>
+          val pause =
+            (rereadReached.complete(()).attempt.void *> releaseReread.get).whenA(afterStale)
+          pause *> current.get.flatTap { hook =>
+            reads.update(_ :+ hook.map(_.registrationId)) *>
+              rereadReturned.complete(()).attempt.void.whenA(afterStale)
+          }
         }
-      }
 
     def delete(team: String, name: String): IO[Boolean] =
-      current.modify(existing => (None, existing.nonEmpty))
+      if !owns(team, name) then IO.pure(false)
+      else current.modify(existing => (None, existing.nonEmpty))
 
     def enqueueIfCurrent[A](team: String, name: String, registrationId: UUID)(enqueue: IO[A]): IO[Option[A]] =
-      fenceReached.complete(()).attempt.void *>
-        releaseFence.get *>
-        current.get.flatMap:
-          case Some(hook) if hook.registrationId == registrationId =>
-            acceptedEnqueues.update(_ :+ registrationId) *> enqueue.map(Some(_))
-          case _ =>
-            staleSeen.set(true).as(None)
+      if !owns(team, name) then IO.pure(None)
+      else
+        fenceReached.complete(()).attempt.void *>
+          releaseFence.get *>
+          current.get.flatMap:
+            case Some(hook) if hook.registrationId == registrationId =>
+              acceptedEnqueues.update(_ :+ registrationId) *> enqueue.map(Some(_))
+            case _ =>
+              staleSeen.set(true).as(None)
 
   private object ControlledWebhookStore:
     def create(initial: BotWebhook): IO[ControlledWebhookStore] =
@@ -127,6 +143,8 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         releaseReread    <- Deferred[IO, Unit]
         rereadReturned   <- Deferred[IO, Unit]
       yield ControlledWebhookStore(
+        initial.team,
+        initial.name,
         current,
         staleSeen,
         reads,
@@ -373,12 +391,13 @@ class WebhooksSuite extends munit.CatsEffectSuite:
                 )
                 mutation.current match
                   case Some(_) =>
-                    assertEquals(enqueues.distinct, List(CurrentRegistrationId))
-                    assertEquals(usedGenerations.headOption, Some(OldRegistrationId))
-                    assert(
-                      usedGenerations.drop(1).nonEmpty && usedGenerations.drop(1).forall(_ == CurrentRegistrationId),
-                      s"${mutation.label}: every request after the stale response must use the current generation: " +
-                        usedGenerations
+                    // Exactly one each: the stale response is re-delivered once under the current generation, and
+                    // nothing else is delivered, because the opponent's seat holds no registration of its own.
+                    assertEquals(enqueues, List(CurrentRegistrationId))
+                    assertEquals(
+                      usedGenerations,
+                      List(OldRegistrationId, CurrentRegistrationId),
+                      s"${mutation.label}: the stale response must be followed by one current-generation request"
                     )
                     assert(
                       deliveryCalls.contains(CurrentRegistrationId -> DeliveryOutcome.Applied),

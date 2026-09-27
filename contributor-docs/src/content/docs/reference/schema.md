@@ -297,6 +297,12 @@ Indexes:
 | `rating_policy_version` | `smallint` | no | `0` | — |
 | `rating_outcome` | `text` | no | `'legacy'::text` | — |
 | `rating_skip_reason` | `text` | yes | — | — |
+| `training_reference_source` | `text` | yes | — | — |
+| `training_reference_anchor_set` | `text` | yes | — | — |
+| `training_reference_anchor_epoch` | `integer` | yes | — | — |
+| `training_reference_rating` | `double precision` | yes | — | — |
+| `training_reference_rd` | `double precision` | yes | — | — |
+| `training_reference_vol` | `double precision` | yes | — | — |
 
 Check constraints:
 
@@ -305,6 +311,14 @@ Check constraints:
 - `CHECK ((rating_domain = ANY (ARRAY['competitive'::text, 'training'::text, 'casual'::text, 'legacy'::text])))`
 - `CHECK ((rating_outcome = ANY (ARRAY['pending'::text, 'applied'::text, 'skipped'::text, 'casual'::text, 'legacy'::text])))`
 - `CHECK (((rating_outcome = 'skipped'::text) = (rating_skip_reason IS NOT NULL)))`
+- `CHECK (((training_reference_source IS NULL) OR (rating_domain = 'training'::text)))`
+- `CHECK (
+CASE training_reference_source
+    WHEN 'anchor'::text THEN ((training_reference_anchor_set IS NOT NULL) AND (training_reference_anchor_epoch IS NOT NULL) AND (training_reference_rating IS NOT NULL) AND (training_reference_rd IS NOT NULL) AND (training_reference_vol IS NOT NULL))
+    WHEN 'bot_rating'::text THEN ((training_reference_anchor_set IS NULL) AND (training_reference_anchor_epoch IS NULL) AND (training_reference_rating IS NOT NULL) AND (training_reference_rd IS NOT NULL) AND (training_reference_vol IS NOT NULL))
+    ELSE ((training_reference_anchor_set IS NULL) AND (training_reference_anchor_epoch IS NULL) AND (training_reference_rating IS NULL) AND (training_reference_rd IS NULL) AND (training_reference_vol IS NULL))
+END)`
+- `CHECK ((training_reference_source = ANY (ARRAY['anchor'::text, 'bot_rating'::text, 'unavailable'::text])))`
 - `CHECK (((white_kind IS NULL) OR (white_kind = ANY (ARRAY['human'::text, 'bot'::text, 'guest'::text]))))`
 
 Indexes:

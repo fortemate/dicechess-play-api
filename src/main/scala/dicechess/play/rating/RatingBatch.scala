@@ -174,42 +174,56 @@ final class RatingBatch private (
       humanIsWhite: Boolean,
       humanScore: Double
   ): IO[Unit] =
-    ratingStore.categoryRatingsOf(bot.identity).flatMap { storedRatings =>
-      val botKey    = s"${bot.bot.team}/${bot.bot.name}"
-      val botRefOpt = TrainingEstimate.resolveBotReference(
-        botKey = botKey,
-        category = category,
-        anchorSet = anchorSet,
-        storedBotRating = storedRatings.get(category)
-      )
-      botRefOpt match
-        case None =>
-          skip(row, s"no reference bot rating for $botKey in category '${category.wireName}'")
-        case Some(botRef) =>
-          ratingStore.trainingStateOf(user.userId, category).flatMap { currentTrainingState =>
-            val nextState = TrainingEstimate.update(
-              current = currentTrainingState,
-              botReference = botRef,
-              humanIsWhite = humanIsWhite,
-              score = humanScore,
-              gameTime = row.finishedAt
-            )
-            val userUpdate = RatingUpdate(
-              identity = user.identity,
-              category = category,
-              before = currentTrainingState.glicko,
-              after = nextState.glicko
-            )
-            val botSeat = if humanIsWhite then Seat.Black else Seat.White
-            ratingStore.applyTrainingUpdate(
-              gameId = row.gameId,
-              userUpdate = userUpdate,
-              botSeat = botSeat,
-              botRefRating = botRef.rating,
-              score = humanScore,
-              finishedAt = row.finishedAt
-            )
-          }
+    val botKey = s"${bot.bot.team}/${bot.bot.name}"
+    referenceFor(row, bot, botKey, category).flatMap {
+      case None =>
+        skip(row, s"no reference bot rating for $botKey in category '${category.wireName}'")
+      case Some(botRef) =>
+        ratingStore.trainingStateOf(user.userId, category).flatMap { currentTrainingState =>
+          val nextState = TrainingEstimate.update(
+            current = currentTrainingState,
+            botReference = botRef.glicko,
+            humanIsWhite = humanIsWhite,
+            score = humanScore,
+            gameTime = row.finishedAt
+          )
+          val userUpdate = RatingUpdate(
+            identity = user.identity,
+            category = category,
+            before = currentTrainingState.glicko,
+            after = nextState.glicko
+          )
+          val botSeat = if humanIsWhite then Seat.Black else Seat.White
+          ratingStore.applyTrainingUpdate(
+            gameId = row.gameId,
+            userUpdate = userUpdate,
+            botSeat = botSeat,
+            botRefRating = botRef.glicko.rating,
+            score = humanScore,
+            finishedAt = row.finishedAt
+          )
+        }
+    }
+
+  /** The reference a training row is applied against (#189): the one captured when the row was queued, so neither a
+    * delayed drain, a retry nor a later anchor-set change can move it, and nothing live is read to apply it. Only a row
+    * queued before references were captured resolves one here, from the bot's current stored rating and this batch's
+    * anchor set — exactly what every row got before #189, which is also why such a row is never given a recorded
+    * reference after the fact.
+    */
+  private def referenceFor(
+      row: GameResultRow,
+      bot: RatingBatch.Participant.OfBot,
+      botKey: String,
+      category: RatingCategory
+  ): IO[Option[TrainingReference]] =
+    ratingStore.trainingReferenceOf(row.gameId).flatMap {
+      case CapturedTrainingReference.Recorded(reference) => IO.pure(Some(reference))
+      case CapturedTrainingReference.Unavailable         => IO.pure(None)
+      case CapturedTrainingReference.NotRecorded         =>
+        ratingStore.categoryRatingsOf(bot.identity).map { storedRatings =>
+          TrainingEstimate.resolveBotReference(botKey, category, anchorSet, storedRatings.get(category))
+        }
     }
 
   /** The Glicko-2 rating update for one game (#280) on the scale the game's own time control belongs to, against both

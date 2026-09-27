@@ -1,13 +1,22 @@
 package dicechess.play.rating
 
 import cats.effect.IO
+import cats.syntax.all.*
 import com.dimafeng.testcontainers.PostgreSQLContainer
 import com.dimafeng.testcontainers.munit.TestContainerForAll
 import dicechess.play.core.*
 import dicechess.play.game.EngineOps
 import dicechess.play.store.*
+import doobie.hikari.HikariTransactor
+import doobie.implicits.*
+import doobie.util.ExecutionContexts
+import doobie.util.fragment.Fragment
+import doobie.util.transactor.Transactor
 import munit.CatsEffectSuite
 import org.testcontainers.utility.DockerImageName
+
+import java.sql.SQLException
+import java.time.Instant
 
 class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
 
@@ -16,6 +25,23 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
 
   private def store(pg: PostgreSQLContainer) =
     PgGameStore.resource(PgGameStore.Config(pg.jdbcUrl, pg.username, pg.password))
+
+  /** The store plus a raw transactor on the same database, for the arrangements no store method makes (#189): a bot's
+    * stored rating moving between the game and the drain, a row as it was written before references were captured, a
+    * row put back into the queue.
+    */
+  private def storeAndXa(pg: PostgreSQLContainer, anchorSet: AnchorSet = AnchorSet.Default) =
+    for
+      db        <- PgGameStore.resource(PgGameStore.Config(pg.jdbcUrl, pg.username, pg.password), anchorSet)
+      connectEC <- ExecutionContexts.fixedThreadPool[IO](2)
+      xa        <- HikariTransactor.newHikariTransactor[IO](
+        driverClassName = "org.postgresql.Driver",
+        url = pg.jdbcUrl,
+        user = pg.username,
+        pass = pg.password,
+        connectEC = connectEC
+      )
+    yield (db, xa)
 
   private def matrixBatch(db: PgGameStore, anchorSet: AnchorSet = AnchorSet.Default): IO[RatingBatch] =
     RatingBatch.create(
@@ -346,5 +372,278 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(training.games, 1, "the training update itself did happen")
           assertEquals(humanTally, Map.empty[RatingCategory, ResultTally], "a training win is not a competitive win")
           assertEquals(botTally, Map.empty[RatingCategory, ResultTally], "a training loss is not on the bot's record")
+      }
+    }
+
+  // ── #189: the training reference is captured when the row is queued ───────────────────────────────────────────
+
+  /** A synthetic calibration, so these tests pin the capture mechanism rather than any production anchor value. */
+  private def fixtureAnchors(version: String, epoch: Int, identity: String, targetElo: Double): AnchorSet =
+    AnchorSet(
+      version = version,
+      epoch = epoch,
+      category = RatingCategory.Blitz.wireName,
+      anchors = List(Anchor(identity, targetElo, 1.0, "synthetic anchor for the #189 capture tests"))
+    )
+
+  /** The Glicko-2 state an anchor target stands for — the same mapping `TrainingEstimate.resolveBotReference` uses. */
+  private def anchorGlicko(targetElo: Double): Glicko =
+    Glicko(1500.0 + targetElo, TrainingEstimate.AnchorDeviation, Glicko.Initial.volatility)
+
+  /** A user's first training estimate against `reference`. The first game has no idle inflation to apply, so the game
+    * time does not enter the numbers.
+    */
+  private def firstGameAgainst(reference: Glicko, humanIsWhite: Boolean, score: Double): TrainingState =
+    TrainingEstimate.update(TrainingState.Initial, reference, humanIsWhite, score, gameTime = Instant.EPOCH)
+
+  private def assertSameEstimate(actual: TrainingState, expected: TrainingState)(using munit.Location): Unit =
+    assertEqualsDouble(actual.rating, expected.rating, 1e-9)
+    assertEqualsDouble(actual.deviation, expected.deviation, 1e-9)
+    assertEqualsDouble(actual.volatility, expected.volatility, 1e-9)
+    assertEquals(actual.games, expected.games)
+
+  private def setBlitzRating(xa: Transactor[IO], bot: Principal.Bot, glicko: Glicko): IO[Unit] =
+    sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+          VALUES (${bot.team}, ${bot.name}, ${RatingCategory.Blitz.wireName},
+                  ${glicko.rating}, ${glicko.deviation}, ${glicko.volatility})
+          ON CONFLICT (team, name, category)
+          DO UPDATE SET rating = EXCLUDED.rating, rd = EXCLUDED.rd, vol = EXCLUDED.vol""".update.run
+      .transact(xa)
+      .void
+
+  /** What a row written before V11 carries: no reference columns at all. */
+  private def forgetReference(xa: Transactor[IO], gameId: GameId): IO[Unit] =
+    sql"""UPDATE play.game_results
+          SET training_reference_source = NULL, training_reference_anchor_set = NULL,
+              training_reference_anchor_epoch = NULL, training_reference_rating = NULL,
+              training_reference_rd = NULL, training_reference_vol = NULL
+          WHERE game_id = ${gameId.value}::uuid""".update.run.transact(xa).void
+
+  /** A re-drain: the applied row goes back to the head of the queue and the estimate it produced is forgotten. */
+  private def requeue(xa: Transactor[IO], gameId: GameId, userId: String): IO[Unit] =
+    (sql"""UPDATE play.game_results
+           SET rating_applied_at = NULL, rating_outcome = 'pending', rating_skip_reason = NULL,
+               white_rating_before = NULL, white_rating_after = NULL,
+               black_rating_before = NULL, black_rating_after = NULL
+           WHERE game_id = ${gameId.value}::uuid""".update.run *>
+      sql"DELETE FROM play.user_training_ratings WHERE user_id = $userId::uuid".update.run).transact(xa).void
+
+  /** Whether PostgreSQL refuses `assignments` on the game's row with a CHECK violation (SQLSTATE 23514). */
+  private def refusedByCheck(xa: Transactor[IO], gameId: GameId, assignments: Fragment): IO[Boolean] =
+    (fr"UPDATE play.game_results SET" ++ assignments ++ fr"WHERE game_id = ${gameId.value}::uuid").update.run
+      .transact(xa)
+      .attempt
+      .map {
+        case Left(error: SQLException) => error.getSQLState == "23514"
+        case _                         => false
+      }
+
+  test("save captures a training row's anchor reference with its set version and epoch; other rows record none"):
+    val anchors = fixtureAnchors("fixture-v1", 7, "fixture/anchor", targetElo = 100.0)
+    withContainers { pg =>
+      storeAndXa(pg, anchors).use { (db, _) =>
+        for
+          player <- db.upsertOnLogin("google", "sub-ref-anchor-1", None, IO.pure("RefAnchor"))
+          rival  <- db.upsertOnLogin("google", "sub-ref-anchor-2", None, IO.pure("RefAnchorRival"))
+          human = Principal.User(player.id)
+          training    <- GameId.random
+          competitive <- GameId.random
+          _           <- db.save(training, trainingFixture(human, Principal.Bot("fixture", "anchor")))
+          _           <- db.save(competitive, competitiveFixture(human, Principal.User(rival.id)))
+          trainingRef <- db.trainingReferenceOf(training)
+          otherRef    <- db.trainingReferenceOf(competitive)
+          unknownRef  <- GameId.random.flatMap(db.trainingReferenceOf)
+        yield
+          assertEquals(
+            trainingRef,
+            CapturedTrainingReference.Recorded(
+              TrainingReference(TrainingReferenceSource.Anchor("fixture-v1", 7), anchorGlicko(100.0))
+            ),
+            "captured by save itself, before any batch has run"
+          )
+          assertEquals(otherRef, CapturedTrainingReference.NotRecorded)
+          assertEquals(unknownRef, CapturedTrainingReference.NotRecorded)
+      }
+    }
+
+  test("a drain delayed past a change in the bot's rating applies the rating the game faced"):
+    val bot: Principal.Bot = Principal.Bot("acme", "delayed")
+    val faced              = Glicko(1700.0, 80.0, 0.06)
+    val moved              = Glicko(1300.0, 60.0, 0.06)
+    withContainers { pg =>
+      storeAndXa(pg).use { (db, xa) =>
+        for
+          player <- db.upsertOnLogin("google", "sub-ref-delay-1", None, IO.pure("RefDelay"))
+          _      <- db.register(bot.team, bot.name, "hash-acme-delayed")
+          _      <- setBlitzRating(xa, bot, faced)
+          gameId <- GameId.random
+          _      <- db.save(gameId, trainingFixture(Principal.User(player.id), bot))
+          // Ladder games applied between the end of the game and the drain move the bot's stored rating.
+          _        <- setBlitzRating(xa, bot, moved)
+          _        <- matrixBatch(db).flatMap(_.tick)
+          state    <- db.trainingStateOf(player.id, RatingCategory.Blitz)
+          change   <- db.ratingChangeFor(gameId)
+          captured <- db.trainingReferenceOf(gameId)
+        yield
+          assertEquals(
+            captured,
+            CapturedTrainingReference.Recorded(TrainingReference(TrainingReferenceSource.BotRating, faced))
+          )
+          assertSameEstimate(state, firstGameAgainst(faced, humanIsWhite = true, score = 1.0))
+          assertNotEquals(state.rating, firstGameAgainst(moved, humanIsWhite = true, score = 1.0).rating)
+          assertEquals(
+            change.flatMap(_.black),
+            Some(SeatRatingChange(faced.rating, faced.rating)),
+            "the row records the reference it was applied against"
+          )
+      }
+    }
+
+  test("an anchor-set version bump does not move a queued game's reference"):
+    val queuedWith         = fixtureAnchors("fixture-v1", 1, "fixture/anchor-bump", targetElo = 100.0)
+    val drainedBy          = fixtureAnchors("fixture-v2", 2, "fixture/anchor-bump", targetElo = -300.0)
+    val bot: Principal.Bot = Principal.Bot("fixture", "anchor-bump")
+    withContainers { pg =>
+      storeAndXa(pg, queuedWith).use { (db, _) =>
+        for
+          player <- db.upsertOnLogin("google", "sub-ref-bump-1", None, IO.pure("RefBump"))
+          _      <- db.register(bot.team, bot.name, "hash-fixture-anchor-bump")
+          gameId <- GameId.random
+          _      <- db.save(
+            gameId,
+            trainingFixture(Principal.User(player.id), bot, result = GameResult.Win(Side.Black), humanIsWhite = false)
+          )
+          // The batch that reaches the row has been rebuilt with the next anchor set.
+          _        <- matrixBatch(db, drainedBy).flatMap(_.tick)
+          state    <- db.trainingStateOf(player.id, RatingCategory.Blitz)
+          captured <- db.trainingReferenceOf(gameId)
+        yield
+          assertEquals(
+            captured,
+            CapturedTrainingReference.Recorded(
+              TrainingReference(TrainingReferenceSource.Anchor("fixture-v1", 1), anchorGlicko(100.0))
+            )
+          )
+          assertSameEstimate(state, firstGameAgainst(anchorGlicko(100.0), humanIsWhite = false, score = 1.0))
+          assertNotEquals(
+            state.rating,
+            firstGameAgainst(anchorGlicko(-300.0), humanIsWhite = false, score = 1.0).rating
+          )
+      }
+    }
+
+  test("re-draining a training row reproduces the same numbers after the bot's rating has moved"):
+    val bot: Principal.Bot = Principal.Bot("acme", "redrain")
+    withContainers { pg =>
+      storeAndXa(pg).use { (db, xa) =>
+        for
+          player       <- db.upsertOnLogin("google", "sub-ref-redrain-1", None, IO.pure("RefRedrain"))
+          _            <- db.register(bot.team, bot.name, "hash-acme-redrain")
+          _            <- setBlitzRating(xa, bot, Glicko(1650.0, 90.0, 0.06))
+          gameId       <- GameId.random
+          _            <- db.save(gameId, trainingFixture(Principal.User(player.id), bot, result = GameResult.Draw))
+          _            <- matrixBatch(db).flatMap(_.tick)
+          first        <- db.trainingStateOf(player.id, RatingCategory.Blitz)
+          firstChange  <- db.ratingChangeFor(gameId)
+          _            <- setBlitzRating(xa, bot, Glicko(1200.0, 50.0, 0.06))
+          _            <- requeue(xa, gameId, player.id)
+          _            <- matrixBatch(db).flatMap(_.tick)
+          second       <- db.trainingStateOf(player.id, RatingCategory.Blitz)
+          secondChange <- db.ratingChangeFor(gameId)
+        yield
+          assertEquals(first.games, 1)
+          assertSameEstimate(second, first)
+          assertEquals(secondChange, firstChange)
+      }
+    }
+
+  test("a training row queued before references were captured applies from current state and gains none"):
+    val bot: Principal.Bot = Principal.Bot("acme", "pre-capture")
+    val current            = Glicko(1450.0, 65.0, 0.06)
+    withContainers { pg =>
+      storeAndXa(pg).use { (db, xa) =>
+        for
+          player <- db.upsertOnLogin("google", "sub-ref-pre-1", None, IO.pure("RefPreCapture"))
+          _      <- db.register(bot.team, bot.name, "hash-acme-pre-capture")
+          _      <- setBlitzRating(xa, bot, Glicko(1550.0, 70.0, 0.06))
+          gameId <- GameId.random
+          _ <- db.save(gameId, trainingFixture(Principal.User(player.id), bot, result = GameResult.Win(Side.Black)))
+          _ <- forgetReference(xa, gameId)
+          before <- db.trainingReferenceOf(gameId)
+          _      <- setBlitzRating(xa, bot, current)
+          _      <- matrixBatch(db).flatMap(_.tick)
+          state  <- db.trainingStateOf(player.id, RatingCategory.Blitz)
+          after  <- db.trainingReferenceOf(gameId)
+        yield
+          assertEquals(before, CapturedTrainingReference.NotRecorded)
+          // Exactly what #149 did for every row: the bot's stored rating at drain time.
+          assertSameEstimate(state, firstGameAgainst(current, humanIsWhite = true, score = 0.0))
+          assertEquals(after, CapturedTrainingReference.NotRecorded, "no provenance is invented after the fact")
+      }
+    }
+
+  test("a bot with no reference when the game was queued stays skipped even if it is rated before the drain"):
+    val bot: Principal.Bot = Principal.Bot("acme", "unrated")
+    withContainers { pg =>
+      storeAndXa(pg).use { (db, xa) =>
+        for
+          player   <- db.upsertOnLogin("google", "sub-ref-unrated-1", None, IO.pure("RefUnrated"))
+          _        <- db.register(bot.team, bot.name, "hash-acme-unrated")
+          gameId   <- GameId.random
+          _        <- db.save(gameId, trainingFixture(Principal.User(player.id), bot))
+          captured <- db.trainingReferenceOf(gameId)
+          _        <- setBlitzRating(xa, bot, Glicko(1500.0, 120.0, 0.06))
+          _        <- matrixBatch(db).flatMap(_.tick)
+          state    <- db.trainingStateOf(player.id, RatingCategory.Blitz)
+          change   <- db.ratingChangeFor(gameId)
+        yield
+          assertEquals(captured, CapturedTrainingReference.Unavailable)
+          assertEquals(state.games, 0)
+          assertEquals(change.map(_.outcome), Some(RatingOutcome.Skipped))
+          assertEquals(change.flatMap(_.reason), Some("no reference bot rating for acme/unrated in category 'blitz'"))
+      }
+    }
+
+  test("the schema refuses a reference on a non-training row, an unknown source, or a source with the wrong fields"):
+    withContainers { pg =>
+      storeAndXa(pg).use { (db, xa) =>
+        for
+          player      <- db.upsertOnLogin("google", "sub-ref-check-1", None, IO.pure("RefCheck"))
+          rival       <- db.upsertOnLogin("google", "sub-ref-check-2", None, IO.pure("RefCheckRival"))
+          training    <- GameId.random
+          competitive <- GameId.random
+          _           <- db.save(training, trainingFixture(Principal.User(player.id), Principal.Bot("acme", "checked")))
+          _           <- db.save(competitive, competitiveFixture(Principal.User(player.id), Principal.User(rival.id)))
+          onCompetitive <- refusedByCheck(xa, competitive, fr"training_reference_source = 'unavailable'")
+          unknownSource <- refusedByCheck(xa, training, fr"training_reference_source = 'guess'")
+          anchorNoSet   <- refusedByCheck(
+            xa,
+            training,
+            fr"""training_reference_source = 'anchor', training_reference_rating = 1500,
+                 training_reference_rd = 50, training_reference_vol = 0.06"""
+          )
+          ratingWithEpoch <- refusedByCheck(
+            xa,
+            training,
+            fr"""training_reference_source = 'bot_rating', training_reference_anchor_epoch = 1,
+                 training_reference_rating = 1500, training_reference_rd = 50, training_reference_vol = 0.06"""
+          )
+          unavailableWithNumbers <- refusedByCheck(
+            xa,
+            training,
+            fr"training_reference_source = 'unavailable', training_reference_rating = 1500"
+          )
+          stillCaptured <- db.trainingReferenceOf(training)
+        yield
+          assert(onCompetitive, "only a training row carries a reference")
+          assert(unknownSource, "the source vocabulary is closed")
+          assert(anchorNoSet, "an anchor reference names its set and epoch")
+          assert(ratingWithEpoch, "a stored-rating reference names no anchor epoch")
+          assert(unavailableWithNumbers, "a missing reference carries no numbers")
+          assertEquals(
+            stillCaptured,
+            CapturedTrainingReference.Unavailable,
+            "every refused write left the row as saved"
+          )
       }
     }

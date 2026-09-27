@@ -279,6 +279,19 @@ without numbers → `legacy` (applied before per-row recording, or skipped witho
 the data cannot say which, so it is not reinterpreted). The kinds are the one legacy field that is
 derivable and they are backfilled.
 
+V11 (#189) records the bot reference a `training` row is applied against. It is captured in the
+terminal transaction that writes the row — the moment the row is queued — instead of being resolved
+by the batch at drain time. `training_reference_source` says where it came from: `anchor` (a scale
+anchor's fixed target, with `training_reference_anchor_set` and `training_reference_anchor_epoch`
+naming the set's version and epoch), `bot_rating` (the bot's stored rating in the game's category
+as it stood when the game ended), or `unavailable` (neither existed, so the batch skips the row).
+`training_reference_rating`/`_rd`/`_vol` are the Glicko-2 state the update uses. A delayed drain, a
+retry or an anchor-set change therefore cannot move a queued game's reference, and recomputing an
+update needs the row alone. NULL is the honest record for every row that is not a training row and
+for a training row queued before V11: the batch keeps resolving those from current state, as it
+always did, and they are never backfilled. Three CHECK constraints pin the vocabulary, restrict a
+reference to training rows and tie each source to exactly its own fields.
+
 `category` (#335) is a **STORED generated column**, `rating_category(time_control)` computed
 once at insert — the schema reference above cannot show that, so it reads as an ordinary nullable
 `text`. It exists because the readers used to call that function inside their `WHERE` clauses, and

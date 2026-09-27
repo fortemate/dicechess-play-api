@@ -30,11 +30,6 @@ tags:
     description: Public, unauthenticated reads — live games, legal moves, a single game snapshot.
   - name: Leaderboard
     description: Public rating-ladder reads. Present only when the server runs with persistence.
-  - name: Strength
-    description: >
-      Public, precise pairwise SPRT verdicts and a Bradley-Terry pool ranking — the error-rate-bounded
-      complement to the Glicko-2 leaderboard. Present only when the server runs with persistence, and
-      answers 503 until the rating batch has completed its first refresh.
   - name: Webhooks
     description: Register an HTTPS callback the server POSTs turns to. Registered bots only; enabled per server.
   - name: Webhook management
@@ -651,40 +646,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/BotProfile' }
         '404': { description: No registered bot with that team/name. }
-  /strength:
-    get:
-      tags: [Strength]
-      summary: Strength report (public)
-      description: >
-        The whole cached report: every pairwise SPRT verdict, plus the Bradley-Terry pool ranking.
-        Refreshed on the rating batch's own cadence, not per request — see
-        [Rating & Ladder](https://bots.fortemate.com/rating/) for why this exists alongside Glicko.
-      security: []
-      responses:
-        '200':
-          description: The current strength report.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/StrengthReportResponse' }
-        '404': { description: Server runs without persistence. }
-        '503': { description: No report has been computed yet (fresh boot, or rating updates disabled). }
-  /bots/{team}/{name}/strength:
-    get:
-      tags: [Strength]
-      summary: Bot strength profile (public)
-      description: Just the matchups involving one registered bot — the profile-page-sized slice of `GET /strength`.
-      security: []
-      parameters:
-        - { name: team, in: path, required: true, schema: { type: string } }
-        - { name: name, in: path, required: true, schema: { type: string } }
-      responses:
-        '200':
-          description: This bot's strength matchups.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/BotStrengthProfile' }
-        '404': { description: No registered bot with that team/name. }
-        '503': { description: No report has been computed yet (fresh boot, or rating updates disabled). }
   /lobby/bots:
     get:
       tags: [Leaderboard]
@@ -2149,86 +2110,6 @@ components:
         termination: { type: string }
         finishedAt: { type: string, format: date-time }
       required: [gameId, seat, opponent, result, rated, termination, finishedAt]
-    PentanomialCounts:
-      type: object
-      description: >
-        Pair-score histogram from `perspective`'s side: n0 = lost both games of the CRN mirror pair … n4 =
-        won both.
-      properties:
-        n0: { type: integer }
-        n1: { type: integer }
-        n2: { type: integer }
-        n3: { type: integer }
-        n4: { type: integer }
-      required: [n0, n1, n2, n3, n4]
-    TrinomialCounts:
-      type: object
-      description: Single-game (unpaired) histogram from `perspective`'s side.
-      properties:
-        losses: { type: integer }
-        draws: { type: integer }
-        wins: { type: integer }
-      required: [losses, draws, wins]
-    SprtVerdictResult:
-      type: object
-      properties:
-        llr: { type: number, description: The log-likelihood ratio. }
-        lower: { type: number, description: The lower SPRT bound — LLR at or below this accepts H0. }
-        upper: { type: number, description: The upper SPRT bound — LLR at or above this accepts H1. }
-        verdict:
-          type: string
-          enum: [AcceptH1, AcceptH0, Continue]
-          description: >
-            AcceptH1 = perspective is stronger; AcceptH0 = not stronger by the tested margin; Continue =
-            not enough data yet for a verdict — surfaced honestly, never hidden or rounded into a claim.
-        observations: { type: integer, description: Pentanomial pairs plus trinomial singles, combined. }
-      required: [llr, lower, upper, verdict, observations]
-    PairwiseResult:
-      type: object
-      description: One unordered bot matchup's SPRT verdict, from `perspective`'s side.
-      properties:
-        perspective: { type: string, description: Team-qualified bot name, the lexicographically smaller of the two. }
-        opponent: { type: string, description: Team-qualified bot name. }
-        pairs: { $ref: '#/components/schemas/PentanomialCounts' }
-        singles: { $ref: '#/components/schemas/TrinomialCounts' }
-        result: { $ref: '#/components/schemas/SprtVerdictResult' }
-      required: [perspective, opponent, pairs, singles, result]
-    RankedBot:
-      type: object
-      description: >
-        One bot's row of the Bradley-Terry pool ranking. `elo` is RELATIVE (the pool's mean is 0 by
-        construction — not comparable to the Glicko-2 board's 1500-centred numbers).
-      properties:
-        player: { type: string, description: Team-qualified bot name. }
-        elo: { type: number }
-        ciLow: { type: number, description: Bootstrap 95% confidence interval, lower bound. }
-        ciHigh: { type: number, description: Bootstrap 95% confidence interval, upper bound. }
-        losVsNext:
-          type: [number, 'null']
-          description: Likelihood of superiority over the next-ranked bot; null for the last row.
-      required: [player, elo, ciLow, ciHigh]
-    StrengthReportResponse:
-      type: object
-      properties:
-        pairwise:
-          type: array
-          items: { $ref: '#/components/schemas/PairwiseResult' }
-        ranking:
-          type: array
-          items: { $ref: '#/components/schemas/RankedBot' }
-        completePairs: { type: integer, description: Complete CRN mirror pairs folded into the report. }
-        singles: { type: integer, description: Unpaired rated games folded into the report. }
-        excludedRows: { type: integer, description: Rows excluded — non-bot participant, undecided, or self-play. }
-      required: [pairwise, ranking, completePairs, singles, excludedRows]
-    BotStrengthProfile:
-      type: object
-      properties:
-        team: { type: string }
-        name: { type: string }
-        pairwise:
-          type: array
-          items: { $ref: '#/components/schemas/PairwiseResult' }
-      required: [team, name, pairwise]
     WebhookCapability:
       type: string
       enum: [draws, doubling]

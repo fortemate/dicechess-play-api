@@ -19,7 +19,7 @@ Everything lives under `src/main/scala/dicechess/play/`.
 | `game/` | `GameRoom` (the actor-style room), `EngineOps` (the only engine wrapper), `PlayerConnection` |
 | `server/` | http4s routes and the services behind them — the largest package |
 | `store/` | `GameStore` / `PgGameStore` (doobie + Flyway), `GameArchive`, `Retention` |
-| `rating/` | `Glicko2`, `RatingBatch`, and the strength report: `Sprt`, `BradleyTerry`, `StrengthReport`, `StrengthCache` |
+| `rating/` | `Glicko2`, `RatingBatch`, and the offline strength report behind `mise run ladder:report`: `Sprt`, `BradleyTerry`, `AnchoredStrength`, `StrengthReport` |
 | `ingest/` | `PlaysiteIngest` + `IngestDeliverer` — the transactional outbox to analytics |
 | `wire/` | `Codecs.scala` — the Circe codecs that *are* the client wire contract |
 
@@ -37,7 +37,7 @@ flowchart TD
     STORE -->|"same transaction, on game end"| OUT["ingest/ outbox"]
     OUT -->|"HTTP POST, retried"| AN["dicechess-analytics"]
     STORE --> RES["game_results projection"]
-    RES --> RB["rating/RatingBatch<br/>Glicko-2 + strength report"]
+    RES --> RB["rating/RatingBatch<br/>Glicko-2 + training estimate"]
 ```
 
 The shape to hold on to: **the room is the only writer of game state**, and everything
@@ -73,7 +73,7 @@ Routes are grouped by audience rather than by resource:
   token grants the seat; redeeming it is also when the seat learns who is sitting in it (#285),
   from the session or a `?guest=` uuid.
 - **Public discovery** — `GET /games`, `GET /leaderboard`, `GET /bots/{team}/{name}`, plus the
-  history and strength endpoints.
+  history endpoints.
 - **Showcase table** — `GET /showcase` and `POST /showcase/claim` (ADR-005, #46), mounted only with
   `SHOWCASE_ENABLED=true`. The homepage's singleton table:
   - `GET /showcase` is the public read: `status` (`unavailable`, `open`, `live`, `finishing`), the

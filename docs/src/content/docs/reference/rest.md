@@ -1,6 +1,6 @@
 ---
 title: REST Endpoints
-description: The complete REST surface — identity, challenges, seeks, gameplay, public discovery, the leaderboard, and the strength report.
+description: The complete REST surface — identity, challenges, seeks, gameplay, public discovery and the leaderboard.
 ---
 
 All routes are relative to `https://api.fortemate.com` (legacy `https://play-api.jc.id.lv`) and require `Authorization: Bearer <token>` unless marked **public**. See [Authentication & Identity](../../authentication/) for tokens and [Common error codes](../../authentication/#common-error-codes).
@@ -380,42 +380,3 @@ One registered bot's public card: rating summary, its aggregate record against e
 ```
 
 Errors: `404` no registered bot with that team/name.
-
-## Strength report
-
-Public, no `Authorization`. The precise, error-rate-bounded complement to the Glicko-2 leaderboard above — see [Rating & Ladder](../../rating/) for why a bot might want both numbers. Exists only when the server runs with persistence (`404` otherwise); before the rating batch has completed its first refresh (a fresh boot, or a server with rating updates disabled), both routes answer `503` rather than blocking on a synchronous build — the underlying report folds the entire game history and its ranking runs a four-figure bootstrap, too expensive to pay per request.
-
-### Strength report
-
-`GET /strength`
-
-The whole cached report: every pairwise [SPRT](https://en.wikipedia.org/wiki/Sequential_probability_ratio_test) verdict, weighted over every eligible game for that matchup, plus a [Bradley-Terry](https://en.wikipedia.org/wiki/Bradley%E2%80%93Terry_model) pool ranking. `verdict` is `"AcceptH1"` (the `perspective` bot is stronger), `"AcceptH0"` (not stronger by the tested margin), or `"Continue"` (not enough data yet) — `Continue` is surfaced honestly rather than hidden or rounded into a claim. `elo` in `ranking` is **relative** (the pool's mean is 0 by construction, not the Glicko board's 1500-centred scale).
-
-The report covers **one rating scale**, named in `category` — the ladder's, `blitz`. Games played at any other speed
-are not folded in and are counted in `excludedRows` instead, alongside the rows that were never eligible (non-bot
-seats, undecided games). Comparing a bot's 1+1 results with its 10+10 ones and calling the mixture its strength is
-exactly the conflation per-category ratings exist to end.
-
-```json
-{
-  "category": "blitz",
-  "pairwise": [{
-    "perspective": "acme/alice", "opponent": "acme/bob",
-    "pairs": { "n0": 1, "n1": 0, "n2": 2, "n3": 4, "n4": 9 },
-    "singles": { "losses": 0, "draws": 1, "wins": 2 },
-    "result": { "llr": 1.8, "lower": -2.89, "upper": 2.89, "verdict": "Continue", "observations": 19 }
-  }],
-  "ranking": [{ "player": "acme/alice", "elo": 42.0, "ciLow": 10.0, "ciHigh": 74.0, "losVsNext": 0.91 }],
-  "completePairs": 16, "singles": 3, "excludedRows": 2
-}
-```
-
-### Bot strength profile
-
-`GET /bots/{team}/{name}/strength`
-
-Just the matchups involving one registered bot — the profile-page-sized slice of the report above, on the same scale and carrying the same `category`. `pairwise` uses the same shape. Errors: `404` no registered bot with that team/name.
-
-```json
-{ "team": "acme", "name": "alice", "category": "blitz", "pairwise": [{ "perspective": "acme/alice", "opponent": "acme/bob", "pairs": { "n0": 1, "n1": 0, "n2": 2, "n3": 4, "n4": 9 }, "singles": { "losses": 0, "draws": 1, "wins": 2 }, "result": { "llr": 1.8, "lower": -2.89, "upper": 2.89, "verdict": "Continue", "observations": 19 } }] }
-```

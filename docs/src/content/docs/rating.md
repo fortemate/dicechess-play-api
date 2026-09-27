@@ -23,7 +23,7 @@ The multiplier is measured, not borrowed: chess uses 40 expected moves per side,
 
 **`Unlimited` and `PerMove` belong to no category, and games under them are always casual.** Neither bounds how long a game lasts, so there is no scale for the result to land on. Asking for `rated` with one of those gets you a casual game and a `rated: false` you can read back — never a promise the game cannot keep. Clockless bot-vs-bot corpus runs keep working exactly as before; they simply stop claiming to be rated.
 
-The ladder plays a single control (5 + 3, Blitz), so that is the scale [`GET /leaderboard`](../reference/rest/#leaderboard) answers on when you do not name one, and the scale the strength report is built from.
+The ladder plays a single control (5 + 3, Blitz), so that is the scale [`GET /leaderboard`](../reference/rest/#leaderboard) answers on when you do not name one.
 
 ## Which games count: rating domains
 
@@ -85,7 +85,7 @@ The public [`GET /leaderboard`](../reference/rest/#leaderboard) sorts by the **c
 
 Why: raw-rating ordering ignores the uncertainty printed right next to the number. A converged bot on a lucky streak gains rating *and* — because a streak is exactly the "my rating didn't see that coming" signal — volatility, which pushes `rd` back up. Sorting by `rating − 2·rd` ranks each bot by what its rating is *at least* (roughly the 97.7% one-sided bound, the same idea as TrueSkill's conservative μ − kσ), so the streak-inflated entry stops jumping better-settled ones, and falls back into place as its `rd` re-converges — without the displayed numbers changing meaning.
 
-The board is a live standing, not a verdict: "is bot A actually stronger than bot B" has its own instrument — the [strength report](#a-more-precise-alternative-the-strength-report) below.
+The board is a live standing, not a verdict on whether one bot is actually stronger than another.
 
 ## Provisional bots and the public board
 
@@ -126,11 +126,3 @@ If your bot runs on a laptop, a dev machine, or anything you shut down at night,
 :::
 
 A genuinely slow bot that keeps flagging on the ladder's 5+3 clock will eventually be parked too. That is intended: at that time control it is not competitive, and the fix is a faster move loop or a [stream/webhook](../connection-modes/) instead of a slow poll.
-
-## A more precise alternative: the strength report
-
-Glicko-2 is a good *live standing* — a number that updates quickly enough to pair bots sensibly and to show on a leaderboard. It is a weaker instrument for the sharper question "is my bot actually stronger than that other one, and how sure can I be?": per-game variance in a dice game is large, so `rd` stays wide and converges slowly, and the ladder pool is small and closed — Glicko measures standing *within* the pool, which can drift as a whole.
-
-[`GET /strength`](../reference/rest/#strength-report) answers that sharper question directly, for every pair of registered bots with enough shared history: a [Sequential Probability Ratio Test](https://en.wikipedia.org/wiki/Sequential_probability_ratio_test) verdict — `"AcceptH1"`, `"AcceptH0"`, or an honest `"Continue"` when there simply isn't enough evidence yet — weighted per game between the two bots, plus a pool-wide [Bradley-Terry](https://en.wikipedia.org/wiki/Bradley%E2%80%93Terry_model) ranking with bootstrap confidence intervals. [`GET /bots/{team}/{name}/strength`](../reference/rest/#bot-strength-profile) narrows that to one bot's own matchups.
-
-The report is refreshed on the same batch cadence as ratings, not per request, so it can lag a live game by up to the batch interval — and it answers `503` rather than a guess before the first refresh completes.

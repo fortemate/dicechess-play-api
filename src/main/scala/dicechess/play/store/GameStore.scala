@@ -821,9 +821,16 @@ trait RatingStore:
   def trainingStatesOf(@unused userId: String): IO[Map[RatingCategory, dicechess.play.rating.TrainingState]] =
     IO.pure(Map.empty)
 
+  /** The bot reference a queued training row recorded when it was written (#189), which is what the batch applies it
+    * against. `NotRecorded` for a row queued before references were captured, for a row that is not a training row, for
+    * an unknown game id, and for a store with no `game_results` projection.
+    */
+  def trainingReferenceOf(@unused gameId: GameId): IO[dicechess.play.rating.CapturedTrainingReference] =
+    IO.pure(dicechess.play.rating.CapturedTrainingReference.NotRecorded)
+
   /** Atomically write human participant's post-game training state into `user_training_ratings`, record the movement
-    * and bot reference on the game's own row in `game_results`, and stamp the game as applied (#149). Bot ratings and
-    * human competitive ratings are untouched.
+    * and bot reference rating on the game's own row in `game_results`, and stamp the game as applied (#149). Bot
+    * ratings and human competitive ratings are untouched.
     */
   def applyTrainingUpdate(
       @unused gameId: GameId,

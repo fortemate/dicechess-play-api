@@ -4405,6 +4405,36 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       ()
     }
 
+  test("V11 adds the training reference without inventing one for a training row already queued (#189)"):
+    withContainers { pg =>
+      rawXa(pg).use { xa =>
+        val schema = "mig_v11_training_reference"
+        val gameId = UUID.randomUUID()
+        val human  = s"user:${UUID.randomUUID()}"
+        val plant  =
+          (fr"INSERT INTO" ++ Fragment.const(s"$schema.game_results") ++
+            fr"""(game_id, white_external_id, black_external_id, result, termination, rated, time_control,
+                  server_seed, white_kind, black_kind, rated_requested, rating_domain, rating_policy_version,
+                  rating_outcome)
+                 VALUES ($gameId, $human, 'bot:team:pre-v11:sparring', 1, 'resign', false, 'Fischer(300,3)',
+                         'seed-pre-v11', 'human', 'bot', true, 'training', 2, 'pending')""").update.run
+            .transact(xa)
+        val reference =
+          (fr"""SELECT training_reference_source, training_reference_anchor_set, training_reference_anchor_epoch,
+                       training_reference_rating, training_reference_rd, training_reference_vol
+                FROM""" ++ Fragment.const(s"$schema.game_results") ++ fr"WHERE game_id = $gameId")
+            .query[(Option[String], Option[String], Option[Int], Option[Double], Option[Double], Option[Double])]
+            .unique
+            .transact(xa)
+        for
+          _   <- migrateInto(pg, schema, Some("10"))
+          _   <- plant
+          _   <- migrateInto(pg, schema)
+          row <- reference
+        yield assertEquals(row, (None, None, None, None, None, None), "unknown provenance stays unknown")
+      }
+    }
+
   test("V4 preserves every pre-existing active webhook field while backfilling control-plane identities (#36)"):
     withContainers { pg =>
       rawXa(pg).use { xa =>

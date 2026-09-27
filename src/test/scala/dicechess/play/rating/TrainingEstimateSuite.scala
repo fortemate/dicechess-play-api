@@ -30,8 +30,10 @@ class TrainingEstimateSuite extends FunSuite:
     // Blitz matches anchor set
     val randomBlitz = TrainingEstimate.resolveBotReference("anchor/random", RatingCategory.Blitz, anchorSet, storedNone)
     assert(randomBlitz.isDefined)
-    assertEquals(randomBlitz.get.rating, 1500.0 - 610.0)                      // 890.0
-    assertEquals(randomBlitz.get.deviation, TrainingEstimate.AnchorDeviation) // 50.0
+    assertEquals(randomBlitz.get.glicko.rating, 1500.0 - 610.0)                      // 890.0
+    assertEquals(randomBlitz.get.glicko.deviation, TrainingEstimate.AnchorDeviation) // 50.0
+    // The anchor set that supplied the target is named, so a captured reference says which calibration it came from.
+    assertEquals(randomBlitz.get.source, TrainingReferenceSource.Anchor(anchorSet.version, anchorSet.epoch))
 
     // Rapid does NOT match anchor set V1.0 category (Blitz)
     val randomRapid = TrainingEstimate.resolveBotReference("anchor/random", RatingCategory.Rapid, anchorSet, storedNone)
@@ -45,7 +47,7 @@ class TrainingEstimateSuite extends FunSuite:
       anchorSet,
       Some(customRapidGlicko)
     )
-    assertEquals(customRapid, Some(customRapidGlicko))
+    assertEquals(customRapid, Some(TrainingReference(TrainingReferenceSource.BotRating, customRapidGlicko)))
 
   test("first-move White advantage shifts opponent effective reference rating"):
     val botRef = Glicko(1500.0, 50.0, 0.06)

@@ -42,6 +42,33 @@ object TrainingState:
     updatedAt = None
   )
 
+/** Where the bot reference of a training update came from (#189). */
+enum TrainingReferenceSource:
+  /** A scale anchor's fixed target, from the named anchor-set version and scale epoch. */
+  case Anchor(anchorSetVersion: String, epoch: Int)
+
+  /** The bot's own stored rating in the game's category. */
+  case BotRating
+
+/** The Glicko-2 state a training update is computed against, and where it came from (#189). */
+final case class TrainingReference(source: TrainingReferenceSource, glicko: Glicko)
+
+/** What a training row recorded about its bot reference when it was queued (#189).
+  *
+  * The reference is captured in the transaction that writes the `game_results` row, so a delayed drain, a retry or an
+  * anchor-set change cannot alter what a queued game is graded against, and the row alone says what was used.
+  */
+enum CapturedTrainingReference:
+  /** The row was queued before references were captured. Nothing is known about what it faced, and nothing is invented:
+    * the batch resolves it from current state, exactly as it did before #189.
+    */
+  case NotRecorded
+
+  /** No reference existed when the game was queued, so the row can never be applied. */
+  case Unavailable
+
+  case Recorded(reference: TrainingReference)
+
 object TrainingEstimate:
   /** Minimum completed games before an estimate can be considered non-provisional. */
   val MinGamesThreshold: Int = 10
@@ -60,7 +87,7 @@ object TrainingEstimate:
 
   /** Resolves a category-matching reference Glicko state for `botKey` ("team/name"). Priority:
     *   1. If anchorSet matches `category` and contains `botKey`, uses fixed anchor target (1500 + targetElo, RD =
-    *      50.0).
+    *      50.0), tagged with the anchor set's version and epoch.
     *   2. Otherwise, uses `storedBotRating` if present for `category`.
     *   3. If neither is available, returns None — never borrows ratings from another category.
     */
@@ -69,11 +96,16 @@ object TrainingEstimate:
       category: RatingCategory,
       anchorSet: AnchorSet,
       storedBotRating: Option[Glicko]
-  ): Option[Glicko] =
+  ): Option[TrainingReference] =
     if anchorSet.category.equalsIgnoreCase(category.wireName) && anchorSet.anchorMap.contains(botKey) then
       val anchor = anchorSet.anchorMap(botKey)
-      Some(Glicko(1500.0 + anchor.targetElo, AnchorDeviation, Glicko.Initial.volatility))
-    else storedBotRating
+      Some(
+        TrainingReference(
+          TrainingReferenceSource.Anchor(anchorSet.version, anchorSet.epoch),
+          Glicko(1500.0 + anchor.targetElo, AnchorDeviation, Glicko.Initial.volatility)
+        )
+      )
+    else storedBotRating.map(TrainingReference(TrainingReferenceSource.BotRating, _))
 
   /** Computes the one-way post-game TrainingState for the human player. The bot reference is strictly immutable and
     * untouched.

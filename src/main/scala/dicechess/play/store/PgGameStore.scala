@@ -27,7 +27,16 @@ import dicechess.play.core.{
   WebhookCapability
 }
 import dicechess.play.ingest.PlaysiteIngest
-import dicechess.play.rating.{Glicko, Glicko2, TrainingState}
+import dicechess.play.rating.{
+  AnchorSet,
+  CapturedTrainingReference,
+  Glicko,
+  Glicko2,
+  TrainingEstimate,
+  TrainingReference,
+  TrainingReferenceSource,
+  TrainingState
+}
 import io.circe.Json
 import io.circe.syntax.*
 import org.flywaydb.core.Flyway
@@ -46,8 +55,11 @@ import scala.concurrent.duration.*
   *
   * Every round trip is bounded by a timeout: the caller treats store trouble as a degradation, and a *hung* query —
   * unlike a failed one — would otherwise stall the game's writer fiber in a way `handleErrorWith` can't catch.
+  *
+  * `anchorSet` is the calibration a training row's bot reference is captured against when `save` writes the row (#189)
+  * — the same set the rating batch is built with.
   */
-final class PgGameStore private (xa: HikariTransactor[IO])
+final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     extends GameStore
     with OutboxStore
     with ClientReportStore
@@ -254,15 +266,25 @@ final class PgGameStore private (xa: HikariTransactor[IO])
     val recordResult = finishedGame match
       case None     => ().pure[ConnectionIO]
       case Some(fg) =>
-        sql"""INSERT INTO play.game_results
-                (game_id, white_external_id, black_external_id, result, termination, rated, time_control,
-                 server_seed, ladder, origin,
-                 white_kind, black_kind, rated_requested, rating_domain, rating_policy_version, rating_outcome)
-              VALUES (${id.value}::uuid, ${fg.whiteExternalId}, ${fg.blackExternalId}, ${fg.result},
-                      ${fg.termination}, ${fg.rated}, ${fg.timeControl}, ${fg.serverSeed}, ${fg.ladder}, $origin,
-                      ${fg.whiteKind}, ${fg.blackKind}, ${fg.ratedRequested}, ${fg.ratingDomain},
-                      ${fg.ratingPolicyVersion.toShort}, ${fg.ratingOutcome})
-              ON CONFLICT (game_id) DO NOTHING""".update.run.void
+        // A training row is queued by this very INSERT, so its bot reference is captured here, in the same
+        // transaction (#189). `DO NOTHING` keeps the first capture: a retried terminal save cannot re-resolve what the
+        // game faced.
+        capturedReferenceOf(fg).flatMap { capture =>
+          val reference = PgGameStore.ReferenceColumns.of(capture)
+          sql"""INSERT INTO play.game_results
+                  (game_id, white_external_id, black_external_id, result, termination, rated, time_control,
+                   server_seed, ladder, origin,
+                   white_kind, black_kind, rated_requested, rating_domain, rating_policy_version, rating_outcome,
+                   training_reference_source, training_reference_anchor_set, training_reference_anchor_epoch,
+                   training_reference_rating, training_reference_rd, training_reference_vol)
+                VALUES (${id.value}::uuid, ${fg.whiteExternalId}, ${fg.blackExternalId}, ${fg.result},
+                        ${fg.termination}, ${fg.rated}, ${fg.timeControl}, ${fg.serverSeed}, ${fg.ladder}, $origin,
+                        ${fg.whiteKind}, ${fg.blackKind}, ${fg.ratedRequested}, ${fg.ratingDomain},
+                        ${fg.ratingPolicyVersion.toShort}, ${fg.ratingOutcome},
+                        ${reference.source}, ${reference.anchorSet}, ${reference.anchorEpoch},
+                        ${reference.rating}, ${reference.rd}, ${reference.vol})
+                ON CONFLICT (game_id) DO NOTHING""".update.run.void
+        }
     val keepAbort = snapshot.status match
       case GameStatus.Ended(GameOver(_, Termination.Aborted)) =>
         sql"SELECT EXISTS (SELECT 1 FROM play.rematch_successors WHERE game_id = ${id.value}::uuid)"
@@ -278,6 +300,36 @@ final class PgGameStore private (xa: HikariTransactor[IO])
                 ON CONFLICT (game_id) DO NOTHING""".update.run.void
     }
     upsert *> enqueue *> recordResult *> archive *> PgRematchStore.captureSource(id, snapshot)
+
+  /** The bot reference a training row is queued with (#189), read in the transaction that writes the row: the anchor
+    * target when the bot is an anchor of `anchorSet` in the game's category, otherwise the bot's stored rating in that
+    * category as it stands when the game ends, otherwise `Unavailable`. `None` for a row that is not a training row,
+    * which carries no reference columns at all.
+    */
+  private def capturedReferenceOf(fg: PgGameStore.FinishedGame): ConnectionIO[Option[CapturedTrainingReference]] =
+    if fg.ratingDomain != RatingDomain.Training.wireName then Option.empty[CapturedTrainingReference].pure[ConnectionIO]
+    else
+      val bots = List(fg.whiteExternalId, fg.blackExternalId).flatMap(Principal.fromBotExternalId)
+      (bots, RatingCategory.ofStored(fg.timeControl)) match
+        case (List(bot), Some(category)) =>
+          sql"""SELECT rating, rd, vol FROM play.bot_ratings
+                WHERE team = ${bot.team} AND name = ${bot.name} AND category = ${category.wireName}"""
+            .query[(Double, Double, Double)]
+            .option
+            .map { stored =>
+              TrainingEstimate
+                .resolveBotReference(
+                  botKey = s"${bot.team}/${bot.name}",
+                  category = category,
+                  anchorSet = anchorSet,
+                  storedBotRating = stored.map((rating, rd, vol) => Glicko(rating, rd, vol))
+                )
+                .fold(CapturedTrainingReference.Unavailable)(CapturedTrainingReference.Recorded(_))
+                .some
+            }
+        // Classification makes a training row only out of one human and one bot, and every control this server stores
+        // has a category, so this is a malformed row: it can never be applied, and its capture says so.
+        case _ => CapturedTrainingReference.Unavailable.some.pure[ConnectionIO]
 
   private[play] def rematchSnapshot(id: GameId): IO[GameSnapshot] =
     sql"SELECT snapshot FROM play.games WHERE id = ${id.value}::uuid"
@@ -2883,6 +2935,17 @@ final class PgGameStore private (xa: HikariTransactor[IO])
         RatingCategory.fromWireName(catStr).map(_ -> TrainingState(r, rd, v, g, w, d, l, Some(u)))
       }.toMap)
 
+  override def trainingReferenceOf(gameId: GameId): IO[CapturedTrainingReference] =
+    sql"""SELECT training_reference_source, training_reference_anchor_set, training_reference_anchor_epoch,
+                 training_reference_rating, training_reference_rd, training_reference_vol
+          FROM play.game_results
+          WHERE game_id = ${gameId.value}::uuid"""
+      .query[PgGameStore.ReferenceTuple]
+      .option
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.fold(CapturedTrainingReference.NotRecorded)(PgGameStore.ReferenceColumns.fromTuple(_).captured))
+
   override def applyTrainingUpdate(
       gameId: GameId,
       userUpdate: RatingUpdate,
@@ -3653,6 +3716,73 @@ object PgGameStore:
   /** The `rating_domain` written for a row whose snapshot predates classification (#146): unknown, never inferred. */
   private val LegacyDomain: String = "legacy"
 
+  /** The six `training_reference_*` columns (V11, #189) in select order. */
+  private type ReferenceTuple =
+    (Option[String], Option[String], Option[Int], Option[Double], Option[Double], Option[Double])
+
+  /** A training row's captured reference as the columns V11 adds to `game_results` — all `NULL` when the row recorded
+    * none. The one place the stored vocabulary is spelled, for both directions.
+    */
+  final private case class ReferenceColumns(
+      source: Option[String],
+      anchorSet: Option[String],
+      anchorEpoch: Option[Int],
+      rating: Option[Double],
+      rd: Option[Double],
+      vol: Option[Double]
+  ):
+    /** Decoded at the persistence boundary. The V11 CHECK constraints pin every combination below, so anything else is
+      * a hand-edited row, and it fails loudly like `storedOrigin` rather than being applied against a guess.
+      */
+    def captured: CapturedTrainingReference = this match
+      case ReferenceColumns(None, None, None, None, None, None) => CapturedTrainingReference.NotRecorded
+      case ReferenceColumns(Some(ReferenceColumns.UnavailableSource), None, None, None, None, None) =>
+        CapturedTrainingReference.Unavailable
+      case ReferenceColumns(Some(ReferenceColumns.BotRatingSource), None, None, Some(rating), Some(rd), Some(vol)) =>
+        CapturedTrainingReference.Recorded(
+          TrainingReference(TrainingReferenceSource.BotRating, Glicko(rating, rd, vol))
+        )
+      case ReferenceColumns(
+            Some(ReferenceColumns.AnchorSource),
+            Some(version),
+            Some(epoch),
+            Some(rating),
+            Some(rd),
+            Some(vol)
+          ) =>
+        CapturedTrainingReference.Recorded(
+          TrainingReference(TrainingReferenceSource.Anchor(version, epoch), Glicko(rating, rd, vol))
+        )
+      case other => throw new IllegalStateException(s"invalid stored training reference: $other")
+
+  private object ReferenceColumns:
+    val AnchorSource: String      = "anchor"
+    val BotRatingSource: String   = "bot_rating"
+    val UnavailableSource: String = "unavailable"
+
+    private val NoReference: ReferenceColumns = ReferenceColumns(None, None, None, None, None, None)
+
+    def fromTuple(columns: ReferenceTuple): ReferenceColumns =
+      val (source, anchorSet, anchorEpoch, rating, rd, vol) = columns
+      ReferenceColumns(source, anchorSet, anchorEpoch, rating, rd, vol)
+
+    /** `None` is a row that is not a training row; `NotRecorded` never comes out of a capture, and would mean the same
+      * columns anyway.
+      */
+    def of(capture: Option[CapturedTrainingReference]): ReferenceColumns = capture match
+      case None | Some(CapturedTrainingReference.NotRecorded) => NoReference
+      case Some(CapturedTrainingReference.Unavailable)        => NoReference.copy(source = Some(UnavailableSource))
+      case Some(CapturedTrainingReference.Recorded(TrainingReference(source, glicko))) =>
+        val measured = NoReference.copy(
+          rating = Some(glicko.rating),
+          rd = Some(glicko.deviation),
+          vol = Some(glicko.volatility)
+        )
+        source match
+          case TrainingReferenceSource.Anchor(version, epoch) =>
+            measured.copy(source = Some(AnchorSource), anchorSet = Some(version), anchorEpoch = Some(epoch))
+          case TrainingReferenceSource.BotRating => measured.copy(source = Some(BotRatingSource))
+
   private[store] type ResultTuple =
     (
         String,
@@ -3799,8 +3929,11 @@ object PgGameStore:
     * connections, preventing subsequent queries from even queueing in Hikari. Additionally, `connectionTimeout` is
     * capped at 5 seconds (matching `SaveTimeout`) so acquisition stalls fail fast with telemetry rather than stalling
     * for Hikari's 30s default.
+    *
+    * `anchorSet` defaults to the one `RatingBatch.create` defaults to, so a training row is captured against the same
+    * calibration the batch would otherwise have resolved it with (#189).
     */
-  def resource(config: Config): Resource[IO, PgGameStore] =
+  def resource(config: Config, anchorSet: AnchorSet = AnchorSet.Default): Resource[IO, PgGameStore] =
     for
       _         <- Resource.eval(migrate(config))
       connectEC <- ExecutionContexts.fixedThreadPool[IO](config.poolSize)
@@ -3818,7 +3951,7 @@ object PgGameStore:
           ds.setConnectionTimeout(5000)
         }
       })
-    yield new PgGameStore(xa)
+    yield new PgGameStore(xa, anchorSet)
 
   /** Boot-time connect races are normal (compose may start the app before Postgres accepts connections; the
     * testcontainers port-forward on Rancher lags a moment), so the initial migration retries briefly before failing the

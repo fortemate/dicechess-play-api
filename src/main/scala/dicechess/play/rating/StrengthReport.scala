@@ -81,9 +81,10 @@ object StrengthReport:
   object Config:
     val Default: Config = Config()
 
-    /** Parse from explicit optional raw values (#181) — every knob falls back to [[Default]] on an absent or
-      * unparseable value. Every one of them is a tuning knob, never a switch. `seed` is deliberately not among them: it
-      * governs bootstrap reproducibility, not statistical trust, so a run has no legitimate reason to change it.
+    /** Parse from explicit optional raw values (#181), which are the ladder report's arguments
+      * (`LadderReportMain.parseOptions`) — every knob falls back to [[Default]] on an absent or unparseable value.
+      * Every one of them is a tuning knob, never a switch. `seed` is deliberately not among them: it governs bootstrap
+      * reproducibility, not statistical trust, so a run has no legitimate reason to change it.
       *
       * `alpha`/`beta` are filtered to the open interval `(0, 1)`: they are error rates that feed `math.log` in
       * [[Sprt.test]], so `0` or `1` would silently produce an infinite or `NaN` LLR forever rather than fail loudly.

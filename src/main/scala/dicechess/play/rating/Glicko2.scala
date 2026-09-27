@@ -22,10 +22,10 @@ object Glicko:
   * for the two sides of one game — honouring that would need per-side apply stamps or a period ledger, real schema for
   * a presentation problem. The wiggle itself is treated where it is felt instead: the public board orders by a
   * conservative estimate (`rating − k·RD`, see [[ConservativeOrderingK]]) and τ is lowered to damp volatility spikes,
-  * while "which bot is actually stronger" was never this number's job — that is SPRT/Bradley-Terry (#120,
-  * `GET /strength`). Idle-time RD inflation (Glicko-2's "did not compete in a period" rule) is deliberately NOT applied
-  * — on-ladder bots play continuously by construction (the scheduler pairs them), so there is no meaningful idle time
-  * to model yet; revisit when human accounts arrive.
+  * while "which bot is actually stronger" was never this number's job — that is SPRT/Bradley-Terry (#120, the offline
+  * `mise run ladder:report`). Idle-time RD inflation (Glicko-2's "did not compete in a period" rule) is deliberately
+  * NOT applied — on-ladder bots play continuously by construction (the scheduler pairs them), so there is no meaningful
+  * idle time to model yet; revisit when human accounts arrive.
   */
 object Glicko2:
 

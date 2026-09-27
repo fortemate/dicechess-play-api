@@ -165,7 +165,7 @@ class StrengthReportSuite extends munit.FunSuite:
       "falling back to BOTH defaults together rather than keeping the one value that was parsed (#181)"
   ):
     val default = StrengthReport.Config()
-    // Only STRENGTH_ELO0 set, but to a value that inverts against the untouched elo1 default (20) — must not
+    // Only elo0 given, but to a value that inverts against the untouched elo1 default (20) — must not
     // silently combine into (30, 20); the whole pair falls back together.
     val inverted = StrengthReport.Config.fromValues(Some("30"), None, None, None, None)
     assertEquals(inverted.elo0, default.elo0, "an inverted pair must not keep the one side that WAS parsed")
@@ -230,6 +230,20 @@ class StrengthReportSuite extends munit.FunSuite:
     assertEquals(posOptions.config.elo1, 30.0)
     assertEquals(posOptions.config.alpha, 0.02)
     assertEquals(posOptions.config.beta, 0.03)
+
+  test("LadderReportMain.parseOptions validates its arguments through Config.fromValues (#181)"):
+    val default = StrengthReport.Config()
+    // A lone elo0 above the elo1 default would invert the SPRT bounds; the pair falls back together instead.
+    val inverted = LadderReportMain.parseOptions(List("elo0=30"))
+    assertEquals((inverted.config.elo0, inverted.config.elo1), (default.elo0, default.elo1))
+    // Error rates outside (0, 1) and a non-positive iteration count fall back to their defaults.
+    val outOfRange = LadderReportMain.parseOptions(List("alpha=0", "beta=1", "iterations=0"))
+    assertEquals(outOfRange.config.alpha, default.alpha)
+    assertEquals(outOfRange.config.beta, default.beta)
+    assertEquals(outOfRange.config.bootstrapIterations, default.bootstrapIterations)
+    // The positional form goes through the same checks.
+    val positional = LadderReportMain.parseOptions(List("30", "20"))
+    assertEquals((positional.config.elo0, positional.config.elo1), (default.elo0, default.elo1))
 
   test("LadderReportMain.parseOptions filters non-positive window values"):
     val zeroWindow = LadderReportMain.parseOptions(List("window=0"))

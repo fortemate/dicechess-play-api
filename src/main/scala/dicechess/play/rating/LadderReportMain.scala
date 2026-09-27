@@ -39,22 +39,15 @@ object LadderReportMain extends IOApp:
           case _           => None
       }.toMap
 
-      val elo0                = pairs.get("elo0").flatMap(_.toDoubleOption).getOrElse(0.0)
-      val elo1                = pairs.get("elo1").flatMap(_.toDoubleOption).getOrElse(20.0)
-      val alpha               = pairs.get("alpha").flatMap(_.toDoubleOption).getOrElse(0.05)
-      val beta                = pairs.get("beta").flatMap(_.toDoubleOption).getOrElse(0.05)
-      val bootstrapIterations =
-        pairs.get("iterations").orElse(pairs.get("bootstrap")).flatMap(_.toIntOption).getOrElse(1000)
-      val windowDays =
-        pairs.get("window").orElse(pairs.get("windowdays")).flatMap(_.toIntOption).filter(_ > 0)
-
-      val config = StrengthReport.Config(
-        elo0 = elo0,
-        elo1 = elo1,
-        alpha = alpha,
-        beta = beta,
-        bootstrapIterations = bootstrapIterations,
-        windowDays = windowDays
+      // The validated parser (#181): an absent, unparseable or out-of-range knob falls back to its default, and an
+      // inverted elo0/elo1 pair falls back as a pair instead of producing verdicts that look valid and mean nothing.
+      val config = StrengthReport.Config.fromValues(
+        elo0Raw = pairs.get("elo0"),
+        elo1Raw = pairs.get("elo1"),
+        alphaRaw = pairs.get("alpha"),
+        betaRaw = pairs.get("beta"),
+        bootstrapIterationsRaw = pairs.get("iterations").orElse(pairs.get("bootstrap")),
+        windowDaysRaw = pairs.get("window").orElse(pairs.get("windowdays"))
       )
 
       val category = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)
@@ -67,11 +60,12 @@ object LadderReportMain extends IOApp:
 
       Options(config, category, out, format)
     else
-      val config = StrengthReport.Config(
-        elo0 = args.headOption.flatMap(_.toDoubleOption).getOrElse(0.0),
-        elo1 = args.lift(1).flatMap(_.toDoubleOption).getOrElse(20.0),
-        alpha = args.lift(2).flatMap(_.toDoubleOption).getOrElse(0.05),
-        beta = args.lift(3).flatMap(_.toDoubleOption).getOrElse(0.05)
+      val config = StrengthReport.Config.fromValues(
+        elo0Raw = args.headOption,
+        elo1Raw = args.lift(1),
+        alphaRaw = args.lift(2),
+        betaRaw = args.lift(3),
+        bootstrapIterationsRaw = None
       )
       Options(config, RatingCategory.Default, None, Format.Text)
 

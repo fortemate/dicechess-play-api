@@ -165,7 +165,7 @@ class StrengthReportSuite extends munit.FunSuite:
       "falling back to BOTH defaults together rather than keeping the one value that was parsed (#181)"
   ):
     val default = StrengthReport.Config()
-    // Only STRENGTH_ELO0 set, but to a value that inverts against the untouched elo1 default (20) — must not
+    // Only elo0 given, but to a value that inverts against the untouched elo1 default (20) — must not
     // silently combine into (30, 20); the whole pair falls back together.
     val inverted = StrengthReport.Config.fromValues(Some("30"), None, None, None, None)
     assertEquals(inverted.elo0, default.elo0, "an inverted pair must not keep the one side that WAS parsed")

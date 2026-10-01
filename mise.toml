@@ -2,7 +2,7 @@
 # Local-development tool set. CI installs the JVM toolchain via setup-java/setup-sbt and
 # runs sbt directly (see .github/workflows/ci.yaml), so keep this lean.
 java = "temurin-25"   # Primary runtime, aligned with CI (Java 25)
-sbt = "2.0.8" # sbt runner; MUST match sbt.version in project/build.properties (also provisions the Jules VM)
+sbt = "2.0.9" # sbt runner; MUST match sbt.version in project/build.properties (also provisions the Jules VM)
 
 # Git hooks & formatting
 lefthook = "latest"   # Git hooks manager (pre-commit / pre-push)
@@ -57,15 +57,15 @@ run = 'sbt shutdown && rm -rf target/covcache && sbt -Dsbt.global.localcache="$P
 [tasks.check]
 description = "✅ Full validation cycle (mirrors CI)"
 # Stop sbt server, clean local covcache, and execute with isolated localcache to force clean scoverage instrumentation.
-run = 'sbt shutdown && rm -rf target/covcache && sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"'
+run = 'sbt shutdown && rm -rf target/covcache && sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; scalafmtSbtCheck; clean; coverage; testOnly *; coverageReport"'
 
 [tasks.format]
 description = "✨ Reformat the codebase"
-run = "sbt scalafmtAll"
+run = "sbt 'scalafmtAll; scalafmtSbt'"
 
 [tasks."format:check"]
 description = "🔍 Verify code formatting"
-run = "sbt scalafmtCheckAll"
+run = "sbt 'scalafmtCheckAll; scalafmtSbtCheck'"
 
 [tasks.clean]
 description = "🧹 Remove build artifacts"

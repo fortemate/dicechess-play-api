@@ -59,7 +59,7 @@ jobs:
           sbt --version
           sbt shutdown
           rm -rf target/covcache
-          sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"
+          sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; scalafmtSbtCheck; clean; coverage; testOnly *; coverageReport"
 
       - name: Verify and locate scoverage report
         run: |

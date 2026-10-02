@@ -15,14 +15,6 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "chore"
-    groups:
-      # `dicechess-rules` and `dicechess-engine` are published from one repository and
-      # move in lockstep until 1.0: the engine depends on the rules artifact of the same
-      # version, so bumping one alone makes sbt's eviction check fail the build. One PR
-      # keeps the pair aligned.
-      dicechess:
-        patterns:
-          - "com.fortemate:*"
     ignore:
       # sbt 2.x -> 3.x is a breaking major requiring a deliberate, manual migration
       # (plugin compatibility, build definition changes) — not an automated bump.
@@ -40,6 +32,12 @@ updates:
       - "documentation"
     commit-message:
       prefix: "chore(docs)"
+    ignore:
+      # mermaid 12 is a breaking release (ES2024, Node 22.12+, new default layout engine).
+      # astro-mermaid@2.1.0 declares peerDependencies mermaid ^10 || ^11 and has not been
+      # updated for mermaid 12 yet. Hold the major until astro-mermaid supports it.
+      - dependency-name: "mermaid"
+        update-types: ["version-update:semver-major"]
     groups:
       # One PR for the routine minor/patch bumps; majors still come individually.
       astro-minor:
@@ -60,6 +58,12 @@ updates:
       - "documentation"
     commit-message:
       prefix: "chore(docs)"
+    ignore:
+      # mermaid 12 is a breaking release (ES2024, Node 22.12+, new default layout engine).
+      # astro-mermaid@2.1.0 declares peerDependencies mermaid ^10 || ^11 and has not been
+      # updated for mermaid 12 yet. Hold the major until astro-mermaid supports it.
+      - dependency-name: "mermaid"
+        update-types: ["version-update:semver-major"]
     groups:
       # One PR for the routine minor/patch bumps; majors still come individually.
       astro-minor:

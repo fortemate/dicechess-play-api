@@ -20,6 +20,12 @@ updates:
       # (plugin compatibility, build definition changes) — not an automated bump.
       - dependency-name: "org.scala-sbt:sbt"
         update-types: ["version-update:semver-major"]
+    groups:
+      # dicechess-engine depends on the same-version dicechess-rules; bumping only one
+      # causes an sbt eviction error, so they must always move together in one PR.
+      dicechess:
+        patterns:
+          - "com.fortemate:dicechess-*"
 
   # Docs site (Astro + Starlight)
   - package-ecosystem: "npm"

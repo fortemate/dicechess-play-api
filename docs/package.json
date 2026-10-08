@@ -21,6 +21,6 @@
   },
   "devDependencies": {
     "ajv": "^8.17.1",
-    "wrangler": "^4.145.0"
+    "wrangler": "^4.147.0"
   }
 }

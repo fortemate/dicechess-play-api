@@ -31,8 +31,8 @@ ThisBuild / resolvers := Seq(
   Resolver.mavenCentral
 )
 
-val DiceChessRulesVersion     = "0.14.5"
-val DiceChessEngineVersion    = "0.14.5"
+val DiceChessRulesVersion     = "0.14.9"
+val DiceChessEngineVersion    = "0.14.9"
 val CatsEffectVersion         = "3.7.1"
 val Fs2Version                = "3.14.0"
 val Http4sVersion             = "0.23.37"
@@ -42,7 +42,7 @@ val Http4sJdkClientVersion    = "0.10.0"
 val MunitVersion              = "1.3.6"
 val MunitCatsEffectVersion    = "2.2.1"
 val DoobieVersion             = "1.0.0-RC9"
-val FlywayVersion             = "13.10.0"
+val FlywayVersion             = "13.10.3"
 val JavaJwtVersion            = "4.6.2"
 val JwksRsaVersion            = "0.24.1"
 val PostgresDriverVersion     = "42.7.14"

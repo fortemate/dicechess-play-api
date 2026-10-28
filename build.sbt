@@ -31,8 +31,8 @@ ThisBuild / resolvers := Seq(
   Resolver.mavenCentral
 )
 
-val DiceChessRulesVersion     = "0.14.5"
-val DiceChessEngineVersion    = "0.14.5"
+val DiceChessRulesVersion     = "0.14.9"
+val DiceChessEngineVersion    = "0.14.9"
 val CatsEffectVersion         = "3.7.1"
 val Fs2Version                = "3.14.0"
 val Http4sVersion             = "0.23.37"

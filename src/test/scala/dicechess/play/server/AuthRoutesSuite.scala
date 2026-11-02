@@ -191,8 +191,9 @@ class AuthRoutesSuite extends munit.CatsEffectSuite:
 
   test("a successful callback honors the configured destination and ignores a caller-supplied return URL"):
     List(
-      "http://localhost:5173/"                         -> "http://localhost:5173/play",
-      "https://play.example/custom?view=board#current" -> "https://play.example/custom?view=board#current"
+      "http://localhost:5173/"                            -> "http://localhost:5173/play",
+      "https://play.example/custom?view=board#room%2Fone" -> "https://play.example/custom?view=board#room%2Fone",
+      "https://play.example/?view=board#room%2Fone"       -> "https://play.example/play?view=board#room%2Fone"
     ).traverse_ { (configured, expected) =>
       fixtureAt(configured).flatMap { (_, _, app) =>
         val req = callbackRequest("good-code", "state-1", Some("state-1"))
@@ -201,6 +202,21 @@ class AuthRoutesSuite extends munit.CatsEffectSuite:
           assertEquals(res.headers.get(ci"Location").map(_.head.value), Some(expected))
         }
       }
+    }
+
+  test("an invalid frontend URL leaves other routes available and fails the callback before creating a session"):
+    List("https://[invalid", "/relative", "javascript:alert(1)").traverse_ { configured =>
+      for
+        (_, _, app) <- fixtureAt(configured)
+        me          <- app.run(Request[IO](Method.GET, uri"/auth/me"))
+        callback    <- app.run(callbackRequest("good-code", "state-1", Some("state-1")))
+        body        <- callback.as[String]
+      yield
+        assertEquals(me.status, Status.Unauthorized)
+        assertEquals(callback.status, Status.InternalServerError)
+        assertEquals(body, "Authentication failed")
+        assert(callback.headers.get(ci"Location").isEmpty)
+        assert(!callback.cookies.exists(_.name == AuthSession.SessionCookieName))
     }
 
   test("a failed Google exchange answers a generic 500 without the diagnostic detail"):

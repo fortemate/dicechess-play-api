@@ -109,10 +109,10 @@ object AuthSession:
 
   private val SessionSecretVar = "PLAY_SESSION_SECRET"
   private val FrontendUrlVar   = "PLAY_FRONTEND_URL"
-  private val DefaultFrontend  = "https://play.jc.id.lv"
+  private val DefaultFrontend  = "https://fortemate.com"
 
-  /** Where login/callback/logout send the browser back to. Always defined — the default is production, and local
-    * development overrides it (`PLAY_FRONTEND_URL=http://localhost:5173`).
+  /** The frontend for a successful OAuth callback. A bare origin selects its game hub at /play; deployments may also
+    * supply an explicit destination URL.
     */
   def frontendUrlFromEnv: IO[String] =
     IO(sys.env.get(FrontendUrlVar).filter(_.nonEmpty).getOrElse(DefaultFrontend))

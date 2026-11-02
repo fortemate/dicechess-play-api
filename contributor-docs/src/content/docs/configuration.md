@@ -94,7 +94,7 @@ boot — someone clearly tried to enable sign-in — instead of the usual silent
 | `GOOGLE_CLIENT_SECRET` | Its secret. Required. |
 | `GOOGLE_REDIRECT_URI` | Must match the console entry, e.g. `https://api.fortemate.com/auth/callback`. Required. |
 | `PLAY_SESSION_SECRET` | HMAC key for session JWTs (e.g. `openssl rand -base64 48`). Required; no fallback on purpose. |
-| `PLAY_FRONTEND_URL` | Where login/callback send the browser back. Default `https://fortemate.com`; local dev sets `http://localhost:5173`. |
+| `PLAY_FRONTEND_URL` | Destination after successful sign-in. An origin opens its `/play` game hub (default `https://fortemate.com/play`, local `http://localhost:5173/play`). An explicit non-root path is used as configured. |
 
 With sign-in enabled, `PLAY_CORS_ORIGINS` must be a real allow-list: the empty allow-all mode
 stays credential-less by design, so the SPA's credentialed fetches would fail against it.

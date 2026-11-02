@@ -18,7 +18,8 @@ import io.circe.Codec
 import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.dsl.io.*
 import org.http4s.headers.{Location, `Retry-After`}
-import org.http4s.{HttpRoutes, Response, Status, Uri}
+import org.http4s.{Header, HttpRoutes, ParseFailure, Response, Status, Uri}
+import org.typelevel.ci.*
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.security.{MessageDigest, SecureRandom}
@@ -87,8 +88,23 @@ object AuthRoutes:
   private def constantTimeEquals(a: String, b: String): Boolean =
     MessageDigest.isEqual(a.getBytes(UTF_8), b.getBytes(UTF_8))
 
-  private def redirect(target: String): Response[IO] =
-    Response[IO](status = Status.SeeOther).putHeaders(Location(Uri.unsafeFromString(target)))
+  private def frontendLocation(configured: String): Either[ParseFailure, Header.Raw] =
+    Uri
+      .fromString(configured)
+      .filterOrElse(
+        uri =>
+          (uri.scheme.contains(Uri.Scheme.http) || uri.scheme.contains(Uri.Scheme.https)) &&
+            uri.host.exists(_.value.nonEmpty),
+        ParseFailure("Invalid PLAY_FRONTEND_URL", "Expected an absolute HTTP(S) URL with a host")
+      )
+      .map { uri =>
+        // Preserve the validated spelling: rendering a parsed http4s fragment encodes '%' a second time.
+        val target = if uri.path.isEmpty then
+          val (origin, suffix) = configured.span(c => c != '?' && c != '#')
+          origin.stripSuffix("/") + "/play" + suffix
+        else configured
+        Header.Raw(ci"Location", target)
+      }
 
   def apply(
       session: AuthSession,
@@ -101,10 +117,13 @@ object AuthRoutes:
       frontendUrl: String,
       admins: Set[String]
   ): HttpRoutes[IO] =
+    val afterLogin = IO.fromEither(frontendLocation(frontendUrl))
     HttpRoutes.of[IO]:
       case GET -> Root / "auth" / "login" =>
         randomState.map { state =>
-          redirect(google.authorizeUrl(state)).addCookie(AuthSession.stateCookie(state))
+          Response[IO](Status.SeeOther)
+            .putHeaders(Location(Uri.unsafeFromString(google.authorizeUrl(state))))
+            .addCookie(AuthSession.stateCookie(state))
         }
 
       case req @ GET -> Root / "auth" / "callback" =>
@@ -115,10 +134,12 @@ object AuthRoutes:
         (code, state, savedState) match
           case (Some(c), Some(s), Some(saved)) if constantTimeEquals(s, saved) =>
             val flow = for
+              location <- afterLogin
               identity <- google.identityFor(c)
               user     <- store.upsertOnLogin("google", identity.subject, identity.email, Nicknames.fresh)
               token    <- session.sign(user)
-            yield redirect(frontendUrl)
+            yield Response[IO](Status.SeeOther)
+              .putHeaders(location)
               .addCookie(session.sessionCookie(token))
               .addCookie(AuthSession.expiredStateCookie)
 

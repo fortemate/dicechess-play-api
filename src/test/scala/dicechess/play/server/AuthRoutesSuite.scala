@@ -23,6 +23,7 @@ import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.headers.{Location, `Retry-After`}
 import org.http4s.implicits.*
 import org.http4s.{Method, Request, RequestCookie, ResponseCookie, SameSite, Status, Uri}
+import org.typelevel.ci.*
 
 import java.util.UUID
 import scala.concurrent.duration.*
@@ -104,11 +105,13 @@ class AuthRoutesSuite extends munit.CatsEffectSuite:
           case Some((key, _)) => (users.removed(key), true)
       }
 
-  private def fixture: IO[(StubUsers, AuthSession, org.http4s.HttpApp[IO])] =
+  private def fixture: IO[(StubUsers, AuthSession, org.http4s.HttpApp[IO])] = fixtureAt(FrontendUrl)
+
+  private def fixtureAt(frontend: String): IO[(StubUsers, AuthSession, org.http4s.HttpApp[IO])] =
     Ref.of[IO, Map[String, UserAccount]](Map.empty).map { ref =>
       val store   = StubUsers(ref)
       val session = AuthSession(store, Secret)
-      (store, session, AuthRoutes(session, stubGoogle, store, noRatings, noBoard, FrontendUrl, Set.empty).orNotFound)
+      (store, session, AuthRoutes(session, stubGoogle, store, noRatings, noBoard, frontend, Set.empty).orNotFound)
     }
 
   private def cookieOf(cookies: List[ResponseCookie], name: String): ResponseCookie =
@@ -158,7 +161,7 @@ class AuthRoutesSuite extends munit.CatsEffectSuite:
       res         <- app.run(callbackRequest("good-code", "state-a", None))
     yield assertEquals(res.status, Status.BadRequest)
 
-  test("a successful callback creates the account, signs the session, and returns to the SPA"):
+  test("a successful callback creates the account, signs the session, and returns to the browser game"):
     for
       (store, _, app) <- fixture
       res             <- app.run(callbackRequest("good-code", "state-1", Some("state-1")))
@@ -171,7 +174,7 @@ class AuthRoutesSuite extends munit.CatsEffectSuite:
       user   <- store.userById(meResp.id)
     yield
       assertEquals(res.status, Status.SeeOther)
-      assertEquals(res.headers.get[Location].map(_.uri.renderString), Some(FrontendUrl))
+      assertEquals(res.headers.get[Location].map(_.uri.renderString), Some(s"$FrontendUrl/play"))
       assert(sessionCookie.httpOnly && sessionCookie.secure, "session cookie must be HttpOnly + Secure")
       assertEquals(sessionCookie.sameSite, Some(SameSite.Lax))
       assertEquals(sessionCookie.path, Some("/"))
@@ -185,6 +188,20 @@ class AuthRoutesSuite extends munit.CatsEffectSuite:
         "the auto-generated nickname must self-validate"
       )
       assert(user.exists(_.isActive))
+
+  test("a successful callback honors the configured destination and ignores a caller-supplied return URL"):
+    List(
+      "http://localhost:5173/"                         -> "http://localhost:5173/play",
+      "https://play.example/custom?view=board#current" -> "https://play.example/custom?view=board#current"
+    ).traverse_ { (configured, expected) =>
+      fixtureAt(configured).flatMap { (_, _, app) =>
+        val req = callbackRequest("good-code", "state-1", Some("state-1"))
+        app.run(req.withUri(req.uri.withQueryParam("return_to", "https://external.example/"))).map { res =>
+          assertEquals(res.status, Status.SeeOther)
+          assertEquals(res.headers.get(ci"Location").map(_.head.value), Some(expected))
+        }
+      }
+    }
 
   test("a failed Google exchange answers a generic 500 without the diagnostic detail"):
     for

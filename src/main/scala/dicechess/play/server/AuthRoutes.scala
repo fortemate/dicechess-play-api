@@ -87,8 +87,8 @@ object AuthRoutes:
   private def constantTimeEquals(a: String, b: String): Boolean =
     MessageDigest.isEqual(a.getBytes(UTF_8), b.getBytes(UTF_8))
 
-  private def redirect(target: String): Response[IO] =
-    Response[IO](status = Status.SeeOther).putHeaders(Location(Uri.unsafeFromString(target)))
+  private def redirect(target: Uri): Response[IO] =
+    Response[IO](status = Status.SeeOther).putHeaders(Location(target))
 
   def apply(
       session: AuthSession,
@@ -101,10 +101,13 @@ object AuthRoutes:
       frontendUrl: String,
       admins: Set[String]
   ): HttpRoutes[IO] =
+    // A bare frontend origin hosts the Fire TV landing page. Operators can still set an explicit return path.
+    val frontend   = Uri.unsafeFromString(frontendUrl)
+    val afterLogin = if frontend.path.isEmpty then frontend / "play" else frontend
     HttpRoutes.of[IO]:
       case GET -> Root / "auth" / "login" =>
         randomState.map { state =>
-          redirect(google.authorizeUrl(state)).addCookie(AuthSession.stateCookie(state))
+          redirect(Uri.unsafeFromString(google.authorizeUrl(state))).addCookie(AuthSession.stateCookie(state))
         }
 
       case req @ GET -> Root / "auth" / "callback" =>
@@ -118,7 +121,7 @@ object AuthRoutes:
               identity <- google.identityFor(c)
               user     <- store.upsertOnLogin("google", identity.subject, identity.email, Nicknames.fresh)
               token    <- session.sign(user)
-            yield redirect(frontendUrl)
+            yield redirect(afterLogin)
               .addCookie(session.sessionCookie(token))
               .addCookie(AuthSession.expiredStateCookie)
 

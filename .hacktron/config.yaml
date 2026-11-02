@@ -1,0 +1,19 @@
+version: 1
+
+# Exclude automated bot PRs and non-production paths
+exclude:
+  authors:
+    - "dependabot[bot]"
+    - "renovate[bot]"
+    - "github-actions[bot]"
+  paths:
+    # Documentation
+    - "docs/**"
+    - "**/*.md"
+    - "contributor-docs/**"
+    # Tests
+    - "**/src/test/**"
+    # Build output, caches, and lockfiles
+    - "target/**"
+    - "project/target/**"
+    - ".bsp/**"

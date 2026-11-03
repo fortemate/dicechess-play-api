@@ -50,6 +50,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         assertEquals(sha256Hex(event.seed.getOrElse(fail("expected a revealed seed"))), commit)
         // And the terminal snapshot carries the same reveal, so a client that joins after the end can still verify.
         assertEquals(snap.seed, event.seed)
+        assertEquals(snap.rulesVersion, Some(RulesVersion.value))
 
   test("two bots play a full game through the room to a terminal state"):
     val white = BotConnection(Principal.Guest("white"), Seat.White, greedy)
@@ -375,11 +376,13 @@ class GameRoomSuite extends munit.CatsEffectSuite:
                 // ...and the capped Snapshot elides it the same way as the event did.
                 assert(snap.dicePending)
                 assertEquals(snap.legalMoves, None)
+                assertEquals(snap.rulesVersion, Some(RulesVersion.value))
                 for
                   snapshot <- room.subscribe.take(1).compile.lastOrError
                   _ = assert(snapshot match
-                    case GameEvent.Snapshot(_, state, _) => state.legalMoves.isEmpty
-                    case _                               => false)
+                    case GameEvent.Snapshot(_, state, _) =>
+                      state.legalMoves.isEmpty && state.rulesVersion.contains(RulesVersion.value)
+                    case _ => false)
                   refused <- room.submitTurn(roll.seat, List("a1a1"))
                   _ = assertEquals(refused, GameRoom.TurnVerdict.Refused("illegal turn"))
                   applied <- room.submitTurn(roll.seat, leafPath(full.legalMoves))
@@ -439,6 +442,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         .flatMap(made => IO.fromEither(made.left.map(e => RuntimeException(s"restore failed: $e"))))
       restoredState <- restored.snapshot
       _ = assertEquals(restoredState.legalMoves, None)
+      _ = assertEquals(restoredState.rulesVersion, Some(RulesVersion.value))
       moves <- restored.legalMoves
       // The cache is transient, so the restored room must have re-derived the same tree from the stored DFEN...
       _ = assertEquals(moves.legalMoves, roll.legalMoves.get)

@@ -52,6 +52,7 @@ Sent immediately on connect — the current state.
     "v": 0,
     "state": {
       "version": 0,
+      "rulesVersion": "<rules-version>",
       "dfen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
       "activeSeat": "White",
       "dicePending": true,
@@ -76,6 +77,12 @@ Sent immediately on connect — the current state.
   }
 }
 ```
+
+`rulesVersion` identifies the server build's resolved `dicechess-rules` dependency, including after a
+restart restores a game. It is also available from public [`GET /health`](../rest/#server-and-rules-versions).
+Clients that compute turns locally should use [`GET /games/{id}/moves`](../rest/#get-legal-moves) instead
+when this field is absent, `null`, or differs from their bundled rules version. Keep it from the snapshot;
+there is no need to request it again on every roll.
 
 `commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `mayOfferDrawBy` indicates for each seat (`white` and `black`) whether that seat holds the right to offer a draw. `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero). `rated` says whether the game **may** move a canonical rating — the eligibility decided at creation, not proof that a rating was applied or that the game counts on a leaderboard — and `ratingDomain` which [rating domain](../../rating/#which-games-count-rating-domains) it was classified into (`competitive`, `training` or `casual`). Both are optional on the wire, and absence means "the server does not say". The snapshot carries no outcome: whether the rating batch applied, skipped or has not yet reached a finished game is [`GET /games/{id}/rating`](../rest/#get-a-games-rating-change)'s `outcome`.
 

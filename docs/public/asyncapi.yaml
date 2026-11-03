@@ -267,6 +267,12 @@ components:
       required: [version, dfen, activeSeat, dicePending, status, timeControl, commit]
       properties:
         version: { type: integer }
+        rulesVersion:
+          type: [string, 'null']
+          description: >
+            Current server's resolved dicechess-rules dependency version. If absent, null,
+            or different from the client's bundled rules version, fetch GET /games/{id}/moves
+            instead of computing legal turns locally. Also available from public GET /health.
         dfen: { type: string }
         activeSeat: { $ref: '#/components/schemas/Seat' }
         dicePending: { type: boolean }

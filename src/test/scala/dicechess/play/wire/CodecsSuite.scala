@@ -234,11 +234,12 @@ class CodecsSuite extends munit.FunSuite:
       clocks = None,
       commit = "c0ffee",
       seed = Some("ab12"),
-      clientSeeds = Some(ClientSeeds("w", "b"))
+      clientSeeds = Some(ClientSeeds("w", "b")),
+      rulesVersion = Some("rules-fixture")
     )
     assertEquals(
       (GameEvent.Snapshot(9L, terminal, Nil): GameEvent).asJson.noSpaces,
-      """{"Snapshot":{"v":9,"state":{"version":9,"dfen":"fen","activeSeat":"White","dicePending":false,"status":{"Ended":{"over":{"result":{"Win":{"side":"White"}},"termination":"KingCaptured"}}},"timeControl":{"Unlimited":{}},"clocks":null,"commit":"c0ffee","seed":"ab12","clientSeeds":{"white":"w","black":"b"},"legalMoves":null,"players":null,"rated":null,"ratingDomain":null,"drawOffer":null,"mayOfferDraw":null,"mayOfferDrawBy":null},"history":[]}}"""
+      """{"Snapshot":{"v":9,"state":{"version":9,"dfen":"fen","activeSeat":"White","dicePending":false,"status":{"Ended":{"over":{"result":{"Win":{"side":"White"}},"termination":"KingCaptured"}}},"timeControl":{"Unlimited":{}},"clocks":null,"commit":"c0ffee","seed":"ab12","clientSeeds":{"white":"w","black":"b"},"legalMoves":null,"players":null,"rated":null,"ratingDomain":null,"drawOffer":null,"mayOfferDraw":null,"mayOfferDrawBy":null,"rulesVersion":"rules-fixture"},"history":[]}}"""
     )
 
   test("Seek and Players pin their wire shapes (who a lobby row / board is looking at)"):
@@ -307,6 +308,7 @@ class CodecsSuite extends munit.FunSuite:
     val decoded = decode[PublicGameState](pre327)
     assertEquals(decoded.map(_.drawOffer), Right(None))
     assertEquals(decoded.map(_.mayOfferDraw), Right(None))
+    assertEquals(decoded.map(_.rulesVersion), Right(None))
 
     val stateWithOffer = PublicGameState(
       2L,

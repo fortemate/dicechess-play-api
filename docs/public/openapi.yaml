@@ -51,6 +51,35 @@ tags:
       while it is off both paths answer a plain 404. The public read never carries a credential;
       the claim's winning response is the only place a seat token ever appears, and it is no-store.
 paths:
+  /health:
+    get:
+      tags: [Discovery]
+      summary: Liveness and server/rules versions
+      description: >
+        Public build metadata. rulesVersion is the resolved dicechess-rules dependency used
+        to validate turns, independent of the server build version. It is also sent in each
+        game snapshot and webhook state, so no per-turn metadata request is necessary.
+        If it differs from the client's bundled rules version, or is unknown on an older
+        server, fetch GET /games/{id}/moves instead of computing legal turns locally.
+      security: []
+      responses:
+        '200':
+          description: Server is alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /version:
+    get:
+      tags: [Discovery]
+      summary: Server build version
+      description: Plain-text server build version. For rules compatibility use rulesVersion from /health or a game snapshot.
+      security: []
+      responses:
+        '200':
+          description: Server build version, independent of the rules dependency version.
+          content:
+            text/plain:
+              schema: { type: string }
   /bot/anon:
     post:
       tags: [Identity]
@@ -1932,11 +1961,26 @@ components:
         version: { type: integer }
         dfen: { type: string }
       required: [gameId, timeControl, activeSeat, dicePending, version, dfen]
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string, description: Server build version. }
+        rulesVersion:
+          type: string
+          description: Resolved dicechess-rules dependency version used by the server to validate turns.
+      required: [status, version, rulesVersion]
     PublicGameState:
       type: object
       description: The single-game snapshot — identical to the game stream's Snapshot.state.
       properties:
         version: { type: integer }
+        rulesVersion:
+          type: [string, 'null']
+          description: >
+            Current server's resolved dicechess-rules dependency version, including for restored games.
+            Older servers may omit it. If absent, null, or different from the client's bundled rules
+            version, fetch GET /games/{id}/moves instead of computing legal turns locally.
         dfen: { type: string, description: DFEN — the 7th field is the pending dice pool as piece letters. }
         activeSeat: { $ref: '#/components/schemas/Seat' }
         dicePending: { type: boolean }

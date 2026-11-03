@@ -624,6 +624,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
           _    <- webhooks.attachSweep
           body <- received.get.timeout(10.seconds)
           _ = assertEquals(body.hcursor.downField("state").downField("legalMoves").focus, Some(Json.Null))
+          _ = assertEquals(body.hcursor.downField("state").get[String]("rulesVersion"), Right(RulesVersion.value))
           over <- room.result.timeout(10.seconds)
           _ = assertEquals(over.termination, Termination.Resign)
         yield ()

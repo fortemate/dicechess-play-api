@@ -5,6 +5,26 @@ description: The complete REST surface — identity, challenges, seeks, gameplay
 
 All routes are relative to `https://api.fortemate.com` (legacy `https://play-api.jc.id.lv`) and require `Authorization: Bearer <token>` unless marked **public**. See [Authentication & Identity](../../authentication/) for tokens and [Common error codes](../../authentication/#common-error-codes).
 
+## Server and rules versions
+
+`GET /health` — **public.** Liveness and build metadata:
+
+```json
+{ "status": "ok", "version": "<server-build>", "rulesVersion": "<rules-version>" }
+```
+
+`rulesVersion` is the `dicechess-rules` dependency version resolved by the server build — the rules the
+server currently uses to validate turns. It is independent of the server's `version` and is also sent in
+[`Snapshot.state`](../streaming/#snapshot), `GET /games/{id}`, and webhook `state`, including for restored
+games. A stream client can read it on connect without a separate request per turn.
+
+A client that computes legal turns locally should compare this value with its bundled rules version.
+If the versions differ, or the server omits the field or sends `null`, use
+[`GET /games/{id}/moves`](#get-legal-moves) for the authoritative tree. Do not assume compatibility from
+the server build version or treat an unknown rules version as a match.
+
+`GET /version` — **public.** The server build version as plain text; its response is unchanged.
+
 ## Identity & tokens
 
 Covered in depth under [Authentication & Identity](../../authentication/); summarised here.

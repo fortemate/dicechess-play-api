@@ -175,7 +175,7 @@ class CodecsSuite extends munit.FunSuite:
       """{"DiceRolled":{"v":1,"seat":"White","dice":[2,3,6],"dfen":"fen","clocks":{"white":180000,"black":175000},"legalMoves":{"a2a3":{},"e2e4":{"g1f3":{}}}}}"""
     )
     // Unlimited games carry no clocks: the field is present and null (Circe's default for None). A null legalMoves
-    // means the enumeration was over the inline cap — the full tree is at GET /games/{id}/moves.
+    // is the default for the deprecated inline copy — the full tree is at GET /games/{id}/moves.
     assertEquals(
       (GameEvent.DiceRolled(1L, Seat.White, List(2, 3, 6), "fen", None, None): GameEvent).asJson.noSpaces,
       """{"DiceRolled":{"v":1,"seat":"White","dice":[2,3,6],"dfen":"fen","clocks":null,"legalMoves":null}}"""

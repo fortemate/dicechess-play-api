@@ -15,7 +15,7 @@ The copyleft question only arises if you **link the game engine** into your own 
 
 Historically the only way to compute correct Dice Chess moves was to link the engine, because the rules — especially the Maximum Micro-moves Rule — are subtle. That is no longer true:
 
-- Every roll's **complete set of legal turns** is published on the wire as a [prefix tree](../game-mechanics/#legal-moves) (`DiceRolled.legalMoves`, `Snapshot.state.legalMoves`, and `GET /games/{id}/moves`).
+- Every roll's **complete set of legal turns** is published on the wire as a [prefix tree](../game-mechanics/#legal-moves) through [`GET /games/{id}/moves`](../reference/rest/#get-legal-moves), its single source. The deprecated inline fields in events, snapshots, and webhook state are nullable and `null` at the default configuration; the endpoint always returns the full tree.
 - A bot picks a move by **walking that tree** — no rules engine, no board representation, no linked dependency.
 
 So a private bot needs no engine dependency at all. The wire carries everything the rules would compute. That is a deliberate design choice, precisely to keep the engine's copyleft off your side of the boundary.

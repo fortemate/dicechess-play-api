@@ -22,7 +22,7 @@ import scala.util.control.NoStackTrace
 
 /** The turn envelope POSTed to a bot's webhook: the existing wire vocabulary verbatim — `state` is the same
   * `PublicGameState` every snapshot and `GET /games/{id}` serve (dfen with the pending dice pool, clocks, inline
-  * `legalMoves` under the same cap — `null` means fetch `GET /games/{id}/moves`), plus which seat the bot holds. The
+  * `legalMoves` deprecated and null by default — fetch `GET /games/{id}/moves`), plus which seat the bot holds. The
   * expected response is the move-endpoint's own request shape: `{"moves":["e2e4",...]}`.
   */
 final case class WebhookEnvelope(`type`: String, gameId: String, seat: Seat, state: PublicGameState)

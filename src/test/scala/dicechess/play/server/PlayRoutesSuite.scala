@@ -167,10 +167,10 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
         assertEquals(idle.legalMoves, MoveTree.empty)
         assertEquals(missing, Status.NotFound)
 
-  test("with cap zero, GET /games/{id}/moves serves the full tree while snapshots omit it"):
+  test("by default GET /games/{id}/moves serves the full tree while snapshots carry null"):
     val resources =
       for
-        port <- serverWithInlineCap(0)
+        port <- server
         http <- JdkHttpClient.simple[IO]
         ws   <- JdkWSClient.simple[IO]
       yield (port, http, ws)

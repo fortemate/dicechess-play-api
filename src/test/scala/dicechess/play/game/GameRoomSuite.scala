@@ -347,9 +347,9 @@ class GameRoomSuite extends munit.CatsEffectSuite:
           }
       }
 
-  test("above the inline cap the tree is elided from events but stays fully queryable"):
+  test("the default elides trees from events but keeps the full tree queryable and playable"):
     GameRoom
-      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = 0))
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -391,7 +391,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             }
       }
 
-  test("cap zero elides the DiceRolled tree on forced passes as well as movable rolls"):
+  test("the default elides the DiceRolled tree on forced passes as well as movable rolls"):
     val dice = new DiceSource:
       def commit: String                                                       = "fixed-commit"
       def reveal: String                                                       = "fixed-reveal"
@@ -399,7 +399,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
         if ply == 0L then List(6, 6, 6) else List(1, 2, 3)
     for
       room <- GameRoom
-        .create(seats, dice, tuning = GameRoom.RoomTuning(maxInlinePaths = 0))
+        .create(seats, dice)
         .flatMap(made => IO.fromEither(made.left.map(RuntimeException(_))))
       ready <- Deferred[IO, Unit]
       events = room.subscribe
@@ -1264,7 +1264,7 @@ class GameRoomSuite extends munit.CatsEffectSuite:
 
   test("respondDraw refuses 'not your turn' when off-turn or dice not pending"):
     GameRoom
-      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds))
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = Int.MaxValue))
       .flatMap:
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>

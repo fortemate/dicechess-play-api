@@ -66,13 +66,10 @@ Reading the tree:
 
 - **A node with no children (`{}`) is a complete legal turn.** Walk any root-to-leaf path and submit that path as `moves`. Every legal turn already uses the maximum number of dice (the *Maximum Micro-moves Rule* is applied for you) — except a king capture, which ends the game and is always a leaf.
 - **An empty tree (`{}` at the top level)** means the roll has no legal move: the server auto-passes, so submit nothing.
-- **`null`** (only on the inline copies carried by events) means the enumeration was too large to inline — fetch the full tree from [`GET /games/{id}/moves`](../reference/rest/#get-legal-moves).
 
-The tree appears in three places:
+[`GET /games/{id}/moves`](../reference/rest/#get-legal-moves) is the **single source of the tree**: public, complete, and never capped. Its response includes `version`, `dfen`, and `dicePending`. Match `version` and `dfen` to the roll you are answering; if they differ, refresh the state before choosing a turn. When `dicePending` is false, the endpoint returns an empty tree.
 
-1. `DiceRolled.legalMoves` — with every roll (see [Event Streams](../reference/streaming/)).
-2. `Snapshot.state.legalMoves` (and the public `GET /games/{id}` snapshot) — while `dicePending` is true, so a joining or polling bot can act from the snapshot alone.
-3. [`GET /games/{id}/moves`](../reference/rest/#get-legal-moves) — always the full tree, never capped.
+The inline `DiceRolled.legalMoves` and `Snapshot.state.legalMoves` fields (also in `GET /games/{id}` and webhook `state`) are **deprecated**. They remain nullable for compatibility and are always `null` at the default configuration, including forced passes. A null inline field says nothing about whether moves exist: fetch the endpoint whenever it is your pending turn. A positive operator override of `PLAY_MAX_INLINE_TURN_PATHS` can temporarily enable legacy inline copies; clients must use the endpoint regardless.
 
 A complete random bot is therefore: read the tree, walk root→leaf picking a random child at each node, and `POST` the path — no engine, no DFEN parsing. That is exactly what [`examples/random_bot.py`](https://github.com/rabestro/dicechess-play-api/blob/main/docs/examples/random_bot.py) does, end to end, in ~100 lines.
 

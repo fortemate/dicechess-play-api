@@ -17,7 +17,7 @@ class MainSuite extends munit.CatsEffectSuite:
     assertEquals(Main.maxInlineTurnPathsFrom(Some("17")), 17)
     assertEquals(Main.maxInlineTurnPathsFrom(Some(Int.MaxValue.toString)), Int.MaxValue)
     List(None, Some(""), Some("-1"), Some("invalid"), Some("2147483648")).foreach { raw =>
-      assertEquals(Main.maxInlineTurnPathsFrom(raw), dicechess.play.game.GameRoom.DefaultMaxInlineTurnPaths)
+      assertEquals(Main.maxInlineTurnPathsFrom(raw), 0)
     }
 
   test("the outbound client's cut clears the configured per-turn window"):

@@ -304,11 +304,11 @@ When it is your turn in any of your games and dice are revealed, the server POST
   "type": "yourTurn",
   "gameId": "game-uuid",
   "seat": "White",
-  "state": { "version": 4, "dfen": "…", "activeSeat": "White", "dicePending": true, "legalMoves": { "e2e4": {} }, "mayOfferDraw": true, "clocks": { "white": 295000, "black": 300000 }, "…": "…" }
+  "state": { "version": 4, "dfen": "…", "activeSeat": "White", "dicePending": true, "legalMoves": null, "mayOfferDraw": true, "clocks": { "white": 295000, "black": 300000 }, "…": "…" }
 }
 ```
 
-`state` is exactly the [`Snapshot.state`](../streaming/#snapshot) object — `dfen` (dice in its 7th field), `activeSeat`, `dicePending`, `clocks`, `commit`, `mayOfferDraw` (whether you may offer a draw under alternation anti-spam), and the inline [`legalMoves`](../../game-mechanics/#legal-moves) tree under the usual cap (fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves) when it is `null`). A bot that computes turns locally must compare `state.rulesVersion` with its bundled rules version; on a mismatch or an absent/`null` value, fetch `GET /games/{id}/moves` for the authoritative tree.
+`state` is exactly the [`Snapshot.state`](../streaming/#snapshot) object — `dfen` (dice in its 7th field), `activeSeat`, `dicePending`, `clocks`, `commit`, `mayOfferDraw` (whether you may offer a draw under alternation anti-spam), and the deprecated nullable `legalMoves` field, always `null` at the default configuration. On each `yourTurn`, read the [tree](../../game-mechanics/#legal-moves) from its single source, [`GET /games/{id}/moves`](../rest/#get-legal-moves), and match its `version` and `dfen` to the delivery before choosing moves. If they differ, the delivery is stale; do not answer it with moves from a different roll. A bot that computes turns locally must compare `state.rulesVersion` with its bundled rules version; on a mismatch or an absent/`null` value, fetch `GET /games/{id}/moves` for the authoritative tree.
 
 ### Draw decision delivery (`drawDecision`)
 

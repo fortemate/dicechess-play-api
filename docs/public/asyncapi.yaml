@@ -145,7 +145,8 @@ components:
               clocks: { $ref: '#/components/schemas/Clocks' }
               legalMoves:
                 oneOf: [{ $ref: '#/components/schemas/MoveTree' }, { type: 'null' }]
-                description: The legal-move tree for this roll; {} = forced pass; null = fetch GET /games/{id}/moves.
+                deprecated: true
+                description: Deprecated inline copy; always null at the default configuration, including forced passes. Read the full tree from GET /games/{id}/moves.
     TurnPlayed:
       name: TurnPlayed
       title: A turn's moves were applied.
@@ -251,7 +252,8 @@ components:
       type: object
       description: >
         A prefix tree of UCI micro-moves; each key is a micro-move whose value is the tree of
-        legal continuations. A leaf ({}) is a complete legal turn.
+        legal continuations. A leaf ({}) is a complete legal turn. Read the full tree from
+        GET /games/{id}/moves; deprecated inline copies are null at the default configuration.
       additionalProperties:
         $ref: '#/components/schemas/MoveTree'
     Principal:
@@ -300,6 +302,8 @@ components:
             black: { type: boolean }
         legalMoves:
           oneOf: [{ $ref: '#/components/schemas/MoveTree' }, { type: 'null' }]
+          deprecated: true
+          description: Deprecated inline copy shared by snapshots, GET /games/{id}, and webhook state; always null at the default configuration. Read the full tree from GET /games/{id}/moves.
         players:
           type: object
           properties:

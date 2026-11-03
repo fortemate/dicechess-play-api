@@ -78,7 +78,7 @@ curl -X POST "https://api.fortemate.com/bot/game/$GAME_ID/seed" \
 
 ## 4. Read the legal moves and play
 
-When `dicePending` is `true` and `activeSeat` is your seat, fetch the legal-move tree for the current roll:
+When `dicePending` is `true` and `activeSeat` is your seat, fetch the legal-move tree for the current roll from its single source, `GET /games/{id}/moves`. The inline `legalMoves` fields in snapshots, events, and webhook state are deprecated and `null` at the default configuration:
 
 ```bash
 curl "https://api.fortemate.com/games/$GAME_ID/moves"
@@ -93,7 +93,9 @@ curl "https://api.fortemate.com/games/$GAME_ID/moves"
 }
 ```
 
-`legalMoves` is a **prefix tree of UCI micro-moves**. Walk any path from the root to a leaf (`{}`) — that path is one complete, legal turn. Submit it:
+Check that `version` and `dfen` still match the pending roll you are answering; refresh the state if they differ. If `dicePending` is false or the top-level tree is `{}`, submit nothing.
+
+`legalMoves` in this endpoint response is a **prefix tree of UCI micro-moves**. Walk any path from the root to a leaf (`{}`) — that path is one complete, legal turn. Submit it:
 
 ```bash
 curl -X POST "https://api.fortemate.com/bot/game/$GAME_ID/move" \

@@ -58,16 +58,17 @@ class TurnCacheSuite extends munit.CatsEffectSuite:
         assertEquals(roll.publicAt(Duration.Zero, 0).legalMoves, None)
       }
 
-  test("the cap includes its boundary and the default preserves inline trees for small rolls"):
+  test("the default elides small rolls without building a tree; a positive cap includes its boundary"):
     val builds = new AtomicInteger()
     val roll   = pendingRoll(builds)
     val count  = roll.turnCache.turns.size
     assert(count > 1)
-    assert(count <= GameRoom.DefaultMaxInlineTurnPaths)
+    assertEquals(roll.publicAt(Duration.Zero, GameRoom.DefaultMaxInlineTurnPaths).legalMoves, None)
+    assertEquals(builds.get(), 0)
     assertEquals(roll.turnCache.inline(count - 1), None)
     assertEquals(builds.get(), 0)
     assertEquals(roll.turnCache.inline(count), Some(roll.turnCache.tree))
-    assertEquals(roll.publicAt(Duration.Zero, GameRoom.DefaultMaxInlineTurnPaths).legalMoves, Some(roll.turnCache.tree))
+    assertEquals(roll.publicAt(Duration.Zero, count).legalMoves, Some(roll.turnCache.tree))
     assertEquals(builds.get(), 1)
 
   test("cap zero elides forced passes without building even an empty tree"):
@@ -75,5 +76,7 @@ class TurnCacheSuite extends munit.CatsEffectSuite:
     val cache  = new GameRoom.TurnCache(Map.empty, { builds.incrementAndGet(); MoveTree.empty })
     assertEquals(cache.inline(0), None)
     assertEquals(builds.get(), 0)
-    assertEquals(cache.inline(GameRoom.DefaultMaxInlineTurnPaths), Some(MoveTree.empty))
+    assertEquals(cache.inline(GameRoom.DefaultMaxInlineTurnPaths), None)
+    assertEquals(builds.get(), 0)
+    assertEquals(cache.inline(1), Some(MoveTree.empty))
     assertEquals(builds.get(), 1)

@@ -1280,12 +1280,10 @@ object GameRoom:
   private val MinSeedChars = 16
   private val MaxSeedChars = 256
 
-  /** Above this many legal turn paths, the `legalMoves` tree is elided from `DiceRolled`/`Snapshot` (streams are
-    * uncompressed and the enumeration's tail reaches tens of thousands of paths) — `GET /games/{id}/moves` always
-    * serves the full tree. ~1000 paths keep the inline tree under a few tens of KB and cover the vast majority of turns
-    * (p50 is ~160 paths).
+  /** Inline trees are deprecated and disabled by default, including on forced passes. A positive configured cap enables
+    * the legacy copies; `GET /games/{id}/moves` always serves the full tree, regardless of the cap.
     */
-  val DefaultMaxInlineTurnPaths: Int = 1000
+  val DefaultMaxInlineTurnPaths: Int = 0
 
   /** `drawReofferTurns` value meaning the right to offer a draw never returns on its own: once a seat's offer has been
     * delivered, only the opponent may offer next, until they offer in turn. This is the model ADR 006 calls a passing

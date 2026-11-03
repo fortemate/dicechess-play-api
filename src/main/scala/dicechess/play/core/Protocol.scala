@@ -209,9 +209,8 @@ final case class PublicGameState(
     seed: Option[String],
     // The client seeds folded into the dice, revealed together with `seed` (so both are `None` while active).
     clientSeeds: Option[ClientSeeds],
-    // The legal turns for the pending roll. Present while `dicePending`, except when the enumeration exceeds the
-    // inline cap — then it is `None` and a client fetches the full tree via `GET /games/{id}/moves`. `None` whenever
-    // no roll is pending.
+    // Deprecated inline copy, `None` by default. Fetch the full tree via `GET /games/{id}/moves`.
+    // A positive configured inline cap enables the legacy copy while a roll is pending and within that cap.
     legalMoves: Option[MoveTree] = None,
     // The public faces of both seats — who a board or spectator is looking at (bots by name, humans anonymous).
     players: Option[Players] = None,
@@ -285,8 +284,8 @@ enum GameEvent:
   // `history` is every completed turn so far, so a client that (re)joins mid-game renders the whole move list, not
   // just what happens after it connected. Atomically consistent with `v` — no separate fetch, no version race.
   case Snapshot(v: Long, state: PublicGameState, history: List[SnapshotTurn])
-  // `legalMoves` carries the roll's legal turns (see MoveTree); `None` only when the enumeration exceeded the inline
-  // cap — fetch `GET /games/{id}/moves` then. The empty tree announces a forced pass the server plays itself.
+  // Deprecated `legalMoves` is `None` by default; a positive configured cap enables the legacy copy up to the inline
+  // cap. Read turns from `GET /games/{id}/moves`; forced passes also carry `None` at the default cap.
   case DiceRolled(
       v: Long,
       seat: Seat,

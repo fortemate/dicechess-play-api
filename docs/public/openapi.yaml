@@ -585,7 +585,7 @@ paths:
     get:
       tags: [Discovery]
       summary: Get legal moves (public)
-      description: The full legal-move tree for the pending roll, never capped.
+      description: The single source of the full legal-move tree for the pending roll, never capped. Inline copies in events, snapshots, and webhook state are deprecated and null at the default configuration.
       security: []
       parameters: [{ $ref: '#/components/parameters/GameId' }]
       responses:
@@ -2000,7 +2000,8 @@ components:
           description: Whether the active player is allowed to offer a draw this turn under anti-spam alternation.
         legalMoves:
           anyOf: [{ $ref: '#/components/schemas/MoveTree' }, { type: 'null' }]
-          description: The legal-move tree while dicePending; null if too large to inline (fetch GET /games/{id}/moves) or absent otherwise.
+          deprecated: true
+          description: Deprecated inline copy shared by snapshots, GET /games/{id}, and webhook state; always null at the default configuration. Read the full tree from GET /games/{id}/moves.
         players:
           anyOf: [{ $ref: '#/components/schemas/Players' }, { type: 'null' }]
           description: Both seats' public faces; may be absent.
@@ -2089,7 +2090,7 @@ components:
       description: >
         A prefix tree of UCI micro-moves. Each key is a micro-move; its value is the tree of legal
         continuations. A leaf ({}) is a complete legal turn. An empty top-level tree means a forced
-        pass. On inline copies, null means the enumeration was too large — fetch GET /games/{id}/moves.
+        pass. Read the tree from GET /games/{id}/moves. Deprecated inline copies are null at the default configuration.
       additionalProperties:
         $ref: '#/components/schemas/MoveTree'
     LeaderRow:

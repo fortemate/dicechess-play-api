@@ -590,6 +590,46 @@ class WebhooksSuite extends munit.CatsEffectSuite:
 
   // ── delivery: full games ─────────────────────────────────────────────────────
 
+  test("cap zero sends null legalMoves in the webhook state and the full tree stays queryable"):
+    for
+      registry <- dicechess.play.Main.registryFor(GameStore.noop, None, maxInlinePaths = 0)
+      store    <- WebhookStore.inMemory
+      received <- Deferred[IO, Json]
+      bot = Principal.Bot("hooks", "no-inline")
+      _    <- store.put(BotWebhook("hooks", "no-inline", "https://bot.example/hook", "secret" * 8, Instant.EPOCH))
+      made <- registry.createWithDice(
+        bot,
+        Principal.Bot("hooks", "opponent"),
+        new DiceSource:
+          def commit: String                                                       = "fixed-commit"
+          def reveal: String                                                       = "fixed-reveal"
+          def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 2, 3)
+      )
+      (_, room) = made.toOption.get
+      endpoint  = HttpApp[IO] { req =>
+        req.as[Json].flatMap { body =>
+          room.legalMoves.flatMap { full =>
+            val state    = EngineOps.parse(full.dfen).toOption.get
+            val expected = MoveTree.fromPaths(EngineOps.legalMovePaths(state).map(_.map(EngineOps.toUci)))
+            assert(full.legalMoves.children.nonEmpty)
+            assertEquals(full.legalMoves, expected)
+            received.complete(body) *> Ok(BotMove(moves = Nil, resign = true).asJson)
+          }
+        }
+      }
+      _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
+      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
+      _ <- service(registry, store, Client.fromHttpApp(endpoint)).use { webhooks =>
+        for
+          _    <- webhooks.attachSweep
+          body <- received.get.timeout(10.seconds)
+          _ = assertEquals(body.hcursor.downField("state").downField("legalMoves").focus, Some(Json.Null))
+          over <- room.result.timeout(10.seconds)
+          _ = assertEquals(over.termination, Termination.Resign)
+        yield ()
+      }
+    yield ()
+
   test("two webhook-driven seats play a full game to a natural end, every delivery HMAC-verified"):
     for
       registry  <- GameRegistry.create(store = GameStore.noop)

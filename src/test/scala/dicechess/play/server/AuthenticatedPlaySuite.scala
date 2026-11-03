@@ -4,6 +4,7 @@ import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import dicechess.play.core.*
+import dicechess.play.game.GameRoom
 import dicechess.play.store.{
   BotCatalogListing,
   BotCatalogState,
@@ -276,7 +277,7 @@ class AuthenticatedPlaySuite extends munit.CatsEffectSuite:
     */
   private def wsServer: Resource[IO, (Int, GameRegistry, UserAccount, String)] =
     for
-      registry <- Resource.eval(GameRegistry.create(disconnectGrace = 500.millis))
+      registry <- Resource.eval(GameRegistry.create(tuning = GameRoom.RoomTuning(disconnectGrace = 500.millis)))
       users    <- Resource.eval(Ref.of[IO, Map[String, UserAccount]](Map.empty).map(StubUsers(_)))
       session = AuthSession(users, Secret)
       user  <- Resource.eval(users.upsertOnLogin("google", "sub-ws", None, IO.pure("WsNick")))

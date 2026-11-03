@@ -128,6 +128,9 @@ object Main extends IOApp.Simple:
 
   def run: IO[Unit] = appResources.use(serve)
 
+  private[play] def maxInlineTurnPathsFrom(raw: Option[String]): Int =
+    raw.flatMap(_.toIntOption).filter(_ >= 0).getOrElse(GameRoom.DefaultMaxInlineTurnPaths)
+
   /** The registry as production builds it, lifted out of [[serve]] so a test can exercise the REAL wiring instead of
     * restating it. That matters here specifically: both resolvers are seat-face lookups that only ever run against a
     * database, so a suite that re-declares this composition proves the queries work and proves nothing about whether
@@ -138,19 +141,26 @@ object Main extends IOApp.Simple:
     * leaderboard's own visibility threshold — a rating the board would hide as provisional never shows on a game
     * either.
     */
-  private[play] def registryFor(store: GameStore, pgStore: Option[PgGameStore]): IO[GameRegistry] =
+  private[play] def registryFor(
+      store: GameStore,
+      pgStore: Option[PgGameStore],
+      maxInlinePaths: Int = maxInlineTurnPathsFrom(sys.env.get("PLAY_MAX_INLINE_TURN_PATHS"))
+  ): IO[GameRegistry] =
     GameRegistry.create(
       // Which eligibility matrix new games are classified under (#146): `legacy` unless `RATING_POLICY=matrix`. Read
       // once at boot and logged by `serve`, so an operator can see which population a deployment is producing.
       ratingPolicy = RatingPolicy.fromEnv,
-      // ADR 006 decision 1 leaves one number open: after how many of its own turns a seat's right to offer a draw
-      // returns without the opponent offering. No governing body defines it for Dice Chess, so it is an operator
-      // setting; anything but a positive integer keeps the shipped rule, where the right only ever passes.
-      drawReofferTurns = sys.env
-        .get("PLAY_DRAW_REOFFER_TURNS")
-        .flatMap(_.toIntOption)
-        .filter(_ > 0)
-        .getOrElse(GameRoom.DefaultDrawReofferTurns),
+      tuning = GameRoom.RoomTuning(
+        maxInlinePaths = maxInlinePaths,
+        // ADR 006 decision 1 leaves one number open: after how many of its own turns a seat's right to offer a draw
+        // returns without the opponent offering. No governing body defines it for Dice Chess, so it is an operator
+        // setting; anything but a positive integer keeps the shipped rule, where the right only ever passes.
+        drawReofferTurns = sys.env
+          .get("PLAY_DRAW_REOFFER_TURNS")
+          .flatMap(_.toIntOption)
+          .filter(_ > 0)
+          .getOrElse(GameRoom.DefaultDrawReofferTurns)
+      ),
       store = store,
       resolveNicknames =
         pgStore.fold[List[String] => IO[Map[String, String]]](_ => IO.pure(Map.empty))(_.nicknamesByExternalId),

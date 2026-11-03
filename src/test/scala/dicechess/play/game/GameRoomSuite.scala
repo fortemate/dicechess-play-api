@@ -814,15 +814,25 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             val path  = leafPath(roll.legalMoves.get)
             val other = if roll.seat == Seat.White then Seat.Black else Seat.White
             for
-              _          <- room.submitTurn(roll.seat, path, offerDraw = true)
-              snapBefore <- room.snapshot
+              _           <- room.submitTurn(roll.seat, path, offerDraw = true)
+              snapBefore  <- room.snapshot
+              movesBefore <- room.legalMoves
               _ = assertEquals(snapBefore.dicePending, false) // unrevealed
               _ = assertEquals(snapBefore.drawOffer, Some(DrawOffer(pending = true)))
+              _ = assertEquals(movesBefore.version, snapBefore.version)
+              _ = assertEquals(movesBefore.dfen, snapBefore.dfen)
+              _ = assertEquals(movesBefore.dicePending, snapBefore.dicePending)
+              _ = assertEquals(movesBefore.legalMoves, MoveTree.empty)
               // Decline and reveal dice
-              _         <- room.respondDraw(other, accept = false)
-              snapAfter <- room.snapshot
+              _          <- room.respondDraw(other, accept = false)
+              snapAfter  <- room.snapshot
+              movesAfter <- room.legalMoves
               _ = assertEquals(snapAfter.dicePending, true) // revealed
               _ = assertEquals(snapAfter.drawOffer, None)
+              _ = assertEquals(movesAfter.version, snapAfter.version)
+              _ = assertEquals(movesAfter.dfen, snapAfter.dfen)
+              _ = assertEquals(movesAfter.dicePending, snapAfter.dicePending)
+              _ = assertEquals(movesAfter.legalMoves, treeFor(snapAfter.dfen))
               // Attempting to accept draw after reveal is rejected
               lateAccept <- room.respondDraw(other, accept = true)
             yield

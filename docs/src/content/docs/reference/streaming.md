@@ -105,7 +105,7 @@ there is no need to request it again on every roll.
 }
 ```
 
-`clocks` is remaining milliseconds per side (or `null` on `Unlimited`); the side to move keeps ticking, so count down locally. `legalMoves` is deprecated and always `null` at the default configuration, even on a forced pass. On your pending turn, fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves), match its `version` and `dfen` to the roll, and walk its tree. An empty endpoint tree (`{}`) means submit nothing; a null inline field does not mean a pass.
+`clocks` is remaining milliseconds per side (or `null` on `Unlimited`); the side to move keeps ticking, so count down locally. `legalMoves` is deprecated and always `null` at the default configuration, even on a forced pass. On your pending turn, fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves), check that the response's `version` matches `DiceRolled.v` and its `dfen` matches `DiceRolled.dfen`, and walk its tree. An empty endpoint tree (`{}`) means submit nothing; a null inline field does not mean a pass.
 
 ### TurnPlayed
 

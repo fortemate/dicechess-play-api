@@ -1611,7 +1611,8 @@ object GameRoom:
         Option.when(status == GameStatus.Active)(
           MayOfferDrawBy(white = mayOffer(Seat.White), black = mayOffer(Seat.Black))
         ),
-        publicRematch
+        publicRematch,
+        rulesVersion = Some(RulesVersion.value)
       )
 
     /** The pair of client seeds actually folded into the dice, for the end-of-game reveal. */

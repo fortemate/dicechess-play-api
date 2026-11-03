@@ -158,9 +158,11 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
         created <- http.expect[CreatedGame](POST(CreateGame(Some(WhiteId), Some(BlackId)), base / "games"))
         // Creation alone never rolls (the room waits for Begin via a WS attach or the seed grace), so the tree is
         // empty while no roll is pending — and the endpoint says so instead of 404ing.
+        state   <- http.expect[PublicGameState](base / "games" / created.gameId)
         idle    <- http.expect[GameMoves](base / "games" / created.gameId / "moves")
         missing <- http.status(GET(base / "games" / "nope" / "moves"))
       yield
+        assertEquals(state.rulesVersion, Some(RulesVersion.value))
         assertEquals(idle.dicePending, false)
         assertEquals(idle.legalMoves, MoveTree.empty)
         assertEquals(missing, Status.NotFound)
@@ -202,6 +204,7 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
               .flatTap { _ =>
                 http.expect[Json](httpBase / "games" / created.gameId).map { snapshot =>
                   assertEquals(snapshot.hcursor.downField("legalMoves").focus, Some(Json.Null))
+                  assertEquals(snapshot.hcursor.get[String]("rulesVersion"), Right(RulesVersion.value))
                 }
               }
       yield

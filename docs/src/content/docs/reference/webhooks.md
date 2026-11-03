@@ -308,7 +308,7 @@ When it is your turn in any of your games and dice are revealed, the server POST
 }
 ```
 
-`state` is exactly the [`Snapshot.state`](../streaming/#snapshot) object — `dfen` (dice in its 7th field), `activeSeat`, `dicePending`, `clocks`, `commit`, `mayOfferDraw` (whether you may offer a draw under alternation anti-spam), and the inline [`legalMoves`](../../game-mechanics/#legal-moves) tree under the usual cap (fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves) when it is `null`). The envelope is self-sufficient: a pure function picks its move from `legalMoves` alone.
+`state` is exactly the [`Snapshot.state`](../streaming/#snapshot) object — `dfen` (dice in its 7th field), `activeSeat`, `dicePending`, `clocks`, `commit`, `mayOfferDraw` (whether you may offer a draw under alternation anti-spam), and the inline [`legalMoves`](../../game-mechanics/#legal-moves) tree under the usual cap (fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves) when it is `null`). A bot that computes turns locally must compare `state.rulesVersion` with its bundled rules version; on a mismatch or an absent/`null` value, fetch `GET /games/{id}/moves` for the authoritative tree.
 
 ### Draw decision delivery (`drawDecision`)
 

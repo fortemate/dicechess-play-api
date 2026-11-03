@@ -233,7 +233,10 @@ final case class PublicGameState(
     // Whether each seat is permitted to offer a draw on its turn.
     mayOfferDrawBy: Option[MayOfferDrawBy] = None,
     // Present only for rematch successors; no participant identities or joined-seat details are exposed.
-    rematchStartup: Option[PublicRematchStartup] = None
+    rematchStartup: Option[PublicRematchStartup] = None,
+    // The server's current rules dependency, not a persisted property of the game. Older servers omit it; a client
+    // must treat absence or a mismatch with its bundled rules as a reason to fetch GET /games/{id}/moves.
+    rulesVersion: Option[String] = None
 )
 
 /** The full legal-move tree for a game's pending roll, served by `GET /games/{id}/moves` — never capped, unlike the

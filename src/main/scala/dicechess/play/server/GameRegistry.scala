@@ -19,9 +19,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 final class GameRegistry private (
     rooms: Ref[IO, Map[GameId, GameRoom]],
     byPlayer: Ref[IO, Map[Principal, Set[GameId]]],
-    disconnectGrace: FiniteDuration,
-    drawReofferTurns: Int,
-    maxInlinePaths: Int,
+    tuning: GameRoom.RoomTuning,
     store: GameStore,
     resolveNicknames: List[String] => IO[Map[String, String]],
     resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]],
@@ -54,11 +52,7 @@ final class GameRegistry private (
           snapshot,
           dice,
           metadata = GameRoom.SeatMetadata(displayNames = names, ratings = ratings),
-          tuning = GameRoom.RoomTuning(
-            disconnectGrace = disconnectGrace,
-            drawReofferTurns = drawReofferTurns,
-            maxInlinePaths = maxInlinePaths
-          ),
+          tuning = tuning,
           persistence = GameRoom.RoomPersistence(
             durability = Durability.required(GameRegistry.logPersistence(game.gameId))
           ),
@@ -263,11 +257,7 @@ final class GameRegistry private (
             ratingPolicyVersion = classification.policy.version
           ),
           metadata = GameRoom.SeatMetadata(displayNames = names, ratings = ratings),
-          tuning = GameRoom.RoomTuning(
-            disconnectGrace = disconnectGrace,
-            drawReofferTurns = drawReofferTurns,
-            maxInlinePaths = maxInlinePaths
-          ),
+          tuning = tuning,
           persistence = GameRoom.RoomPersistence(
             save = store.save(id, _),
             durability = durabilityFor(id, origin)
@@ -329,11 +319,7 @@ final class GameRegistry private (
                       displayNames = names,
                       ratings = RatingCategory.of(snapshot.timeControl).flatMap(byCategory.get).getOrElse(Map.empty)
                     ),
-                    tuning = GameRoom.RoomTuning(
-                      disconnectGrace = disconnectGrace,
-                      drawReofferTurns = drawReofferTurns,
-                      maxInlinePaths = maxInlinePaths
-                    ),
+                    tuning = tuning,
                     persistence = GameRoom.RoomPersistence(
                       save = store.save(id, _),
                       // A resumed showcase game is as fail-closed as it was before the restart: the origin travels in the
@@ -508,16 +494,14 @@ object GameRegistry:
     * scale is the game's own, never a default the caller would have to remember to pass.
     */
   def create(
-      disconnectGrace: FiniteDuration = GameRoom.DefaultDisconnectGrace,
-      drawReofferTurns: Int = GameRoom.DefaultDrawReofferTurns,
+      tuning: GameRoom.RoomTuning = GameRoom.RoomTuning.Default,
       store: GameStore = GameStore.noop,
       resolveNicknames: List[String] => IO[Map[String, String]] = _ => IO.pure(Map.empty),
       resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]] = (_, _) => IO.pure(Map.empty),
       diceSource: () => IO[DiceSource] = () => DiceSource.newCommitReveal(),
       // `Legacy` by default (#146): a registry that is not told otherwise classifies exactly as every game before the
       // policy existed was classified. Production reads `RatingPolicy.fromEnv`.
-      ratingPolicy: RatingPolicy = RatingPolicy.Legacy,
-      maxInlinePaths: Int = GameRoom.DefaultMaxInlineTurnPaths
+      ratingPolicy: RatingPolicy = RatingPolicy.Legacy
   ): IO[GameRegistry] =
     (
       Ref.of[IO, Map[GameId, GameRoom]](Map.empty),
@@ -526,9 +510,7 @@ object GameRegistry:
       new GameRegistry(
         rooms,
         byPlayer,
-        disconnectGrace,
-        drawReofferTurns,
-        maxInlinePaths,
+        tuning,
         store,
         resolveNicknames,
         resolveRatings,

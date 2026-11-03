@@ -4,6 +4,7 @@ import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import dicechess.play.core.*
+import dicechess.play.game.GameRoom
 import dicechess.play.store.{GameStore, GuestLink, NicknameUpdate, UserAccount, UserStore}
 import dicechess.play.wire.Codecs.given
 import io.circe.syntax.*
@@ -50,7 +51,9 @@ class SpectatorModeSuite extends munit.CatsEffectSuite:
 
   private def server: Resource[IO, (Int, GameRegistry, String, String)] =
     for
-      registry <- Resource.make(GameRegistry.create(store = GameStore.noop, disconnectGrace = 500.millis))(
+      registry <- Resource.make(
+        GameRegistry.create(store = GameStore.noop, tuning = GameRoom.RoomTuning(disconnectGrace = 500.millis))
+      )(
         _.list.flatMap(_.traverse_(_._2.stopForRestart))
       )
       users <- Resource.eval(Ref.of[IO, Map[String, UserAccount]](Map.empty).map(StubUsers(_)))

@@ -150,15 +150,17 @@ object Main extends IOApp.Simple:
       // Which eligibility matrix new games are classified under (#146): `legacy` unless `RATING_POLICY=matrix`. Read
       // once at boot and logged by `serve`, so an operator can see which population a deployment is producing.
       ratingPolicy = RatingPolicy.fromEnv,
-      maxInlinePaths = maxInlinePaths,
-      // ADR 006 decision 1 leaves one number open: after how many of its own turns a seat's right to offer a draw
-      // returns without the opponent offering. No governing body defines it for Dice Chess, so it is an operator
-      // setting; anything but a positive integer keeps the shipped rule, where the right only ever passes.
-      drawReofferTurns = sys.env
-        .get("PLAY_DRAW_REOFFER_TURNS")
-        .flatMap(_.toIntOption)
-        .filter(_ > 0)
-        .getOrElse(GameRoom.DefaultDrawReofferTurns),
+      tuning = GameRoom.RoomTuning(
+        maxInlinePaths = maxInlinePaths,
+        // ADR 006 decision 1 leaves one number open: after how many of its own turns a seat's right to offer a draw
+        // returns without the opponent offering. No governing body defines it for Dice Chess, so it is an operator
+        // setting; anything but a positive integer keeps the shipped rule, where the right only ever passes.
+        drawReofferTurns = sys.env
+          .get("PLAY_DRAW_REOFFER_TURNS")
+          .flatMap(_.toIntOption)
+          .filter(_ > 0)
+          .getOrElse(GameRoom.DefaultDrawReofferTurns)
+      ),
       store = store,
       resolveNicknames =
         pgStore.fold[List[String] => IO[Map[String, String]]](_ => IO.pure(Map.empty))(_.nicknamesByExternalId),

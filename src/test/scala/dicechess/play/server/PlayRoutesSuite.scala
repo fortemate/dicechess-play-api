@@ -45,8 +45,10 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
 
   private def serverWithInlineCap(maxInlinePaths: Int): Resource[IO, Int] =
     for
-      registry <- Resource.eval(GameRegistry.create(disconnectGrace = 500.millis, maxInlinePaths = maxInlinePaths))
-      srv      <- EmberServerBuilder
+      registry <- Resource.eval(
+        GameRegistry.create(tuning = GameRoom.RoomTuning(disconnectGrace = 500.millis, maxInlinePaths = maxInlinePaths))
+      )
+      srv <- EmberServerBuilder
         .default[IO]
         .withHost(host"127.0.0.1")
         .withPort(port"0")

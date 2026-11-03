@@ -12,6 +12,14 @@ import scala.concurrent.duration.*
   */
 class MainSuite extends munit.CatsEffectSuite:
 
+  test("the inline turn-path cap accepts zero and non-negative integers, defaulting invalid values"):
+    assertEquals(Main.maxInlineTurnPathsFrom(Some("0")), 0)
+    assertEquals(Main.maxInlineTurnPathsFrom(Some("17")), 17)
+    assertEquals(Main.maxInlineTurnPathsFrom(Some(Int.MaxValue.toString)), Int.MaxValue)
+    List(None, Some(""), Some("-1"), Some("invalid"), Some("2147483648")).foreach { raw =>
+      assertEquals(Main.maxInlineTurnPathsFrom(raw), dicechess.play.game.GameRoom.DefaultMaxInlineTurnPaths)
+    }
+
   test("the outbound client's cut clears the configured per-turn window"):
     val config  = Webhooks.Config(timeout = 120.seconds)
     val builder = Main.outboundClientBuilder(Some(config))

@@ -8,6 +8,7 @@ import dicechess.play.core.*
 import dicechess.play.dice.DiceSource
 import dicechess.play.game.{EngineOps, GameRoom}
 import dicechess.play.wire.Codecs.given
+import io.circe.Json
 import io.circe.parser.decode
 import io.circe.syntax.*
 import org.http4s.Method.*
@@ -40,9 +41,11 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
   /** An Ember server on an ephemeral port; yields the bound port. A short reconnect grace keeps the disconnect test
     * fast — a dropped player forfeits shortly after the socket closes rather than after the production grace.
     */
-  private def server: Resource[IO, Int] =
+  private def server: Resource[IO, Int] = serverWithInlineCap(GameRoom.DefaultMaxInlineTurnPaths)
+
+  private def serverWithInlineCap(maxInlinePaths: Int): Resource[IO, Int] =
     for
-      registry <- Resource.eval(GameRegistry.create(disconnectGrace = 500.millis))
+      registry <- Resource.eval(GameRegistry.create(disconnectGrace = 500.millis, maxInlinePaths = maxInlinePaths))
       srv      <- EmberServerBuilder
         .default[IO]
         .withHost(host"127.0.0.1")
@@ -160,10 +163,10 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
         assertEquals(idle.legalMoves, MoveTree.empty)
         assertEquals(missing, Status.NotFound)
 
-  test("GET /games/{id}/moves carries the pending roll's tree once the game rolls"):
+  test("with cap zero, GET /games/{id}/moves serves the full tree while snapshots omit it"):
     val resources =
       for
-        port <- server
+        port <- serverWithInlineCap(0)
         http <- JdkHttpClient.simple[IO]
         ws   <- JdkWSClient.simple[IO]
       yield (port, http, ws)
@@ -194,6 +197,11 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
             send(black, GameCommand.SubmitSeed("client-seed-Black-0123456789")) *>
             pollMovable(httpBase / "games" / created.gameId / "moves")
               .timeoutTo(10.seconds, IO.raiseError(RuntimeException("no movable roll became pending")))
+              .flatTap { _ =>
+                http.expect[Json](httpBase / "games" / created.gameId).map { snapshot =>
+                  assertEquals(snapshot.hcursor.downField("legalMoves").focus, Some(Json.Null))
+                }
+              }
       yield
         // The served tree is exactly the engine's enumeration for the DFEN the endpoint itself reported.
         val expected = EngineOps.parse(moves.dfen) match

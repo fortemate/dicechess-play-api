@@ -31,13 +31,18 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
-          // Subscribe first, then resign shortly after so the terminal event is the live GameEnded (not a snapshot).
-          val ended      = room.subscribe.collectFirst { case e: GameEvent.GameEnded => e }.compile.lastOrError
-          val resignSoon = IO.sleep(100.millis) *> room.submit(Seat.White, GameCommand.Resign)
-          (ended, resignSoon)
-            .parMapN((event, _) => event)
-            .flatMap(event => (room.diceCommit, room.snapshot).mapN((commit, snap) => (event, commit, snap)))
-            .timeoutTo(10.seconds, IO.raiseError(RuntimeException("no game-end event")))
+          Deferred[IO, Unit].flatMap { subscribed =>
+            val ended = room.subscribe
+              .evalTap(_ => subscribed.complete(()).attempt.void)
+              .collectFirst { case e: GameEvent.GameEnded => e }
+              .compile
+              .lastOrError
+            val resign = subscribed.get *> room.submit(Seat.White, GameCommand.Resign)
+            (ended, resign)
+              .parMapN((event, _) => event)
+              .flatMap(event => (room.diceCommit, room.snapshot).mapN((commit, snap) => (event, commit, snap)))
+              .timeoutTo(10.seconds, IO.raiseError(RuntimeException("no game-end event")))
+          }
       }
       .map: (event, commit, snap) =>
         assert(event.seed.nonEmpty, "the game-end event must reveal the seed")
@@ -342,10 +347,8 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       }
 
   test("above the inline cap the tree is elided from events but stays fully queryable"):
-    val dice = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
     GameRoom
-      // Cap 0: every movable roll's tree is elided (a forced pass — zero paths — would still ride inline).
-      .create(seats, dice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = 0))
+      .create(seats, movableDice, tuning = GameRoom.RoomTuning(seedGrace = 10.seconds, maxInlinePaths = 0))
       .flatMap {
         case Left(error) => IO.raiseError(RuntimeException(s"room creation failed: $error"))
         case Right(room) =>
@@ -365,16 +368,54 @@ class GameRoomSuite extends munit.CatsEffectSuite:
             .parMapN((roll, _) => roll)
             .timeoutTo(10.seconds, IO.raiseError(RuntimeException("no elided roll arrived")))
             .flatMap { roll =>
-              (room.legalMoves, room.snapshot).mapN { (full, snap) =>
+              (room.legalMoves, room.snapshot).flatMapN { (full, snap) =>
                 // The event elided the tree, but the dedicated endpoint still has all of it...
                 assertEquals(full.legalMoves, treeFor(roll.dfen))
                 assert(full.legalMoves.children.nonEmpty)
                 // ...and the capped Snapshot elides it the same way as the event did.
                 assert(snap.dicePending)
                 assertEquals(snap.legalMoves, None)
+                for
+                  snapshot <- room.subscribe.take(1).compile.lastOrError
+                  _ = assert(snapshot match
+                    case GameEvent.Snapshot(_, state, _) => state.legalMoves.isEmpty
+                    case _                               => false)
+                  refused <- room.submitTurn(roll.seat, List("a1a1"))
+                  _ = assertEquals(refused, GameRoom.TurnVerdict.Refused("illegal turn"))
+                  applied <- room.submitTurn(roll.seat, leafPath(full.legalMoves))
+                yield assert(applied.isInstanceOf[GameRoom.TurnVerdict.Applied])
               }
             }
       }
+
+  test("cap zero elides the DiceRolled tree on forced passes as well as movable rolls"):
+    val dice = new DiceSource:
+      def commit: String                                                       = "fixed-commit"
+      def reveal: String                                                       = "fixed-reveal"
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] =
+        if ply == 0L then List(6, 6, 6) else List(1, 2, 3)
+    for
+      room <- GameRoom
+        .create(seats, dice, tuning = GameRoom.RoomTuning(maxInlinePaths = 0))
+        .flatMap(made => IO.fromEither(made.left.map(RuntimeException(_))))
+      ready <- Deferred[IO, Unit]
+      events = room.subscribe
+        .evalTap {
+          case _: GameEvent.Snapshot => ready.complete(()).void
+          case _                     => IO.unit
+        }
+        .collect { case roll: GameEvent.DiceRolled => roll }
+        .take(2)
+        .compile
+        .toList
+      drive = ready.get *> room.submit(Seat.White, GameCommand.SubmitSeed(seedW)) *>
+        room.submit(Seat.Black, GameCommand.SubmitSeed(seedB)) *> room.start
+      rolls <- (events, drive).parMapN((seen, _) => seen).timeout(10.seconds)
+      _     <- room.stopForRestart
+    yield
+      assertEquals(rolls.map(_.legalMoves), List(None, None))
+      assertEquals(treeFor(rolls.head.dfen), MoveTree.empty)
+      assert(treeFor(rolls.last.dfen).children.nonEmpty)
 
   test("a restored room recomputes the pending roll's paths: tree served, submits validated"):
     val dice = DiceSource.commitReveal("restore-seed-fixture".getBytes("UTF-8"))
@@ -394,8 +435,10 @@ class GameRoomSuite extends munit.CatsEffectSuite:
       _ = assert(snap.pending, "the persisted snapshot must carry the pending roll")
       restoredDice <- IO.fromEither(DiceSource.fromHexSeed(snap.serverSeed).left.map(RuntimeException(_)))
       restored     <- GameRoom
-        .restore(snap, restoredDice)
+        .restore(snap, restoredDice, tuning = GameRoom.RoomTuning(maxInlinePaths = 0))
         .flatMap(made => IO.fromEither(made.left.map(e => RuntimeException(s"restore failed: $e"))))
+      restoredState <- restored.snapshot
+      _ = assertEquals(restoredState.legalMoves, None)
       moves <- restored.legalMoves
       // The cache is transient, so the restored room must have re-derived the same tree from the stored DFEN...
       _ = assertEquals(moves.legalMoves, roll.legalMoves.get)

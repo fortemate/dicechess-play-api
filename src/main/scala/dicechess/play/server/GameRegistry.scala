@@ -21,6 +21,7 @@ final class GameRegistry private (
     byPlayer: Ref[IO, Map[Principal, Set[GameId]]],
     disconnectGrace: FiniteDuration,
     drawReofferTurns: Int,
+    maxInlinePaths: Int,
     store: GameStore,
     resolveNicknames: List[String] => IO[Map[String, String]],
     resolveRatings: (List[String], RatingCategory) => IO[Map[String, Double]],
@@ -55,7 +56,8 @@ final class GameRegistry private (
           metadata = GameRoom.SeatMetadata(displayNames = names, ratings = ratings),
           tuning = GameRoom.RoomTuning(
             disconnectGrace = disconnectGrace,
-            drawReofferTurns = drawReofferTurns
+            drawReofferTurns = drawReofferTurns,
+            maxInlinePaths = maxInlinePaths
           ),
           persistence = GameRoom.RoomPersistence(
             durability = Durability.required(GameRegistry.logPersistence(game.gameId))
@@ -263,7 +265,8 @@ final class GameRegistry private (
           metadata = GameRoom.SeatMetadata(displayNames = names, ratings = ratings),
           tuning = GameRoom.RoomTuning(
             disconnectGrace = disconnectGrace,
-            drawReofferTurns = drawReofferTurns
+            drawReofferTurns = drawReofferTurns,
+            maxInlinePaths = maxInlinePaths
           ),
           persistence = GameRoom.RoomPersistence(
             save = store.save(id, _),
@@ -328,7 +331,8 @@ final class GameRegistry private (
                     ),
                     tuning = GameRoom.RoomTuning(
                       disconnectGrace = disconnectGrace,
-                      drawReofferTurns = drawReofferTurns
+                      drawReofferTurns = drawReofferTurns,
+                      maxInlinePaths = maxInlinePaths
                     ),
                     persistence = GameRoom.RoomPersistence(
                       save = store.save(id, _),
@@ -512,7 +516,8 @@ object GameRegistry:
       diceSource: () => IO[DiceSource] = () => DiceSource.newCommitReveal(),
       // `Legacy` by default (#146): a registry that is not told otherwise classifies exactly as every game before the
       // policy existed was classified. Production reads `RatingPolicy.fromEnv`.
-      ratingPolicy: RatingPolicy = RatingPolicy.Legacy
+      ratingPolicy: RatingPolicy = RatingPolicy.Legacy,
+      maxInlinePaths: Int = GameRoom.DefaultMaxInlineTurnPaths
   ): IO[GameRegistry] =
     (
       Ref.of[IO, Map[GameId, GameRoom]](Map.empty),
@@ -523,6 +528,7 @@ object GameRegistry:
         byPlayer,
         disconnectGrace,
         drawReofferTurns,
+        maxInlinePaths,
         store,
         resolveNicknames,
         resolveRatings,

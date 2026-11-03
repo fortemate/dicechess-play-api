@@ -510,7 +510,7 @@ final class GameRoom private (
     */
   def legalMoves: IO[GameMoves] =
     stateRef.get.map: s =>
-      GameMoves(s.version, EngineOps.serialize(s.state), s.pending, s.legalTree)
+      GameMoves(s.version, EngineOps.serialize(s.state), s.pending, s.turnCache.tree)
 
   // ── consumer fiber ─────────────────────────────────────────────────────────
 
@@ -888,30 +888,29 @@ final class GameRoom private (
     // `ply - 1`. Deriving both from one `plyAfter` is what keeps the sequence consecutive: rolling with the
     // already-advanced `ply` skipped an index and dealt the next one to two consecutive turns — after a declined
     // draw offer the offerer, having seen the responder's dice, knew their own next roll in advance (#331).
-    val plyAfter      = if s0.pending then s0.ply else s0.ply + 1
-    val dice          = s0.dice.roll(plyAfter - 1, s0.seedFor(Seat.White), s0.seedFor(Seat.Black))
-    val rolled        = EngineOps.withDice(s0.state, dice)
-    val seat          = EngineOps.activeSeat(rolled)
-    val (turns, tree) = turnCache(rolled)
-    val s1            = s0.copy(
+    val plyAfter = if s0.pending then s0.ply else s0.ply + 1
+    val dice     = s0.dice.roll(plyAfter - 1, s0.seedFor(Seat.White), s0.seedFor(Seat.Black))
+    val rolled   = EngineOps.withDice(s0.state, dice)
+    val seat     = EngineOps.activeSeat(rolled)
+    val cache    = turnCache(rolled)
+    val s1       = s0.copy(
       state = rolled,
       ply = plyAfter,
       pending = true,
       lastRoll = dice,
-      legalTurns = turns,
-      legalTree = tree,
+      turnCache = cache,
       pendingDrawOffer = None
     )
     // The new mover's clock has not started ticking yet (startClock runs below), so these are the banks at turn start —
     // including the increment just credited to the side that completed the previous turn.
-    val inline   = Option.when(turns.sizeIs <= maxInlinePaths)(tree)
+    val inline   = cache.inline(maxInlinePaths)
     val emitRoll =
       IO.monotonic.flatMap: now =>
         val clocks = liveClocks(s1, now)
         emit(s1, v => GameEvent.DiceRolled(v, seat, dice, EngineOps.serialize(rolled), clocks, inline))
 
     emitRoll.flatMap: s2 =>
-      if turns.nonEmpty then adjustClockForTurn(s2, s0, seat)
+      if cache.turns.nonEmpty then adjustClockForTurn(s2, s0, seat)
       else handleForcedPass(s2, seat, rolled, dice)
 
   private def adjustClockForTurn(s2: Session, s0: Session, seat: Seat): IO[Session] =
@@ -967,8 +966,7 @@ final class GameRoom private (
         pending = false,
         remaining = nextRemaining,
         turnStartedAt = None,
-        legalTurns = Map.empty,
-        legalTree = MoveTree.empty,
+        turnCache = TurnCache.empty,
         armedDrawOffer = nextArmed,
         drawTogglesThisTurn = nextToggles,
         pendingDrawOffer = newPendingOffer,
@@ -990,8 +988,7 @@ final class GameRoom private (
           ply = s0.ply + 1,
           pending = true,
           lastRoll = Nil,
-          legalTurns = Map.empty,
-          legalTree = MoveTree.empty
+          turnCache = TurnCache.empty
         )
         emit(s1, v => GameEvent.DrawOffered(v, offerer)).flatMap(s =>
           startClock(s, presentationGraceFor(s0, seat, includeRoll = false))
@@ -1124,7 +1121,7 @@ final class GameRoom private (
         .flatTap(_ => answer(reply, TurnVerdict.Refused("dice not rolled yet — accept or decline draw offer first")))
     else
       // Validate against the UCI index cached when the turn was rolled — a lookup, never a re-enumeration.
-      s.legalTurns.get(uci) match
+      s.turnCache.turns.get(uci) match
         case None =>
           emit(s, v => GameEvent.Rejected(v, seat, "illegal turn"))
             .flatTap(_ => answer(reply, TurnVerdict.Refused("illegal turn")))
@@ -1168,8 +1165,7 @@ final class GameRoom private (
       sd.copy(
         state = next,
         pending = false,
-        legalTurns = Map.empty,
-        legalTree = MoveTree.empty,
+        turnCache = TurnCache.empty,
         armedDrawOffer = nextArmed,
         drawTogglesThisTurn = nextToggles,
         pendingDrawOffer = newPendingOffer,
@@ -1362,13 +1358,21 @@ object GameRoom:
     */
   private[play] val MaxDrawTogglesPerTurn: Int = 10
 
-  /** The per-roll turn cache, built once when the dice land: the UCI→engine-path index `SubmitTurn` validates against
-    * (a lookup per submit, never a re-enumeration or re-mapping), and the prebuilt wire tree every snapshot and
-    * `GET /games/{id}/moves` read serves as-is.
+  /** The UCI index is eager; the wire tree is built at most once, on its first inline or endpoint read. Scala's
+    * thread-safe lazy val also covers readers outside the room's writer fiber. Session copies share this cache.
     */
-  private def turnCache(state: GameState): (Map[List[String], List[Move]], MoveTree) =
+  final private[play] class TurnCache(val turns: Map[List[String], List[Move]], buildTree: => MoveTree):
+    lazy val tree: MoveTree = buildTree
+
+    def inline(maxPaths: Int): Option[MoveTree] =
+      Option.when(maxPaths > 0 && turns.sizeIs <= maxPaths)(tree)
+
+  private[play] object TurnCache:
+    val empty: TurnCache = new TurnCache(Map.empty, MoveTree.empty)
+
+  private def turnCache(state: GameState): TurnCache =
     val turns = EngineOps.legalMovePaths(state).map(path => path.map(EngineOps.toUci) -> path).toMap
-    (turns, MoveTree.fromPaths(turns.keys.toList))
+    new TurnCache(turns, MoveTree.fromPaths(turns.keys.toList))
 
   /** A live subscriber's mailbox plus a one-shot "you fell behind, disconnect" signal. */
   final private case class Subscriber(id: Long, queue: Queue[IO, GameEvent], dropped: Deferred[IO, Unit])
@@ -1474,10 +1478,9 @@ object GameRoom:
       turns: Vector[TurnRecord] = Vector.empty,
       createdAtEpochMs: Option[Long] = None,
       // The roll-in-flight turn cache (see `turnCache`): the UCI index `SubmitTurn` validates against and the
-      // prebuilt wire tree. Transient: never persisted (a pure function of the pending `state`), recomputed on
+      // lazy wire tree. Transient: never persisted (a pure function of the pending `state`), recomputed on
       // restore, cleared when the turn completes.
-      legalTurns: Map[List[String], List[Move]] = Map.empty,
-      legalTree: MoveTree = MoveTree.empty,
+      turnCache: TurnCache = TurnCache.empty,
       // Whether a draw offer from the opponent is currently live on this turn (#327). `None` when no offer is pending.
       pendingDrawOffer: Option[Seat] = None,
       // The seat that last offered a draw, enforcing the Option A alternation anti-spam rule (#327).
@@ -1591,7 +1594,7 @@ object GameRoom:
         dice.commit,
         revealed,
         seeds,
-        Option.when(dicePending && legalTurns.sizeIs <= maxInlinePaths)(legalTree),
+        Option.when(dicePending)(turnCache.inline(maxInlinePaths)).flatten,
         // The public faces of the seats: bots by name, registered players by nickname, guests anonymous. The guest
         // rule (and the rating-only-on-a-named-face rule) lives in `PublicPlayer.ofExternalId`, not here.
         (players.get(Seat.White), players.get(Seat.Black))
@@ -1686,10 +1689,10 @@ object GameRoom:
         IO.uncancelable { _ =>
           IO.monotonic.flatMap { now =>
             // The cache is transient; a pending roll's turns re-derive from the persisted DFEN (dice included).
-            val (turns, tree) =
-              if snapshot.pendingDrawOffer.isDefined then (Map.empty[List[String], List[Move]], MoveTree.empty)
+            val cache =
+              if snapshot.pendingDrawOffer.isDefined then TurnCache.empty
               else if snapshot.pending then turnCache(state0)
-              else (Map.empty[List[String], List[Move]], MoveTree.empty)
+              else TurnCache.empty
             val session0 = Session(
               state0,
               snapshot.version,
@@ -1721,8 +1724,7 @@ object GameRoom:
               lastRoll = snapshot.lastRoll,
               turns = snapshot.turns,
               createdAtEpochMs = snapshot.createdAtEpochMs,
-              legalTurns = turns,
-              legalTree = tree,
+              turnCache = cache,
               pendingDrawOffer = snapshot.pendingDrawOffer,
               lastDrawOfferer = snapshot.lastDrawOfferer,
               drawReofferTurns = tuning.drawReofferTurns,

@@ -248,7 +248,7 @@ Every live game you are seated in — the polling counterpart of `GameStart` and
 
 ### Get legal moves
 
-`GET /games/{id}/moves` — **public.** The full [legal-move tree](../../game-mechanics/#legal-moves) for the pending roll, never capped.
+`GET /games/{id}/moves` — **public.** The single source of the full [legal-move tree](../../game-mechanics/#legal-moves) for the pending roll, never capped.
 
 ```json
 {
@@ -259,11 +259,11 @@ Every live game you are seated in — the polling counterpart of `GameStart` and
 }
 ```
 
-`version` and `dfen` tie the tree to the roll it answers. `legalMoves` is `{}` when `dicePending` is `false` or the roll is a forced pass. Errors: `404` unknown game.
+`version` and `dfen` tie the tree to the roll it answers: match both against your snapshot or event before choosing moves, and refresh the state if they differ. Deprecated inline copies in snapshots, events, and webhook state are nullable and always `null` at the default configuration. `legalMoves` is `{}` when `dicePending` is `false` or the roll is a forced pass. Errors: `404` unknown game.
 
 ### Get a game snapshot
 
-`GET /games/{id}` — **public.** The polling read of a single game: the same `Snapshot.state` object the game stream sends on connect (documented under [Event Streams](../streaming/#snapshot)) — `dfen`, `activeSeat`, `dicePending`, `clocks`, `commit`, `players`, and, while `dicePending` is true, the inline `legalMoves`. `seed`/`clientSeeds` are `null` while the game is active and appear the instant it ends, on this endpoint exactly as on the live `GameEnded` event. Errors: `404` unknown game.
+`GET /games/{id}` — **public.** The polling read of a single game: the same `Snapshot.state` object the game stream sends on connect (documented under [Event Streams](../streaming/#snapshot)) — `dfen`, `activeSeat`, `dicePending`, `clocks`, `commit`, `players`, and the deprecated nullable `legalMoves` field, always `null` at the default configuration. On your pending turn, read the tree from [`GET /games/{id}/moves`](#get-legal-moves). `seed`/`clientSeeds` are `null` while the game is active and appear the instant it ends, on this endpoint exactly as on the live `GameEnded` event. Errors: `404` unknown game.
 
 ### Get game history (replay)
 

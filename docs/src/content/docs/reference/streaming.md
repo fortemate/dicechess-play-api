@@ -84,7 +84,7 @@ Clients that compute turns locally should use [`GET /games/{id}/moves`](../rest/
 when this field is absent, `null`, or differs from their bundled rules version. Keep it from the snapshot;
 there is no need to request it again on every roll.
 
-`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. While `dicePending` is `true`, `legalMoves` carries the pending roll's [tree](../../game-mechanics/#legal-moves) (or `null` if too large — fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves)). `mayOfferDrawBy` indicates for each seat (`white` and `black`) whether that seat holds the right to offer a draw. `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero). `rated` says whether the game **may** move a canonical rating — the eligibility decided at creation, not proof that a rating was applied or that the game counts on a leaderboard — and `ratingDomain` which [rating domain](../../rating/#which-games-count-rating-domains) it was classified into (`competitive`, `training` or `casual`). Both are optional on the wire, and absence means "the server does not say". The snapshot carries no outcome: whether the rating batch applied, skipped or has not yet reached a finished game is [`GET /games/{id}/rating`](../rest/#get-a-games-rating-change)'s `outcome`.
+`commit` is the dice commitment (constant for the game). `seed`/`clientSeeds` stay `null` until the game ends, then carry the [reveal](../../provably-fair/) immediately, with nothing ever withheld. `legalMoves` is a deprecated nullable inline field, always `null` at the default configuration, including while `dicePending` is true. Read the pending roll's [tree](../../game-mechanics/#legal-moves) from its single source, [`GET /games/{id}/moves`](../rest/#get-legal-moves). `mayOfferDrawBy` indicates for each seat (`white` and `black`) whether that seat holds the right to offer a draw. `players` is both seats' public faces; a named face may carry its settled `rating` as of game start (absent/`null` for anonymous, provisional, or unrated participants — treat absence as "the server does not say", never as zero). `rated` says whether the game **may** move a canonical rating — the eligibility decided at creation, not proof that a rating was applied or that the game counts on a leaderboard — and `ratingDomain` which [rating domain](../../rating/#which-games-count-rating-domains) it was classified into (`competitive`, `training` or `casual`). Both are optional on the wire, and absence means "the server does not say". The snapshot carries no outcome: whether the rating batch applied, skipped or has not yet reached a finished game is [`GET /games/{id}/rating`](../rest/#get-a-games-rating-change)'s `outcome`.
 
 `rated` says whether the game counts toward the [leaderboard](../rest/#leaderboard). Treat absence as "the server does not say", never as "casual". No rating delta is sent on `GameEnded`: ratings are applied by an asynchronous batch after the game, so refetch the profile or leaderboard for the post-game numbers.
 
@@ -100,12 +100,12 @@ there is no need to request it again on every roll.
     "dice": [2, 3, 6],
     "dfen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 NBK",
     "clocks": { "white": 180000, "black": 175000 },
-    "legalMoves": { "b1c3": { "g1f3": { "e2e4": {} } }, "e2e4": { "b1c3": { "g1f3": {} } } }
+    "legalMoves": null
   }
 }
 ```
 
-`clocks` is remaining milliseconds per side (or `null` on `Unlimited`); the side to move keeps ticking, so count down locally. `legalMoves` is the roll's [tree](../../game-mechanics/#legal-moves): `{}` = forced pass (submit nothing); `null` = fetch the full tree.
+`clocks` is remaining milliseconds per side (or `null` on `Unlimited`); the side to move keeps ticking, so count down locally. `legalMoves` is deprecated and always `null` at the default configuration, even on a forced pass. On your pending turn, fetch [`GET /games/{id}/moves`](../rest/#get-legal-moves), check that the response's `version` matches `DiceRolled.v` and its `dfen` matches `DiceRolled.dfen`, and walk its tree. An empty endpoint tree (`{}`) means submit nothing; a null inline field does not mean a pass.
 
 ### TurnPlayed
 

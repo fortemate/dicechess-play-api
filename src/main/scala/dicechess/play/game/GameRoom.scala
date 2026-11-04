@@ -510,7 +510,12 @@ final class GameRoom private (
     */
   def legalMoves: IO[GameMoves] =
     stateRef.get.map: s =>
-      GameMoves(s.version, EngineOps.serialize(s.state), s.pending, s.turnCache.tree)
+      GameMoves(
+        s.version,
+        EngineOps.serialize(s.state),
+        s.dicePending,
+        if s.dicePending then s.turnCache.tree else MoveTree.empty
+      )
 
   // ── consumer fiber ─────────────────────────────────────────────────────────
 
@@ -1280,12 +1285,10 @@ object GameRoom:
   private val MinSeedChars = 16
   private val MaxSeedChars = 256
 
-  /** Above this many legal turn paths, the `legalMoves` tree is elided from `DiceRolled`/`Snapshot` (streams are
-    * uncompressed and the enumeration's tail reaches tens of thousands of paths) — `GET /games/{id}/moves` always
-    * serves the full tree. ~1000 paths keep the inline tree under a few tens of KB and cover the vast majority of turns
-    * (p50 is ~160 paths).
+  /** Inline trees are deprecated and disabled by default, including on forced passes. A positive configured cap enables
+    * the legacy copies; `GET /games/{id}/moves` always serves the full tree, regardless of the cap.
     */
-  val DefaultMaxInlineTurnPaths: Int = 1000
+  val DefaultMaxInlineTurnPaths: Int = 0
 
   /** `drawReofferTurns` value meaning the right to offer a draw never returns on its own: once a seat's offer has been
     * delivered, only the opponent may offer next, until they offer in turn. This is the model ADR 006 calls a passing
@@ -1565,13 +1568,15 @@ object GameRoom:
 
     def awaitingJoins: Boolean = rematchStartup.exists(_.phase == RematchStartupPhase.AwaitingJoins)
 
+    def isDrawPending: Boolean = pending && pendingDrawOffer.exists(_ != EngineOps.activeSeat(state))
+
+    def dicePending: Boolean = pending && !isDrawPending
+
     def publicAt(now: FiniteDuration, maxInlinePaths: Int): PublicGameState =
       val (revealed, seeds) = status match
         case GameStatus.Ended(_) => (Some(dice.reveal), Some(clientSeedsRevealed))
         case _                   => (None, None)
       val activeSt      = EngineOps.activeSeat(state)
-      val isDrawPending = pending && pendingDrawOffer.exists(_ != activeSt)
-      val dicePending   = pending && !isDrawPending
       val publicRematch = rematchStartup
         .map { startup =>
           PublicRematchStartup(

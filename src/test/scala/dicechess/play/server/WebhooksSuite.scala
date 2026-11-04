@@ -193,8 +193,8 @@ class WebhooksSuite extends munit.CatsEffectSuite:
 
   /** The scripted bot endpoint: echoes verification nonces, and answers `yourTurn` envelopes with the first legal path
     * — after verifying the delivery's signature against the registered secrets (a bad MAC is a 401 and counted). When
-    * the envelope's inline tree is elided (over the cap), it falls back to the room's full tree — the in-process
-    * stand-in for the documented `GET /games/{id}/moves` fetch.
+    * the envelope's inline tree is null (the default), it reads the room's full tree — the in-process stand-in for the
+    * documented `GET /games/{id}/moves` fetch.
     */
   private def botEndpoint(
       secrets: Ref[IO, List[String]],
@@ -219,6 +219,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
                 decode[WebhookEnvelope](body) match
                   case Left(_)         => IO.pure(Response[IO](Status.BadRequest))
                   case Right(envelope) =>
+                    assertEquals(envelope.state.legalMoves, None, "default webhook state must never inline a tree")
                     delivered.update(_ + 1) *> resolveMoves(registry, envelope).flatMap(m => Ok(BotMove(m).asJson))
             }
       }
@@ -265,9 +266,9 @@ class WebhooksSuite extends munit.CatsEffectSuite:
 
   private def awaitWhiteTurn(room: GameRoom): IO[PublicGameState] =
     def loop: IO[PublicGameState] =
-      room.snapshot.flatMap { state =>
+      (room.snapshot, room.legalMoves).flatMapN { (state, moves) =>
         val ready = state.status == GameStatus.Active && state.activeSeat == Seat.White && state.dicePending &&
-          state.legalMoves.exists(_.children.nonEmpty)
+          moves.version == state.version && moves.dfen == state.dfen && moves.legalMoves.children.nonEmpty
         if ready then IO.pure(state) else IO.cede *> loop
       }
     loop.timeoutTo(5.seconds, IO.raiseError(new RuntimeException("deterministic White turn never became ready")))
@@ -590,9 +591,9 @@ class WebhooksSuite extends munit.CatsEffectSuite:
 
   // ── delivery: full games ─────────────────────────────────────────────────────
 
-  test("cap zero sends null legalMoves in the webhook state and the full tree stays queryable"):
+  test("the default sends null legalMoves in webhook state and keeps the full tree queryable"):
     for
-      registry <- dicechess.play.Main.registryFor(GameStore.noop, None, maxInlinePaths = 0)
+      registry <- dicechess.play.Main.registryFor(GameStore.noop, None)
       store    <- WebhookStore.inMemory
       received <- Deferred[IO, Json]
       bot = Principal.Bot("hooks", "no-inline")

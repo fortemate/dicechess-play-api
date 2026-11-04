@@ -65,6 +65,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Machine-Readable Specs', link: '/specifications/' },
 						{ label: 'Licensing for Bots', link: '/licensing/' },
+						{ label: 'Release Notes', link: '/release-notes/' },
 					],
 				},
 				// Generated from public/openapi.yaml by starlight-openapi.

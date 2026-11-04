@@ -144,8 +144,7 @@ object PlayRoutes:
             case Some(room) => room.snapshot.flatMap(Ok(_))
 
       // Public like the state snapshot above — legal moves are a pure function of the already-public DFEN. Always the
-      // full tree: this is the fallback when the inline `legalMoves` on DiceRolled/Snapshot was elided by the cap,
-      // and the primary source for polling bots.
+      // full tree: the single source for clients. Deprecated inline copies are null at the default configuration.
       case GET -> Root / "games" / id / "moves" =>
         registry
           .get(GameId(id))

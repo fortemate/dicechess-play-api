@@ -48,7 +48,7 @@ via mise). If a tool is missing, run `bash scripts/jules-setup.sh` instead of in
 ## Commands
 
 Prerequisites (in order):
-1. `mise install` — tools pinned in `mise.toml` (Java temurin-25, sbt 2.0.8, scalafmt 3.11.4, gh, lefthook, betterleaks, jq); then `mise run setup` to register git hooks.
+1. `mise install` — tools pinned in `mise.toml` (Java temurin-25, sbt pinned by project/build.properties, scalafmt 3.11.4, gh, lefthook, betterleaks, jq); then `mise run setup` to register git hooks.
 2. Docker running — tests use testcontainers for real PostgreSQL testing.
 
 Daily tasks:

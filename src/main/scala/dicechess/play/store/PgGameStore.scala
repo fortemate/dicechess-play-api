@@ -29,6 +29,9 @@ import dicechess.play.core.{
 import dicechess.play.ingest.PlaysiteIngest
 import dicechess.play.rating.{
   AnchorSet,
+  AnchoredStrength,
+  BotStrengthSnapshot,
+  BotStrengthSnapshotSummary,
   CapturedTrainingReference,
   Glicko,
   Glicko2,
@@ -2855,24 +2858,63 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
   def ratingChangeFor(gameId: GameId): IO[Option[GameRatingChange]] =
     sql"""SELECT rating_applied_at IS NOT NULL,
                  white_rating_before, white_rating_after, black_rating_before, black_rating_after,
-                 rating_outcome, rating_skip_reason, rating_domain
+                 rating_outcome, rating_skip_reason, rating_domain,
+                 training_reference_source, training_reference_anchor_set, training_reference_anchor_epoch,
+                 training_reference_rating, training_reference_rd, training_reference_vol
           FROM play.game_results
           WHERE game_id = ${gameId.value}::uuid"""
-      .query[(Boolean, Option[Double], Option[Double], Option[Double], Option[Double], String, Option[String], String)]
+      .query[
+        (
+            Boolean,
+            Option[Double],
+            Option[Double],
+            Option[Double],
+            Option[Double],
+            String,
+            Option[String],
+            String,
+            Option[String],
+            Option[String],
+            Option[Int],
+            Option[Double],
+            Option[Double],
+            Option[Double]
+        )
+      ]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.map { case (applied, whiteBefore, whiteAfter, blackBefore, blackAfter, outcome, reason, domain) =>
-        GameRatingChange(
-          applied,
-          (whiteBefore, whiteAfter).mapN(SeatRatingChange.apply),
-          (blackBefore, blackAfter).mapN(SeatRatingChange.apply),
-          // The CHECK constraints pin both vocabularies, so an unknown value is a hand-edited row; `legacy` and
-          // "no domain" are the honest readings of one rather than a crash on a public route.
-          RatingOutcome.fromWireName(outcome).getOrElse(RatingOutcome.Legacy),
-          reason,
-          RatingDomain.fromWireName(domain)
-        )
+      .map(_.map {
+        case (
+              applied,
+              whiteBefore,
+              whiteAfter,
+              blackBefore,
+              blackAfter,
+              outcome,
+              reason,
+              domain,
+              refSrc,
+              refSet,
+              refEpoch,
+              refRat,
+              refRd,
+              refVol
+            ) =>
+          val ref = PgGameStore.ReferenceColumns(refSrc, refSet, refEpoch, refRat, refRd, refVol).captured match
+            case CapturedTrainingReference.Recorded(reference) => Some(reference)
+            case _                                             => None
+          GameRatingChange(
+            applied,
+            (whiteBefore, whiteAfter).mapN(SeatRatingChange.apply),
+            (blackBefore, blackAfter).mapN(SeatRatingChange.apply),
+            // The CHECK constraints pin both vocabularies, so an unknown value is a hand-edited row; `legacy` and
+            // "no domain" are the honest readings of one rather than a crash on a public route.
+            RatingOutcome.fromWireName(outcome).getOrElse(RatingOutcome.Legacy),
+            reason,
+            RatingDomain.fromWireName(domain),
+            ref
+          )
       })
 
   def categoryRatingOf(identity: RatedIdentity, category: RatingCategory): IO[Glicko] =
@@ -3220,6 +3262,101 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       .unique
       .transact(xa)
       .timeout(SaveTimeout)
+
+  override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[BotStrengthSnapshot]] =
+    sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
+          FROM play.bot_strength_snapshots
+          WHERE category = ${category.wireName} AND is_current = TRUE
+          ORDER BY epoch DESC, computed_at DESC
+          LIMIT 1"""
+      .query[(Long, String, Int, String, Instant, Instant, Boolean, Json)]
+      .option
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.flatMap { case (id, catStr, epoch, anchorSetVer, cutoff, computedAt, isCurrent, payload) =>
+        RatingCategory.fromWireName(catStr).flatMap { cat =>
+          import dicechess.play.rating.BotStrengthSnapshot.given
+          payload.as[AnchoredStrength.Result].toOption.map { res =>
+            BotStrengthSnapshot(id, cat, epoch, anchorSetVer, cutoff, computedAt, isCurrent, res)
+          }
+        }
+      })
+
+  override def botStrengthSnapshotAt(
+      category: RatingCategory,
+      epoch: Int,
+      cutoff: Instant
+  ): IO[Option[BotStrengthSnapshot]] =
+    sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
+          FROM play.bot_strength_snapshots
+          WHERE category = ${category.wireName} AND epoch = $epoch AND cutoff = $cutoff"""
+      .query[(Long, String, Int, String, Instant, Instant, Boolean, Json)]
+      .option
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.flatMap { case (id, catStr, ep, anchorSetVer, cut, computedAt, isCurrent, payload) =>
+        RatingCategory.fromWireName(catStr).flatMap { cat =>
+          import dicechess.play.rating.BotStrengthSnapshot.given
+          payload.as[AnchoredStrength.Result].toOption.map { res =>
+            BotStrengthSnapshot(id, cat, ep, anchorSetVer, cut, computedAt, isCurrent, res)
+          }
+        }
+      })
+
+  override def listBotStrengthSnapshots(
+      category: RatingCategory,
+      epoch: Option[Int]
+  ): IO[List[BotStrengthSnapshotSummary]] =
+    val query = epoch match
+      case Some(ep) =>
+        sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current,
+                     COALESCE(jsonb_array_length(payload->'admitted'), 0),
+                     COALESCE(jsonb_array_length(payload->'provisional'), 0)
+              FROM play.bot_strength_snapshots
+              WHERE category = ${category.wireName} AND epoch = $ep
+              ORDER BY computed_at DESC LIMIT 50"""
+      case None =>
+        sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current,
+                     COALESCE(jsonb_array_length(payload->'admitted'), 0),
+                     COALESCE(jsonb_array_length(payload->'provisional'), 0)
+              FROM play.bot_strength_snapshots
+              WHERE category = ${category.wireName}
+              ORDER BY epoch DESC, computed_at DESC LIMIT 50"""
+    query
+      .query[(Long, String, Int, String, Instant, Instant, Boolean, Int, Int)]
+      .to[List]
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.flatMap { case (id, catStr, ep, anchorSetVer, cutoff, computedAt, isCurrent, adm, prov) =>
+        RatingCategory.fromWireName(catStr).map { cat =>
+          BotStrengthSnapshotSummary(id, cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, adm, prov)
+        }
+      })
+
+  override def saveBotStrengthSnapshot(
+      category: RatingCategory,
+      epoch: Int,
+      anchorSetVersion: String,
+      cutoff: Instant,
+      result: AnchoredStrength.Result
+  ): IO[Long] =
+    import dicechess.play.rating.BotStrengthSnapshot.given
+    val payload = result.asJson
+    val tx      = for
+      _ <- sql"""UPDATE play.bot_strength_snapshots
+                 SET is_current = FALSE
+                 WHERE category = ${category.wireName} AND epoch = $epoch AND is_current = TRUE""".update.run
+      id <- sql"""INSERT INTO play.bot_strength_snapshots
+                    (category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload)
+                  VALUES (${category.wireName}, $epoch, $anchorSetVersion, $cutoff, ${Instant.now()}, TRUE, $payload)
+                  ON CONFLICT (category, epoch, cutoff) DO UPDATE
+                  SET anchor_set_version = EXCLUDED.anchor_set_version,
+                      computed_at = EXCLUDED.computed_at,
+                      is_current = TRUE,
+                      payload = EXCLUDED.payload
+                  RETURNING id""".query[Long].unique
+    yield id
+    tx.transact(xa).timeout(SaveTimeout)
 
   // ── UserStore (#232) ────────────────────────────────────────────────────────
 

@@ -4,6 +4,7 @@ import cats.effect.IO
 import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.ingest.PlaysiteIngest
+import dicechess.play.rating.{AnchoredStrength, BotStrengthSnapshot, BotStrengthSnapshotSummary}
 import scala.annotation.unused
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.syntax.*
@@ -760,7 +761,8 @@ final case class GameRatingChange(
     black: Option[SeatRatingChange],
     outcome: RatingOutcome = RatingOutcome.Legacy,
     reason: Option[String] = None,
-    domain: Option[RatingDomain] = None
+    domain: Option[RatingDomain] = None,
+    trainingReference: Option[dicechess.play.rating.TrainingReference] = None
 )
 
 trait RatingStore:
@@ -918,6 +920,31 @@ trait LeaderboardStore:
     * hence a second count, not a redefinition of the first.
     */
   def totalGamesFor(externalId: String): IO[Int]
+
+  /** Reads the latest/current bot strength snapshot for `category` (#150). */
+  def latestBotStrengthSnapshot(@unused category: RatingCategory): IO[Option[BotStrengthSnapshot]] = IO.pure(None)
+
+  /** Reads a specific bot strength snapshot by category, epoch, and cutoff (#150). */
+  def botStrengthSnapshotAt(
+      @unused category: RatingCategory,
+      @unused epoch: Int,
+      @unused cutoff: java.time.Instant
+  ): IO[Option[BotStrengthSnapshot]] = IO.pure(None)
+
+  /** Lists historical snapshots for `category`, newest first (#150). */
+  def listBotStrengthSnapshots(
+      @unused category: RatingCategory,
+      @unused epoch: Option[Int] = None
+  ): IO[List[BotStrengthSnapshotSummary]] = IO.pure(Nil)
+
+  /** Saves and publishes a bot strength snapshot (#150). */
+  def saveBotStrengthSnapshot(
+      @unused category: RatingCategory,
+      @unused epoch: Int,
+      @unused anchorSetVersion: String,
+      @unused cutoff: java.time.Instant,
+      @unused result: AnchoredStrength.Result
+  ): IO[Long] = IO.pure(0L)
 
 object LeaderboardStore:
   /** Payload guard for the public leaderboard endpoint: the SQL query is bounded to this many rows, so the response

@@ -97,6 +97,18 @@ A rating is **provisional** while `rd > 110` — Glickman's own convergence thre
 
 If your bot has played plenty of games and is still provisional, check its win/loss pattern on its profile before assuming something is broken: a bot with a genuinely volatile result pattern (frequent upsets in either direction) converges slower than one that consistently loses — or consistently wins — no matter how many games it plays.
 
+## Anchored bot strength and versioned snapshots
+
+To eliminate rating inflation across long horizons, bot strength is computed using anchored comparative models pinned to immutable reference anchors (`anchor/random`, `anchor/greedy`, `anchor/hunter-*`). Nightly rating snapshots are published to PostgreSQL and served on [`GET /leaderboard`](../reference/rest/#leaderboard) and [`GET /leaderboard/snapshots`](../reference/rest/#rating-snapshots).
+
+Each bot rating snapshot states:
+- `epoch`: the current scale epoch (e.g. `1`);
+- `anchorSetVersion`: the anchor calibration set (e.g. `v1.0`);
+- `cutoff` and `computedAt`: ISO-8601 timestamps marking data boundary and calculation time;
+- 95% confidence intervals (`ciLow`, `ciHigh`) and graph admission status (`status`).
+
+Human-versus-bot training games are tracked in an isolated training domain (`user_training_ratings`) and served as `training` estimates on [`GET /players/by-nickname/{nick}`](../reference/rest/#leaderboard-bot-profiles).
+
 ## Joining and leaving
 
 Covered in [Authentication & Identity → Joining the rating ladder](../authentication/#joining-the-rating-ladder): `POST /bot/ladder/join` / `POST /bot/ladder/leave`, both registered-bot only. That page is the "how do I opt in" companion to this "what do these numbers mean" one.

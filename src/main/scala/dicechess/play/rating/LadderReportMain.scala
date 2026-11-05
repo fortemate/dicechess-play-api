@@ -27,7 +27,8 @@ object LadderReportMain extends IOApp:
       config: StrengthReport.Config,
       category: RatingCategory,
       out: Option[Path],
-      format: Format
+      format: Format,
+      saveSnapshot: Boolean = false
   )
 
   def parseOptions(args: List[String]): Options =
@@ -50,15 +51,20 @@ object LadderReportMain extends IOApp:
         windowDaysRaw = pairs.get("window").orElse(pairs.get("windowdays"))
       )
 
-      val category = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)
-      val out      = pairs.get("out").map(Paths.get(_))
-      val format   = pairs.get("format").map(_.toLowerCase) match
+      val category     = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)
+      val out          = pairs.get("out").map(Paths.get(_))
+      val saveSnapshot = pairs
+        .get("savesnapshot")
+        .orElse(pairs.get("savedb"))
+        .orElse(pairs.get("snapshot"))
+        .exists(v => v == "true" || v == "1" || v == "yes")
+      val format = pairs.get("format").map(_.toLowerCase) match
         case Some("markdown") | Some("md")                           => Format.Markdown
         case Some("text") | Some("txt")                              => Format.Text
         case _ if out.exists(_.getFileName.toString.endsWith(".md")) => Format.Markdown
         case _                                                       => Format.Text
 
-      Options(config, category, out, format)
+      Options(config, category, out, format, saveSnapshot)
     else
       val config = StrengthReport.Config.fromValues(
         elo0Raw = args.headOption,
@@ -67,7 +73,7 @@ object LadderReportMain extends IOApp:
         betaRaw = args.lift(3),
         bootstrapIterationsRaw = None
       )
-      Options(config, RatingCategory.Default, None, Format.Text)
+      Options(config, RatingCategory.Default, None, Format.Text, saveSnapshot = false)
 
   def run(args: List[String]): IO[ExitCode] =
     val options = parseOptions(args)
@@ -80,13 +86,13 @@ object LadderReportMain extends IOApp:
           .use { store =>
             store
               .finishedRatedSince(Instant.EPOCH) // every rated game ever — the corpus IS the input
-              .map(StrengthReport.build(_, options.category, options.config))
-              .flatMap { report =>
+              .flatMap { rows =>
+                val report  = StrengthReport.build(rows, options.category, options.config)
                 val content = options.format match
                   case Format.Markdown => StrengthReport.renderMarkdown(report, options.config)
                   case Format.Text     => StrengthReport.render(report, options.config)
 
-                options.out match
+                val writeOut = options.out match
                   case Some(path) =>
                     IO.blocking {
                       val parent = path.getParent
@@ -95,6 +101,21 @@ object LadderReportMain extends IOApp:
                     } *> IO.println(s"[ladder-report] wrote ${options.format.toString.toLowerCase} report to $path")
                   case None =>
                     IO.println(content)
+
+                val saveDb = if options.saveSnapshot then
+                  val cutoff = rows.flatMap(r => Option(r.finishedAt)).maxOption.getOrElse(Instant.now())
+                  store.saveBotStrengthSnapshot(
+                    category = options.category,
+                    epoch = options.config.anchorSet.epoch,
+                    anchorSetVersion = options.config.anchorSet.version,
+                    cutoff = cutoff,
+                    result = report.anchored
+                  ) *> IO.println(
+                    s"[ladder-report] saved bot strength snapshot to database for category ${options.category.wireName}"
+                  )
+                else IO.unit
+
+                writeOut *> saveDb
               }
           }
           .as(ExitCode.Success)

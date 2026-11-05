@@ -220,12 +220,19 @@ class StrengthReportSuite extends munit.FunSuite:
     assertEquals(kvOptions.config.elo1, 25.0)
     assertEquals(kvOptions.config.alpha, 0.01)
     assertEquals(kvOptions.config.beta, 0.02)
+    assertEquals(kvOptions.saveSnapshot, false)
+
+    val dbOptions = LadderReportMain.parseOptions(List("savedb=true", "out=test.md"))
+    assertEquals(dbOptions.saveSnapshot, true)
+    val snapOptions = LadderReportMain.parseOptions(List("savesnapshot=yes"))
+    assertEquals(snapOptions.saveSnapshot, true)
 
     // Positional fallback
     val posArgs    = List("10.0", "30.0", "0.02", "0.03")
     val posOptions = LadderReportMain.parseOptions(posArgs)
     assertEquals(posOptions.out, None)
     assertEquals(posOptions.format, LadderReportMain.Format.Text)
+    assertEquals(posOptions.saveSnapshot, false)
     assertEquals(posOptions.config.elo0, 10.0)
     assertEquals(posOptions.config.elo1, 30.0)
     assertEquals(posOptions.config.alpha, 0.02)

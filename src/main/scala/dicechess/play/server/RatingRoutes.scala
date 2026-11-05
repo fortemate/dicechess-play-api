@@ -3,8 +3,9 @@ package dicechess.play.server
 import cats.effect.IO
 import cats.syntax.all.*
 import dicechess.play.core.GameId
+import dicechess.play.rating.TrainingReferenceSource
 import dicechess.play.store.{GameRatingChange, RatingStore, SeatRatingChange}
-import io.circe.Codec
+import io.circe.{Codec, Json}
 import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.dsl.io.*
 import org.http4s.headers.`Cache-Control`
@@ -18,6 +19,15 @@ import scala.concurrent.duration.*
   * is not sent, so there is exactly one place it can be computed from.
   */
 final case class SeatRatingChangeResponse(before: Double, after: Double) derives Codec.AsObject
+
+/** Bot reference against which a training update was computed (#150, #189). */
+final case class TrainingReferenceResponse(
+    source: String,
+    anchorSetVersion: Option[String],
+    epoch: Option[Int],
+    rating: Double,
+    rd: Double
+) derives Codec.AsObject
 
 /** `GET /games/{id}/rating`'s response (#296): what one finished game did to each seat's rating.
   *
@@ -37,8 +47,23 @@ final case class GameRatingResponse(
     reason: Option[String],
     // The namespace the game was classified into at creation: `competitive`, `training`, `casual`; `null` for a
     // game recorded before classification existed.
-    ratingDomain: Option[String]
-) derives Codec.AsObject
+    ratingDomain: Option[String],
+    trainingReference: Option[TrainingReferenceResponse] = None
+)
+
+object GameRatingResponse:
+  import io.circe.generic.semiauto.deriveCodec
+  given Codec[GameRatingResponse] =
+    val base = deriveCodec[GameRatingResponse]
+    Codec.from(
+      base,
+      base.mapJson { json =>
+        json.asObject match
+          case Some(obj) if obj("trainingReference").contains(Json.Null) =>
+            Json.fromJsonObject(obj.remove("trainingReference"))
+          case _ => json
+      }
+    )
 
 /** Public, unauthenticated per-game rating movement (#296) — the read side of what `RatingBatch` records.
   *
@@ -79,6 +104,18 @@ object RatingRoutes:
             }
 
   private def responseFor(id: String, change: GameRatingChange): GameRatingResponse =
+    val refResponse = change.trainingReference.map { ref =>
+      val (sourceName, setVer, epoch) = ref.source match
+        case TrainingReferenceSource.Anchor(set, ep) => ("anchor", Some(set), Some(ep))
+        case TrainingReferenceSource.BotRating       => ("bot_rating", None, None)
+      TrainingReferenceResponse(
+        source = sourceName,
+        anchorSetVersion = setVer,
+        epoch = epoch,
+        rating = ref.glicko.rating,
+        rd = ref.glicko.deviation
+      )
+    }
     GameRatingResponse(
       id,
       change.applied,
@@ -86,7 +123,8 @@ object RatingRoutes:
       change.black.map(seat),
       change.outcome.wireName,
       change.reason,
-      change.domain.map(_.wireName)
+      change.domain.map(_.wireName),
+      refResponse
     )
 
   private def seat(change: SeatRatingChange): SeatRatingChangeResponse =

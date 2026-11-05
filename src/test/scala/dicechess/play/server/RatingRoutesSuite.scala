@@ -143,3 +143,31 @@ class RatingRoutesSuite extends munit.CatsEffectSuite:
         assertEquals(white.get[Double]("before").toOption, Some(1500.0))
         assertEquals(white.get[Double]("after").toOption, Some(1512.75))
       }
+
+  test("GET /games/{id}/rating serves the training reference for training games (#150, #189)"):
+    val trainRef = dicechess.play.rating.TrainingReference(
+      source = dicechess.play.rating.TrainingReferenceSource.Anchor("v1.0", 1),
+      glicko = Glicko(1390.0, 50.0, 0.06)
+    )
+    val trainingGame = GameRatingChange(
+      applied = true,
+      white = Some(SeatRatingChange(before = 1500.0, after = 1515.0)),
+      black = None,
+      outcome = RatingOutcome.Applied,
+      reason = None,
+      domain = Some(RatingDomain.Training),
+      trainingReference = Some(trainRef)
+    )
+    app(Map(gameId -> trainingGame))
+      .run(Request[IO](Method.GET, uri"/games/11111111-2222-3333-4444-555555555555/rating"))
+      .flatMap(_.as[Json])
+      .map { body =>
+        val c = body.hcursor
+        assertEquals(c.get[String]("ratingDomain"), Right("training"))
+        val ref = c.downField("trainingReference")
+        assertEquals(ref.get[String]("source"), Right("anchor"))
+        assertEquals(ref.get[String]("anchorSetVersion"), Right("v1.0"))
+        assertEquals(ref.get[Int]("epoch"), Right(1))
+        assertEquals(ref.get[Double]("rating"), Right(1390.0))
+        assertEquals(ref.get[Double]("rd"), Right(50.0))
+      }

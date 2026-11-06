@@ -669,7 +669,7 @@ paths:
     get:
       tags: [Leaderboard]
       summary: List rating snapshots (public)
-      description: Lists historical bot strength snapshot summaries for a category, newest first.
+      description: Lists historical rating snapshot summaries for a category, newest first.
       security: []
       parameters:
         - { name: category, in: query, schema: { type: string, enum: [bullet, blitz, rapid] } }
@@ -682,28 +682,22 @@ paths:
               schema:
                 type: array
                 items:
-                  type: object
-                  properties:
-                    id: { type: integer, format: int64 }
-                    category: { type: string }
-                    epoch: { type: integer }
-                    anchorSetVersion: { type: string }
-                    cutoff: { type: string, format: date-time }
-                    computedAt: { type: string, format: date-time }
-                    isCurrent: { type: boolean }
-                    admittedCount: { type: integer }
-                    provisionalCount: { type: integer }
+                  $ref: '#/components/schemas/RatingSnapshotSummary'
   /leaderboard/snapshots/{category}/latest:
     get:
       tags: [Leaderboard]
       summary: Latest rating snapshot for category (public)
-      description: Returns the latest anchored strength snapshot for the given time control category.
+      description: Returns the latest rating snapshot for the given time control category.
       security: []
       parameters:
         - { name: category, in: path, required: true, schema: { type: string, enum: [bullet, blitz, rapid] } }
       responses:
         '200':
-          description: Latest anchored strength snapshot.
+          description: Latest rating snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RatingSnapshot'
         '404':
           description: Snapshot not found.
   /leaderboard/snapshots/{category}/{epoch}/{cutoff}:
@@ -719,6 +713,10 @@ paths:
       responses:
         '200':
           description: Historical snapshot at cutoff.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RatingSnapshot'
         '404':
           description: Snapshot not found.
   /bots/{team}/{name}:
@@ -739,6 +737,24 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/BotProfile' }
         '404': { description: No registered bot with that team/name. }
+  /players/by-nickname/{nickname}:
+    get:
+      tags: [Leaderboard]
+      summary: Player public profile (public)
+      description: >
+        One registered player's public profile — competitive ratings, training estimates (human-vs-bot),
+        aggregate record vs opponents, and recent games. Deactivated or missing accounts return 404.
+      security: []
+      parameters:
+        - { name: nickname, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The player's public profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlayerProfile' }
+        '404':
+          description: No active registered player with that nickname.
   /lobby/bots:
     get:
       tags: [Leaderboard]
@@ -2185,11 +2201,96 @@ components:
         wins: { type: integer }
         draws: { type: integer }
         losses: { type: integer }
-        status: { type: string, enum: [admitted, provisional, disconnected], nullable: true }
-        isAnchor: { type: boolean, nullable: true }
+        domain: { type: string, nullable: true }
+        algorithm: { type: string, nullable: true }
+        epoch: { type: integer, nullable: true }
+        orderingValue: { type: number, nullable: true }
+        orderingRule: { type: string, nullable: true }
         ciLow: { type: number, nullable: true }
         ciHigh: { type: number, nullable: true }
       required: [rank, kind, name, rating, rd, onLadder, games, wins, draws, losses]
+    RatingSnapshotSummary:
+      type: object
+      properties:
+        category: { type: string }
+        epoch: { type: integer }
+        anchorSetVersion: { type: string }
+        cutoff: { type: string, format: date-time }
+        computedAt: { type: string, format: date-time }
+        isCurrent: { type: boolean }
+        entryCount: { type: integer }
+      required: [category, epoch, anchorSetVersion, cutoff, computedAt, isCurrent, entryCount]
+    RatingSnapshot:
+      type: object
+      properties:
+        category: { type: string }
+        epoch: { type: integer }
+        anchorSetVersion: { type: string }
+        cutoff: { type: string, format: date-time }
+        computedAt: { type: string, format: date-time }
+        isCurrent: { type: boolean }
+        leaders:
+          type: array
+          items: { $ref: '#/components/schemas/LeaderRow' }
+      required: [category, epoch, anchorSetVersion, cutoff, computedAt, isCurrent, leaders]
+    CategoryRating:
+      type: object
+      properties:
+        category: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+      required: [category, rating, rd, provisional, games, wins, draws, losses]
+    TrainingCategoryRating:
+      type: object
+      properties:
+        category: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        ciLow: { type: number }
+        ciHigh: { type: number }
+        intervalCalculation: { type: string }
+        domain: { type: string }
+        algorithm: { type: string }
+        algorithmVersion: { type: string }
+        epoch: { type: integer }
+        cutoff: { type: string, format: date-time, nullable: true }
+        computedAt: { type: string, format: date-time, nullable: true }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+      required: [category, rating, rd, provisional, ciLow, ciHigh, intervalCalculation, domain, algorithm, algorithmVersion, epoch, games, wins, draws, losses]
+    PlayerProfile:
+      type: object
+      properties:
+        nickname: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+        totalGames: { type: integer }
+        ratings:
+          type: array
+          items: { $ref: '#/components/schemas/CategoryRating' }
+        training:
+          type: array
+          items: { $ref: '#/components/schemas/TrainingCategoryRating' }
+        opponents:
+          type: array
+          items: { $ref: '#/components/schemas/OpponentRecord' }
+        recent:
+          type: array
+          items: { $ref: '#/components/schemas/RecentGame' }
+      required: [nickname, rating, rd, provisional, games, wins, draws, losses, totalGames, ratings, training, opponents, recent]
     BotProfile:
       type: object
       properties:

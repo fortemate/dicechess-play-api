@@ -103,16 +103,42 @@ object LadderReportMain extends IOApp:
                     IO.println(content)
 
                 val saveDb = if options.saveSnapshot then
-                  val cutoff = rows.flatMap(r => Option(r.finishedAt)).maxOption.getOrElse(Instant.now())
-                  store.saveBotStrengthSnapshot(
-                    category = options.category,
-                    epoch = options.config.anchorSet.epoch,
-                    anchorSetVersion = options.config.anchorSet.version,
-                    cutoff = cutoff,
-                    result = report.anchored
-                  ) *> IO.println(
-                    s"[ladder-report] saved bot strength snapshot to database for category ${options.category.wireName}"
-                  )
+                  val effectiveAnchor =
+                    if options.config.anchorSet.category == options.category.wireName then options.config.anchorSet
+                    else if options.config.anchorSet == AnchorSet.Default then
+                      AnchorSet.unanchored(options.category.wireName)
+                    else options.config.anchorSet
+
+                  if !report.anchored.isCalibrated || effectiveAnchor.epoch < 1 then
+                    IO.println(
+                      s"[ladder-report] snapshot publication refused: category ${options.category.wireName} is uncalibrated or lacks scale anchors (epoch ${effectiveAnchor.epoch})"
+                    )
+                  else
+                    val cutoff = rows.flatMap(r => Option(r.finishedAt)).maxOption.getOrElse(Instant.now())
+                    store.leaderboard(options.category, maxRd = Double.MaxValue, limit = 500).flatMap { existingBots =>
+                      val existingMap = existingBots.map(b => (b.team, b.name) -> b).toMap
+                      val leaders     = report.anchored.admitted.zipWithIndex.flatMap { (b, rankIndex) =>
+                        val idx             = b.player.indexOf('/')
+                        val (teamOpt, name) =
+                          if idx >= 0 then (Some(b.player.substring(0, idx)), b.player.substring(idx + 1))
+                          else (None, b.player)
+                        val existing = teamOpt.flatMap(t => existingMap.get((t, name)))
+                        existing.map { e =>
+                          dicechess.play.server.LeaderboardRoutes
+                            .botRow(e, Some(effectiveAnchor.epoch))
+                            .copy(rank = rankIndex + 1)
+                        }
+                      }
+                      store.saveBotStrengthSnapshot(
+                        category = options.category,
+                        epoch = effectiveAnchor.epoch,
+                        anchorSetVersion = effectiveAnchor.version,
+                        cutoff = cutoff,
+                        leaders = leaders
+                      ) *> IO.println(
+                        s"[ladder-report] saved bot strength snapshot to database for category ${options.category.wireName}"
+                      )
+                    }
                 else IO.unit
 
                 writeOut *> saveDb

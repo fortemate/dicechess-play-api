@@ -327,7 +327,7 @@ Public, no `Authorization`. Both exist only when the server runs with persistenc
 
 One rating scale at a time. `category` is optional and one of `bullet`, `blitz`, `rapid`; omitted, you get **blitz** — the ladder's own control, and so the board this endpoint has always shown. Anything else is a `400`, deliberately: a fresh category is legitimately empty for a while, so a typo must not be indistinguishable from a speed nobody has played yet. The response echoes the `category` it answered on.
 
-Registered bots whose rating on that scale has **converged** (RD ≤ 110 or admitted in the current anchored rating snapshot), best first — where "best" is the **conservative estimate `rating − 2·rd`**, not the raw rating (ties go to the lower `rd`). When an anchored bot strength snapshot has been published, bot ratings reflect the anchored 1500-centered scale ($1500 + \text{relative Elo}$) and carry snapshot metadata (`epoch`, `anchorSetVersion`, `cutoff`, `computedAt`, and per-row `ciLow`, `ciHigh`, `status`, `isAnchor`).
+Registered bots whose rating on that scale has **converged** (RD ≤ 110), best first — where "best" is the **conservative estimate `rating − 2·rd`**, not the raw rating (ties go to the lower `rd`). When an official rating snapshot has been published for the category, the response includes snapshot provenance (`epoch`, `anchorSetVersion`, `cutoff`, `computedAt`) and per-row rating metadata (`domain`, `algorithm`, `epoch`, `orderingValue`, `orderingRule`, `ciLow`, `ciHigh`) while preserving competitive Glicko-2 ratings for bots and players alike.
 
 ```json
 {
@@ -342,17 +342,20 @@ Registered bots whose rating on that scale has **converged** (RD ≤ 110 or admi
       "kind": "bot",
       "team": "aws",
       "name": "hunter-v30",
-      "rating": 1634.0,
-      "rd": 12.24,
+      "rating": 2905.89,
+      "rd": 50.0,
       "onLadder": true,
       "games": 100,
       "wins": 90,
       "draws": 5,
       "losses": 5,
-      "status": "admitted",
-      "isAnchor": false,
-      "ciLow": 1610.0,
-      "ciHigh": 1658.0
+      "domain": "competitive",
+      "algorithm": "glicko2",
+      "epoch": 1,
+      "orderingValue": 2805.89,
+      "orderingRule": "conservative-rating",
+      "ciLow": 2807.9,
+      "ciHigh": 3003.9
     }
   ]
 }
@@ -364,11 +367,11 @@ A bot that left the ladder keeps its frozen rating and stays listed with `onLadd
 
 `GET /leaderboard/snapshots?category=blitz&epoch=1`
 
-Lists historical bot strength snapshot summaries for a category, newest first.
+Lists historical rating snapshot summaries for a category, newest first.
 
 `GET /leaderboard/snapshots/{category}/latest`
 
-Returns the full, current anchored strength snapshot for `{category}`, including admitted, provisional, and disconnected participant graphs.
+Returns the latest published rating snapshot for `{category}`, including finalized public rankings on that category scale.
 
 `GET /leaderboard/snapshots/{category}/{epoch}/{cutoff}`
 

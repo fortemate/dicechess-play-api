@@ -29,12 +29,11 @@ import dicechess.play.core.{
 import dicechess.play.ingest.PlaysiteIngest
 import dicechess.play.rating.{
   AnchorSet,
-  AnchoredStrength,
-  BotStrengthSnapshot,
-  BotStrengthSnapshotSummary,
   CapturedTrainingReference,
   Glicko,
   Glicko2,
+  RatingSnapshot,
+  RatingSnapshotSummary,
   TrainingEstimate,
   TrainingReference,
   TrainingReferenceSource,
@@ -3263,22 +3262,19 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       .transact(xa)
       .timeout(SaveTimeout)
 
-  override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[BotStrengthSnapshot]] =
-    sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
+  override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[RatingSnapshot]] =
+    sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
           FROM play.bot_strength_snapshots
           WHERE category = ${category.wireName} AND is_current = TRUE
           ORDER BY epoch DESC, computed_at DESC
           LIMIT 1"""
-      .query[(Long, String, Int, String, Instant, Instant, Boolean, Json)]
+      .query[(String, Int, String, Instant, Instant, Boolean, Json)]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.flatMap { case (id, catStr, epoch, anchorSetVer, cutoff, computedAt, isCurrent, payload) =>
-        RatingCategory.fromWireName(catStr).flatMap { cat =>
-          import dicechess.play.rating.BotStrengthSnapshot.given
-          payload.as[AnchoredStrength.Result].toOption.map { res =>
-            BotStrengthSnapshot(id, cat, epoch, anchorSetVer, cutoff, computedAt, isCurrent, res)
-          }
+      .map(_.flatMap { case (cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, payload) =>
+        payload.hcursor.downField("leaders").as[List[dicechess.play.server.LeaderRow]].toOption.map { leaders =>
+          RatingSnapshot(cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, leaders)
         }
       })
 
@@ -3286,51 +3282,44 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       category: RatingCategory,
       epoch: Int,
       cutoff: Instant
-  ): IO[Option[BotStrengthSnapshot]] =
-    sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
+  ): IO[Option[RatingSnapshot]] =
+    sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
           FROM play.bot_strength_snapshots
           WHERE category = ${category.wireName} AND epoch = $epoch AND cutoff = $cutoff"""
-      .query[(Long, String, Int, String, Instant, Instant, Boolean, Json)]
+      .query[(String, Int, String, Instant, Instant, Boolean, Json)]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.flatMap { case (id, catStr, ep, anchorSetVer, cut, computedAt, isCurrent, payload) =>
-        RatingCategory.fromWireName(catStr).flatMap { cat =>
-          import dicechess.play.rating.BotStrengthSnapshot.given
-          payload.as[AnchoredStrength.Result].toOption.map { res =>
-            BotStrengthSnapshot(id, cat, ep, anchorSetVer, cut, computedAt, isCurrent, res)
-          }
+      .map(_.flatMap { case (cat, ep, anchorSetVer, cut, computedAt, isCurrent, payload) =>
+        payload.hcursor.downField("leaders").as[List[dicechess.play.server.LeaderRow]].toOption.map { leaders =>
+          RatingSnapshot(cat, ep, anchorSetVer, cut, computedAt, isCurrent, leaders)
         }
       })
 
   override def listBotStrengthSnapshots(
       category: RatingCategory,
       epoch: Option[Int]
-  ): IO[List[BotStrengthSnapshotSummary]] =
+  ): IO[List[RatingSnapshotSummary]] =
     val query = epoch match
       case Some(ep) =>
-        sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current,
-                     COALESCE(jsonb_array_length(payload->'admitted'), 0),
-                     COALESCE(jsonb_array_length(payload->'provisional'), 0)
+        sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current,
+                     COALESCE(jsonb_array_length(payload->'leaders'), 0)
               FROM play.bot_strength_snapshots
               WHERE category = ${category.wireName} AND epoch = $ep
               ORDER BY computed_at DESC LIMIT 50"""
       case None =>
-        sql"""SELECT id, category, epoch, anchor_set_version, cutoff, computed_at, is_current,
-                     COALESCE(jsonb_array_length(payload->'admitted'), 0),
-                     COALESCE(jsonb_array_length(payload->'provisional'), 0)
+        sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current,
+                     COALESCE(jsonb_array_length(payload->'leaders'), 0)
               FROM play.bot_strength_snapshots
               WHERE category = ${category.wireName}
               ORDER BY epoch DESC, computed_at DESC LIMIT 50"""
     query
-      .query[(Long, String, Int, String, Instant, Instant, Boolean, Int, Int)]
+      .query[(String, Int, String, Instant, Instant, Boolean, Int)]
       .to[List]
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.flatMap { case (id, catStr, ep, anchorSetVer, cutoff, computedAt, isCurrent, adm, prov) =>
-        RatingCategory.fromWireName(catStr).map { cat =>
-          BotStrengthSnapshotSummary(id, cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, adm, prov)
-        }
+      .map(_.map { case (cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, count) =>
+        RatingSnapshotSummary(cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, count)
       })
 
   override def saveBotStrengthSnapshot(
@@ -3338,25 +3327,33 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       epoch: Int,
       anchorSetVersion: String,
       cutoff: Instant,
-      result: AnchoredStrength.Result
+      leaders: List[dicechess.play.server.LeaderRow]
   ): IO[Long] =
-    import dicechess.play.rating.BotStrengthSnapshot.given
-    val payload = result.asJson
-    val tx      = for
-      _ <- sql"""UPDATE play.bot_strength_snapshots
-                 SET is_current = FALSE
-                 WHERE category = ${category.wireName} AND epoch = $epoch AND is_current = TRUE""".update.run
-      id <- sql"""INSERT INTO play.bot_strength_snapshots
-                    (category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload)
-                  VALUES (${category.wireName}, $epoch, $anchorSetVersion, $cutoff, ${Instant.now()}, TRUE, $payload)
-                  ON CONFLICT (category, epoch, cutoff) DO UPDATE
-                  SET anchor_set_version = EXCLUDED.anchor_set_version,
-                      computed_at = EXCLUDED.computed_at,
-                      is_current = TRUE,
-                      payload = EXCLUDED.payload
-                  RETURNING id""".query[Long].unique
-    yield id
-    tx.transact(xa).timeout(SaveTimeout)
+    if epoch < 1 then IO.raiseError(new IllegalArgumentException(s"Cannot save snapshot with epoch $epoch < 1"))
+    else
+      val payload = io.circe.Json.obj("leaders" -> io.circe.syntax.EncoderOps(leaders).asJson)
+      val tx      = for
+        insertedIdOpt <- sql"""INSERT INTO play.bot_strength_snapshots
+                                 (category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload)
+                               VALUES (${category.wireName}, $epoch, $anchorSetVersion, $cutoff, ${Instant
+            .now()}, FALSE, $payload)
+                               ON CONFLICT (category, epoch, cutoff) DO NOTHING
+                               RETURNING id""".query[Long].option
+        id <- insertedIdOpt match
+          case Some(newId) =>
+            for
+              _ <- sql"""UPDATE play.bot_strength_snapshots
+                         SET is_current = FALSE
+                         WHERE category = ${category.wireName} AND epoch = $epoch AND is_current = TRUE""".update.run
+              _ <- sql"""UPDATE play.bot_strength_snapshots
+                         SET is_current = TRUE
+                         WHERE id = $newId""".update.run
+            yield newId
+          case None =>
+            sql"""SELECT id FROM play.bot_strength_snapshots
+                  WHERE category = ${category.wireName} AND epoch = $epoch AND cutoff = $cutoff""".query[Long].unique
+      yield id
+      tx.transact(xa).timeout(SaveTimeout)
 
   // ── UserStore (#232) ────────────────────────────────────────────────────────
 

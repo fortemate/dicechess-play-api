@@ -4,7 +4,7 @@ import cats.effect.IO
 import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.ingest.PlaysiteIngest
-import dicechess.play.rating.{AnchoredStrength, BotStrengthSnapshot, BotStrengthSnapshotSummary}
+import dicechess.play.rating.{RatingSnapshot, RatingSnapshotSummary}
 import scala.annotation.unused
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.syntax.*
@@ -921,29 +921,29 @@ trait LeaderboardStore:
     */
   def totalGamesFor(externalId: String): IO[Int]
 
-  /** Reads the latest/current bot strength snapshot for `category` (#150). */
-  def latestBotStrengthSnapshot(@unused category: RatingCategory): IO[Option[BotStrengthSnapshot]] = IO.pure(None)
+  /** Reads the latest/current public rating snapshot for `category` (#150). */
+  def latestBotStrengthSnapshot(@unused category: RatingCategory): IO[Option[RatingSnapshot]] = IO.pure(None)
 
-  /** Reads a specific bot strength snapshot by category, epoch, and cutoff (#150). */
+  /** Reads a specific public rating snapshot by category, epoch, and cutoff (#150). */
   def botStrengthSnapshotAt(
       @unused category: RatingCategory,
       @unused epoch: Int,
       @unused cutoff: java.time.Instant
-  ): IO[Option[BotStrengthSnapshot]] = IO.pure(None)
+  ): IO[Option[RatingSnapshot]] = IO.pure(None)
 
-  /** Lists historical snapshots for `category`, newest first (#150). */
+  /** Lists historical rating snapshots for `category`, newest first (#150). */
   def listBotStrengthSnapshots(
       @unused category: RatingCategory,
       @unused epoch: Option[Int] = None
-  ): IO[List[BotStrengthSnapshotSummary]] = IO.pure(Nil)
+  ): IO[List[RatingSnapshotSummary]] = IO.pure(Nil)
 
-  /** Saves and publishes a bot strength snapshot (#150). */
+  /** Saves and publishes an immutable rating snapshot (#150). */
   def saveBotStrengthSnapshot(
       @unused category: RatingCategory,
       @unused epoch: Int,
       @unused anchorSetVersion: String,
       @unused cutoff: java.time.Instant,
-      @unused result: AnchoredStrength.Result
+      @unused leaders: List[dicechess.play.server.LeaderRow]
   ): IO[Long] = IO.pure(0L)
 
 object LeaderboardStore:

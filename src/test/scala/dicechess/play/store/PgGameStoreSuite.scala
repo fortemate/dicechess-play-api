@@ -7,7 +7,7 @@ import com.dimafeng.testcontainers.munit.TestContainerForAll
 import dicechess.play.Main
 import dicechess.play.core.*
 import dicechess.play.game.{EngineOps, GameRoom}
-import dicechess.play.rating.{AnchoredStrength, Glicko, Glicko2, GraphConnectivity}
+import dicechess.play.rating.{Glicko, Glicko2}
 import dicechess.play.server.GameRegistry
 import doobie.hikari.HikariTransactor
 import doobie.implicits.*
@@ -5138,37 +5138,28 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         val cat     = RatingCategory.Rapid
         val cutoff1 = Instant.parse("2026-10-01T00:00:00Z")
         val cutoff2 = Instant.parse("2026-10-02T00:00:00Z")
-        val bot1    = AnchoredStrength.RankedBot(
-          player = "aws/hunter-v30",
-          elo = 120.0,
-          ciLow = 100.0,
-          ciHigh = 140.0,
-          losVsNext = Some(0.9),
-          status = GraphConnectivity.AdmissionStatus.Admitted,
-          isAnchor = false,
+        val leader1 = dicechess.play.server.LeaderRow(
+          rank = 1,
+          kind = "bot",
+          team = Some("aws"),
+          name = "hunter-v30",
+          rating = 2200.0,
+          rd = 50.0,
+          onLadder = true,
           games = 50,
-          opponents = 3
+          wins = 40,
+          draws = 5,
+          losses = 5,
+          domain = Some("competitive"),
+          algorithm = Some("glicko2"),
+          epoch = Some(1),
+          orderingValue = Some(2100.0),
+          orderingRule = Some("conservative-rating"),
+          ciLow = Some(2102.0),
+          ciHigh = Some(2298.0)
         )
-        val result1 = AnchoredStrength.Result(
-          epoch = 1,
-          anchorSetVersion = "v1.0",
-          admitted = List(bot1),
-          provisional = Nil,
-          disconnected = Nil,
-          connectivity = GraphConnectivity.Result(
-            Map.empty,
-            Map.empty,
-            Map.empty,
-            Set("aws/hunter-v30"),
-            Set.empty,
-            Nil,
-            hasAnchors = true
-          ),
-          appliedOffset = Some(0.0)
-        )
-        val result2 = result1.copy(
-          admitted = List(bot1.copy(elo = 125.0, games = 60))
-        )
+        val leaders1 = List(leader1)
+        val leaders2 = List(leader1.copy(rating = 2250.0))
 
         for
           id1 <- db.saveBotStrengthSnapshot(
@@ -5176,39 +5167,52 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             epoch = 1,
             anchorSetVersion = "v1.0",
             cutoff = cutoff1,
-            result = result1
+            leaders = leaders1
           )
           _ = assert(id1 > 0L, s"id1 was $id1")
           snap1Latest <- db.latestBotStrengthSnapshot(cat)
-          _ = assertEquals(snap1Latest.map(_.id), Some(id1))
           _ = assertEquals(snap1Latest.map(_.isCurrent), Some(true))
           _ = assertEquals(snap1Latest.map(_.cutoff), Some(cutoff1))
-          _ = assertEquals(snap1Latest.map(_.result.admitted.head.elo), Some(120.0))
+          _ = assertEquals(snap1Latest.map(_.leaders.head.rating), Some(2200.0))
+
+          // Duplicate publication with same (category, epoch, cutoff) must preserve immutability
+          idDup <- db.saveBotStrengthSnapshot(
+            cat,
+            epoch = 1,
+            anchorSetVersion = "v1.0",
+            cutoff = cutoff1,
+            leaders = List(leader1.copy(rating = 9999.0))
+          )
+          _ = assertEquals(idDup, id1, "conflict returns existing id")
+          hist1Again <- db.botStrengthSnapshotAt(cat, epoch = 1, cutoff = cutoff1)
+          _ = assertEquals(
+            hist1Again.map(_.leaders.head.rating),
+            Some(2200.0),
+            "published snapshot must remain immutable on duplicate publication"
+          )
 
           id2 <- db.saveBotStrengthSnapshot(
             cat,
             epoch = 1,
             anchorSetVersion = "v1.0",
             cutoff = cutoff2,
-            result = result2
+            leaders = leaders2
           )
           _ = assert(id2 > id1, s"id2 ($id2) must be > id1 ($id1)")
 
           snap2Latest <- db.latestBotStrengthSnapshot(cat)
-          _ = assertEquals(snap2Latest.map(_.id), Some(id2))
           _ = assertEquals(snap2Latest.map(_.isCurrent), Some(true))
           _ = assertEquals(snap2Latest.map(_.cutoff), Some(cutoff2))
-          _ = assertEquals(snap2Latest.map(_.result.admitted.head.elo), Some(125.0))
+          _ = assertEquals(snap2Latest.map(_.leaders.head.rating), Some(2250.0))
 
           hist1 <- db.botStrengthSnapshotAt(cat, epoch = 1, cutoff = cutoff1)
-          _ = assertEquals(hist1.map(_.id), Some(id1))
           _ = assertEquals(hist1.map(_.isCurrent), Some(false), "earlier snapshot retired from current")
-          _ = assertEquals(hist1.map(_.result.admitted.head.elo), Some(120.0))
+          _ = assertEquals(hist1.map(_.leaders.head.rating), Some(2200.0))
 
           summaries <- db.listBotStrengthSnapshots(cat, epoch = Some(1))
-          _ = assertEquals(summaries.map(_.id), List(id2, id1), "newest first")
           _ = assertEquals(summaries.map(_.isCurrent), List(true, false))
           _ = assertEquals(summaries.map(_.cutoff), List(cutoff2, cutoff1))
+          _ = assertEquals(summaries.map(_.entryCount), List(1, 1))
         yield ()
       }
     }

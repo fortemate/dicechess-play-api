@@ -2,15 +2,7 @@ package dicechess.play.server
 
 import cats.effect.IO
 import dicechess.play.core.{GameId, Principal, RatingCategory}
-import dicechess.play.rating.{
-  AnchoredStrength,
-  BotStrengthSnapshot,
-  BotStrengthSnapshotSummary,
-  Glicko,
-  GraphConnectivity,
-  TrainingState
-}
-import dicechess.play.rating.BotStrengthSnapshot.given
+import dicechess.play.rating.{Glicko, Glicko2, RatingSnapshot, RatingSnapshotSummary, TrainingState}
 import dicechess.play.store.*
 import io.circe.Json
 import io.circe.parser.parse
@@ -53,8 +45,8 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       // The rated record, split by category (#280) — the profiles' scalar W-D-L is the default category's entry of
       // this map, not a second read.
       categoryTallies: Map[String, Map[RatingCategory, ResultTally]],
-      snapshots: Map[RatingCategory, BotStrengthSnapshot],
-      snapshotHistory: List[BotStrengthSnapshot]
+      snapshots: Map[RatingCategory, RatingSnapshot],
+      snapshotHistory: List[RatingSnapshot]
   ): LeaderboardStore =
     new LeaderboardStore:
       def leaderboard(category: RatingCategory, maxRd: Double, limit: Int): IO[List[LeaderboardEntry]] =
@@ -68,37 +60,35 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       def categoryTalliesFor(externalId: String): IO[Map[RatingCategory, ResultTally]] =
         IO.pure(categoryTallies.getOrElse(externalId, Map.empty))
       def totalGamesFor(externalId: String): IO[Int] = IO.pure(totals.getOrElse(externalId, 0))
-      override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[BotStrengthSnapshot]] =
+      override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[RatingSnapshot]] =
         IO.pure(snapshots.get(category))
       override def botStrengthSnapshotAt(
           category: RatingCategory,
           epoch: Int,
           cutoff: Instant
-      ): IO[Option[BotStrengthSnapshot]] =
+      ): IO[Option[RatingSnapshot]] =
         IO.pure(
           snapshotHistory
-            .find(s => s.category == category && s.epoch == epoch && s.cutoff == cutoff)
+            .find(s => s.category == category.wireName && s.epoch == epoch && s.cutoff == cutoff)
             .orElse(snapshots.get(category).filter(s => s.epoch == epoch && s.cutoff == cutoff))
         )
       override def listBotStrengthSnapshots(
           category: RatingCategory,
           epoch: Option[Int]
-      ): IO[List[BotStrengthSnapshotSummary]] =
+      ): IO[List[RatingSnapshotSummary]] =
         val all = (snapshots.values.toList ++ snapshotHistory)
-          .filter(_.category == category)
+          .filter(_.category == category.wireName)
           .filter(s => epoch.forall(_ == s.epoch))
         IO.pure(
           all.map(s =>
-            BotStrengthSnapshotSummary(
-              s.id,
+            RatingSnapshotSummary(
               s.category,
               s.epoch,
               s.anchorSetVersion,
               s.cutoff,
               s.computedAt,
               s.isCurrent,
-              s.result.admitted.size,
-              s.result.provisional.size
+              s.leaders.size
             )
           )
         )
@@ -164,8 +154,8 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       playersByCategory: Map[RatingCategory, List[PlayerLeaderboardEntry]] = Map.empty,
       ratings: Map[RatedIdentity, Map[RatingCategory, Glicko]] = Map.empty,
       categoryTallies: Map[String, Map[RatingCategory, ResultTally]] = Map.empty,
-      snapshots: Map[RatingCategory, BotStrengthSnapshot] = Map.empty,
-      snapshotHistory: List[BotStrengthSnapshot] = Nil,
+      snapshots: Map[RatingCategory, RatingSnapshot] = Map.empty,
+      snapshotHistory: List[RatingSnapshot] = Nil,
       training: Map[String, Map[RatingCategory, TrainingState]] = Map.empty
   ): HttpApp[IO] =
     LeaderboardRoutes(
@@ -460,69 +450,58 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
 
   // ── Versioned snapshot read contract (#150) ──────────────────────────────────
 
-  private val sampleSnapshot = BotStrengthSnapshot(
-    id = 42L,
-    category = RatingCategory.Blitz,
+  private val sampleSnapshot = RatingSnapshot(
+    category = "blitz",
     epoch = 1,
     anchorSetVersion = "v1.0",
     cutoff = at,
     computedAt = at,
     isCurrent = true,
-    result = AnchoredStrength.Result(
-      epoch = 1,
-      anchorSetVersion = "v1.0",
-      admitted = List(
-        AnchoredStrength.RankedBot(
-          player = "aws/hunter-v30",
-          elo = 134.0,
-          ciLow = 110.0,
-          ciHigh = 158.0,
-          losVsNext = Some(0.95),
-          status = GraphConnectivity.AdmissionStatus.Admitted,
-          isAnchor = false,
-          games = 100,
-          opponents = 4
-        ),
-        AnchoredStrength.RankedBot(
-          player = "anchor/greedy",
-          elo = -110.0,
-          ciLow = -120.0,
-          ciHigh = -100.0,
-          losVsNext = None,
-          status = GraphConnectivity.AdmissionStatus.Admitted,
-          isAnchor = true,
-          games = 200,
-          opponents = 4
-        )
+    leaders = List(
+      LeaderRow(
+        rank = 1,
+        kind = "bot",
+        team = Some("aws"),
+        name = "hunter-v30",
+        rating = 2905.89,
+        rd = 50.0,
+        onLadder = true,
+        games = 100,
+        wins = 90,
+        draws = 5,
+        losses = 5,
+        domain = Some("competitive"),
+        algorithm = Some("glicko2"),
+        epoch = Some(1),
+        orderingValue = Some(2805.89),
+        orderingRule = Some("conservative-rating"),
+        ciLow = Some(2807.9),
+        ciHigh = Some(3003.9)
       ),
-      provisional = List(
-        AnchoredStrength.RankedBot(
-          player = "acme/fresh",
-          elo = 0.0,
-          ciLow = -50.0,
-          ciHigh = 50.0,
-          losVsNext = None,
-          status = GraphConnectivity.AdmissionStatus.Provisional(games = 5, opponents = 1),
-          isAnchor = false,
-          games = 5,
-          opponents = 1
-        )
-      ),
-      disconnected = Nil,
-      connectivity = GraphConnectivity.Result(
-        statuses = Map.empty,
-        gameCounts = Map.empty,
-        opponentCounts = Map.empty,
-        anchorConnectedPlayers = Set("aws/hunter-v30", "anchor/greedy"),
-        disconnectedPlayers = Set.empty,
-        components = Nil,
-        hasAnchors = true
-      ),
-      appliedOffset = Some(0.0)
+      LeaderRow(
+        rank = 2,
+        kind = "bot",
+        team = Some("anchor"),
+        name = "greedy",
+        rating = 1390.0,
+        rd = 45.0,
+        onLadder = true,
+        games = 200,
+        wins = 100,
+        draws = 20,
+        losses = 80,
+        domain = Some("competitive"),
+        algorithm = Some("glicko2"),
+        epoch = Some(1),
+        orderingValue = Some(1300.0),
+        orderingRule = Some("conservative-rating"),
+        ciLow = Some(1301.8),
+        ciHigh = Some(1478.2)
+      )
     )
   )
 
-  test("GET /leaderboard serves versioned bot rating snapshots with 1500+elo and metadata (#150)"):
+  test("GET /leaderboard serves versioned metadata while preserving competitive Glicko-2 ratings (#150)"):
     val service = app(
       bots = Map(("aws", "hunter-v30") -> BotRating(onLadder = true, None)),
       entries = List(LeaderboardEntry("aws", "hunter-v30", 2905.89, 50.0, onLadder = true, ResultTally(90, 5, 5))),
@@ -534,25 +513,21 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       assertEquals(board.anchorSetVersion, Some("v1.0"))
       assertEquals(board.cutoff, Some(at))
       assertEquals(board.computedAt, Some(at))
-      // Provisional bot 'acme/fresh' must be filtered off the public board
-      assertEquals(board.leaders.map(_.name), List("hunter-v30", "greedy"))
+      assertEquals(board.leaders.map(_.name), List("hunter-v30"))
       val hunter = board.leaders.head
       assertEquals(hunter.team, Some("aws"))
-      assertEquals(hunter.rating, 1634.0, "1500 + relative Elo (134.0)")
-      assertEquals(hunter.ciLow, Some(1610.0), "1500 + ciLow (110.0)")
-      assertEquals(hunter.ciHigh, Some(1658.0), "1500 + ciHigh (158.0)")
-      assertEquals(hunter.status, Some("admitted"))
-      assertEquals(hunter.isAnchor, Some(false))
+      assertEquals(hunter.rating, 2905.89, "competitive Glicko-2 rating preserved")
+      assertEquals(hunter.rd, 50.0)
+      assertEquals(hunter.domain, Some("competitive"))
+      assertEquals(hunter.algorithm, Some("glicko2"))
+      assertEquals(hunter.epoch, Some(1))
+      assertEquals(hunter.orderingValue, Some(Glicko2.conservativeRating(2905.89, 50.0)))
+      assertEquals(hunter.orderingRule, Some("conservative-rating"))
       assertEquals(hunter.onLadder, true)
       assertEquals((hunter.games, hunter.wins, hunter.draws, hunter.losses), (100, 90, 5, 5))
-
-      val greedy = board.leaders(1)
-      assertEquals(greedy.team, Some("anchor"))
-      assertEquals(greedy.rating, 1390.0, "1500 + relative Elo (-110.0)")
-      assertEquals(greedy.isAnchor, Some(true))
     }
 
-  test("GET /players/by-nickname/{nick} serves training estimates isolated from competitive ratings (#150)"):
+  test("GET /players/by-nickname/{nick} serves versioned training estimates isolated from competitive ratings (#150)"):
     val account     = UserAccount("0197f0a0-0000-7000-8000-000000000249", "SwiftRook7", at, Some(at), isActive = true)
     val me          = Principal.User(account.id).externalId
     val trainingMap = Map(
@@ -564,7 +539,8 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
           games = 25,
           wins = 15,
           draws = 3,
-          losses = 7
+          losses = 7,
+          updatedAt = Some(at)
         )
       )
     )
@@ -585,34 +561,35 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
         assertEquals(blitzTrain.rating, 1580.0)
         assertEquals(blitzTrain.rd, 75.0)
         assertEquals(blitzTrain.provisional, false)
+        assertEquals(blitzTrain.domain, "training")
+        assertEquals(blitzTrain.algorithm, "glicko2")
+        assertEquals(blitzTrain.algorithmVersion, "v1")
+        assertEquals(blitzTrain.epoch, 1)
+        assertEquals(blitzTrain.intervalCalculation, "rating ± 1.96 · rd (95% confidence interval)")
+        assertEquals(blitzTrain.cutoff, Some(at))
+        assertEquals(blitzTrain.computedAt, Some(at))
         assertEquals((blitzTrain.games, blitzTrain.wins, blitzTrain.draws, blitzTrain.losses), (25, 15, 3, 7))
-        assertEquals(blitzTrain.ciLow, 1580.0 - 1.96 * 75.0)
-        assertEquals(blitzTrain.ciHigh, 1580.0 + 1.96 * 75.0)
+        assertEquals(blitzTrain.ciLow, ((1580.0 - 1.96 * 75.0) * 10).round / 10.0)
+        assertEquals(blitzTrain.ciHigh, ((1580.0 + 1.96 * 75.0) * 10).round / 10.0)
       }
 
-  test("GET /bots/{team}/{name} returns strength summary when present in current snapshot (#150)"):
+  test("GET /bots/{team}/{name} serves competitive ratings without leaking internal anchored strength report (#150)"):
     val service = app(
       bots = Map(("aws", "hunter-v30") -> BotRating(onLadder = true, None)),
       ratings = Map(RatedIdentity.Bot("aws", "hunter-v30") -> Map(RatingCategory.Blitz -> Glicko(1650.0, 95.0, 0.058))),
       snapshots = Map(RatingCategory.Blitz -> sampleSnapshot)
     )
-    service.run(Request[IO](Method.GET, uri"/bots/aws/hunter-v30")).flatMap(_.as[BotProfile]).map { profile =>
-      assert(profile.strength.isDefined, "strength summary must be populated")
-      val s = profile.strength.get
-      assertEquals(s.category, "blitz")
-      assertEquals(s.epoch, 1)
-      assertEquals(s.anchorSetVersion, "v1.0")
-      assertEquals(s.status, "admitted")
-      assertEquals(s.isAnchor, false)
-      assertEquals(s.rating, 1634.0)
-      assertEquals(s.ciLow, 1610.0)
-      assertEquals(s.ciHigh, 1658.0)
-      assertEquals(s.losVsNext, Some(0.95))
-    }
+    for
+      resp    <- service.run(Request[IO](Method.GET, uri"/bots/aws/hunter-v30"))
+      profile <- resp.as[BotProfile]
+      json    <- resp.as[Json]
+    yield
+      assertEquals(profile.rating, 1650.0)
+      assertEquals(profile.rd, 95.0)
+      assert(!json.asObject.exists(_.contains("strength")), "strength report must remain internal")
 
   test("GET /leaderboard/snapshots endpoints list and retrieve immutable snapshots (#150)"):
     val historicalSnapshot = sampleSnapshot.copy(
-      id = 41L,
       cutoff = at.minusSeconds(86400),
       isCurrent = false
     )
@@ -620,20 +597,19 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
       snapshotHistory = List(historicalSnapshot)
     )
+    val histCutoff = historicalSnapshot.cutoff.toString
+    val histUri    = org.http4s.Uri.unsafeFromString(s"/leaderboard/snapshots/blitz/1/$histCutoff")
     for
       listResp   <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots?category=blitz"))
-      summaries  <- listResp.as[List[BotStrengthSnapshotSummary]]
+      summaries  <- listResp.as[List[RatingSnapshotSummary]]
       latestResp <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/blitz/latest"))
-      latestSnap <- latestResp.as[BotStrengthSnapshot]
-      histCutoff = historicalSnapshot.cutoff.toString
-      histResp   <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/blitz/1/" / histCutoff))
-      histSnap   <- histResp.as[BotStrengthSnapshot]
+      latestSnap <- latestResp.as[RatingSnapshot]
+      histResp   <- service.run(Request[IO](Method.GET, histUri))
+      histSnap   <- histResp.as[RatingSnapshot]
       badCatResp <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/invalid/latest"))
     yield
       assertEquals(summaries.size, 2)
-      assertEquals(latestSnap.id, 42L)
       assertEquals(latestSnap.isCurrent, true)
-      assertEquals(latestSnap.result.admitted.size, 2)
-      assertEquals(histSnap.id, 41L)
+      assertEquals(latestSnap.leaders.size, 2)
       assertEquals(histSnap.isCurrent, false)
       assertEquals(badCatResp.status, Status.BadRequest)

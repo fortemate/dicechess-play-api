@@ -27,6 +27,7 @@ Regenerate with `mise run contrib-docs:schema` after adding a migration.
 erDiagram
     admin_actions
     bot_ratings
+    bot_strength_snapshots
     bot_webhook_setups
     bot_webhook_stats
     bot_webhooks
@@ -64,7 +65,7 @@ erDiagram
     users ||--o{ user_training_ratings : ""
 ```
 
-Only foreign keys appear as edges. Thirteen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `nickname_history` and `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
+Only foreign keys appear as edges. Fourteen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bot_strength_snapshots` holds version-pinned engine strength snapshots and benchmark ratings independently of dynamic bot registrations, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `nickname_history` and `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
 
 ## Tables
 
@@ -117,6 +118,31 @@ Check constraints:
 Indexes:
 
 - `bot_ratings_pkey` — `CREATE UNIQUE INDEX bot_ratings_pkey ON public.bot_ratings USING btree (team, name, category)`
+
+### `bot_strength_snapshots`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `id` | `bigint` | no | `nextval('bot_strength_snapshots_id_seq'::regclass)` | PK |
+| `category` | `text` | no | — | — |
+| `epoch` | `integer` | no | — | — |
+| `anchor_set_version` | `text` | no | — | — |
+| `cutoff` | `timestamp with time zone` | no | — | — |
+| `computed_at` | `timestamp with time zone` | no | `now()` | — |
+| `is_current` | `boolean` | no | `false` | — |
+| `payload` | `jsonb` | no | — | — |
+
+Check constraints:
+
+- `CHECK ((category = ANY (ARRAY['bullet'::text, 'blitz'::text, 'rapid'::text])))`
+- `CHECK ((epoch >= 1))`
+
+Indexes:
+
+- `bot_strength_snapshots_current_idx` — `CREATE UNIQUE INDEX bot_strength_snapshots_current_idx ON public.bot_strength_snapshots USING btree (category, epoch) WHERE (is_current = true)`
+- `bot_strength_snapshots_cutoff_idx` — `CREATE UNIQUE INDEX bot_strength_snapshots_cutoff_idx ON public.bot_strength_snapshots USING btree (category, epoch, cutoff)`
+- `bot_strength_snapshots_lookup_idx` — `CREATE INDEX bot_strength_snapshots_lookup_idx ON public.bot_strength_snapshots USING btree (category, epoch, computed_at DESC)`
+- `bot_strength_snapshots_pkey` — `CREATE UNIQUE INDEX bot_strength_snapshots_pkey ON public.bot_strength_snapshots USING btree (id)`
 
 ### `bot_webhook_setups`
 

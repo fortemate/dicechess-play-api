@@ -5308,19 +5308,23 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
   test("user training ratings preserves NULL computed_at for historical estimates (#150)"):
     withContainers { pg =>
       (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
-        val userId = UUID.randomUUID()
-        val cat    = RatingCategory.Default
+        val cat = RatingCategory.Default
         for
+          player <- db.upsertOnLogin("google", "sub-training-null-time", None, IO.pure("NullTimePlayer"))
+          userId = UUID.fromString(player.id)
           _ <-
-            sql"""INSERT INTO play.user_training_ratings (user_id, category, rating, deviation, games, wins, draws, losses, updated_at, computed_at)
-                  VALUES ($userId, ${cat.wireName}, 1500.0, 100.0, 5, 3, 1, 1, now(), NULL)""".update.run
+            sql"""INSERT INTO play.user_training_ratings (user_id, category, rating, rd, vol, games, wins, draws, losses, updated_at, computed_at)
+                  VALUES ($userId, ${cat.wireName}, 1500.0, 100.0, 0.06, 5, 3, 1, 1, now(), NULL)""".update.run
               .transact(xa)
-          state <- db.trainingStateOf(userId.toString, cat)
+          state <- db.trainingStateOf(player.id, cat)
           _ = assertEquals(
             state.computedAt,
             None,
             "legacy training estimate with NULL computed_at must read back as None"
           )
+          _ = assertEquals(state.games, 5)
+          _ = assertEquals(state.rating, 1500.0)
+          _ = assertEquals(state.deviation, 100.0)
         yield ()
       }
     }

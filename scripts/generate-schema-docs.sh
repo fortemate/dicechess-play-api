@@ -51,12 +51,12 @@ readonly port
 
 echo "==> waiting for postgres on :${port}"
 for _ in $(seq 1 60); do
-	if docker exec "${CONTAINER}" pg_isready -U "${USER}" -d "${DB}" >/dev/null 2>&1; then
+	if docker exec "${CONTAINER}" psql -U "${USER}" -d "${DB}" -c "SELECT 1;" >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
-docker exec "${CONTAINER}" pg_isready -U "${USER}" -d "${DB}" >/dev/null
+docker exec "${CONTAINER}" psql -U "${USER}" -d "${DB}" -c "SELECT 1;" >/dev/null
 
 echo "==> applying Flyway migrations"
 # On the shared network, so Postgres is reachable by container name — "localhost" inside the

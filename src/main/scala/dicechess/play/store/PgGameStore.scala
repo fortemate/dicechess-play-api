@@ -2956,24 +2956,24 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     sql"""SELECT rating, rd, vol, games, wins, draws, losses, updated_at, computed_at
           FROM play.user_training_ratings
           WHERE user_id = $userId::uuid AND category = ${category.wireName}"""
-      .query[(Double, Double, Double, Int, Int, Int, Int, Instant, Instant)]
+      .query[(Double, Double, Double, Int, Int, Int, Int, Instant, Option[Instant])]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
       .map(_.fold(TrainingState.Initial) { case (r, rd, v, g, w, d, l, u, c) =>
-        TrainingState(r, rd, v, g, w, d, l, Some(u), Some(c))
+        TrainingState(r, rd, v, g, w, d, l, Some(u), c)
       })
 
   override def trainingStatesOf(userId: String): IO[Map[RatingCategory, TrainingState]] =
     sql"""SELECT category, rating, rd, vol, games, wins, draws, losses, updated_at, computed_at
           FROM play.user_training_ratings
           WHERE user_id = $userId::uuid"""
-      .query[(String, Double, Double, Double, Int, Int, Int, Int, Instant, Instant)]
+      .query[(String, Double, Double, Double, Int, Int, Int, Int, Instant, Option[Instant])]
       .to[List]
       .transact(xa)
       .timeout(SaveTimeout)
       .map(_.flatMap { case (catStr, r, rd, v, g, w, d, l, u, c) =>
-        RatingCategory.fromWireName(catStr).map(_ -> TrainingState(r, rd, v, g, w, d, l, Some(u), Some(c)))
+        RatingCategory.fromWireName(catStr).map(_ -> TrainingState(r, rd, v, g, w, d, l, Some(u), c))
       }.toMap)
 
   override def trainingReferenceOf(gameId: GameId): IO[CapturedTrainingReference] =
@@ -3135,47 +3135,113 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       limit: Int,
       asOfCutoff: Option[Instant]
   ): IO[List[LeaderboardEntry]] =
-    // The tally is the COMPETITIVE record. A training row (#149) is stamped `applied` because the batch really
-    // did apply a training update, so filtering on the outcome alone would start counting human-vs-bot games
-    // in this record — the one thing ADR 008's domain separation exists to prevent.
-    val cutoffFilter = asOfCutoff.fold(fr"")(cut => fr"AND finished_at <= $cut")
-    (sql"""SELECT b.team, b.name, r.rating, r.rd, b.on_ladder,
-                 COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
-          FROM play.bots b
-          JOIN play.bot_ratings r
-            ON r.team = b.team AND r.name = b.name AND r.category = ${category.wireName}
-          LEFT JOIN (
-            SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
-            FROM (
-              SELECT white_external_id AS external_id,
-                     CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
-                     CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
-                     CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
-              FROM play.game_results
-              WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
-              UNION ALL
-              SELECT black_external_id,
-                     CASE WHEN result = -1 THEN 1 ELSE 0 END,
-                     CASE WHEN result = 0  THEN 1 ELSE 0 END,
-                     CASE WHEN result = 1  THEN 1 ELSE 0 END
-              FROM play.game_results
-              WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
-            ) sides
-            GROUP BY external_id
-          ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
-          WHERE r.rd <= $maxRd
-          ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
-                   r.rd ASC, b.team, b.name
-          LIMIT ${limit.toLong}""")
-      .query[(String, String, Double, Double, Boolean, Int, Int, Int)]
-      .to[List]
-      .transact(xa)
-      .timeout(SaveTimeout)
-      .map(_.map { case (team, name, rating, rd, onLadder, wins, draws, losses) =>
-        LeaderboardEntry(team, name, rating, rd, onLadder, ResultTally(wins, draws, losses))
-      })
+    leaderboardSql(category, maxRd, limit, asOfCutoff).transact(xa).timeout(SaveTimeout)
+
+  private def leaderboardSql(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[Instant]
+  ): ConnectionIO[List[LeaderboardEntry]] =
+    asOfCutoff match
+      case None =>
+        sql"""SELECT b.team, b.name, r.rating, r.rd, b.on_ladder,
+                     COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
+              FROM play.bots b
+              JOIN play.bot_ratings r
+                ON r.team = b.team AND r.name = b.name AND r.category = ${category.wireName}
+              LEFT JOIN (
+                SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
+                FROM (
+                  SELECT white_external_id AS external_id,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                  UNION ALL
+                  SELECT black_external_id,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                ) sides
+                GROUP BY external_id
+              ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
+              WHERE r.rd <= $maxRd
+              ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
+                       r.rd ASC, b.team, b.name
+              LIMIT ${limit.toLong}"""
+          .query[(String, String, Double, Double, Boolean, Int, Int, Int)]
+          .to[List]
+          .map(_.map { case (team, name, rating, rd, onLadder, wins, draws, losses) =>
+            LeaderboardEntry(team, name, rating, rd, onLadder, ResultTally(wins, draws, losses))
+          })
+
+      case Some(cut) =>
+        sql"""SELECT b.team, b.name,
+                     COALESCE(latest_game.rating_after, 1500.0) AS effective_rating,
+                     CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END AS effective_rd,
+                     b.on_ladder,
+                     COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
+              FROM play.bots b
+              JOIN play.bot_ratings r
+                ON r.team = b.team AND r.name = b.name AND r.category = ${category.wireName}
+              LEFT JOIN LATERAL (
+                SELECT CASE
+                         WHEN white_external_id = 'bot:team:' || b.team || ':' || b.name THEN white_rating_after
+                         ELSE black_rating_after
+                       END AS rating_after
+                FROM play.game_results
+                WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                  AND result IS NOT NULL AND category = ${category.wireName}
+                  AND finished_at <= $cut
+                  AND (white_external_id = 'bot:team:' || b.team || ':' || b.name
+                       OR black_external_id = 'bot:team:' || b.team || ':' || b.name)
+                  AND (
+                    (white_external_id = 'bot:team:' || b.team || ':' || b.name AND white_rating_after IS NOT NULL)
+                    OR
+                    (black_external_id = 'bot:team:' || b.team || ':' || b.name AND black_rating_after IS NOT NULL)
+                  )
+                ORDER BY finished_at DESC, game_id DESC
+                LIMIT 1
+              ) latest_game ON true
+              LEFT JOIN (
+                SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
+                FROM (
+                  SELECT white_external_id AS external_id,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                    AND finished_at <= $cut
+                  UNION ALL
+                  SELECT black_external_id,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                    AND finished_at <= $cut
+                ) sides
+                GROUP BY external_id
+              ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
+              WHERE (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) <= $maxRd
+              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) DESC,
+                       (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) ASC,
+                       b.team, b.name
+              LIMIT ${limit.toLong}"""
+          .query[(String, String, Double, Double, Boolean, Int, Int, Int)]
+          .to[List]
+          .map(_.map { case (team, name, rating, rd, onLadder, wins, draws, losses) =>
+            LeaderboardEntry(team, name, rating, rd, onLadder, ResultTally(wins, draws, losses))
+          })
 
   /** The account half of the same board (#249) — deliberately the SAME shape of query as `leaderboard` above, joining
     * `users` against the rated W-D-L aggregated from `game_results` by the account's `user:` external id. A player's
@@ -3194,46 +3260,110 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       limit: Int,
       asOfCutoff: Option[Instant]
   ): IO[List[PlayerLeaderboardEntry]] =
-    // The tally is the COMPETITIVE record. A training row (#149) is stamped `applied` because the batch really
-    // did apply a training update, so filtering on the outcome alone would start counting human-vs-bot games
-    // in this record — the one thing ADR 008's domain separation exists to prevent.
-    val cutoffFilter = asOfCutoff.fold(fr"")(cut => fr"AND finished_at <= $cut")
-    (sql"""SELECT u.nickname, r.rating, r.rd,
-                 COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
-          FROM play.users u
-          JOIN play.user_ratings r ON r.user_id = u.id AND r.category = ${category.wireName}
-          LEFT JOIN (
-            SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
-            FROM (
-              SELECT white_external_id AS external_id,
-                     CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
-                     CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
-                     CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
-              FROM play.game_results
-              WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
-              UNION ALL
-              SELECT black_external_id,
-                     CASE WHEN result = -1 THEN 1 ELSE 0 END,
-                     CASE WHEN result = 0  THEN 1 ELSE 0 END,
-                     CASE WHEN result = 1  THEN 1 ELSE 0 END
-              FROM play.game_results
-              WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
-            ) sides
-            GROUP BY external_id
-          ) t ON t.external_id = 'user:' || u.id::text
-          WHERE r.rd <= $maxRd AND u.is_active
-          ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
-                   r.rd ASC, u.nickname
-          LIMIT ${limit.toLong}""")
-      .query[(String, Double, Double, Int, Int, Int)]
-      .to[List]
-      .transact(xa)
-      .timeout(SaveTimeout)
-      .map(_.map { case (nickname, rating, rd, wins, draws, losses) =>
-        PlayerLeaderboardEntry(nickname, rating, rd, ResultTally(wins, draws, losses))
-      })
+    playerLeaderboardSql(category, maxRd, limit, asOfCutoff).transact(xa).timeout(SaveTimeout)
+
+  private def playerLeaderboardSql(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[Instant]
+  ): ConnectionIO[List[PlayerLeaderboardEntry]] =
+    asOfCutoff match
+      case None =>
+        sql"""SELECT u.nickname, r.rating, r.rd,
+                     COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
+              FROM play.users u
+              JOIN play.user_ratings r ON r.user_id = u.id AND r.category = ${category.wireName}
+              LEFT JOIN (
+                SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
+                FROM (
+                  SELECT white_external_id AS external_id,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                  UNION ALL
+                  SELECT black_external_id,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                ) sides
+                GROUP BY external_id
+              ) t ON t.external_id = 'user:' || u.id::text
+              WHERE r.rd <= $maxRd AND u.is_active
+              ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
+                       r.rd ASC, u.nickname
+              LIMIT ${limit.toLong}"""
+          .query[(String, Double, Double, Int, Int, Int)]
+          .to[List]
+          .map(_.map { case (nickname, rating, rd, wins, draws, losses) =>
+            PlayerLeaderboardEntry(nickname, rating, rd, ResultTally(wins, draws, losses))
+          })
+
+      case Some(cut) =>
+        sql"""SELECT u.nickname,
+                     COALESCE(latest_game.rating_after, 1500.0) AS effective_rating,
+                     CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END AS effective_rd,
+                     COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
+              FROM play.users u
+              JOIN play.user_ratings r ON r.user_id = u.id AND r.category = ${category.wireName}
+              LEFT JOIN LATERAL (
+                SELECT CASE
+                         WHEN white_external_id = 'user:' || u.id::text THEN white_rating_after
+                         ELSE black_rating_after
+                       END AS rating_after
+                FROM play.game_results
+                WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                  AND result IS NOT NULL AND category = ${category.wireName}
+                  AND finished_at <= $cut
+                  AND (white_external_id = 'user:' || u.id::text
+                       OR black_external_id = 'user:' || u.id::text)
+                  AND (
+                    (white_external_id = 'user:' || u.id::text AND white_rating_after IS NOT NULL)
+                    OR
+                    (black_external_id = 'user:' || u.id::text AND black_rating_after IS NOT NULL)
+                  )
+                ORDER BY finished_at DESC, game_id DESC
+                LIMIT 1
+              ) latest_game ON true
+              LEFT JOIN (
+                SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
+                FROM (
+                  SELECT white_external_id AS external_id,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                    AND finished_at <= $cut
+                  UNION ALL
+                  SELECT black_external_id,
+                         CASE WHEN result = -1 THEN 1 ELSE 0 END,
+                         CASE WHEN result = 0  THEN 1 ELSE 0 END,
+                         CASE WHEN result = 1  THEN 1 ELSE 0 END
+                  FROM play.game_results
+                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
+                    AND result IS NOT NULL AND category = ${category.wireName}
+                    AND finished_at <= $cut
+                ) sides
+                GROUP BY external_id
+              ) t ON t.external_id = 'user:' || u.id::text
+              WHERE (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) <= $maxRd AND u.is_active
+              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) DESC,
+                       (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) ASC,
+                       u.nickname
+              LIMIT ${limit.toLong}"""
+          .query[(String, Double, Double, Int, Int, Int)]
+          .to[List]
+          .map(_.map { case (nickname, rating, rd, wins, draws, losses) =>
+            PlayerLeaderboardEntry(nickname, rating, rd, ResultTally(wins, draws, losses))
+          })
 
   /** One participant's rated, decided record grouped by the row's stored `category` (V22, #335 — never by calling
     * `rating_category` per row; see that migration for the 28-second reason). Rows whose control categorises to NULL
@@ -3279,7 +3409,28 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       .transact(xa)
       .timeout(SaveTimeout)
 
-  override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[RatingSnapshot]] =
+  override def liveLeaderboardView(
+      category: RatingCategory,
+      wantedBots: Boolean,
+      wantedPlayers: Boolean,
+      maxRd: Double,
+      limit: Int
+  ): IO[LeaderboardStore.LiveLeaderboardView] =
+    val tx: ConnectionIO[LeaderboardStore.LiveLeaderboardView] = for
+      _    <- sql"SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".update.run
+      bots <-
+        if wantedBots then leaderboardSql(category, maxRd, limit, None)
+        else List.empty[LeaderboardEntry].pure[ConnectionIO]
+      players <-
+        if wantedPlayers then playerLeaderboardSql(category, maxRd, limit, None)
+        else List.empty[PlayerLeaderboardEntry].pure[ConnectionIO]
+      snapshot <- latestBotStrengthSnapshotSql(category)
+      cutoff   <- latestAppliedCutoffSql(category)
+    yield LeaderboardStore.LiveLeaderboardView(bots, players, snapshot, cutoff._1, cutoff._2)
+
+    tx.transact(xa).timeout(SaveTimeout)
+
+  private def latestBotStrengthSnapshotSql(category: RatingCategory): ConnectionIO[Option[RatingSnapshot]] =
     sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
           FROM play.bot_strength_snapshots
           WHERE category = ${category.wireName} AND is_current = TRUE
@@ -3287,13 +3438,14 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
           LIMIT 1"""
       .query[(String, Int, String, Instant, Instant, Boolean, Json)]
       .option
-      .transact(xa)
-      .timeout(SaveTimeout)
       .map(_.flatMap { case (cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, payload) =>
         payload.hcursor.downField("leaders").as[List[dicechess.play.server.LeaderRow]].toOption.map { leaders =>
           RatingSnapshot(cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, leaders)
         }
       })
+
+  override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[RatingSnapshot]] =
+    latestBotStrengthSnapshotSql(category).transact(xa).timeout(SaveTimeout)
 
   override def botStrengthSnapshotAt(
       category: RatingCategory,
@@ -3339,7 +3491,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
         RatingSnapshotSummary(cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, count)
       })
 
-  override def latestAppliedCutoff(category: RatingCategory): IO[(Option[Instant], Option[Instant])] =
+  private def latestAppliedCutoffSql(category: RatingCategory): ConnectionIO[(Option[Instant], Option[Instant])] =
     sql"""SELECT MAX(finished_at), MAX(COALESCE(rating_applied_at, finished_at))
           FROM play.game_results
           WHERE category = ${category.wireName}
@@ -3347,8 +3499,9 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
             AND rating_domain <> 'training'"""
       .query[(Option[Instant], Option[Instant])]
       .unique
-      .transact(xa)
-      .timeout(SaveTimeout)
+
+  override def latestAppliedCutoff(category: RatingCategory): IO[(Option[Instant], Option[Instant])] =
+    latestAppliedCutoffSql(category).transact(xa).timeout(SaveTimeout)
 
   override def saveBotStrengthSnapshot(
       category: RatingCategory,

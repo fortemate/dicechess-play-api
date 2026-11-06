@@ -968,7 +968,30 @@ trait LeaderboardStore:
   ): IO[(Option[java.time.Instant], Option[java.time.Instant])] =
     IO.pure((None, None))
 
+  /** Atomically reads the live leaderboard entries and provenance from one database snapshot (#150). */
+  def liveLeaderboardView(
+      category: RatingCategory,
+      wantedBots: Boolean,
+      wantedPlayers: Boolean,
+      maxRd: Double,
+      limit: Int = LeaderboardStore.MaxBoardSize
+  ): IO[LeaderboardStore.LiveLeaderboardView] =
+    for
+      b <- if wantedBots then leaderboard(category, maxRd, limit) else IO.pure(Nil)
+      p <- if wantedPlayers then playerLeaderboard(category, maxRd, limit) else IO.pure(Nil)
+      s <- latestBotStrengthSnapshot(category)
+      c <- latestAppliedCutoff(category)
+    yield LeaderboardStore.LiveLeaderboardView(b, p, s, c._1, c._2)
+
 object LeaderboardStore:
+  final case class LiveLeaderboardView(
+      bots: List[LeaderboardEntry],
+      players: List[PlayerLeaderboardEntry],
+      snapshot: Option[RatingSnapshot],
+      dataCutoff: Option[java.time.Instant],
+      computedAt: Option[java.time.Instant]
+  )
+
   /** Payload guard for the public leaderboard endpoint: the SQL query is bounded to this many rows, so the response
     * never grows without limit as the platform scales (#289). Sized to match Lichess's own top-list and to be an order
     * of magnitude above anything this platform will have soon — it is NOT a display cap; the SPA decides what to show.

@@ -620,7 +620,7 @@ Indexes:
 | `draws` | `integer` | no | `0` | — |
 | `losses` | `integer` | no | `0` | — |
 | `updated_at` | `timestamp with time zone` | no | `now()` | — |
-| `computed_at` | `timestamp with time zone` | no | `now()` | — |
+| `computed_at` | `timestamp with time zone` | yes | — | — |
 
 Check constraints:
 

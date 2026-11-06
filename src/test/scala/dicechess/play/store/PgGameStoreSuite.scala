@@ -5238,3 +5238,89 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         yield ()
       }
     }
+
+  test("leaderboard bounds numeric rating and tallies at historical cutoff (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val team: String        = "hist-cutoff-suite"
+        val botA: Principal.Bot = Principal.Bot(team, "bot-a")
+        val botB: Principal.Bot = Principal.Bot(team, "bot-b")
+        val cat                 = RatingCategory.Default
+        val cutoffOct1          = Instant.parse("2026-10-01T12:00:00Z")
+        val cutoffOct2          = Instant.parse("2026-10-02T12:00:00Z")
+
+        for
+          _ <- db.register(team, "bot-a", "hash-a")
+          _ <- db.register(team, "bot-b", "hash-b")
+          _ <- db.setOnLadder(team, "bot-a", true)
+          _ <- db.setOnLadder(team, "bot-b", true)
+
+          // Game 1 at Oct 1: rating becomes 1800.0, rd = 80.0
+          id1 <- GameId.random
+          _   <- db.save(id1, endedResultFixture(botA, botB, rated = true))
+          update1A = seeded(RatedIdentity.of(botA), 1800.0, 80.0)
+          update1B = seeded(RatedIdentity.of(botB), 1400.0, 80.0)
+          _ <- db.applyRatingUpdate(id1, update1A, update1B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct1 WHERE game_id = ${id1.value}::uuid".update.run
+              .transact(xa)
+
+          // Check historical cutoff at Oct 1: rating is 1800.0, games = 1
+          boardOct1Pre <- db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct1))
+            .map(_.filter(_.team == team))
+          _ = assertEquals(boardOct1Pre.find(_.name == "bot-a").map(_.rating), Some(1800.0))
+          _ = assertEquals(boardOct1Pre.find(_.name == "bot-a").map(_.tally.games), Some(1))
+
+          // Game 2 at Oct 2: rating advances to 2000.0, rd = 70.0
+          id2 <- GameId.random
+          _   <- db.save(id2, endedResultFixture(botA, botB, rated = true))
+          update2A = seeded(RatedIdentity.of(botA), 2000.0, 70.0)
+          update2B = seeded(RatedIdentity.of(botB), 1300.0, 70.0)
+          _ <- db.applyRatingUpdate(id2, update2A, update2B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct2 WHERE game_id = ${id2.value}::uuid".update.run
+              .transact(xa)
+
+          // Live bot_ratings now has rating = 2000.0
+          liveBoard <- db.leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = None).map(_.filter(_.team == team))
+          _ = assertEquals(liveBoard.find(_.name == "bot-a").map(_.rating), Some(2000.0))
+          _ = assertEquals(liveBoard.find(_.name == "bot-a").map(_.tally.games), Some(2))
+
+          // Crucial regression: querying historical cutoff at Oct 1 MUST NOT see 2000.0, but still 1800.0 with games = 1 (#150)
+          boardOct1Post <- db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct1))
+            .map(_.filter(_.team == team))
+          _ = assertEquals(
+            boardOct1Post.find(_.name == "bot-a").map(_.rating),
+            Some(1800.0),
+            "advancing live rating must not change historical rating at earlier cutoff"
+          )
+          _ = assertEquals(boardOct1Post.find(_.name == "bot-a").map(_.tally.games), Some(1))
+
+          // And liveLeaderboardView must return consistent view
+          view <- db.liveLeaderboardView(cat, wantedBots = true, wantedPlayers = false, maxRd = 110.0, limit = 10)
+          _ = assert(view.bots.exists(_.name == "bot-a"))
+        yield ()
+      }
+    }
+
+  test("user training ratings preserves NULL computed_at for historical estimates (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val userId = UUID.randomUUID()
+        val cat    = RatingCategory.Default
+        for
+          _ <-
+            sql"""INSERT INTO play.user_training_ratings (user_id, category, rating, deviation, games, wins, draws, losses, updated_at, computed_at)
+                  VALUES ($userId, ${cat.wireName}, 1500.0, 100.0, 5, 3, 1, 1, now(), NULL)""".update.run
+              .transact(xa)
+          state <- db.trainingStateOf(userId.toString, cat)
+          _ = assertEquals(
+            state.computedAt,
+            None,
+            "legacy training estimate with NULL computed_at must read back as None"
+          )
+        yield ()
+      }
+    }

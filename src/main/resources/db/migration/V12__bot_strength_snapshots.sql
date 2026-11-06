@@ -28,5 +28,4 @@ CREATE INDEX IF NOT EXISTS bot_strength_snapshots_lookup_idx
     ON bot_strength_snapshots (category, epoch, computed_at DESC);
 
 -- #150: Record calculation timestamp for user training estimates independently from game finish cutoff.
-ALTER TABLE user_training_ratings ADD COLUMN IF NOT EXISTS computed_at timestamptz NOT NULL DEFAULT now();
-
+ALTER TABLE user_training_ratings ADD COLUMN IF NOT EXISTS computed_at timestamptz;

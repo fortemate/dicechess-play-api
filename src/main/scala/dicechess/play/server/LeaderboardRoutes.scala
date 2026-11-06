@@ -333,24 +333,17 @@ object LeaderboardRoutes:
         (LeaderboardRoutes.parseKind(kind), LeaderboardRoutes.parseCategory(category)).tupled match
           case Left(error)                    => BadRequest(error)
           case Right((wantedFor, onCategory)) =>
-            val maxRd    = Glicko2.ProvisionalDeviationThreshold
-            val limit    = LeaderboardStore.MaxBoardSize
-            val botRows  = if wantedFor.bots then board.leaderboard(onCategory, maxRd, limit) else IO.pure(Nil)
-            val playRows =
-              if wantedFor.players then board.playerLeaderboard(onCategory, maxRd, limit) else IO.pure(Nil)
-            val snapshotOpt = board.latestBotStrengthSnapshot(onCategory)
-            val liveCutoff  = board.latestAppliedCutoff(onCategory)
-
-            (botRows, playRows, snapshotOpt, liveCutoff).flatMapN:
-              (botEntries, playerEntries, snapshot, liveProvenance) =>
-                val (dataCutoff, computedTime) = liveProvenance
-                val epochOpt                   = snapshot.map(_.epoch)
-                val effectiveCutoff            = dataCutoff.orElse(snapshot.map(_.cutoff))
-                val effectiveComputed          = computedTime.orElse(snapshot.map(_.computedAt))
-                val merged                     =
-                  (botEntries.map(b => LeaderboardRoutes.botRow(b, epochOpt)) ++ playerEntries.map(p =>
-                    LeaderboardRoutes.playerRow(p, epochOpt)
-                  ))
+            val maxRd = Glicko2.ProvisionalDeviationThreshold
+            val limit = LeaderboardStore.MaxBoardSize
+            board
+              .liveLeaderboardView(onCategory, wantedFor.bots, wantedFor.players, maxRd, limit)
+              .flatMap: view =>
+                val epochOpt          = view.snapshot.map(_.epoch)
+                val effectiveCutoff   = view.dataCutoff.orElse(view.snapshot.map(_.cutoff))
+                val effectiveComputed = view.computedAt.orElse(view.snapshot.map(_.computedAt))
+                val merged            =
+                  (view.bots.map(b => LeaderboardRoutes.botRow(b, epochOpt)) ++ view.players
+                    .map(p => LeaderboardRoutes.playerRow(p, epochOpt)))
                     .sortBy(row =>
                       (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name)
                     )
@@ -361,7 +354,7 @@ object LeaderboardRoutes:
                     category = onCategory.wireName,
                     leaders = ranked,
                     epoch = epochOpt,
-                    anchorSetVersion = snapshot.map(_.anchorSetVersion),
+                    anchorSetVersion = view.snapshot.map(_.anchorSetVersion),
                     cutoff = effectiveCutoff,
                     computedAt = effectiveComputed
                   )
@@ -504,7 +497,7 @@ object LeaderboardRoutes:
               algorithmVersion = "v1",
               epoch = 1,
               cutoff = state.updatedAt,
-              computedAt = state.computedAt.orElse(state.updatedAt),
+              computedAt = state.computedAt,
               games = state.games,
               wins = state.wins,
               draws = state.draws,

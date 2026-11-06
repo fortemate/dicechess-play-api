@@ -302,7 +302,6 @@ class StrengthReportSuite extends munit.FunSuite:
     assert(md.contains("`[Provisional]`"))
 
   test("LadderReportMain helpers: parsePlayerKey, resolveEffectiveAnchor, assembleLeaders, and renderReport"):
-    import dicechess.play.rating.AnchoredStrength.RankedBot
     import dicechess.play.store.{LeaderboardEntry, ResultTally}
 
     // parsePlayerKey
@@ -319,63 +318,6 @@ class StrengthReportSuite extends munit.FunSuite:
     assertEquals(LadderReportMain.resolveEffectiveAnchor(custom, RatingCategory.Default), custom)
 
     // assembleLeaders
-    val admitted = List(
-      RankedBot(
-        "oracle/v1",
-        elo = 1600.0,
-        ciLow = 1550.0,
-        ciHigh = 1650.0,
-        losVsNext = None,
-        status = GraphConnectivity.AdmissionStatus.Admitted,
-        isAnchor = false,
-        games = 10,
-        opponents = 2
-      ),
-      RankedBot(
-        "oracle/v2",
-        elo = 1700.0, // higher anchored elo
-        ciLow = 1650.0,
-        ciHigh = 1750.0,
-        losVsNext = None,
-        status = GraphConnectivity.AdmissionStatus.Admitted,
-        isAnchor = false,
-        games = 10,
-        opponents = 2
-      ),
-      RankedBot(
-        "oracle/provisional",
-        elo = 1650.0,
-        ciLow = 1600.0,
-        ciHigh = 1700.0,
-        losVsNext = None,
-        status = GraphConnectivity.AdmissionStatus.Admitted,
-        isAnchor = false,
-        games = 10,
-        opponents = 2
-      ),
-      RankedBot(
-        "unknown/v3",
-        elo = 1500.0,
-        ciLow = 1450.0,
-        ciHigh = 1550.0,
-        losVsNext = None,
-        status = GraphConnectivity.AdmissionStatus.Admitted,
-        isAnchor = false,
-        games = 10,
-        opponents = 2
-      ),
-      RankedBot(
-        "no-team",
-        elo = 1400.0,
-        ciLow = 1350.0,
-        ciHigh = 1450.0,
-        losVsNext = None,
-        status = GraphConnectivity.AdmissionStatus.Admitted,
-        isAnchor = false,
-        games = 10,
-        opponents = 2
-      )
-    )
     val existing = List(
       // v1: lower anchored elo (1600), but higher conservative rating (1800 - 2*50 = 1700)
       LeaderboardEntry("oracle", "v1", 1800.0, 50.0, onLadder = true, ResultTally(6, 2, 2)),
@@ -384,7 +326,7 @@ class StrengthReportSuite extends munit.FunSuite:
       // provisional: filtered out because rd = 350 > 110
       LeaderboardEntry("oracle", "provisional", 1750.0, 350.0, onLadder = true, ResultTally.Empty)
     )
-    val leaders = LadderReportMain.assembleLeaders(admitted, existing, epoch = 1)
+    val leaders = LadderReportMain.assembleLeaders(existing, epoch = 1)
     assertEquals(leaders.size, 2)
     assertEquals(leaders.map(_.name), List("v1", "v2"), "sorted by conservative Glicko-2 rating, not anchored elo")
     assertEquals(leaders.map(_.rank), List(1, 2), "contiguous ranks without gaps from excluded bots")

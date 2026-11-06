@@ -2,7 +2,6 @@ package dicechess.play.rating
 
 import cats.effect.{ExitCode, IO, IOApp}
 import dicechess.play.core.RatingCategory
-import dicechess.play.rating.AnchoredStrength.RankedBot
 import dicechess.play.server.{LeaderRow, LeaderboardRoutes}
 import dicechess.play.store.{GameResultRow, LeaderboardEntry, PgGameStore}
 
@@ -104,20 +103,11 @@ object LadderReportMain extends IOApp:
     else (None, player)
 
   private[rating] def assembleLeaders(
-      admitted: List[RankedBot],
       existingBots: List[LeaderboardEntry],
       epoch: Int
   ): List[LeaderRow] =
-    val existingMap = existingBots.map(b => (b.team, b.name) -> b).toMap
-    val eligible    = admitted.flatMap { b =>
-      val (teamOpt, name) = parsePlayerKey(b.player)
-      for
-        team  <- teamOpt
-        entry <- existingMap.get((team, name))
-        if entry.rd <= Glicko2.ProvisionalDeviationThreshold
-      yield entry
-    }
-    val sorted = eligible
+    val eligible = existingBots.filter(_.rd <= Glicko2.ProvisionalDeviationThreshold)
+    val sorted   = eligible
       .map(e => LeaderboardRoutes.botRow(e, Some(epoch)))
       .sortBy(row => (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name))
     sorted.zipWithIndex.map { (row, index) =>
@@ -146,7 +136,7 @@ object LadderReportMain extends IOApp:
             limit = 500,
             asOfCutoff = Some(cutoff)
           )
-          leaders = assembleLeaders(report.anchored.admitted, existingBots, effectiveAnchor.epoch)
+          leaders = assembleLeaders(existingBots, effectiveAnchor.epoch)
           _ <- store.saveBotStrengthSnapshot(
             category = options.category,
             epoch = effectiveAnchor.epoch,

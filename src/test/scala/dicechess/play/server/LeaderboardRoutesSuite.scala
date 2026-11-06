@@ -599,6 +599,10 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     )
     val histCutoff = historicalSnapshot.cutoff.toString
     val histUri    = org.http4s.Uri.unsafeFromString(s"/leaderboard/snapshots/blitz/1/$histCutoff")
+    val missingUri = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/blitz/1/2020-01-01T00:00:00Z")
+    val badEpUri   = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/blitz/notanint/2026-10-01T00:00:00Z")
+    val badCutUri  = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/blitz/1/notaninstant")
+    val badCatHUri = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/invalid/1/2026-10-01T00:00:00Z")
     for
       listResp   <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots?category=blitz"))
       summaries  <- listResp.as[List[RatingSnapshotSummary]]
@@ -607,9 +611,38 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       histResp   <- service.run(Request[IO](Method.GET, histUri))
       histSnap   <- histResp.as[RatingSnapshot]
       badCatResp <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/invalid/latest"))
+      missingLat <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/rapid/latest"))
+      badListCat <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots?category=invalid"))
+      badEpoch   <- service.run(Request[IO](Method.GET, badEpUri))
+      badCutoff  <- service.run(Request[IO](Method.GET, badCutUri))
+      badHistCat <- service.run(Request[IO](Method.GET, badCatHUri))
+      missingH   <- service.run(Request[IO](Method.GET, missingUri))
     yield
       assertEquals(summaries.size, 2)
       assertEquals(latestSnap.isCurrent, true)
       assertEquals(latestSnap.leaders.size, 2)
       assertEquals(histSnap.isCurrent, false)
       assertEquals(badCatResp.status, Status.BadRequest)
+      assertEquals(missingLat.status, Status.NotFound)
+      assertEquals(badListCat.status, Status.BadRequest)
+      assertEquals(badEpoch.status, Status.BadRequest)
+      assertEquals(badCutoff.status, Status.BadRequest)
+      assertEquals(badHistCat.status, Status.BadRequest)
+      assertEquals(missingH.status, Status.NotFound)
+
+  test("LeaderboardStore default trait implementations (#150)"):
+    val defaultStore = new dicechess.play.store.LeaderboardStore:
+      def leaderboard(c: dicechess.play.core.RatingCategory, m: Double, l: Int)       = IO.pure(Nil)
+      def playerLeaderboard(c: dicechess.play.core.RatingCategory, m: Double, l: Int) = IO.pure(Nil)
+      def categoryTalliesFor(e: String)                                               = IO.pure(Map.empty)
+      def totalGamesFor(e: String)                                                    = IO.pure(0)
+    for
+      latest <- defaultStore.latestBotStrengthSnapshot(dicechess.play.core.RatingCategory.Blitz)
+      atSnap <- defaultStore.botStrengthSnapshotAt(dicechess.play.core.RatingCategory.Blitz, 1, at)
+      list   <- defaultStore.listBotStrengthSnapshots(dicechess.play.core.RatingCategory.Blitz)
+      saved  <- defaultStore.saveBotStrengthSnapshot(dicechess.play.core.RatingCategory.Blitz, 1, "v1", at, Nil)
+    yield
+      assertEquals(latest, None)
+      assertEquals(atSnap, None)
+      assertEquals(list, Nil)
+      assertEquals(saved, 0L)

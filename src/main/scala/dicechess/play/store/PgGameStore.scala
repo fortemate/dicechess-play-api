@@ -2953,27 +2953,27 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       }.toMap)
 
   override def trainingStateOf(userId: String, category: RatingCategory): IO[TrainingState] =
-    sql"""SELECT rating, rd, vol, games, wins, draws, losses, updated_at
+    sql"""SELECT rating, rd, vol, games, wins, draws, losses, updated_at, computed_at
           FROM play.user_training_ratings
           WHERE user_id = $userId::uuid AND category = ${category.wireName}"""
-      .query[(Double, Double, Double, Int, Int, Int, Int, Instant)]
+      .query[(Double, Double, Double, Int, Int, Int, Int, Instant, Instant)]
       .option
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.fold(TrainingState.Initial) { case (r, rd, v, g, w, d, l, u) =>
-        TrainingState(r, rd, v, g, w, d, l, Some(u))
+      .map(_.fold(TrainingState.Initial) { case (r, rd, v, g, w, d, l, u, c) =>
+        TrainingState(r, rd, v, g, w, d, l, Some(u), Some(c))
       })
 
   override def trainingStatesOf(userId: String): IO[Map[RatingCategory, TrainingState]] =
-    sql"""SELECT category, rating, rd, vol, games, wins, draws, losses, updated_at
+    sql"""SELECT category, rating, rd, vol, games, wins, draws, losses, updated_at, computed_at
           FROM play.user_training_ratings
           WHERE user_id = $userId::uuid"""
-      .query[(String, Double, Double, Double, Int, Int, Int, Int, Instant)]
+      .query[(String, Double, Double, Double, Int, Int, Int, Int, Instant, Instant)]
       .to[List]
       .transact(xa)
       .timeout(SaveTimeout)
-      .map(_.flatMap { case (catStr, r, rd, v, g, w, d, l, u) =>
-        RatingCategory.fromWireName(catStr).map(_ -> TrainingState(r, rd, v, g, w, d, l, Some(u)))
+      .map(_.flatMap { case (catStr, r, rd, v, g, w, d, l, u, c) =>
+        RatingCategory.fromWireName(catStr).map(_ -> TrainingState(r, rd, v, g, w, d, l, Some(u), Some(c)))
       }.toMap)
 
   override def trainingReferenceOf(gameId: GameId): IO[CapturedTrainingReference] =
@@ -3001,10 +3001,10 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     val isLoss = if score < 0.25 then 1 else 0
 
     def updateTrainingState(userId: String): ConnectionIO[Unit] =
-      sql"""INSERT INTO play.user_training_ratings (user_id, category, rating, rd, vol, games, wins, draws, losses, updated_at)
+      sql"""INSERT INTO play.user_training_ratings (user_id, category, rating, rd, vol, games, wins, draws, losses, updated_at, computed_at)
             SELECT u.id, ${userUpdate.category.wireName},
                    ${glicko.rating}, ${glicko.deviation}, ${glicko.volatility},
-                   1, $isWin, $isDraw, $isLoss, $finishedAt
+                   1, $isWin, $isDraw, $isLoss, $finishedAt, now()
             FROM play.users u WHERE u.id = $userId::uuid
             ON CONFLICT (user_id, category)
             DO UPDATE SET rating = EXCLUDED.rating,
@@ -3014,7 +3014,8 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                           wins = play.user_training_ratings.wins + EXCLUDED.wins,
                           draws = play.user_training_ratings.draws + EXCLUDED.draws,
                           losses = play.user_training_ratings.losses + EXCLUDED.losses,
-                          updated_at = GREATEST(play.user_training_ratings.updated_at, EXCLUDED.updated_at)""".update.run.void
+                          updated_at = GREATEST(play.user_training_ratings.updated_at, EXCLUDED.updated_at),
+                          computed_at = now()""".update.run.void
 
     val seats: Either[Throwable, (Option[Double], Option[Double], Option[Double], Option[Double])] = botSeat match
       case Seat.White =>
@@ -3122,15 +3123,23 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     * re-sort (`LeaderboardRoutes`) uses the same key via `Glicko2.conservativeRating`, so this ORDER BY is really the
     * deterministic fetch order for the single-population case; keeping the two identical is what makes that harmless.
     */
-  def leaderboard(
+  override def leaderboard(
       category: RatingCategory,
       maxRd: Double,
-      limit: Int = LeaderboardStore.MaxBoardSize
+      limit: Int
+  ): IO[List[LeaderboardEntry]] = leaderboard(category, maxRd, limit, None)
+
+  override def leaderboard(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[Instant]
   ): IO[List[LeaderboardEntry]] =
     // The tally is the COMPETITIVE record. A training row (#149) is stamped `applied` because the batch really
     // did apply a training update, so filtering on the outcome alone would start counting human-vs-bot games
     // in this record — the one thing ADR 008's domain separation exists to prevent.
-    sql"""SELECT b.team, b.name, r.rating, r.rd, b.on_ladder,
+    val cutoffFilter = asOfCutoff.fold(fr"")(cut => fr"AND finished_at <= $cut")
+    (sql"""SELECT b.team, b.name, r.rating, r.rd, b.on_ladder,
                  COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
           FROM play.bots b
           JOIN play.bot_ratings r
@@ -3144,7 +3153,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                      CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
               FROM play.game_results
               WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName}
+                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
               UNION ALL
               SELECT black_external_id,
                      CASE WHEN result = -1 THEN 1 ELSE 0 END,
@@ -3152,14 +3161,14 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                      CASE WHEN result = 1  THEN 1 ELSE 0 END
               FROM play.game_results
               WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName}
+                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
             ) sides
             GROUP BY external_id
           ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
           WHERE r.rd <= $maxRd
           ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
                    r.rd ASC, b.team, b.name
-          LIMIT ${limit.toLong}"""
+          LIMIT ${limit.toLong}""")
       .query[(String, String, Double, Double, Boolean, Int, Int, Int)]
       .to[List]
       .transact(xa)
@@ -3173,15 +3182,23 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     * CLAIMED guest games are not counted here even though `/me/games` merges them: this is a public read, and folding
     * that history in would retroactively deanonymise every anonymous game the id ever played (#236).
     */
-  def playerLeaderboard(
+  override def playerLeaderboard(
       category: RatingCategory,
       maxRd: Double,
-      limit: Int = LeaderboardStore.MaxBoardSize
+      limit: Int
+  ): IO[List[PlayerLeaderboardEntry]] = playerLeaderboard(category, maxRd, limit, None)
+
+  override def playerLeaderboard(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[Instant]
   ): IO[List[PlayerLeaderboardEntry]] =
     // The tally is the COMPETITIVE record. A training row (#149) is stamped `applied` because the batch really
     // did apply a training update, so filtering on the outcome alone would start counting human-vs-bot games
     // in this record — the one thing ADR 008's domain separation exists to prevent.
-    sql"""SELECT u.nickname, r.rating, r.rd,
+    val cutoffFilter = asOfCutoff.fold(fr"")(cut => fr"AND finished_at <= $cut")
+    (sql"""SELECT u.nickname, r.rating, r.rd,
                  COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
           FROM play.users u
           JOIN play.user_ratings r ON r.user_id = u.id AND r.category = ${category.wireName}
@@ -3194,7 +3211,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                      CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
               FROM play.game_results
               WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName}
+                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
               UNION ALL
               SELECT black_external_id,
                      CASE WHEN result = -1 THEN 1 ELSE 0 END,
@@ -3202,14 +3219,14 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                      CASE WHEN result = 1  THEN 1 ELSE 0 END
               FROM play.game_results
               WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                AND result IS NOT NULL AND category = ${category.wireName}
+                AND result IS NOT NULL AND category = ${category.wireName} """ ++ cutoffFilter ++ fr"""
             ) sides
             GROUP BY external_id
           ) t ON t.external_id = 'user:' || u.id::text
           WHERE r.rd <= $maxRd AND u.is_active
           ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
                    r.rd ASC, u.nickname
-          LIMIT ${limit.toLong}"""
+          LIMIT ${limit.toLong}""")
       .query[(String, Double, Double, Int, Int, Int)]
       .to[List]
       .transact(xa)
@@ -3322,6 +3339,17 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
         RatingSnapshotSummary(cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, count)
       })
 
+  override def latestAppliedCutoff(category: RatingCategory): IO[(Option[Instant], Option[Instant])] =
+    sql"""SELECT MAX(finished_at), MAX(COALESCE(rating_applied_at, finished_at))
+          FROM play.game_results
+          WHERE category = ${category.wireName}
+            AND rating_outcome IN ('applied', 'legacy')
+            AND rating_domain <> 'training'"""
+      .query[(Option[Instant], Option[Instant])]
+      .unique
+      .transact(xa)
+      .timeout(SaveTimeout)
+
   override def saveBotStrengthSnapshot(
       category: RatingCategory,
       epoch: Int,
@@ -3332,7 +3360,9 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     if epoch < 1 then IO.raiseError(new IllegalArgumentException(s"Cannot save snapshot with epoch $epoch < 1"))
     else
       val payload = io.circe.Json.obj("leaders" -> io.circe.syntax.EncoderOps(leaders).asJson)
+      val lockKey = s"bot_strength_snapshots:${category.wireName}:$epoch"
       val tx      = for
+        _ <- sql"""SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($lockKey, 0))""".query[Int].unique.void
         insertedIdOpt <- sql"""INSERT INTO play.bot_strength_snapshots
                                  (category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload)
                                VALUES (${category.wireName}, $epoch, $anchorSetVersion, $cutoff, ${Instant
@@ -3340,18 +3370,26 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                                ON CONFLICT (category, epoch, cutoff) DO NOTHING
                                RETURNING id""".query[Long].option
         id <- insertedIdOpt match
-          case Some(newId) =>
-            for
-              _ <- sql"""UPDATE play.bot_strength_snapshots
-                         SET is_current = FALSE
-                         WHERE category = ${category.wireName} AND epoch = $epoch AND is_current = TRUE""".update.run
-              _ <- sql"""UPDATE play.bot_strength_snapshots
-                         SET is_current = TRUE
-                         WHERE id = $newId""".update.run
-            yield newId
-          case None =>
+          case Some(newId) => newId.pure[ConnectionIO]
+          case None        =>
             sql"""SELECT id FROM play.bot_strength_snapshots
                   WHERE category = ${category.wireName} AND epoch = $epoch AND cutoff = $cutoff""".query[Long].unique
+        currentCutoffOpt <- sql"""SELECT cutoff FROM play.bot_strength_snapshots
+                                  WHERE category = ${category.wireName} AND epoch = $epoch AND is_current = TRUE"""
+          .query[Instant]
+          .option
+        shouldBeCurrent = currentCutoffOpt.forall(curCutoff => !cutoff.isBefore(curCutoff))
+        _ <-
+          if shouldBeCurrent then
+            for
+              _ <- sql"""UPDATE play.bot_strength_snapshots
+                       SET is_current = FALSE
+                       WHERE category = ${category.wireName} AND epoch = $epoch AND is_current = TRUE AND id <> $id""".update.run
+              _ <- sql"""UPDATE play.bot_strength_snapshots
+                       SET is_current = TRUE
+                       WHERE id = $id""".update.run
+            yield ()
+          else ().pure[ConnectionIO]
       yield id
       tx.transact(xa).timeout(SaveTimeout)
 

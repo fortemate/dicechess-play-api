@@ -332,7 +332,29 @@ class StrengthReportSuite extends munit.FunSuite:
         opponents = 2
       ),
       RankedBot(
-        "unknown/v2",
+        "oracle/v2",
+        elo = 1700.0, // higher anchored elo
+        ciLow = 1650.0,
+        ciHigh = 1750.0,
+        losVsNext = None,
+        status = GraphConnectivity.AdmissionStatus.Admitted,
+        isAnchor = false,
+        games = 10,
+        opponents = 2
+      ),
+      RankedBot(
+        "oracle/provisional",
+        elo = 1650.0,
+        ciLow = 1600.0,
+        ciHigh = 1700.0,
+        losVsNext = None,
+        status = GraphConnectivity.AdmissionStatus.Admitted,
+        isAnchor = false,
+        games = 10,
+        opponents = 2
+      ),
+      RankedBot(
+        "unknown/v3",
         elo = 1500.0,
         ciLow = 1450.0,
         ciHigh = 1550.0,
@@ -355,13 +377,18 @@ class StrengthReportSuite extends munit.FunSuite:
       )
     )
     val existing = List(
-      LeaderboardEntry("oracle", "v1", 1620.0, 50.0, onLadder = true, ResultTally(6, 2, 2))
+      // v1: lower anchored elo (1600), but higher conservative rating (1800 - 2*50 = 1700)
+      LeaderboardEntry("oracle", "v1", 1800.0, 50.0, onLadder = true, ResultTally(6, 2, 2)),
+      // v2: higher anchored elo (1700), but lower conservative rating (1600 - 2*50 = 1500)
+      LeaderboardEntry("oracle", "v2", 1600.0, 50.0, onLadder = true, ResultTally(6, 2, 2)),
+      // provisional: filtered out because rd = 350 > 110
+      LeaderboardEntry("oracle", "provisional", 1750.0, 350.0, onLadder = true, ResultTally.Empty)
     )
     val leaders = LadderReportMain.assembleLeaders(admitted, existing, epoch = 1)
-    assertEquals(leaders.size, 1)
-    assertEquals(leaders.head.name, "v1")
+    assertEquals(leaders.size, 2)
+    assertEquals(leaders.map(_.name), List("v1", "v2"), "sorted by conservative Glicko-2 rating, not anchored elo")
+    assertEquals(leaders.map(_.rank), List(1, 2), "contiguous ranks without gaps from excluded bots")
     assertEquals(leaders.head.team, Some("oracle"))
-    assertEquals(leaders.head.rank, 1)
     assertEquals(leaders.head.epoch, Some(1))
 
     // renderReport

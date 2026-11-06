@@ -339,28 +339,33 @@ object LeaderboardRoutes:
             val playRows =
               if wantedFor.players then board.playerLeaderboard(onCategory, maxRd, limit) else IO.pure(Nil)
             val snapshotOpt = board.latestBotStrengthSnapshot(onCategory)
+            val liveCutoff  = board.latestAppliedCutoff(onCategory)
 
-            (botRows, playRows, snapshotOpt).flatMapN: (botEntries, playerEntries, snapshot) =>
-              val epochOpt = snapshot.map(_.epoch)
-              val merged   =
-                (botEntries.map(b => LeaderboardRoutes.botRow(b, epochOpt)) ++ playerEntries.map(p =>
-                  LeaderboardRoutes.playerRow(p, epochOpt)
-                ))
-                  .sortBy(row =>
-                    (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name)
+            (botRows, playRows, snapshotOpt, liveCutoff).flatMapN:
+              (botEntries, playerEntries, snapshot, liveProvenance) =>
+                val (dataCutoff, computedTime) = liveProvenance
+                val epochOpt                   = snapshot.map(_.epoch)
+                val effectiveCutoff            = dataCutoff.orElse(snapshot.map(_.cutoff))
+                val effectiveComputed          = computedTime.orElse(snapshot.map(_.computedAt))
+                val merged                     =
+                  (botEntries.map(b => LeaderboardRoutes.botRow(b, epochOpt)) ++ playerEntries.map(p =>
+                    LeaderboardRoutes.playerRow(p, epochOpt)
+                  ))
+                    .sortBy(row =>
+                      (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name)
+                    )
+                    .take(limit)
+                val ranked = merged.zipWithIndex.map((row, index) => row.copy(rank = index + 1))
+                Ok(
+                  Leaderboard(
+                    category = onCategory.wireName,
+                    leaders = ranked,
+                    epoch = epochOpt,
+                    anchorSetVersion = snapshot.map(_.anchorSetVersion),
+                    cutoff = effectiveCutoff,
+                    computedAt = effectiveComputed
                   )
-                  .take(limit)
-              val ranked = merged.zipWithIndex.map((row, index) => row.copy(rank = index + 1))
-              Ok(
-                Leaderboard(
-                  category = onCategory.wireName,
-                  leaders = ranked,
-                  epoch = epochOpt,
-                  anchorSetVersion = snapshot.map(_.anchorSetVersion),
-                  cutoff = snapshot.map(_.cutoff),
-                  computedAt = snapshot.map(_.computedAt)
                 )
-              )
 
       case GET -> Root / "leaderboard" / "snapshots" :? CategoryParam(catOpt) +& EpochParam(epochOpt) =>
         LeaderboardRoutes.parseCategory(catOpt) match
@@ -499,7 +504,7 @@ object LeaderboardRoutes:
               algorithmVersion = "v1",
               epoch = 1,
               cutoff = state.updatedAt,
-              computedAt = state.updatedAt,
+              computedAt = state.computedAt.orElse(state.updatedAt),
               games = state.games,
               wins = state.wins,
               draws = state.draws,

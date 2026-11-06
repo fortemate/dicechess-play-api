@@ -50,13 +50,29 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   ): LeaderboardStore =
     new LeaderboardStore:
       def leaderboard(category: RatingCategory, maxRd: Double, limit: Int): IO[List[LeaderboardEntry]] =
+        leaderboard(category, maxRd, limit, None)
+      override def leaderboard(
+          category: RatingCategory,
+          maxRd: Double,
+          limit: Int,
+          asOfCutoff: Option[Instant]
+      ): IO[List[LeaderboardEntry]] =
         IO.pure(entries.getOrElse(category, Nil).filter(_.rd <= maxRd).take(limit))
       def playerLeaderboard(
           category: RatingCategory,
           maxRd: Double,
           limit: Int
       ): IO[List[PlayerLeaderboardEntry]] =
+        playerLeaderboard(category, maxRd, limit, None)
+      override def playerLeaderboard(
+          category: RatingCategory,
+          maxRd: Double,
+          limit: Int,
+          asOfCutoff: Option[Instant]
+      ): IO[List[PlayerLeaderboardEntry]] =
         IO.pure(players.getOrElse(category, Nil).filter(_.rd <= maxRd).take(limit))
+      override def latestAppliedCutoff(category: RatingCategory): IO[(Option[Instant], Option[Instant])] =
+        IO.pure((snapshots.get(category).map(_.cutoff), snapshots.get(category).map(_.computedAt)))
       def categoryTalliesFor(externalId: String): IO[Map[RatingCategory, ResultTally]] =
         IO.pure(categoryTallies.getOrElse(externalId, Map.empty))
       def totalGamesFor(externalId: String): IO[Int] = IO.pure(totals.getOrElse(externalId, 0))
@@ -540,7 +556,8 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
           wins = 15,
           draws = 3,
           losses = 7,
-          updatedAt = Some(at)
+          updatedAt = Some(at),
+          computedAt = Some(at.plusSeconds(3600))
         )
       )
     )
@@ -567,7 +584,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
         assertEquals(blitzTrain.epoch, 1)
         assertEquals(blitzTrain.intervalCalculation, "rating ± 1.96 · rd (95% confidence interval)")
         assertEquals(blitzTrain.cutoff, Some(at))
-        assertEquals(blitzTrain.computedAt, Some(at))
+        assertEquals(blitzTrain.computedAt, Some(at.plusSeconds(3600)))
         assertEquals((blitzTrain.games, blitzTrain.wins, blitzTrain.draws, blitzTrain.losses), (25, 15, 3, 7))
         assertEquals(blitzTrain.ciLow, ((1580.0 - 1.96 * 75.0) * 10).round / 10.0)
         assertEquals(blitzTrain.ciHigh, ((1580.0 + 1.96 * 75.0) * 10).round / 10.0)

@@ -16,7 +16,8 @@ final case class TrainingState(
     wins: Int,
     draws: Int,
     losses: Int,
-    updatedAt: Option[Instant] = None
+    updatedAt: Option[Instant] = None,
+    computedAt: Option[Instant] = None
 ):
   def glicko: Glicko = Glicko(rating, deviation, volatility)
 
@@ -39,7 +40,8 @@ object TrainingState:
     wins = 0,
     draws = 0,
     losses = 0,
-    updatedAt = None
+    updatedAt = None,
+    computedAt = None
   )
 
 /** Where the bot reference of a training update came from (#189). */

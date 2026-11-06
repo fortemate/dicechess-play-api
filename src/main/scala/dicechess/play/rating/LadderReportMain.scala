@@ -109,15 +109,19 @@ object LadderReportMain extends IOApp:
       epoch: Int
   ): List[LeaderRow] =
     val existingMap = existingBots.map(b => (b.team, b.name) -> b).toMap
-    admitted.zipWithIndex.flatMap { (b, rankIndex) =>
+    val eligible    = admitted.flatMap { b =>
       val (teamOpt, name) = parsePlayerKey(b.player)
-      teamOpt
-        .flatMap(t => existingMap.get((t, name)))
-        .map { e =>
-          LeaderboardRoutes
-            .botRow(e, Some(epoch))
-            .copy(rank = rankIndex + 1)
-        }
+      for
+        team  <- teamOpt
+        entry <- existingMap.get((team, name))
+        if entry.rd <= Glicko2.ProvisionalDeviationThreshold
+      yield entry
+    }
+    val sorted = eligible
+      .map(e => LeaderboardRoutes.botRow(e, Some(epoch)))
+      .sortBy(row => (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name))
+    sorted.zipWithIndex.map { (row, index) =>
+      row.copy(rank = index + 1)
     }
 
   private[rating] def publishSnapshot(
@@ -136,7 +140,12 @@ object LadderReportMain extends IOApp:
       else
         val cutoff = rows.flatMap(r => Option(r.finishedAt)).maxOption.getOrElse(Instant.now())
         for
-          existingBots <- store.leaderboard(options.category, maxRd = Double.MaxValue, limit = 500)
+          existingBots <- store.leaderboard(
+            options.category,
+            maxRd = Glicko2.ProvisionalDeviationThreshold,
+            limit = 500,
+            asOfCutoff = Some(cutoff)
+          )
           leaders = assembleLeaders(report.anchored.admitted, existingBots, effectiveAnchor.epoch)
           _ <- store.saveBotStrengthSnapshot(
             category = options.category,

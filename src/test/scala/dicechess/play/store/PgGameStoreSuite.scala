@@ -5209,10 +5209,32 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _ = assertEquals(hist1.map(_.isCurrent), Some(false), "earlier snapshot retired from current")
           _ = assertEquals(hist1.map(_.leaders.head.rating), Some(2200.0))
 
+          // Saving an older snapshot (cutoff0 < cutoff2) must NOT move current cutoff backwards (#150)
+          cutoff0 = Instant.parse("2026-09-01T00:00:00Z")
+          _ <- db.saveBotStrengthSnapshot(
+            cat,
+            epoch = 1,
+            anchorSetVersion = "v1.0",
+            cutoff = cutoff0,
+            leaders = leaders1
+          )
+          snap2StillCurrent <- db.latestBotStrengthSnapshot(cat)
+          _ = assertEquals(snap2StillCurrent.map(_.cutoff), Some(cutoff2), "newer cutoff2 remains current")
+          hist0 <- db.botStrengthSnapshotAt(cat, epoch = 1, cutoff = cutoff0)
+          _ = assertEquals(hist0.map(_.isCurrent), Some(false), "older snapshot saved as non-current")
+
+          // Concurrent saves under transaction advisory lock must both succeed (#150)
+          cutoffA = Instant.parse("2026-10-03T00:00:00Z")
+          cutoffB = Instant.parse("2026-10-04T00:00:00Z")
+          _ <- (
+            db.saveBotStrengthSnapshot(cat, 1, "v1.0", cutoffA, leaders1),
+            db.saveBotStrengthSnapshot(cat, 1, "v1.0", cutoffB, leaders2)
+          ).parTupled
+
           summaries <- db.listBotStrengthSnapshots(cat, epoch = Some(1))
-          _ = assertEquals(summaries.map(_.isCurrent), List(true, false))
-          _ = assertEquals(summaries.map(_.cutoff), List(cutoff2, cutoff1))
-          _ = assertEquals(summaries.map(_.entryCount), List(1, 1))
+          _ = assertEquals(summaries.count(_.isCurrent), 1, "exactly one snapshot remains current")
+          latestAfterConcur <- db.latestBotStrengthSnapshot(cat)
+          _ = assertEquals(latestAfterConcur.map(_.cutoff), Some(cutoffB))
         yield ()
       }
     }

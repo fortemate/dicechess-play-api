@@ -892,6 +892,14 @@ trait LeaderboardStore:
       limit: Int = LeaderboardStore.MaxBoardSize
   ): IO[List[LeaderboardEntry]]
 
+  def leaderboard(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[java.time.Instant]
+  ): IO[List[LeaderboardEntry]] =
+    asOfCutoff.fold(leaderboard(category, maxRd, limit))(_ => leaderboard(category, maxRd, limit))
+
   /** Every ACCOUNT whose rating in `category` has converged (#249) — the human half of the same board, same threshold,
     * same policy, same per-category scoping as [[leaderboard]].
     *
@@ -902,6 +910,14 @@ trait LeaderboardStore:
       maxRd: Double,
       limit: Int = LeaderboardStore.MaxBoardSize
   ): IO[List[PlayerLeaderboardEntry]]
+
+  def playerLeaderboard(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[java.time.Instant]
+  ): IO[List[PlayerLeaderboardEntry]] =
+    asOfCutoff.fold(playerLeaderboard(category, maxRd, limit))(_ => playerLeaderboard(category, maxRd, limit))
 
   /** The rated, decided W-D-L record of one participant (either seat), split by category in one query (#280) — what a
     * profile needs to put a W-D-L beside each of its per-category ratings. Categories the participant has no rated
@@ -945,6 +961,12 @@ trait LeaderboardStore:
       @unused cutoff: java.time.Instant,
       @unused leaders: List[dicechess.play.server.LeaderRow]
   ): IO[Long] = IO.pure(0L)
+
+  /** Reads the data cutoff and computation time of the latest applied rated game in `category` (#150). */
+  def latestAppliedCutoff(
+      @unused category: RatingCategory
+  ): IO[(Option[java.time.Instant], Option[java.time.Instant])] =
+    IO.pure((None, None))
 
 object LeaderboardStore:
   /** Payload guard for the public leaderboard endpoint: the SQL query is bounded to this many rows, so the response

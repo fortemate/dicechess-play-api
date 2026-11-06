@@ -300,3 +300,75 @@ class StrengthReportSuite extends munit.FunSuite:
     assert(md.contains("### Provisional Bots"))
     assert(md.contains("fewer than 50 games or fewer than 5 distinct opponents"))
     assert(md.contains("`[Provisional]`"))
+
+  test("LadderReportMain helpers: parsePlayerKey, resolveEffectiveAnchor, assembleLeaders, and renderReport"):
+    import dicechess.play.rating.AnchoredStrength.RankedBot
+    import dicechess.play.store.{LeaderboardEntry, ResultTally}
+
+    // parsePlayerKey
+    assertEquals(LadderReportMain.parsePlayerKey("oracle/v1"), (Some("oracle"), "v1"))
+    assertEquals(LadderReportMain.parsePlayerKey("standalone"), (None, "standalone"))
+
+    // resolveEffectiveAnchor
+    val defaultBlitz = AnchorSet.Default
+    assertEquals(LadderReportMain.resolveEffectiveAnchor(defaultBlitz, RatingCategory.Default), defaultBlitz)
+    val unanchoredRapid = LadderReportMain.resolveEffectiveAnchor(defaultBlitz, RatingCategory.Rapid)
+    assertEquals(unanchoredRapid.category, "rapid")
+    assertEquals(unanchoredRapid.epoch, 0)
+    val custom = AnchorSet("custom-blitz", 2, "blitz", Nil)
+    assertEquals(LadderReportMain.resolveEffectiveAnchor(custom, RatingCategory.Default), custom)
+
+    // assembleLeaders
+    val admitted = List(
+      RankedBot(
+        "oracle/v1",
+        elo = 1600.0,
+        ciLow = 1550.0,
+        ciHigh = 1650.0,
+        losVsNext = None,
+        status = GraphConnectivity.AdmissionStatus.Admitted,
+        isAnchor = false,
+        games = 10,
+        opponents = 2
+      ),
+      RankedBot(
+        "unknown/v2",
+        elo = 1500.0,
+        ciLow = 1450.0,
+        ciHigh = 1550.0,
+        losVsNext = None,
+        status = GraphConnectivity.AdmissionStatus.Admitted,
+        isAnchor = false,
+        games = 10,
+        opponents = 2
+      ),
+      RankedBot(
+        "no-team",
+        elo = 1400.0,
+        ciLow = 1350.0,
+        ciHigh = 1450.0,
+        losVsNext = None,
+        status = GraphConnectivity.AdmissionStatus.Admitted,
+        isAnchor = false,
+        games = 10,
+        opponents = 2
+      )
+    )
+    val existing = List(
+      LeaderboardEntry("oracle", "v1", 1620.0, 50.0, onLadder = true, ResultTally(6, 2, 2))
+    )
+    val leaders = LadderReportMain.assembleLeaders(admitted, existing, epoch = 1)
+    assertEquals(leaders.size, 1)
+    assertEquals(leaders.head.name, "v1")
+    assertEquals(leaders.head.team, Some("oracle"))
+    assertEquals(leaders.head.rank, 1)
+    assertEquals(leaders.head.epoch, Some(1))
+
+    // renderReport
+    val games   = pair("p1", -1)
+    val report  = StrengthReport.build(games, RatingCategory.Default)
+    val optText =
+      LadderReportMain.Options(StrengthReport.Config(), RatingCategory.Default, None, LadderReportMain.Format.Text)
+    val optMd = optText.copy(format = LadderReportMain.Format.Markdown)
+    assert(LadderReportMain.renderReport(report, optText).contains("Dice Chess ladder — strength report"))
+    assert(LadderReportMain.renderReport(report, optMd).contains("title: Bot Strength Report"))

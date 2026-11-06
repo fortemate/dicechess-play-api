@@ -2,7 +2,9 @@ package dicechess.play.rating
 
 import cats.effect.{ExitCode, IO, IOApp}
 import dicechess.play.core.RatingCategory
-import dicechess.play.store.PgGameStore
+import dicechess.play.rating.AnchoredStrength.RankedBot
+import dicechess.play.server.{LeaderRow, LeaderboardRoutes}
+import dicechess.play.store.{GameResultRow, LeaderboardEntry, PgGameStore}
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
@@ -75,6 +77,79 @@ object LadderReportMain extends IOApp:
       )
       Options(config, RatingCategory.Default, None, Format.Text, saveSnapshot = false)
 
+  private[rating] def renderReport(report: StrengthReport, options: Options): String =
+    options.format match
+      case Format.Markdown => StrengthReport.renderMarkdown(report, options.config)
+      case Format.Text     => StrengthReport.render(report, options.config)
+
+  private[rating] def writeReport(content: String, options: Options): IO[Unit] =
+    options.out match
+      case Some(path) =>
+        IO.blocking {
+          val parent = path.getParent
+          if parent != null then Files.createDirectories(parent)
+          Files.writeString(path, content, UTF_8)
+        } *> IO.println(s"[ladder-report] wrote ${options.format.toString.toLowerCase} report to $path")
+      case None =>
+        IO.println(content)
+
+  private[rating] def resolveEffectiveAnchor(anchorSet: AnchorSet, category: RatingCategory): AnchorSet =
+    if anchorSet.category == category.wireName then anchorSet
+    else if anchorSet == AnchorSet.Default then AnchorSet.unanchored(category.wireName)
+    else anchorSet
+
+  private[rating] def parsePlayerKey(player: String): (Option[String], String) =
+    val idx = player.indexOf('/')
+    if idx >= 0 then (Some(player.substring(0, idx)), player.substring(idx + 1))
+    else (None, player)
+
+  private[rating] def assembleLeaders(
+      admitted: List[RankedBot],
+      existingBots: List[LeaderboardEntry],
+      epoch: Int
+  ): List[LeaderRow] =
+    val existingMap = existingBots.map(b => (b.team, b.name) -> b).toMap
+    admitted.zipWithIndex.flatMap { (b, rankIndex) =>
+      val (teamOpt, name) = parsePlayerKey(b.player)
+      teamOpt
+        .flatMap(t => existingMap.get((t, name)))
+        .map { e =>
+          LeaderboardRoutes
+            .botRow(e, Some(epoch))
+            .copy(rank = rankIndex + 1)
+        }
+    }
+
+  private[rating] def publishSnapshot(
+      store: PgGameStore,
+      options: Options,
+      rows: List[GameResultRow],
+      report: StrengthReport
+  ): IO[Unit] =
+    if !options.saveSnapshot then IO.unit
+    else
+      val effectiveAnchor = resolveEffectiveAnchor(options.config.anchorSet, options.category)
+      if !report.anchored.isCalibrated || effectiveAnchor.epoch < 1 then
+        IO.println(
+          s"[ladder-report] snapshot publication refused: category ${options.category.wireName} is uncalibrated or lacks scale anchors (epoch ${effectiveAnchor.epoch})"
+        )
+      else
+        val cutoff = rows.flatMap(r => Option(r.finishedAt)).maxOption.getOrElse(Instant.now())
+        for
+          existingBots <- store.leaderboard(options.category, maxRd = Double.MaxValue, limit = 500)
+          leaders = assembleLeaders(report.anchored.admitted, existingBots, effectiveAnchor.epoch)
+          _ <- store.saveBotStrengthSnapshot(
+            category = options.category,
+            epoch = effectiveAnchor.epoch,
+            anchorSetVersion = effectiveAnchor.version,
+            cutoff = cutoff,
+            leaders = leaders
+          )
+          _ <- IO.println(
+            s"[ladder-report] saved bot strength snapshot to database for category ${options.category.wireName}"
+          )
+        yield ()
+
   def run(args: List[String]): IO[ExitCode] =
     val options = parseOptions(args)
     PgGameStore.configFromEnv match
@@ -84,64 +159,12 @@ object LadderReportMain extends IOApp:
         PgGameStore
           .resource(dbConfig)
           .use { store =>
-            store
-              .finishedRatedSince(Instant.EPOCH) // every rated game ever — the corpus IS the input
-              .flatMap { rows =>
-                val report  = StrengthReport.build(rows, options.category, options.config)
-                val content = options.format match
-                  case Format.Markdown => StrengthReport.renderMarkdown(report, options.config)
-                  case Format.Text     => StrengthReport.render(report, options.config)
-
-                val writeOut = options.out match
-                  case Some(path) =>
-                    IO.blocking {
-                      val parent = path.getParent
-                      if parent != null then Files.createDirectories(parent)
-                      Files.writeString(path, content, UTF_8)
-                    } *> IO.println(s"[ladder-report] wrote ${options.format.toString.toLowerCase} report to $path")
-                  case None =>
-                    IO.println(content)
-
-                val saveDb = if options.saveSnapshot then
-                  val effectiveAnchor =
-                    if options.config.anchorSet.category == options.category.wireName then options.config.anchorSet
-                    else if options.config.anchorSet == AnchorSet.Default then
-                      AnchorSet.unanchored(options.category.wireName)
-                    else options.config.anchorSet
-
-                  if !report.anchored.isCalibrated || effectiveAnchor.epoch < 1 then
-                    IO.println(
-                      s"[ladder-report] snapshot publication refused: category ${options.category.wireName} is uncalibrated or lacks scale anchors (epoch ${effectiveAnchor.epoch})"
-                    )
-                  else
-                    val cutoff = rows.flatMap(r => Option(r.finishedAt)).maxOption.getOrElse(Instant.now())
-                    store.leaderboard(options.category, maxRd = Double.MaxValue, limit = 500).flatMap { existingBots =>
-                      val existingMap = existingBots.map(b => (b.team, b.name) -> b).toMap
-                      val leaders     = report.anchored.admitted.zipWithIndex.flatMap { (b, rankIndex) =>
-                        val idx             = b.player.indexOf('/')
-                        val (teamOpt, name) =
-                          if idx >= 0 then (Some(b.player.substring(0, idx)), b.player.substring(idx + 1))
-                          else (None, b.player)
-                        val existing = teamOpt.flatMap(t => existingMap.get((t, name)))
-                        existing.map { e =>
-                          dicechess.play.server.LeaderboardRoutes
-                            .botRow(e, Some(effectiveAnchor.epoch))
-                            .copy(rank = rankIndex + 1)
-                        }
-                      }
-                      store.saveBotStrengthSnapshot(
-                        category = options.category,
-                        epoch = effectiveAnchor.epoch,
-                        anchorSetVersion = effectiveAnchor.version,
-                        cutoff = cutoff,
-                        leaders = leaders
-                      ) *> IO.println(
-                        s"[ladder-report] saved bot strength snapshot to database for category ${options.category.wireName}"
-                      )
-                    }
-                else IO.unit
-
-                writeOut *> saveDb
-              }
+            for
+              rows <- store.finishedRatedSince(Instant.EPOCH) // every rated game ever — the corpus IS the input
+              report  = StrengthReport.build(rows, options.category, options.config)
+              content = renderReport(report, options)
+              _ <- writeReport(content, options)
+              _ <- publishSnapshot(store, options, rows, report)
+            yield ()
           }
           .as(ExitCode.Success)

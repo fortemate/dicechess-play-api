@@ -128,8 +128,16 @@ object LadderReportMain extends IOApp:
           s"[ladder-report] snapshot publication refused: category ${options.category.wireName} is uncalibrated or lacks scale anchors (epoch ${effectiveAnchor.epoch})"
         )
       else
-        val cutoff = rows.flatMap(r => Option(r.finishedAt)).maxOption.getOrElse(Instant.now())
+        val categoryRows = rows.filter(r => RatingCategory.ofStored(r.timeControl).contains(options.category))
+        val corpusCutoff = categoryRows.flatMap(r => Option(r.finishedAt)).maxOption
         for
+          appliedCutoffPair <- store.latestAppliedCutoff(options.category)
+          appliedCutoffOpt = appliedCutoffPair._1
+          cutoff           = (corpusCutoff, appliedCutoffOpt) match
+            case (Some(cc), Some(ac)) => if cc.isBefore(ac) then cc else ac
+            case (Some(cc), None)     => cc
+            case (None, Some(ac))     => ac
+            case (None, None)         => Instant.now()
           existingBots <- store.leaderboard(
             options.category,
             maxRd = Glicko2.ProvisionalDeviationThreshold,
@@ -137,16 +145,22 @@ object LadderReportMain extends IOApp:
             asOfCutoff = Some(cutoff)
           )
           leaders = assembleLeaders(existingBots, effectiveAnchor.epoch)
-          _ <- store.saveBotStrengthSnapshot(
+          saveResult <- store.saveBotStrengthSnapshot(
             category = options.category,
             epoch = effectiveAnchor.epoch,
             anchorSetVersion = effectiveAnchor.version,
             cutoff = cutoff,
             leaders = leaders
           )
-          _ <- IO.println(
-            s"[ladder-report] saved bot strength snapshot to database for category ${options.category.wireName}"
-          )
+          _ <-
+            if saveResult.inserted then
+              IO.println(
+                s"[ladder-report] saved new bot strength snapshot (id=${saveResult.id}) for category ${options.category.wireName}"
+              )
+            else
+              IO.println(
+                s"[ladder-report] retained existing immutable snapshot (id=${saveResult.id}) for category ${options.category.wireName} at cutoff $cutoff"
+              )
         yield ()
 
   def run(args: List[String]): IO[ExitCode] =

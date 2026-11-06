@@ -46,7 +46,8 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       // this map, not a second read.
       categoryTallies: Map[String, Map[RatingCategory, ResultTally]],
       snapshots: Map[RatingCategory, RatingSnapshot],
-      snapshotHistory: List[RatingSnapshot]
+      snapshotHistory: List[RatingSnapshot],
+      liveCutoffs: Map[RatingCategory, (Option[Instant], Option[Instant])]
   ): LeaderboardStore =
     new LeaderboardStore:
       def leaderboard(category: RatingCategory, maxRd: Double, limit: Int): IO[List[LeaderboardEntry]] =
@@ -72,7 +73,9 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       ): IO[List[PlayerLeaderboardEntry]] =
         IO.pure(players.getOrElse(category, Nil).filter(_.rd <= maxRd).take(limit))
       override def latestAppliedCutoff(category: RatingCategory): IO[(Option[Instant], Option[Instant])] =
-        IO.pure((snapshots.get(category).map(_.cutoff), snapshots.get(category).map(_.computedAt)))
+        liveCutoffs.get(category) match
+          case Some(pair) => IO.pure(pair)
+          case None       => IO.pure((snapshots.get(category).map(_.cutoff), snapshots.get(category).map(_.computedAt)))
       def categoryTalliesFor(externalId: String): IO[Map[RatingCategory, ResultTally]] =
         IO.pure(categoryTallies.getOrElse(externalId, Map.empty))
       def totalGamesFor(externalId: String): IO[Int] = IO.pure(totals.getOrElse(externalId, 0))
@@ -172,6 +175,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       categoryTallies: Map[String, Map[RatingCategory, ResultTally]] = Map.empty,
       snapshots: Map[RatingCategory, RatingSnapshot] = Map.empty,
       snapshotHistory: List[RatingSnapshot] = Nil,
+      liveCutoffs: Map[RatingCategory, (Option[Instant], Option[Instant])] = Map.empty,
       training: Map[String, Map[RatingCategory, TrainingState]] = Map.empty
   ): HttpApp[IO] =
     LeaderboardRoutes(
@@ -182,7 +186,8 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
         totals,
         categoryTallies,
         snapshots,
-        snapshotHistory
+        snapshotHistory,
+        liveCutoffs
       ),
       stubResults(recent, opponents),
       stubRatings(ratings, training),
@@ -518,17 +523,24 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   )
 
   test("GET /leaderboard serves versioned metadata while preserving competitive Glicko-2 ratings (#150)"):
-    val service = app(
+    val liveCutoff   = at.plusSeconds(3600)
+    val liveComputed = at.plusSeconds(7200)
+    val service      = app(
       bots = Map(("aws", "hunter-v30") -> BotRating(onLadder = true, None)),
       entries = List(LeaderboardEntry("aws", "hunter-v30", 2905.89, 50.0, onLadder = true, ResultTally(90, 5, 5))),
-      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot)
+      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
+      liveCutoffs = Map(RatingCategory.Blitz -> (Some(liveCutoff), Some(liveComputed)))
     )
     service.run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Leaderboard]).map { board =>
       assertEquals(board.category, "blitz")
       assertEquals(board.epoch, Some(1))
       assertEquals(board.anchorSetVersion, Some("v1.0"))
-      assertEquals(board.cutoff, Some(at))
-      assertEquals(board.computedAt, Some(at))
+      assertEquals(board.cutoff, Some(liveCutoff), "cutoff should prefer live provenance over snapshot cutoff")
+      assertEquals(
+        board.computedAt,
+        Some(liveComputed),
+        "computedAt should prefer live provenance over snapshot computedAt"
+      )
       assertEquals(board.leaders.map(_.name), List("hunter-v30"))
       val hunter = board.leaders.head
       assertEquals(hunter.team, Some("aws"))
@@ -662,4 +674,31 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       assertEquals(latest, None)
       assertEquals(atSnap, None)
       assertEquals(list, Nil)
-      assertEquals(saved, 0L)
+      assertEquals(saved, dicechess.play.store.LeaderboardStore.SnapshotSaveResult(0L, false))
+
+  test("GET /leaderboard/snapshots returns 400 for invalid non-integer epoch"):
+    val service = app()
+    service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots?epoch=not-a-number")).map { resp =>
+      assertEquals(resp.status, Status.BadRequest)
+    }
+
+  test("LeaderRow preserves 'team: null' for players and omits empty snapshot metadata in raw JSON"):
+    import io.circe.syntax.*
+    val botRow = LeaderboardRoutes.botRow(
+      LeaderboardEntry("acme", "bot1", 1600.0, 50.0, onLadder = true, ResultTally.Empty),
+      snapshotEpoch = None
+    )
+    val playerRow =
+      LeaderboardRoutes.playerRow(
+        PlayerLeaderboardEntry("Player1", 1550.0, 60.0, ResultTally.Empty),
+        snapshotEpoch = None
+      )
+
+    val botJson    = botRow.asJson.noSpaces
+    val playerJson = playerRow.asJson.noSpaces
+
+    assert(botJson.contains("\"team\":\"acme\""), "bot row must contain team")
+    assert(playerJson.contains("\"team\":null"), "player row must retain 'team: null' for API consumers")
+    assert(!botJson.contains("\"epoch\""), "unset epoch must be omitted")
+    assert(!playerJson.contains("\"epoch\""), "unset epoch must be omitted")
+    assert(!botJson.contains("\"domain\""), "unset domain must be omitted")

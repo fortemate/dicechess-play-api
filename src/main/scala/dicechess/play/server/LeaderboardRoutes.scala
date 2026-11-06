@@ -54,9 +54,21 @@ final case class LeaderRow(
 )
 
 object LeaderRow:
+  private val omitIfNull =
+    Set("domain", "algorithm", "epoch", "orderingValue", "orderingRule", "ciLow", "ciHigh")
+
   given Codec[LeaderRow] =
     val base = deriveCodec[LeaderRow]
-    Codec.from(base, base.mapJson(_.dropNullValues))
+    Codec.from(
+      base,
+      base.mapJson { json =>
+        json.asObject.fold(json) { obj =>
+          io.circe.Json.fromJsonObject(obj.filter { case (k, v) =>
+            !(v.isNull && omitIfNull.contains(k))
+          })
+        }
+      }
+    )
 
 /** The public board. Provisional entrants (RD above the convergence threshold) are absent by policy (#119) — the same
   * rule for accounts as for bots.
@@ -293,7 +305,7 @@ object LeaderboardRoutes:
   /** `?category=` selects the scale (#280); absent is [[RatingCategory.Default]], the ladder's. */
   private object CategoryParam extends OptionalQueryParamDecoderMatcher[String]("category")
 
-  private object EpochParam extends OptionalQueryParamDecoderMatcher[Int]("epoch")
+  private object EpochParam extends OptionalValidatingQueryParamDecoderMatcher[Int]("epoch")
 
   /** One participant's per-category standing (#280): the categories it has been rated in, each with the W-D-L that
     * produced that rating, in enum order so a client's tabs never reshuffle.
@@ -360,10 +372,17 @@ object LeaderboardRoutes:
                   )
                 )
 
-      case GET -> Root / "leaderboard" / "snapshots" :? CategoryParam(catOpt) +& EpochParam(epochOpt) =>
+      case GET -> Root / "leaderboard" / "snapshots" :? CategoryParam(catOpt) +& EpochParam(epochVal) =>
         LeaderboardRoutes.parseCategory(catOpt) match
           case Left(err)  => BadRequest(err)
-          case Right(cat) => board.listBotStrengthSnapshots(cat, epochOpt).flatMap(Ok(_))
+          case Right(cat) =>
+            epochVal match
+              case Some(cats.data.Validated.Invalid(errors)) =>
+                BadRequest(s"epoch must be an integer, got: ${errors.head.sanitized}")
+              case Some(cats.data.Validated.Valid(epoch)) =>
+                board.listBotStrengthSnapshots(cat, Some(epoch)).flatMap(Ok(_))
+              case None =>
+                board.listBotStrengthSnapshots(cat, None).flatMap(Ok(_))
 
       case GET -> Root / "leaderboard" / "snapshots" / category / "latest" =>
         RatingCategory.fromWireName(category) match

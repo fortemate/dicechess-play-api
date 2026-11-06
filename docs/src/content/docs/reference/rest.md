@@ -448,4 +448,51 @@ One registered bot's public card: rating summary, its aggregate record against e
 }
 ```
 
+### Player profile
+
+`GET /players/by-nickname/{nick}`
+
+One registered human player's public card: their nickname, account status, competitive per-category ratings, up to 20 recent games, and versioned training estimates against calibrated bots:
+
+```json
+{
+  "nickname": "Player1",
+  "isActive": true,
+  "ratings": [
+    {
+      "category": "blitz",
+      "rating": 1650.0,
+      "rd": 65.0,
+      "provisional": false,
+      "games": 42,
+      "wins": 25,
+      "draws": 5,
+      "losses": 12
+    }
+  ],
+  "training": [
+    {
+      "category": "blitz",
+      "rating": 1580.0,
+      "rd": 95.0,
+      "provisional": false,
+      "ciLow": 1393.8,
+      "ciHigh": 1766.2,
+      "intervalCalculation": "glicko2-95ci-rd",
+      "domain": "training",
+      "algorithm": "glicko2",
+      "algorithmVersion": "v1",
+      "epoch": 1,
+      "cutoff": "2026-11-06T15:00:00Z",
+      "computedAt": "2026-11-06T15:05:00Z",
+      "games": 18,
+      "wins": 10,
+      "draws": 2,
+      "losses": 6
+    }
+  ],
+  "recent": []
+}
+```
+
 Errors: `404` no registered bot with that team/name.

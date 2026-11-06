@@ -3424,11 +3424,23 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       players <-
         if wantedPlayers then playerLeaderboardSql(category, maxRd, limit, None)
         else List.empty[PlayerLeaderboardEntry].pure[ConnectionIO]
-      snapshot <- latestBotStrengthSnapshotSql(category)
+      snapshot <- latestBotStrengthSnapshotMetadataSql(category)
       cutoff   <- latestAppliedCutoffSql(category)
     yield LeaderboardStore.LiveLeaderboardView(bots, players, snapshot, cutoff._1, cutoff._2)
 
     tx.transact(xa).timeout(SaveTimeout)
+
+  private def latestBotStrengthSnapshotMetadataSql(category: RatingCategory): ConnectionIO[Option[RatingSnapshot]] =
+    sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current
+          FROM play.bot_strength_snapshots
+          WHERE category = ${category.wireName} AND is_current = TRUE
+          ORDER BY epoch DESC, computed_at DESC
+          LIMIT 1"""
+      .query[(String, Int, String, Instant, Instant, Boolean)]
+      .option
+      .map(_.map { case (cat, ep, anchorSetVer, cutoff, computedAt, isCurrent) =>
+        RatingSnapshot(cat, ep, anchorSetVer, cutoff, computedAt, isCurrent, Nil)
+      })
 
   private def latestBotStrengthSnapshotSql(category: RatingCategory): ConnectionIO[Option[RatingSnapshot]] =
     sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
@@ -3509,7 +3521,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       anchorSetVersion: String,
       cutoff: Instant,
       leaders: List[dicechess.play.server.LeaderRow]
-  ): IO[Long] =
+  ): IO[LeaderboardStore.SnapshotSaveResult] =
     if epoch < 1 then IO.raiseError(new IllegalArgumentException(s"Cannot save snapshot with epoch $epoch < 1"))
     else
       val payload = io.circe.Json.obj("leaders" -> io.circe.syntax.EncoderOps(leaders).asJson)
@@ -3518,8 +3530,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
         _ <- sql"""SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($lockKey, 0))""".query[Int].unique.void
         insertedIdOpt <- sql"""INSERT INTO play.bot_strength_snapshots
                                  (category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload)
-                               VALUES (${category.wireName}, $epoch, $anchorSetVersion, $cutoff, ${Instant
-            .now()}, FALSE, $payload)
+                               VALUES (${category.wireName}, $epoch, $anchorSetVersion, $cutoff, clock_timestamp(), FALSE, $payload)
                                ON CONFLICT (category, epoch, cutoff) DO NOTHING
                                RETURNING id""".query[Long].option
         id <- insertedIdOpt match
@@ -3543,7 +3554,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                        WHERE id = $id""".update.run
             yield ()
           else ().pure[ConnectionIO]
-      yield id
+      yield LeaderboardStore.SnapshotSaveResult(id, insertedIdOpt.isDefined)
       tx.transact(xa).timeout(SaveTimeout)
 
   // ── UserStore (#232) ────────────────────────────────────────────────────────

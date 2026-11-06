@@ -5169,7 +5169,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             cutoff = cutoff1,
             leaders = leaders1
           )
-          _ = assert(id1 > 0L, s"id1 was $id1")
+          _ = assert(id1.id > 0L, s"id1 was ${id1.id}")
+          _ = assert(id1.inserted, "id1 must be newly inserted")
           snap1Latest <- db.latestBotStrengthSnapshot(cat)
           _ = assertEquals(snap1Latest.map(_.isCurrent), Some(true))
           _ = assertEquals(snap1Latest.map(_.cutoff), Some(cutoff1))
@@ -5183,7 +5184,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             cutoff = cutoff1,
             leaders = List(leader1.copy(rating = 9999.0))
           )
-          _ = assertEquals(idDup, id1, "conflict returns existing id")
+          _ = assertEquals(idDup.id, id1.id, "conflict returns existing id")
+          _ = assert(!idDup.inserted, "conflict must report inserted = false")
           hist1Again <- db.botStrengthSnapshotAt(cat, epoch = 1, cutoff = cutoff1)
           _ = assertEquals(
             hist1Again.map(_.leaders.head.rating),
@@ -5198,7 +5200,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             cutoff = cutoff2,
             leaders = leaders2
           )
-          _ = assert(id2 > id1, s"id2 ($id2) must be > id1 ($id1)")
+          _ = assert(id2.id > id1.id, s"id2 (${id2.id}) must be > id1 (${id1.id})")
+          _ = assert(id2.inserted, "id2 must be newly inserted")
 
           snap2Latest <- db.latestBotStrengthSnapshot(cat)
           _ = assertEquals(snap2Latest.map(_.isCurrent), Some(true))

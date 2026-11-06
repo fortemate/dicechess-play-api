@@ -109,7 +109,7 @@ The leaderboard preserves competitive Glicko-2 ratings for both bots and players
 
 Internal offline calibration reports and admission graphs remain internal operator tooling; published snapshot endpoints serve finalized public ratings.
 
-Human-versus-bot training games are tracked in an isolated training domain (`user_training_ratings`) and served as `training` estimates on [`GET /players/by-nickname/{nick}`](../reference/rest/#leaderboard-bot-profiles). Training estimates are publicly visible on player profiles for spectators, tournament organizers, and the player, but are strictly isolated from competitive ratings. Each training estimate specifies `domain` (`training`), `algorithm` (`glicko2`), `algorithmVersion` (`v1`), `epoch`, interval calculation, and provisional status.
+Human-versus-bot training games are tracked in an isolated training domain (`user_training_ratings`) and served as `training` estimates on [`GET /players/by-nickname/{nick}`](../reference/rest/#player-profile). Training estimates are publicly visible on player profiles for spectators, tournament organizers, and the player, but are strictly isolated from competitive ratings. Each training estimate specifies `domain` (`training`), `algorithm` (`glicko2`), `algorithmVersion` (`v1`), `epoch`, interval calculation, and provisional status.
 
 ## Joining and leaving
 

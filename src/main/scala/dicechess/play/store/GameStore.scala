@@ -960,7 +960,7 @@ trait LeaderboardStore:
       @unused anchorSetVersion: String,
       @unused cutoff: java.time.Instant,
       @unused leaders: List[dicechess.play.server.LeaderRow]
-  ): IO[Long] = IO.pure(0L)
+  ): IO[LeaderboardStore.SnapshotSaveResult] = IO.pure(LeaderboardStore.SnapshotSaveResult(0L, false))
 
   /** Reads the data cutoff and computation time of the latest applied rated game in `category` (#150). */
   def latestAppliedCutoff(
@@ -984,6 +984,8 @@ trait LeaderboardStore:
     yield LeaderboardStore.LiveLeaderboardView(b, p, s, c._1, c._2)
 
 object LeaderboardStore:
+  final case class SnapshotSaveResult(id: Long, inserted: Boolean)
+
   final case class LiveLeaderboardView(
       bots: List[LeaderboardEntry],
       players: List[PlayerLeaderboardEntry],

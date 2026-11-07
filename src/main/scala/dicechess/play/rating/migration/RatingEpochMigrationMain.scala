@@ -21,11 +21,13 @@ import scala.util.control.NonFatal
   * separately. No credentials or SQL exception text are printed. Every output directory must be new.
   */
 object RatingEpochMigrationMain extends IOApp:
-  private val Utf8             = StandardCharsets.UTF_8
-  private val MaxDocumentBytes = 1024 * 1024
-  private val MaxPlanBytes     = 512 * 1024 * 1024
-  private val MaxLineChars     = 1024 * 1024
-  private val Roles            = Set("classification", "continuity", "ownership", "order", "reset")
+  private val Utf8               = StandardCharsets.UTF_8
+  private val MaxDocumentBytes   = 1024 * 1024
+  private val MaxPlanBytes       = 512 * 1024 * 1024
+  private val MaxLineChars       = 1024 * 1024
+  private val Roles              = Set("classification", "continuity", "ownership", "order", "reset")
+  private val PlanSha256Option   = "plan-sha256"
+  private val SourceSha256Option = "source-sha256"
 
   /** Human-reviewed evidence payload. The CLI verifies bytes, declared use and exact game scope; the evidence's factual
     * assertions must be vetted at human acceptance. Creating a hash is not an ownership/history proof.
@@ -54,8 +56,8 @@ object RatingEpochMigrationMain extends IOApp:
       "probe"    -> Set.empty[String],
       "pause"    -> Set("revision"),
       "resume"   -> Set("revision"),
-      "stage"    -> Set("plan", "source", "artifacts", "revision", "source-sha256", "plan-sha256"),
-      "activate" -> Set("run", "revision", "plan-sha256"),
+      "stage"    -> Set("plan", "source", "artifacts", "revision", SourceSha256Option, PlanSha256Option),
+      "activate" -> Set("run", "revision", PlanSha256Option),
       "rollback" -> Set("run", "revision"),
       "status"   -> Set("run")
     )
@@ -259,9 +261,9 @@ object RatingEpochMigrationMain extends IOApp:
   private def verifyPlan(options: Options): Plan =
     val values = options.values
     val plan   = readPlan(Paths.get(values("plan")))
-    if !plan.config.databaseSourceSha256.contains(values("source-sha256")) then
+    if !plan.config.databaseSourceSha256.contains(values(SourceSha256Option)) then
       refuse("plan must bind the exact probed database source fingerprint before staging")
-    if planDigest(plan) != values("plan-sha256") then refuse("plan digest differs from the accepted immutable plan")
+    if planDigest(plan) != values(PlanSha256Option) then refuse("plan digest differs from the accepted immutable plan")
     val rebuilt = reconstruct(plan.config, Paths.get(values("source")), Paths.get(values("artifacts")))
     if planDigest(rebuilt) != planDigest(plan) then refuse("plan does not reproduce from its source/evidence artifacts")
     plan
@@ -310,11 +312,11 @@ object RatingEpochMigrationMain extends IOApp:
           case "resume" => executor.setPaused(revision, false).flatMap(value => IO.println(value.asJson.noSpaces))
           case "stage"  =>
             IO.blocking(verifyPlan(options))
-              .flatMap(plan => executor.stage(plan, revision, values("source-sha256")))
+              .flatMap(plan => executor.stage(plan, revision, values(SourceSha256Option)))
               .flatMap(value => IO.println(value.asJson.noSpaces))
           case "activate" =>
             executor
-              .activate(runId, revision, values("plan-sha256"))
+              .activate(runId, revision, values(PlanSha256Option))
               .flatMap(value => IO.println(value.asJson.noSpaces))
           case "rollback" => executor.rollback(runId, revision).flatMap(value => IO.println(value.asJson.noSpaces))
           case "status"   => executor.status(runId).flatMap(value => IO.println(value.asJson.noSpaces))

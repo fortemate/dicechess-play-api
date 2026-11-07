@@ -49,14 +49,15 @@ class RatingEpochPlanSuite extends FunSuite:
     TrainingReference(TrainingReferenceSource.Anchor("synthetic-recorded-v1", 1), Glicko(1700, 50, 0.06))
   )
 
+  final private case class Pairing(origin: GameOrigin = GameOrigin.Ladder, ladder: Boolean = true)
+
   private def game(
       id: String = "one",
       white: SourceSeat = botA,
       black: SourceSeat = botB,
       at: Instant = start,
       control: String = "Fischer(300,3)",
-      origin: GameOrigin = GameOrigin.Ladder,
-      ladder: Boolean = true,
+      pairing: Pairing = Pairing(),
       result: Option[Int] = Some(1)
   ): SourceGame =
     def principal(seat: SourceSeat): Principal = seat.kind match
@@ -69,8 +70,8 @@ class RatingEpochPlanSuite extends FunSuite:
       principal(black),
       true,
       TimeControl.parse(control).get,
-      origin,
-      ladder
+      pairing.origin,
+      pairing.ladder
     )
     SourceGame(
       id,
@@ -80,8 +81,8 @@ class RatingEpochPlanSuite extends FunSuite:
       black,
       result,
       "king_captured",
-      origin,
-      ladder,
+      pairing.origin,
+      pairing.ladder,
       true,
       RatingOutcome.Applied,
       Some(ClassificationEvidence(2, true, classification.rated, classification.domain, evidence)),
@@ -172,7 +173,7 @@ class RatingEpochPlanSuite extends FunSuite:
 
   test("known exclusions have explicit ledger reasons"):
     val ownBot     = game(white = userA).copy(ownership = Some(OwnershipEvidence(true, evidence)))
-    val direct     = game(origin = GameOrigin.Legacy, ladder = false)
+    val direct     = game(pairing = Pairing(GameOrigin.Legacy, ladder = false))
     val missingRef = game(white = userA).copy(reference = CapturedTrainingReference.Unavailable)
     val skipped    = game().copy(outcome = RatingOutcome.Skipped, skipReason = Some("synthetic prior skip"))
     Vector(
@@ -191,7 +192,7 @@ class RatingEpochPlanSuite extends FunSuite:
     }
 
   test("classification mismatches cannot override the matrix"):
-    val direct = game(origin = GameOrigin.Legacy, ladder = false)
+    val direct = game(pairing = Pairing(GameOrigin.Legacy, ladder = false))
     val output = plan(
       direct.copy(classification = direct.classification.map(_.copy(rated = true, domain = RatingDomain.Competitive)))
     )

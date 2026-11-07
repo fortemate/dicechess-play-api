@@ -3095,8 +3095,10 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       black: Option[RatingUpdate],
       skipReason: Option[String] = None
   ): ConnectionIO[Unit] =
-    def before(update: Option[RatingUpdate]) = update.map(_.before.rating)
-    def after(update: Option[RatingUpdate])  = update.map(_.after.rating)
+    def before(update: Option[RatingUpdate])   = update.map(_.before.rating)
+    def after(update: Option[RatingUpdate])    = update.map(_.after.rating)
+    def rdBefore(update: Option[RatingUpdate]) = update.map(_.before.deviation)
+    def rdAfter(update: Option[RatingUpdate])  = update.map(_.after.deviation)
     // The outcome travels with the stamp (#146): `applied` when both seats' updates are written, `skipped` with the
     // batch's reason otherwise — so the stamp is never the only evidence of what happened to the row.
     val outcome =
@@ -3107,6 +3109,10 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
               white_rating_after = ${after(white)},
               black_rating_before = ${before(black)},
               black_rating_after = ${after(black)},
+              white_rd_before = ${rdBefore(white)},
+              white_rd_after = ${rdAfter(white)},
+              black_rd_before = ${rdBefore(black)},
+              black_rd_after = ${rdAfter(black)},
               rating_outcome = $outcome,
               rating_skip_reason = $skipReason
           WHERE game_id = ${gameId.value}::uuid""".update.run.void
@@ -3184,7 +3190,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       case Some(cut) =>
         sql"""SELECT b.team, b.name,
                      COALESCE(latest_game.rating_after, 1500.0) AS effective_rating,
-                     CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END AS effective_rd,
+                     COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) AS effective_rd,
                      b.on_ladder,
                      COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
               FROM play.bots b
@@ -3194,7 +3200,11 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                 SELECT CASE
                          WHEN white_external_id = 'bot:team:' || b.team || ':' || b.name THEN white_rating_after
                          ELSE black_rating_after
-                       END AS rating_after
+                       END AS rating_after,
+                       CASE
+                         WHEN white_external_id = 'bot:team:' || b.team || ':' || b.name THEN white_rd_after
+                         ELSE black_rd_after
+                       END AS rd_after
                 FROM play.game_results
                 WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
                   AND result IS NOT NULL AND category = ${category.wireName}
@@ -3206,7 +3216,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                     OR
                     (black_external_id = 'bot:team:' || b.team || ':' || b.name AND black_rating_after IS NOT NULL)
                   )
-                ORDER BY finished_at DESC, game_id DESC
+                ORDER BY finished_at DESC, rating_applied_at DESC NULLS LAST, game_id DESC
                 LIMIT 1
               ) latest_game ON true
               LEFT JOIN (
@@ -3232,9 +3242,9 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                 ) sides
                 GROUP BY external_id
               ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
-              WHERE (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) <= $maxRd
-              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) DESC,
-                       (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) ASC,
+              WHERE (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) <= $maxRd
+              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) DESC,
+                       (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) ASC,
                        b.team, b.name
               LIMIT ${limit.toLong}"""
           .query[(String, String, Double, Double, Boolean, Int, Int, Int)]
@@ -3308,7 +3318,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       case Some(cut) =>
         sql"""SELECT u.nickname,
                      COALESCE(latest_game.rating_after, 1500.0) AS effective_rating,
-                     CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END AS effective_rd,
+                     COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) AS effective_rd,
                      COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
               FROM play.users u
               JOIN play.user_ratings r ON r.user_id = u.id AND r.category = ${category.wireName}
@@ -3316,7 +3326,11 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                 SELECT CASE
                          WHEN white_external_id = 'user:' || u.id::text THEN white_rating_after
                          ELSE black_rating_after
-                       END AS rating_after
+                       END AS rating_after,
+                       CASE
+                         WHEN white_external_id = 'user:' || u.id::text THEN white_rd_after
+                         ELSE black_rd_after
+                       END AS rd_after
                 FROM play.game_results
                 WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
                   AND result IS NOT NULL AND category = ${category.wireName}
@@ -3328,7 +3342,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                     OR
                     (black_external_id = 'user:' || u.id::text AND black_rating_after IS NOT NULL)
                   )
-                ORDER BY finished_at DESC, game_id DESC
+                ORDER BY finished_at DESC, rating_applied_at DESC NULLS LAST, game_id DESC
                 LIMIT 1
               ) latest_game ON true
               LEFT JOIN (
@@ -3354,9 +3368,9 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                 ) sides
                 GROUP BY external_id
               ) t ON t.external_id = 'user:' || u.id::text
-              WHERE (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) <= $maxRd AND u.is_active
-              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) DESC,
-                       (CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) ASC,
+              WHERE (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) <= $maxRd AND u.is_active
+              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) DESC,
+                       (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) ASC,
                        u.nickname
               LIMIT ${limit.toLong}"""
           .query[(String, Double, Double, Int, Int, Int)]

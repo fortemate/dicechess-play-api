@@ -5299,7 +5299,46 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             Some(1800.0),
             "advancing live rating must not change historical rating at earlier cutoff"
           )
+          _ = assertEquals(
+            boardOct1Post.find(_.name == "bot-a").map(_.rd),
+            Some(80.0),
+            "advancing live rd must not change historical rd at earlier cutoff"
+          )
           _ = assertEquals(boardOct1Post.find(_.name == "bot-a").map(_.tally.games), Some(1))
+
+          // Crucial regression (P2): multiple games at identical finished_at must resolve by rating_applied_at, not random UUID
+          idSame1 <- GameId.random
+          idSame2 <- GameId.random
+          _       <- db.save(idSame1, endedResultFixture(botA, botB, rated = true))
+          _       <- db.save(idSame2, endedResultFixture(botA, botB, rated = true))
+          updateSame1A = seeded(RatedIdentity.of(botA), 2100.0, 65.0)
+          updateSame1B = seeded(RatedIdentity.of(botB), 1250.0, 65.0)
+          updateSame2A = seeded(RatedIdentity.of(botA), 2200.0, 60.0)
+          updateSame2B = seeded(RatedIdentity.of(botB), 1200.0, 60.0)
+          _ <- db.applyRatingUpdate(idSame1, updateSame1A, updateSame1B)
+          _ <- db.applyRatingUpdate(idSame2, updateSame2A, updateSame2B)
+          cutoffOct3 = Instant.parse("2026-10-03T12:00:00Z")
+          appTime1   = Instant.parse("2026-10-03T12:01:00Z")
+          appTime2   = Instant.parse("2026-10-03T12:02:00Z")
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct3, rating_applied_at = $appTime1 WHERE game_id = ${idSame1.value}::uuid".update.run
+              .transact(xa)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct3, rating_applied_at = $appTime2 WHERE game_id = ${idSame2.value}::uuid".update.run
+              .transact(xa)
+          boardOct3 <- db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct3))
+            .map(_.filter(_.team == team))
+          _ = assertEquals(
+            boardOct3.find(_.name == "bot-a").map(_.rating),
+            Some(2200.0),
+            "games at identical finished_at must pick the later rating_applied_at, not random UUID"
+          )
+          _ = assertEquals(
+            boardOct3.find(_.name == "bot-a").map(_.rd),
+            Some(60.0),
+            "games at identical finished_at must pick the later rating_applied_at RD"
+          )
 
           // And liveLeaderboardView must return consistent view
           view <- db.liveLeaderboardView(cat, wantedBots = true, wantedPlayers = false, maxRd = 110.0, limit = 10)

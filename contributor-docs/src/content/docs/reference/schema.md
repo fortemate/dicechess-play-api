@@ -329,6 +329,10 @@ Indexes:
 | `training_reference_rating` | `double precision` | yes | — | — |
 | `training_reference_rd` | `double precision` | yes | — | — |
 | `training_reference_vol` | `double precision` | yes | — | — |
+| `white_rd_before` | `double precision` | yes | — | — |
+| `white_rd_after` | `double precision` | yes | — | — |
+| `black_rd_before` | `double precision` | yes | — | — |
+| `black_rd_after` | `double precision` | yes | — | — |
 
 Check constraints:
 

@@ -29,3 +29,9 @@ CREATE INDEX IF NOT EXISTS bot_strength_snapshots_lookup_idx
 
 -- #150: Record calculation timestamp for user training estimates independently from game finish cutoff.
 ALTER TABLE user_training_ratings ADD COLUMN IF NOT EXISTS computed_at timestamptz;
+
+-- #150: Track rating deviation (RD) changes alongside ratings for historical cutoff consistency.
+ALTER TABLE game_results ADD COLUMN IF NOT EXISTS white_rd_before double precision;
+ALTER TABLE game_results ADD COLUMN IF NOT EXISTS white_rd_after double precision;
+ALTER TABLE game_results ADD COLUMN IF NOT EXISTS black_rd_before double precision;
+ALTER TABLE game_results ADD COLUMN IF NOT EXISTS black_rd_after double precision;

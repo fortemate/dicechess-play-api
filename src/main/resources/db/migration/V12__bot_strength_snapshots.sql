@@ -49,6 +49,7 @@ WITH latest_bot_games AS (
   JOIN game_results g
     ON g.category = r.category
    AND g.rating_outcome IN ('applied', 'legacy')
+   AND g.rating_domain <> 'training'
    AND (
      (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
      OR
@@ -72,6 +73,7 @@ WITH latest_bot_games AS (
   JOIN game_results g
     ON g.category = r.category
    AND g.rating_outcome IN ('applied', 'legacy')
+   AND g.rating_domain <> 'training'
    AND (
      (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
      OR
@@ -95,6 +97,7 @@ WITH latest_user_games AS (
   JOIN game_results g
     ON g.category = r.category
    AND g.rating_outcome IN ('applied', 'legacy')
+   AND g.rating_domain <> 'training'
    AND (
      (g.white_external_id = 'user:' || r.user_id::text AND g.white_rating_after IS NOT NULL)
      OR
@@ -118,6 +121,7 @@ WITH latest_user_games AS (
   JOIN game_results g
     ON g.category = r.category
    AND g.rating_outcome IN ('applied', 'legacy')
+   AND g.rating_domain <> 'training'
    AND (
      (g.white_external_id = 'user:' || r.user_id::text AND g.white_rating_after IS NOT NULL)
      OR

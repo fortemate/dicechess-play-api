@@ -5509,6 +5509,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
                     JOIN play.game_results g
                       ON g.category = r.category
                      AND g.rating_outcome IN ('applied', 'legacy')
+                     AND g.rating_domain <> 'training'
                      AND (
                        (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
                        OR
@@ -5533,6 +5534,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
                     JOIN play.game_results g
                       ON g.category = r.category
                      AND g.rating_outcome IN ('applied', 'legacy')
+                     AND g.rating_domain <> 'training'
                      AND (
                        (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
                        OR
@@ -5561,6 +5563,95 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
               .unique
               .transact(xa)
           _ = assertEquals(oldRds, (None, None))
+        yield ()
+      }
+    }
+
+  test("V12 migration ignores training games when backfilling user competitive RD (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val cat = RatingCategory.Default
+        for
+          userA <- db.upsertOnLogin("google", "sub-dom-a", None, IO.pure("DomainA"))
+          userB <- db.upsertOnLogin("google", "sub-dom-b", None, IO.pure("DomainB"))
+          uidA = UUID.fromString(userA.id)
+          uidB = UUID.fromString(userB.id)
+          _ <-
+            sql"""INSERT INTO play.user_ratings (user_id, category, rating, rd, vol)
+                  VALUES ($uidA, ${cat.wireName}, 1800.0, 50.0, 0.06),
+                         ($uidB, ${cat.wireName}, 1400.0, 55.0, 0.06)
+                  ON CONFLICT (user_id, category) DO UPDATE SET rd = EXCLUDED.rd""".update.run
+              .transact(xa)
+
+          // Earlier competitive game
+          compGame <- GameId.random
+          _        <-
+            sql"""INSERT INTO play.game_results(game_id, white_external_id, black_external_id, result, termination, rated, time_control,
+                                                server_seed, finished_at, rating_applied_at, rating_outcome, rating_domain,
+                                                white_rating_after, black_rating_after)
+                  VALUES (${compGame.value}::uuid, ${"user:" + userA.id}, ${"user:" + userB.id}, 1, 'resign', true, 'Fischer(300,3)',
+                          'seed', '2026-10-01T00:00:00Z'::timestamptz, '2026-10-01T00:05:00Z'::timestamptz, 'applied', 'competitive',
+                          1800.0, 1400.0)""".update.run
+              .transact(xa)
+
+          // Later training game for userA
+          trainGame <- GameId.random
+          _         <-
+            sql"""INSERT INTO play.game_results(game_id, white_external_id, black_external_id, result, termination, rated, time_control,
+                                                server_seed, finished_at, rating_applied_at, rating_outcome, rating_domain,
+                                                white_rating_after, black_rating_after)
+                  VALUES (${trainGame.value}::uuid, ${"user:" + userA.id}, 'bot:team:review:training', 1, 'resign', false, 'Fischer(300,3)',
+                          'seed', '2026-10-02T00:00:00Z'::timestamptz, '2026-10-02T00:05:00Z'::timestamptz, 'applied', 'training',
+                          1900.0, NULL)""".update.run
+              .transact(xa)
+
+          // Run V12 backfill for users
+          _ <-
+            sql"""WITH latest_user_games AS (
+                    SELECT DISTINCT ON (r.user_id, r.category)
+                      g.game_id,
+                      r.rd,
+                      CASE WHEN g.white_external_id = 'user:' || r.user_id::text THEN 'white' ELSE 'black' END AS seat
+                    FROM play.user_ratings r
+                    JOIN play.game_results g
+                      ON g.category = r.category
+                     AND g.rating_outcome IN ('applied', 'legacy')
+                     AND g.rating_domain <> 'training'
+                     AND (
+                       (g.white_external_id = 'user:' || r.user_id::text AND g.white_rating_after IS NOT NULL)
+                       OR
+                       (g.black_external_id = 'user:' || r.user_id::text AND g.black_rating_after IS NOT NULL)
+                     )
+                    ORDER BY r.user_id, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+                  )
+                  UPDATE play.game_results g
+                  SET white_rd_after = l.rd
+                  FROM latest_user_games l
+                  WHERE g.game_id = l.game_id
+                    AND l.seat = 'white'
+                    AND g.white_rd_after IS NULL""".update.run
+              .transact(xa)
+
+          compRd <-
+            sql"SELECT white_rd_after FROM play.game_results WHERE game_id = ${compGame.value}::uuid"
+              .query[Option[Double]]
+              .unique
+              .transact(xa)
+          trainRd <-
+            sql"SELECT white_rd_after FROM play.game_results WHERE game_id = ${trainGame.value}::uuid"
+              .query[Option[Double]]
+              .unique
+              .transact(xa)
+          _ = assertEquals(compRd, Some(50.0))
+          _ = assertEquals(trainRd, None)
+
+          board <- db.playerLeaderboard(
+            cat,
+            maxRd = 110.0,
+            limit = 10,
+            asOfCutoff = Some(Instant.parse("2026-10-03T00:00:00Z"))
+          )
+          _ = assertEquals(board.find(_.nickname == "DomainA").map(_.rd), Some(50.0))
         yield ()
       }
     }

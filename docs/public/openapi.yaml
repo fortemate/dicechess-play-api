@@ -644,6 +644,9 @@ paths:
       summary: Rating leaderboard (public)
       description: Registered bots whose rating has converged (RD ≤ 110), ordered by the conservative estimate rating − 2·rd (ties to the lower rd), not the raw rating. Provisional bots are hidden.
       security: []
+      parameters:
+        - { name: category, in: query, schema: { type: string, enum: [bullet, blitz, rapid] } }
+        - { name: kind, in: query, schema: { type: string, enum: [bots, players, all] } }
       responses:
         '200':
           description: Ranked leaders.
@@ -652,11 +655,76 @@ paths:
               schema:
                 type: object
                 properties:
+                  category: { type: string }
+                  epoch: { type: integer }
+                  anchorSetVersion: { type: string }
+                  cutoff: { type: string, format: date-time }
+                  computedAt: { type: string, format: date-time }
                   leaders:
                     type: array
                     items: { $ref: '#/components/schemas/LeaderRow' }
-                required: [leaders]
+                required: [category, leaders]
         '404': { description: Server runs without persistence. }
+  /leaderboard/snapshots:
+    get:
+      tags: [Leaderboard]
+      summary: List rating snapshots (public)
+      description: Lists historical rating snapshot summaries for a category, newest first.
+      security: []
+      parameters:
+        - { name: category, in: query, schema: { type: string, enum: [bullet, blitz, rapid], default: blitz } }
+        - { name: epoch, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: List of snapshot summaries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RatingSnapshotSummary'
+        '400':
+          description: Invalid category or epoch.
+  /leaderboard/snapshots/{category}/latest:
+    get:
+      tags: [Leaderboard]
+      summary: Latest rating snapshot for category (public)
+      description: Returns the latest rating snapshot for the given time control category.
+      security: []
+      parameters:
+        - { name: category, in: path, required: true, schema: { type: string, enum: [bullet, blitz, rapid] } }
+      responses:
+        '200':
+          description: Latest rating snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RatingSnapshot'
+        '400':
+          description: Invalid category.
+        '404':
+          description: Snapshot not found.
+  /leaderboard/snapshots/{category}/{epoch}/{cutoff}:
+    get:
+      tags: [Leaderboard]
+      summary: Specific historical rating snapshot (public)
+      description: Retrieves an immutable past rating snapshot by its exact ISO-8601 cutoff timestamp.
+      security: []
+      parameters:
+        - { name: category, in: path, required: true, schema: { type: string, enum: [bullet, blitz, rapid] } }
+        - { name: epoch, in: path, required: true, schema: { type: integer } }
+        - { name: cutoff, in: path, required: true, description: ISO-8601 instant parsed by Instant.parse, schema: { type: string } }
+      responses:
+        '200':
+          description: Historical snapshot at cutoff.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RatingSnapshot'
+        '400':
+          description: Invalid category, epoch, or cutoff.
+        '404':
+          description: Snapshot not found.
   /bots/{team}/{name}:
     get:
       tags: [Leaderboard]
@@ -675,6 +743,24 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/BotProfile' }
         '404': { description: No registered bot with that team/name. }
+  /players/by-nickname/{nickname}:
+    get:
+      tags: [Leaderboard]
+      summary: Player public profile (public)
+      description: >
+        One registered player's public profile — competitive ratings, training estimates (human-vs-bot),
+        aggregate record vs opponents, and recent games. Deactivated or missing accounts return 404.
+      security: []
+      parameters:
+        - { name: nickname, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The player's public profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlayerProfile' }
+        '404':
+          description: No active registered player with that nickname.
   /lobby/bots:
     get:
       tags: [Leaderboard]
@@ -2050,10 +2136,23 @@ components:
             even when both seats are absent.
         white: { $ref: '#/components/schemas/SeatRatingChange' }
         black: { $ref: '#/components/schemas/SeatRatingChange' }
+        outcome: { type: string }
+        reason: { type: [string, "null"] }
+        ratingDomain: { type: [string, "null"] }
+        trainingReference: { $ref: '#/components/schemas/TrainingReference' }
       required: [gameId, applied]
+    TrainingReference:
+      type: [object, "null"]
+      description: Bot reference against which a training update was computed.
+      properties:
+        source: { type: string, enum: [anchor, bot_rating, unavailable] }
+        anchorSetVersion: { type: [string, "null"] }
+        epoch: { type: [integer, "null"] }
+        rating: { type: number, format: double }
+        rd: { type: number, format: double }
+      required: [source, rating, rd]
     SeatRatingChange:
-      type: object
-      nullable: true
+      type: [object, "null"]
       description: >
         One seat's rating on both sides of the game, unrounded. Absent (null) when that seat's rating did not move.
         The delta is after - before; it is not sent, so there is one place it can be computed from.
@@ -2097,7 +2196,8 @@ components:
       type: object
       properties:
         rank: { type: integer }
-        team: { type: string }
+        kind: { type: string, enum: [bot, player] }
+        team: { type: [string, "null"] }
         name: { type: string }
         rating: { type: number }
         rd: { type: number }
@@ -2106,7 +2206,96 @@ components:
         wins: { type: integer }
         draws: { type: integer }
         losses: { type: integer }
-      required: [rank, team, name, rating, rd, onLadder, games, wins, draws, losses]
+        domain: { type: [string, "null"] }
+        algorithm: { type: [string, "null"] }
+        epoch: { type: [integer, "null"] }
+        orderingValue: { type: [number, "null"] }
+        orderingRule: { type: [string, "null"] }
+        ciLow: { type: [number, "null"] }
+        ciHigh: { type: [number, "null"] }
+      required: [rank, kind, name, rating, rd, onLadder, games, wins, draws, losses]
+    RatingSnapshotSummary:
+      type: object
+      properties:
+        category: { type: string }
+        epoch: { type: integer }
+        anchorSetVersion: { type: string }
+        cutoff: { type: string, format: date-time }
+        computedAt: { type: string, format: date-time }
+        isCurrent: { type: boolean }
+        entryCount: { type: integer }
+      required: [category, epoch, anchorSetVersion, cutoff, computedAt, isCurrent, entryCount]
+    RatingSnapshot:
+      type: object
+      properties:
+        category: { type: string }
+        epoch: { type: integer }
+        anchorSetVersion: { type: string }
+        cutoff: { type: string, format: date-time }
+        computedAt: { type: string, format: date-time }
+        isCurrent: { type: boolean }
+        leaders:
+          type: array
+          items: { $ref: '#/components/schemas/LeaderRow' }
+      required: [category, epoch, anchorSetVersion, cutoff, computedAt, isCurrent, leaders]
+    CategoryRating:
+      type: object
+      properties:
+        category: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+      required: [category, rating, rd, provisional, games, wins, draws, losses]
+    TrainingCategoryRating:
+      type: object
+      properties:
+        category: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        ciLow: { type: number }
+        ciHigh: { type: number }
+        intervalCalculation: { type: string }
+        domain: { type: string }
+        algorithm: { type: string }
+        algorithmVersion: { type: string }
+        epoch: { type: integer }
+        cutoff: { type: [string, "null"], format: date-time }
+        computedAt: { type: [string, "null"], format: date-time }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+      required: [category, rating, rd, provisional, ciLow, ciHigh, intervalCalculation, domain, algorithm, algorithmVersion, epoch, games, wins, draws, losses]
+    PlayerProfile:
+      type: object
+      properties:
+        nickname: { type: string }
+        rating: { type: number }
+        rd: { type: number }
+        provisional: { type: boolean }
+        games: { type: integer }
+        wins: { type: integer }
+        draws: { type: integer }
+        losses: { type: integer }
+        totalGames: { type: integer }
+        ratings:
+          type: array
+          items: { $ref: '#/components/schemas/CategoryRating' }
+        training:
+          type: array
+          items: { $ref: '#/components/schemas/TrainingCategoryRating' }
+        opponents:
+          type: array
+          items: { $ref: '#/components/schemas/OpponentRecord' }
+        recent:
+          type: array
+          items: { $ref: '#/components/schemas/RecentGame' }
+      required: [nickname, rating, rd, provisional, games, wins, draws, losses, totalGames, ratings, training, opponents, recent]
     BotProfile:
       type: object
       properties:
@@ -2508,9 +2697,9 @@ components:
         outcomes:
           type: array
           items: { $ref: '#/components/schemas/DeliveryOutcomeCount' }
-        p50Ms: { type: integer, nullable: true, description: Bucket-resolution approximation, not exact. }
-        p90Ms: { type: integer, nullable: true }
-        p99Ms: { type: integer, nullable: true }
+        p50Ms: { type: [integer, "null"], description: Bucket-resolution approximation, not exact. }
+        p90Ms: { type: [integer, "null"] }
+        p99Ms: { type: [integer, "null"] }
       required: [totalDeliveries, outcomes, p50Ms, p90Ms, p99Ms]
     LastDeliveryFailure:
       type: object

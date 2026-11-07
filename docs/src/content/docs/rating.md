@@ -97,6 +97,20 @@ A rating is **provisional** while `rd > 110` — Glickman's own convergence thre
 
 If your bot has played plenty of games and is still provisional, check its win/loss pattern on its profile before assuming something is broken: a bot with a genuinely volatile result pattern (frequent upsets in either direction) converges slower than one that consistently loses — or consistently wins — no matter how many games it plays.
 
+## Anchored bot strength and versioned snapshots
+
+To eliminate rating drift across long horizons, bot strength is calibrated against immutable reference anchors (`anchor/random`, `anchor/greedy`, `anchor/hunter-*`) using anchored comparative models. Official rating snapshots are published to PostgreSQL and served on [`GET /leaderboard`](../reference/rest/#leaderboard) and [`GET /leaderboard/snapshots`](../reference/rest/#rating-snapshots).
+
+The leaderboard preserves competitive Glicko-2 ratings for both bots and players. When an official rating snapshot has been published for a category, the board carries snapshot provenance:
+- `epoch`: the rating epoch (e.g. `1`);
+- `anchorSetVersion`: the anchor calibration set (e.g. `v1.0`);
+- `cutoff` and `computedAt`: ISO-8601 timestamps marking data boundary and computation time;
+- Per-row rating metadata: `domain` (`competitive`), `algorithm` (`glicko2`), `epoch`, `orderingValue`, `orderingRule` (`conservative-rating`), and 95% confidence intervals (`ciLow`, `ciHigh`).
+
+Internal offline calibration reports and admission graphs remain internal operator tooling; published snapshot endpoints serve finalized public ratings.
+
+Human-versus-bot training games are tracked in an isolated training domain (`user_training_ratings`) and served as `training` estimates on [`GET /players/by-nickname/{nick}`](../reference/rest/#player-profile). Training estimates are publicly visible on player profiles for spectators, tournament organizers, and the player, but are strictly isolated from competitive ratings. Each training estimate specifies `domain` (`training`), `algorithm` (`glicko2`), `algorithmVersion` (`v1`), `epoch`, interval calculation, and provisional status.
+
 ## Joining and leaving
 
 Covered in [Authentication & Identity → Joining the rating ladder](../authentication/#joining-the-rating-ladder): `POST /bot/ladder/join` / `POST /bot/ladder/leave`, both registered-bot only. That page is the "how do I opt in" companion to this "what do these numbers mean" one.

@@ -5131,3 +5131,527 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         yield assert(!c)
       }
     }
+
+  test("bot_strength_snapshots stores, retrieves latest and historical, and updates is_current (#150)"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        val cat     = RatingCategory.Rapid
+        val cutoff1 = Instant.parse("2026-10-01T00:00:00Z")
+        val cutoff2 = Instant.parse("2026-10-02T00:00:00Z")
+        val leader1 = dicechess.play.server.LeaderRow(
+          rank = 1,
+          kind = "bot",
+          team = Some("aws"),
+          name = "hunter-v30",
+          rating = 2200.0,
+          rd = 50.0,
+          onLadder = true,
+          games = 50,
+          wins = 40,
+          draws = 5,
+          losses = 5,
+          domain = Some("competitive"),
+          algorithm = Some("glicko2"),
+          epoch = Some(1),
+          orderingValue = Some(2100.0),
+          orderingRule = Some("conservative-rating"),
+          ciLow = Some(2102.0),
+          ciHigh = Some(2298.0)
+        )
+        val leaders1 = List(leader1)
+        val leaders2 = List(leader1.copy(rating = 2250.0))
+
+        for
+          id1 <- db.saveBotStrengthSnapshot(
+            cat,
+            epoch = 1,
+            anchorSetVersion = "v1.0",
+            cutoff = cutoff1,
+            leaders = leaders1
+          )
+          _ = assert(id1.id > 0L, s"id1 was ${id1.id}")
+          _ = assert(id1.inserted, "id1 must be newly inserted")
+          snap1Latest <- db.latestBotStrengthSnapshot(cat)
+          _ = assertEquals(snap1Latest.map(_.isCurrent), Some(true))
+          _ = assertEquals(snap1Latest.map(_.cutoff), Some(cutoff1))
+          _ = assertEquals(snap1Latest.map(_.leaders.head.rating), Some(2200.0))
+
+          // Duplicate publication with same (category, epoch, cutoff) must preserve immutability
+          idDup <- db.saveBotStrengthSnapshot(
+            cat,
+            epoch = 1,
+            anchorSetVersion = "v1.0",
+            cutoff = cutoff1,
+            leaders = List(leader1.copy(rating = 9999.0))
+          )
+          _ = assertEquals(idDup.id, id1.id, "conflict returns existing id")
+          _ = assert(!idDup.inserted, "conflict must report inserted = false")
+          hist1Again <- db.botStrengthSnapshotAt(cat, epoch = 1, cutoff = cutoff1)
+          _ = assertEquals(
+            hist1Again.map(_.leaders.head.rating),
+            Some(2200.0),
+            "published snapshot must remain immutable on duplicate publication"
+          )
+
+          id2 <- db.saveBotStrengthSnapshot(
+            cat,
+            epoch = 1,
+            anchorSetVersion = "v1.0",
+            cutoff = cutoff2,
+            leaders = leaders2
+          )
+          _ = assert(id2.id > id1.id, s"id2 (${id2.id}) must be > id1 (${id1.id})")
+          _ = assert(id2.inserted, "id2 must be newly inserted")
+
+          snap2Latest <- db.latestBotStrengthSnapshot(cat)
+          _ = assertEquals(snap2Latest.map(_.isCurrent), Some(true))
+          _ = assertEquals(snap2Latest.map(_.cutoff), Some(cutoff2))
+          _ = assertEquals(snap2Latest.map(_.leaders.head.rating), Some(2250.0))
+
+          hist1 <- db.botStrengthSnapshotAt(cat, epoch = 1, cutoff = cutoff1)
+          _ = assertEquals(hist1.map(_.isCurrent), Some(false), "earlier snapshot retired from current")
+          _ = assertEquals(hist1.map(_.leaders.head.rating), Some(2200.0))
+
+          // Saving an older snapshot (cutoff0 < cutoff2) must NOT move current cutoff backwards (#150)
+          cutoff0 = Instant.parse("2026-09-01T00:00:00Z")
+          _ <- db.saveBotStrengthSnapshot(
+            cat,
+            epoch = 1,
+            anchorSetVersion = "v1.0",
+            cutoff = cutoff0,
+            leaders = leaders1
+          )
+          snap2StillCurrent <- db.latestBotStrengthSnapshot(cat)
+          _ = assertEquals(snap2StillCurrent.map(_.cutoff), Some(cutoff2), "newer cutoff2 remains current")
+          hist0 <- db.botStrengthSnapshotAt(cat, epoch = 1, cutoff = cutoff0)
+          _ = assertEquals(hist0.map(_.isCurrent), Some(false), "older snapshot saved as non-current")
+
+          // Concurrent saves under transaction advisory lock must both succeed (#150)
+          cutoffA = Instant.parse("2026-10-03T00:00:00Z")
+          cutoffB = Instant.parse("2026-10-04T00:00:00Z")
+          _ <- (
+            db.saveBotStrengthSnapshot(cat, 1, "v1.0", cutoffA, leaders1),
+            db.saveBotStrengthSnapshot(cat, 1, "v1.0", cutoffB, leaders2)
+          ).parTupled
+
+          summaries <- db.listBotStrengthSnapshots(cat, epoch = Some(1))
+          _ = assertEquals(summaries.count(_.isCurrent), 1, "exactly one snapshot remains current")
+          latestAfterConcur <- db.latestBotStrengthSnapshot(cat)
+          _ = assertEquals(latestAfterConcur.map(_.cutoff), Some(cutoffB))
+        yield ()
+      }
+    }
+
+  test("leaderboard bounds numeric rating and tallies at historical cutoff (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val team: String        = "hist-cutoff-suite"
+        val botA: Principal.Bot = Principal.Bot(team, "bot-a")
+        val botB: Principal.Bot = Principal.Bot(team, "bot-b")
+        val cat                 = RatingCategory.Default
+        val cutoffOct1          = Instant.parse("2026-10-01T12:00:00Z")
+        val cutoffOct2          = Instant.parse("2026-10-02T12:00:00Z")
+
+        for
+          _ <- db.register(team, "bot-a", s"hash-$team-a")
+          _ <- db.register(team, "bot-b", s"hash-$team-b")
+          _ <- db.setOnLadder(team, "bot-a", true)
+          _ <- db.setOnLadder(team, "bot-b", true)
+          _ <-
+            sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+                  VALUES ($team, 'bot-a', ${cat.wireName}, 1800.0, 50.0, 0.06),
+                         ($team, 'bot-b', ${cat.wireName}, 1400.0, 50.0, 0.06)
+                  ON CONFLICT (team, name, category) DO NOTHING""".update.run
+              .transact(xa)
+
+          // Game 1 at Oct 1: rating becomes 1800.0, rd = 80.0
+          id1 <- GameId.random
+          _   <- db.save(id1, endedResultFixture(botA, botB, rated = true))
+          update1A = seeded(RatedIdentity.of(botA), 1800.0, 80.0)
+          update1B = seeded(RatedIdentity.of(botB), 1400.0, 80.0)
+          _ <- db.applyRatingUpdate(id1, update1A, update1B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct1 WHERE game_id = ${id1.value}::uuid".update.run
+              .transact(xa)
+
+          // Check historical cutoff at Oct 1: rating is 1800.0, games = 1
+          boardOct1Pre <- db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct1))
+            .map(_.filter(_.team == team))
+          _ = assertEquals(boardOct1Pre.find(_.name == "bot-a").map(_.rating), Some(1800.0))
+          _ = assertEquals(boardOct1Pre.find(_.name == "bot-a").map(_.tally.games), Some(1))
+
+          // Game 2 at Oct 2: rating advances to 2000.0, rd = 70.0
+          id2 <- GameId.random
+          _   <- db.save(id2, endedResultFixture(botA, botB, rated = true))
+          update2A = seeded(RatedIdentity.of(botA), 2000.0, 70.0)
+          update2B = seeded(RatedIdentity.of(botB), 1300.0, 70.0)
+          _ <- db.applyRatingUpdate(id2, update2A, update2B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct2 WHERE game_id = ${id2.value}::uuid".update.run
+              .transact(xa)
+
+          // Live bot_ratings now has rating = 2000.0
+          liveBoard <- db.leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = None).map(_.filter(_.team == team))
+          _ = assertEquals(liveBoard.find(_.name == "bot-a").map(_.rating), Some(2000.0))
+          _ = assertEquals(liveBoard.find(_.name == "bot-a").map(_.tally.games), Some(2))
+
+          // Crucial regression: querying historical cutoff at Oct 1 MUST NOT see 2000.0, but still 1800.0 with games = 1 (#150)
+          boardOct1Post <- db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct1))
+            .map(_.filter(_.team == team))
+          _ = assertEquals(
+            boardOct1Post.find(_.name == "bot-a").map(_.rating),
+            Some(1800.0),
+            "advancing live rating must not change historical rating at earlier cutoff"
+          )
+          _ = assertEquals(
+            boardOct1Post.find(_.name == "bot-a").map(_.rd),
+            Some(80.0),
+            "advancing live rd must not change historical rd at earlier cutoff"
+          )
+          _ = assertEquals(boardOct1Post.find(_.name == "bot-a").map(_.tally.games), Some(1))
+
+          // Crucial regression (P2): multiple games at identical finished_at must resolve by rating_applied_at, not random UUID
+          idSame1 <- GameId.random
+          idSame2 <- GameId.random
+          _       <- db.save(idSame1, endedResultFixture(botA, botB, rated = true))
+          _       <- db.save(idSame2, endedResultFixture(botA, botB, rated = true))
+          updateSame1A = seeded(RatedIdentity.of(botA), 2100.0, 65.0)
+          updateSame1B = seeded(RatedIdentity.of(botB), 1250.0, 65.0)
+          updateSame2A = seeded(RatedIdentity.of(botA), 2200.0, 60.0)
+          updateSame2B = seeded(RatedIdentity.of(botB), 1200.0, 60.0)
+          _ <- db.applyRatingUpdate(idSame1, updateSame1A, updateSame1B)
+          _ <- db.applyRatingUpdate(idSame2, updateSame2A, updateSame2B)
+          cutoffOct3 = Instant.parse("2026-10-03T12:00:00Z")
+          appTime1   = Instant.parse("2026-10-03T12:01:00Z")
+          appTime2   = Instant.parse("2026-10-03T12:02:00Z")
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct3, rating_applied_at = $appTime1 WHERE game_id = ${idSame1.value}::uuid".update.run
+              .transact(xa)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = $cutoffOct3, rating_applied_at = $appTime2 WHERE game_id = ${idSame2.value}::uuid".update.run
+              .transact(xa)
+          boardOct3 <- db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct3))
+            .map(_.filter(_.team == team))
+          _ = assertEquals(
+            boardOct3.find(_.name == "bot-a").map(_.rating),
+            Some(2200.0),
+            "games at identical finished_at must pick the later rating_applied_at, not random UUID"
+          )
+          _ = assertEquals(
+            boardOct3.find(_.name == "bot-a").map(_.rd),
+            Some(60.0),
+            "games at identical finished_at must pick the later rating_applied_at RD"
+          )
+
+          // And liveLeaderboardView must return consistent view
+          view <- db.liveLeaderboardView(cat, wantedBots = true, wantedPlayers = false, maxRd = 110.0, limit = 10)
+          _ = assert(view.bots.exists(_.name == "bot-a"))
+        yield ()
+      }
+    }
+
+  test("user training ratings preserves NULL computed_at for historical estimates (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val cat = RatingCategory.Default
+        for
+          player <- db.upsertOnLogin("google", "sub-training-null-time", None, IO.pure("NullTimePlayer"))
+          userId = UUID.fromString(player.id)
+          _ <-
+            sql"""INSERT INTO play.user_training_ratings (user_id, category, rating, rd, vol, games, wins, draws, losses, updated_at, computed_at)
+                  VALUES ($userId, ${cat.wireName}, 1500.0, 100.0, 0.06, 5, 3, 1, 1, now(), NULL)""".update.run
+              .transact(xa)
+          state <- db.trainingStateOf(player.id, cat)
+          _ = assertEquals(
+            state.computedAt,
+            None,
+            "legacy training estimate with NULL computed_at must read back as None"
+          )
+          _ = assertEquals(state.games, 5)
+          _ = assertEquals(state.rating, 1500.0)
+          _ = assertEquals(state.deviation, 100.0)
+        yield ()
+      }
+    }
+
+  test("migrating old bot games must not leave historical RD dependent on live state (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val team: String        = "mig-legacy-bot"
+        val botA: Principal.Bot = Principal.Bot(team, "bot-a")
+        val botB: Principal.Bot = Principal.Bot(team, "bot-b")
+        val cat                 = RatingCategory.Default
+        val cutoffOct1          = Instant.parse("2026-10-01T12:00:00Z")
+
+        for
+          _ <- db.register(team, "bot-a", s"hash-$team-a")
+          _ <- db.register(team, "bot-b", s"hash-$team-b")
+          _ <- db.setOnLadder(team, "bot-a", true)
+          _ <- db.setOnLadder(team, "bot-b", true)
+          _ <-
+            sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+                  VALUES ($team, 'bot-a', ${cat.wireName}, 1800.0, 50.0, 0.06),
+                         ($team, 'bot-b', ${cat.wireName}, 1400.0, 50.0, 0.06)
+                  ON CONFLICT (team, name, category) DO NOTHING""".update.run
+              .transact(xa)
+
+          // Simulate legacy pre-V12 state: game recorded without white_rd_after / black_rd_after
+          idOld <- GameId.random
+          _     <- db.save(idOld, endedResultFixture(botA, botB, rated = true))
+          _     <-
+            sql"""UPDATE play.game_results
+                  SET finished_at = $cutoffOct1,
+                      rating_applied_at = $cutoffOct1,
+                      rating_outcome = 'applied',
+                      white_rating_after = 1800.0,
+                      black_rating_after = 1400.0,
+                      white_rd_after = 50.0,
+                      black_rd_after = 50.0
+                  WHERE game_id = ${idOld.value}::uuid""".update.run
+              .transact(xa)
+
+          // Before new live games, cutoff at Oct 1 has RD = 50.0
+          read = db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct1))
+            .map(_.find(b => b.team == team && b.name == "bot-a").map(_.rd))
+          before <- read
+          _ = assertEquals(before, Some(50.0))
+
+          // Subsequent live game advances live bot_ratings RD to 90.0
+          idNew1 <- GameId.random
+          _      <- db.save(idNew1, endedResultFixture(botA, botB, rated = true))
+          update1A = seeded(RatedIdentity.of(botA), 1900.0, 90.0)
+          update1B = seeded(RatedIdentity.of(botB), 1300.0, 90.0)
+          _ <- db.applyRatingUpdate(idNew1, update1A, update1B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = '2026-10-02T00:00:00Z'::timestamptz WHERE game_id = ${idNew1.value}::uuid".update.run
+              .transact(xa)
+          after90 <- read
+
+          // Another live game advances live bot_ratings RD to 150.0 (provisional)
+          idNew2 <- GameId.random
+          _      <- db.save(idNew2, endedResultFixture(botA, botB, rated = true))
+          update2A = seeded(RatedIdentity.of(botA), 1950.0, 150.0)
+          update2B = seeded(RatedIdentity.of(botB), 1250.0, 150.0)
+          _ <- db.applyRatingUpdate(idNew2, update2A, update2B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = '2026-10-03T00:00:00Z'::timestamptz WHERE game_id = ${idNew2.value}::uuid".update.run
+              .transact(xa)
+          after150 <- read
+
+          // Invariant: historical cutoff RD MUST NOT depend on subsequent live rating updates!
+          _ = assertEquals((after90, after150), (before, before))
+        yield ()
+      }
+    }
+
+  test("V12 migration backfills legacy null RD for latest applied game from ratings at migration time (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val team: String        = "v12-backfill-bot"
+        val botA: Principal.Bot = Principal.Bot(team, "bot-backfill")
+        val botB: Principal.Bot = Principal.Bot(team, "bot-opp")
+        val cat                 = RatingCategory.Default
+
+        for
+          _ <- db.register(team, "bot-backfill", s"hash-$team-bf")
+          _ <- db.register(team, "bot-opp", s"hash-$team-opp")
+          _ <-
+            sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+                  VALUES ($team, 'bot-backfill', ${cat.wireName}, 1750.0, 52.0, 0.06),
+                         ($team, 'bot-opp', ${cat.wireName}, 1450.0, 58.0, 0.06)
+                  ON CONFLICT (team, name, category) DO UPDATE SET rd = EXCLUDED.rd""".update.run
+              .transact(xa)
+
+          // Older game: should NOT be backfilled with later RD
+          idOld <- GameId.random
+          _     <- db.save(idOld, endedResultFixture(botA, botB, rated = true))
+          _     <-
+            sql"""UPDATE play.game_results
+                  SET finished_at = '2026-09-01T00:00:00Z'::timestamptz,
+                      rating_outcome = 'applied',
+                      white_rating_after = 1600.0,
+                      black_rating_after = 1400.0,
+                      white_rd_after = NULL,
+                      black_rd_after = NULL,
+                      white_rd_before = NULL,
+                      black_rd_before = NULL
+                  WHERE game_id = ${idOld.value}::uuid""".update.run
+              .transact(xa)
+
+          // Latest game: should be backfilled with rd_after from ratings
+          idLatest <- GameId.random
+          _        <- db.save(idLatest, endedResultFixture(botA, botB, rated = true))
+          _        <-
+            sql"""UPDATE play.game_results
+                  SET finished_at = '2026-10-01T00:00:00Z'::timestamptz,
+                      rating_outcome = 'applied',
+                      white_rating_after = 1750.0,
+                      black_rating_after = 1450.0,
+                      white_rd_after = NULL,
+                      black_rd_after = NULL,
+                      white_rd_before = NULL,
+                      black_rd_before = NULL
+                  WHERE game_id = ${idLatest.value}::uuid""".update.run
+              .transact(xa)
+
+          // Run the V12 backfill logic
+          _ <-
+            sql"""WITH latest_bot_games AS (
+                    SELECT DISTINCT ON (r.team, r.name, r.category)
+                      g.game_id,
+                      r.rd,
+                      CASE WHEN g.white_external_id = 'bot:team:' || r.team || ':' || r.name THEN 'white' ELSE 'black' END AS seat
+                    FROM play.bot_ratings r
+                    JOIN play.game_results g
+                      ON g.category = r.category
+                     AND g.rating_outcome IN ('applied', 'legacy')
+                     AND g.rating_domain <> 'training'
+                     AND (
+                       (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
+                       OR
+                       (g.black_external_id = 'bot:team:' || r.team || ':' || r.name AND g.black_rating_after IS NOT NULL)
+                     )
+                    ORDER BY r.team, r.name, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+                  )
+                  UPDATE play.game_results g
+                  SET white_rd_after = l.rd
+                  FROM latest_bot_games l
+                  WHERE g.game_id = l.game_id
+                    AND l.seat = 'white'
+                    AND g.white_rd_after IS NULL""".update.run
+              .transact(xa)
+          _ <-
+            sql"""WITH latest_bot_games AS (
+                    SELECT DISTINCT ON (r.team, r.name, r.category)
+                      g.game_id,
+                      r.rd,
+                      CASE WHEN g.white_external_id = 'bot:team:' || r.team || ':' || r.name THEN 'white' ELSE 'black' END AS seat
+                    FROM play.bot_ratings r
+                    JOIN play.game_results g
+                      ON g.category = r.category
+                     AND g.rating_outcome IN ('applied', 'legacy')
+                     AND g.rating_domain <> 'training'
+                     AND (
+                       (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
+                       OR
+                       (g.black_external_id = 'bot:team:' || r.team || ':' || r.name AND g.black_rating_after IS NOT NULL)
+                     )
+                    ORDER BY r.team, r.name, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+                  )
+                  UPDATE play.game_results g
+                  SET black_rd_after = l.rd
+                  FROM latest_bot_games l
+                  WHERE g.game_id = l.game_id
+                    AND l.seat = 'black'
+                    AND g.black_rd_after IS NULL""".update.run
+              .transact(xa)
+
+          latestRds <-
+            sql"SELECT white_rd_after, black_rd_after, white_rd_before, black_rd_before FROM play.game_results WHERE game_id = ${idLatest.value}::uuid"
+              .query[(Option[Double], Option[Double], Option[Double], Option[Double])]
+              .unique
+              .transact(xa)
+          _ = assertEquals(latestRds, (Some(52.0), Some(58.0), None, None))
+
+          oldRds <-
+            sql"SELECT white_rd_after, black_rd_after FROM play.game_results WHERE game_id = ${idOld.value}::uuid"
+              .query[(Option[Double], Option[Double])]
+              .unique
+              .transact(xa)
+          _ = assertEquals(oldRds, (None, None))
+        yield ()
+      }
+    }
+
+  test("V12 migration ignores training games when backfilling user competitive RD (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val cat = RatingCategory.Default
+        for
+          userA <- db.upsertOnLogin("google", "sub-dom-a", None, IO.pure("DomainA"))
+          userB <- db.upsertOnLogin("google", "sub-dom-b", None, IO.pure("DomainB"))
+          uidA = UUID.fromString(userA.id)
+          uidB = UUID.fromString(userB.id)
+          _ <-
+            sql"""INSERT INTO play.user_ratings (user_id, category, rating, rd, vol)
+                  VALUES ($uidA, ${cat.wireName}, 1800.0, 50.0, 0.06),
+                         ($uidB, ${cat.wireName}, 1400.0, 55.0, 0.06)
+                  ON CONFLICT (user_id, category) DO UPDATE SET rd = EXCLUDED.rd""".update.run
+              .transact(xa)
+
+          // Earlier competitive game
+          compGame <- GameId.random
+          _        <-
+            sql"""INSERT INTO play.game_results(game_id, white_external_id, black_external_id, result, termination, rated, time_control,
+                                                server_seed, finished_at, rating_applied_at, rating_outcome, rating_domain,
+                                                white_rating_after, black_rating_after)
+                  VALUES (${compGame.value}::uuid, ${"user:" + userA.id}, ${"user:" + userB.id}, 1, 'resign', true, 'Fischer(300,3)',
+                          'seed', '2026-10-01T00:00:00Z'::timestamptz, '2026-10-01T00:05:00Z'::timestamptz, 'applied', 'competitive',
+                          1800.0, 1400.0)""".update.run
+              .transact(xa)
+
+          // Later training game for userA
+          trainGame <- GameId.random
+          _         <-
+            sql"""INSERT INTO play.game_results(game_id, white_external_id, black_external_id, result, termination, rated, time_control,
+                                                server_seed, finished_at, rating_applied_at, rating_outcome, rating_domain,
+                                                white_rating_after, black_rating_after)
+                  VALUES (${trainGame.value}::uuid, ${"user:" + userA.id}, 'bot:team:review:training', 1, 'resign', false, 'Fischer(300,3)',
+                          'seed', '2026-10-02T00:00:00Z'::timestamptz, '2026-10-02T00:05:00Z'::timestamptz, 'applied', 'training',
+                          1900.0, NULL)""".update.run
+              .transact(xa)
+
+          // Run V12 backfill for users
+          _ <-
+            sql"""WITH latest_user_games AS (
+                    SELECT DISTINCT ON (r.user_id, r.category)
+                      g.game_id,
+                      r.rd,
+                      CASE WHEN g.white_external_id = 'user:' || r.user_id::text THEN 'white' ELSE 'black' END AS seat
+                    FROM play.user_ratings r
+                    JOIN play.game_results g
+                      ON g.category = r.category
+                     AND g.rating_outcome IN ('applied', 'legacy')
+                     AND g.rating_domain <> 'training'
+                     AND (
+                       (g.white_external_id = 'user:' || r.user_id::text AND g.white_rating_after IS NOT NULL)
+                       OR
+                       (g.black_external_id = 'user:' || r.user_id::text AND g.black_rating_after IS NOT NULL)
+                     )
+                    ORDER BY r.user_id, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+                  )
+                  UPDATE play.game_results g
+                  SET white_rd_after = l.rd
+                  FROM latest_user_games l
+                  WHERE g.game_id = l.game_id
+                    AND l.seat = 'white'
+                    AND g.white_rd_after IS NULL""".update.run
+              .transact(xa)
+
+          compRd <-
+            sql"SELECT white_rd_after FROM play.game_results WHERE game_id = ${compGame.value}::uuid"
+              .query[Option[Double]]
+              .unique
+              .transact(xa)
+          trainRd <-
+            sql"SELECT white_rd_after FROM play.game_results WHERE game_id = ${trainGame.value}::uuid"
+              .query[Option[Double]]
+              .unique
+              .transact(xa)
+          _ = assertEquals(compRd, Some(50.0))
+          _ = assertEquals(trainRd, None)
+
+          board <- db.playerLeaderboard(
+            cat,
+            maxRd = 110.0,
+            limit = 10,
+            asOfCutoff = Some(Instant.parse("2026-10-03T00:00:00Z"))
+          )
+          _ = assertEquals(board.find(_.nickname == "DomainA").map(_.rd), Some(50.0))
+        yield ()
+      }
+    }

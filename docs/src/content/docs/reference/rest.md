@@ -288,17 +288,24 @@ Every live game you are seated in — the polling counterpart of `GameStart` and
 
 ### Get a game's rating change
 
-`GET /games/{id}/rating` — **public.** What one finished game did to each seat's rating, on the same Glicko-2 scale as the leaderboard.
+`GET /games/{id}/rating` — **public.** What one finished game did to each seat's rating, on the same Glicko-2 scale as the leaderboard. For a training game, it also serves the bot reference against which the update was computed (`trainingReference`).
 
 ```json
 {
   "gameId": "game-uuid",
   "applied": true,
-  "white": { "before": 1775.6714474976957, "after": 1797.2144251082318 },
-  "black": { "before": 1601.5, "after": 1580.25 },
+  "white": { "before": 1500.0, "after": 1515.0 },
+  "black": null,
   "outcome": "applied",
   "reason": null,
-  "ratingDomain": "competitive"
+  "ratingDomain": "training",
+  "trainingReference": {
+    "source": "anchor",
+    "anchorSetVersion": "v1.0",
+    "epoch": 1,
+    "rating": 1390.0,
+    "rd": 50.0
+  }
 }
 ```
 
@@ -320,13 +327,55 @@ Public, no `Authorization`. Both exist only when the server runs with persistenc
 
 One rating scale at a time. `category` is optional and one of `bullet`, `blitz`, `rapid`; omitted, you get **blitz** — the ladder's own control, and so the board this endpoint has always shown. Anything else is a `400`, deliberately: a fresh category is legitimately empty for a while, so a typo must not be indistinguishable from a speed nobody has played yet. The response echoes the `category` it answered on.
 
-Registered bots whose rating on that scale has **converged** (RD ≤ 110), best first — where "best" is the **conservative estimate `rating − 2·rd`**, not the raw rating (ties go to the lower `rd`). The response still carries the raw `rating` and `rd`; only the ordering is conservative, so an entry whose rating a hot streak has inflated (visible as a raised `rd`) does not jump ahead of better-settled estimates. See [Rating & Ladder](../../rating/#how-the-board-is-ordered) for the reasoning. Provisional bots are counted internally but absent by policy — see the same page for what that means and why it can take longer than expected. `wins`/`draws`/`losses` count **rated, decided** games **in that category** only: a Blitz rating beside an all-speeds record would be two different questions answered as one. A bot that has never played the category is absent for the same reason a provisional one is — nothing has been measured yet.
+Registered bots whose rating on that scale has **converged** (RD ≤ 110), best first — where "best" is the **conservative estimate `rating − 2·rd`**, not the raw rating (ties go to the lower `rd`). When an official rating snapshot has been published for the category, the response includes snapshot provenance (`epoch`, `anchorSetVersion`, `cutoff`, `computedAt`) and per-row rating metadata (`domain`, `algorithm`, `epoch`, `orderingValue`, `orderingRule`, `ciLow`, `ciHigh`) while preserving competitive Glicko-2 ratings for bots and players alike.
 
 ```json
-{ "category": "blitz", "leaders": [{ "rank": 1, "kind": "bot", "team": "acme", "name": "alice", "rating": 1720.5, "rd": 85.2, "onLadder": true, "games": 42, "wins": 30, "draws": 2, "losses": 10 }] }
+{
+  "category": "blitz",
+  "epoch": 1,
+  "anchorSetVersion": "v1.0",
+  "cutoff": "2026-11-05T00:00:00Z",
+  "computedAt": "2026-11-05T01:00:00Z",
+  "leaders": [
+    {
+      "rank": 1,
+      "kind": "bot",
+      "team": "aws",
+      "name": "hunter-v30",
+      "rating": 2905.89,
+      "rd": 50.0,
+      "onLadder": true,
+      "games": 100,
+      "wins": 90,
+      "draws": 5,
+      "losses": 5,
+      "domain": "competitive",
+      "algorithm": "glicko2",
+      "epoch": 1,
+      "orderingValue": 2805.89,
+      "orderingRule": "conservative-rating",
+      "ciLow": 2807.9,
+      "ciHigh": 3003.9
+    }
+  ]
+}
 ```
 
 A bot that left the ladder keeps its frozen rating and stays listed with `onLadder: false`.
+
+### Rating snapshots
+
+`GET /leaderboard/snapshots?category=blitz&epoch=1`
+
+Lists historical rating snapshot summaries for a category, newest first.
+
+`GET /leaderboard/snapshots/{category}/latest`
+
+Returns the latest published rating snapshot for `{category}`, including finalized public rankings on that category scale.
+
+`GET /leaderboard/snapshots/{category}/{epoch}/{cutoff}`
+
+Retrieves an immutable past rating snapshot by its exact ISO-8601 cutoff timestamp.
 
 ### Bot catalog
 
@@ -396,6 +445,53 @@ One registered bot's public card: rating summary, its aggregate record against e
     { "opponent": { "kind": "Human", "name": null }, "team": null, "botName": null, "games": 15, "wins": 11, "draws": 1, "losses": 3, "lastPlayedAt": "2026-07-15T09:30:00Z" }
   ],
   "recent": [{ "gameId": "game-uuid", "seat": "White", "opponent": { "kind": "Bot", "name": "acme bob" }, "result": "win", "rated": true, "termination": "resign", "finishedAt": "2026-07-16T12:00:00Z" }]
+}
+```
+
+### Player profile
+
+`GET /players/by-nickname/{nick}`
+
+One registered human player's public card: their nickname, account status, competitive per-category ratings, up to 20 recent games, and versioned training estimates against calibrated bots:
+
+```json
+{
+  "nickname": "Player1",
+  "isActive": true,
+  "ratings": [
+    {
+      "category": "blitz",
+      "rating": 1650.0,
+      "rd": 65.0,
+      "provisional": false,
+      "games": 42,
+      "wins": 25,
+      "draws": 5,
+      "losses": 12
+    }
+  ],
+  "training": [
+    {
+      "category": "blitz",
+      "rating": 1580.0,
+      "rd": 95.0,
+      "provisional": false,
+      "ciLow": 1393.8,
+      "ciHigh": 1766.2,
+      "intervalCalculation": "glicko2-95ci-rd",
+      "domain": "training",
+      "algorithm": "glicko2",
+      "algorithmVersion": "v1",
+      "epoch": 1,
+      "cutoff": "2026-11-06T15:00:00Z",
+      "computedAt": "2026-11-06T15:05:00Z",
+      "games": 18,
+      "wins": 10,
+      "draws": 2,
+      "losses": 6
+    }
+  ],
+  "recent": []
 }
 ```
 

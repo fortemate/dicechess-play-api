@@ -2,23 +2,24 @@ package dicechess.play.server
 
 import cats.effect.IO
 import cats.syntax.all.*
-import dicechess.play.core.{PublicPlayer, Principal, RatingCategory, Seat}
-import dicechess.play.rating.{Glicko, Glicko2}
+import dicechess.play.core.{Principal, PublicPlayer, RatingCategory, Seat}
+import dicechess.play.rating.{Glicko, Glicko2, RatingSnapshot, RatingSnapshotSummary}
 import dicechess.play.store.{
   BotStore,
-  RatedIdentity,
-  RatingStore,
-  ResultTally,
   GameResultRow,
   GameResultsStore,
   LeaderboardEntry,
   LeaderboardStore,
   PlayerLeaderboardEntry,
+  RatedIdentity,
+  RatingStore,
+  ResultTally,
   UserAccount,
   UserStore
 }
 import dicechess.play.wire.Codecs.given
 import io.circe.Codec
+import io.circe.generic.semiauto.deriveCodec
 import org.http4s.{HttpRoutes, Response}
 import org.http4s.circe.CirceEntityCodec.given
 import org.http4s.dsl.io.*
@@ -42,8 +43,32 @@ final case class LeaderRow(
     games: Int,
     wins: Int,
     draws: Int,
-    losses: Int
-) derives Codec.AsObject
+    losses: Int,
+    domain: Option[String] = None,
+    algorithm: Option[String] = None,
+    epoch: Option[Int] = None,
+    orderingValue: Option[Double] = None,
+    orderingRule: Option[String] = None,
+    ciLow: Option[Double] = None,
+    ciHigh: Option[Double] = None
+)
+
+object LeaderRow:
+  private val omitIfNull =
+    Set("domain", "algorithm", "epoch", "orderingValue", "orderingRule", "ciLow", "ciHigh")
+
+  given Codec[LeaderRow] =
+    val base = deriveCodec[LeaderRow]
+    Codec.from(
+      base,
+      base.mapJson { json =>
+        json.asObject.fold(json) { obj =>
+          io.circe.Json.fromJsonObject(obj.filter { case (k, v) =>
+            !(v.isNull && omitIfNull.contains(k))
+          })
+        }
+      }
+    )
 
 /** The public board. Provisional entrants (RD above the convergence threshold) are absent by policy (#119) — the same
   * rule for accounts as for bots.
@@ -51,7 +76,19 @@ final case class LeaderRow(
   * `category` (#280) echoes which scale these rows are on, including when the request named none: a client that renders
   * tabs must be able to tell what it is displaying without re-deriving the server's default.
   */
-final case class Leaderboard(category: String, leaders: List[LeaderRow]) derives Codec.AsObject
+final case class Leaderboard(
+    category: String,
+    leaders: List[LeaderRow],
+    epoch: Option[Int] = None,
+    anchorSetVersion: Option[String] = None,
+    cutoff: Option[Instant] = None,
+    computedAt: Option[Instant] = None
+)
+
+object Leaderboard:
+  given Codec[Leaderboard] =
+    val base = deriveCodec[Leaderboard]
+    Codec.from(base, base.mapJson(_.dropNullValues))
 
 /** One recent game from the profiled bot's point of view. `opponent` is a public face — bots by team-qualified name,
   * humans anonymous — NEVER a raw external id: a guest's stable uuid would let anyone correlate an anonymous player
@@ -123,6 +160,26 @@ final case class BotProfile(
     recent: List[RecentGame]
 ) derives Codec.AsObject
 
+final case class TrainingCategoryRating(
+    category: String,
+    rating: Double,
+    rd: Double,
+    provisional: Boolean,
+    ciLow: Double,
+    ciHigh: Double,
+    intervalCalculation: String = "rating ± 1.96 · rd (95% confidence interval)",
+    domain: String = "training",
+    algorithm: String = "glicko2",
+    algorithmVersion: String = "v1",
+    epoch: Int = 1,
+    cutoff: Option[Instant] = None,
+    computedAt: Option[Instant] = None,
+    games: Int,
+    wins: Int,
+    draws: Int,
+    losses: Int
+) derives Codec.AsObject
+
 /** An account's PUBLIC profile (#249) — deliberately the same shape as [[BotProfile]] so the SPA renders both with one
   * component, minus what only a bot has (`team`, `onLadder`).
   *
@@ -151,6 +208,7 @@ final case class PlayerProfile(
     // Per category (#280), with the scalars above describing `RatingCategory.Default` — see [[BotProfile]] for why the
     // two coexist and why the old names were re-pointed rather than removed.
     ratings: List[CategoryRating],
+    training: List[TrainingCategoryRating] = Nil,
     opponents: List[PlayerOpponent],
     recent: List[RecentGame]
 ) derives Codec.AsObject
@@ -189,7 +247,8 @@ object LeaderboardRoutes:
           .toRight(s"category: '$value' must be ${RatingCategory.values.map(c => s"'${c.wireName}'").mkString(", ")}")
 
   /** Rank is assigned after merging, so both builders emit 0 and the caller overwrites it. */
-  private def botRow(entry: LeaderboardEntry): LeaderRow =
+  private[play] def botRow(entry: LeaderboardEntry, snapshotEpoch: Option[Int] = None): LeaderRow =
+    val (low, high) = Glicko2.confidenceInterval95(entry.rating, entry.rd)
     LeaderRow(
       rank = 0,
       kind = "bot",
@@ -201,10 +260,18 @@ object LeaderboardRoutes:
       games = entry.tally.games,
       wins = entry.tally.wins,
       draws = entry.tally.draws,
-      losses = entry.tally.losses
+      losses = entry.tally.losses,
+      domain = snapshotEpoch.as("competitive"),
+      algorithm = snapshotEpoch.as("glicko2"),
+      epoch = snapshotEpoch,
+      orderingValue = snapshotEpoch.as(Glicko2.conservativeRating(entry.rating, entry.rd)),
+      orderingRule = snapshotEpoch.as("conservative-rating"),
+      ciLow = snapshotEpoch.as((low * 10).round / 10.0),
+      ciHigh = snapshotEpoch.as((high * 10).round / 10.0)
     )
 
-  private def playerRow(entry: PlayerLeaderboardEntry): LeaderRow =
+  private[server] def playerRow(entry: PlayerLeaderboardEntry, snapshotEpoch: Option[Int] = None): LeaderRow =
+    val (low, high) = Glicko2.confidenceInterval95(entry.rating, entry.rd)
     LeaderRow(
       rank = 0,
       kind = "player",
@@ -217,7 +284,14 @@ object LeaderboardRoutes:
       games = entry.tally.games,
       wins = entry.tally.wins,
       draws = entry.tally.draws,
-      losses = entry.tally.losses
+      losses = entry.tally.losses,
+      domain = snapshotEpoch.as("competitive"),
+      algorithm = snapshotEpoch.as("glicko2"),
+      epoch = snapshotEpoch,
+      orderingValue = snapshotEpoch.as(Glicko2.conservativeRating(entry.rating, entry.rd)),
+      orderingRule = snapshotEpoch.as("conservative-rating"),
+      ciLow = snapshotEpoch.as((low * 10).round / 10.0),
+      ciHigh = snapshotEpoch.as((high * 10).round / 10.0)
     )
 
   /** Recent games shown on a profile — a glance at current form, not a full history. */
@@ -230,6 +304,8 @@ object LeaderboardRoutes:
 
   /** `?category=` selects the scale (#280); absent is [[RatingCategory.Default]], the ladder's. */
   private object CategoryParam extends OptionalQueryParamDecoderMatcher[String]("category")
+
+  private object EpochParam extends OptionalValidatingQueryParamDecoderMatcher[Int]("epoch")
 
   /** One participant's per-category standing (#280): the categories it has been rated in, each with the W-D-L that
     * produced that rating, in enum order so a client's tabs never reshuffle.
@@ -269,23 +345,80 @@ object LeaderboardRoutes:
         (LeaderboardRoutes.parseKind(kind), LeaderboardRoutes.parseCategory(category)).tupled match
           case Left(error)                    => BadRequest(error)
           case Right((wantedFor, onCategory)) =>
-            val maxRd    = Glicko2.ProvisionalDeviationThreshold
-            val limit    = LeaderboardStore.MaxBoardSize
-            val botRows  = if wantedFor.bots then board.leaderboard(onCategory, maxRd, limit) else IO.pure(Nil)
-            val playRows =
-              if wantedFor.players then board.playerLeaderboard(onCategory, maxRd, limit) else IO.pure(Nil)
-            (botRows, playRows).flatMapN: (botEntries, playerEntries) =>
-              // Ranked across both populations by the conservative estimate `rating − k·RD` (#169, the same key as
-              // the stores' ORDER BY — see `Glicko2.ConservativeOrderingK`), because they ARE one scale — a separate
-              // rank per kind would imply two currencies. Ties break exactly as each single-population query already
-              // orders: more-certain (lower RD) first.
-              // Re-limited after merge so `?kind=all` returns the true top N across both populations rather than up
-              // to 2N — the same pattern `GameResultsStore.recentResultsFor` uses for its two-sided UNION (#289).
-              val merged = (botEntries.map(LeaderboardRoutes.botRow) ++ playerEntries.map(LeaderboardRoutes.playerRow))
-                .sortBy(row => (-Glicko2.conservativeRating(row.rating, row.rd), row.rd, row.name))
-                .take(limit)
-              val ranked = merged.zipWithIndex.map((row, index) => row.copy(rank = index + 1))
-              Ok(Leaderboard(onCategory.wireName, ranked))
+            val maxRd = Glicko2.ProvisionalDeviationThreshold
+            val limit = LeaderboardStore.MaxBoardSize
+            board
+              .liveLeaderboardView(onCategory, wantedFor.bots, wantedFor.players, maxRd, limit)
+              .flatMap: view =>
+                val epochOpt          = view.snapshot.map(_.epoch)
+                val effectiveCutoff   = view.dataCutoff.orElse(view.snapshot.map(_.cutoff))
+                val effectiveComputed = view.computedAt.orElse(view.snapshot.map(_.computedAt))
+                val merged            =
+                  (view.bots.map(b => LeaderboardRoutes.botRow(b, epochOpt)) ++ view.players
+                    .map(p => LeaderboardRoutes.playerRow(p, epochOpt)))
+                    .sortBy(row =>
+                      (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name)
+                    )
+                    .take(limit)
+                val ranked = merged.zipWithIndex.map((row, index) => row.copy(rank = index + 1))
+                Ok(
+                  Leaderboard(
+                    category = onCategory.wireName,
+                    leaders = ranked,
+                    epoch = epochOpt,
+                    anchorSetVersion = view.snapshot.map(_.anchorSetVersion),
+                    cutoff = effectiveCutoff,
+                    computedAt = effectiveComputed
+                  )
+                )
+
+      case GET -> Root / "leaderboard" / "snapshots" :? CategoryParam(catOpt) +& EpochParam(epochVal) =>
+        LeaderboardRoutes.parseCategory(catOpt) match
+          case Left(err)  => BadRequest(err)
+          case Right(cat) =>
+            epochVal match
+              case Some(cats.data.Validated.Invalid(errors)) =>
+                BadRequest(s"epoch must be an integer, got: ${errors.head.sanitized}")
+              case Some(cats.data.Validated.Valid(epoch)) =>
+                board.listBotStrengthSnapshots(cat, Some(epoch)).flatMap(Ok(_))
+              case None =>
+                board.listBotStrengthSnapshots(cat, None).flatMap(Ok(_))
+
+      case GET -> Root / "leaderboard" / "snapshots" / category / "latest" =>
+        RatingCategory.fromWireName(category) match
+          case None =>
+            BadRequest(
+              s"category: '$category' must be ${RatingCategory.values.map(c => s"'${c.wireName}'").mkString(", ")}"
+            )
+          case Some(cat) =>
+            board
+              .latestBotStrengthSnapshot(cat)
+              .flatMap:
+                case Some(snap) => Ok(snap)
+                case None       => NotFound()
+
+      case GET -> Root / "leaderboard" / "snapshots" / category / epochStr / cutoffStr =>
+        val parsed = for
+          cat <- RatingCategory
+            .fromWireName(category)
+            .toRight(
+              s"category: '$category' must be ${RatingCategory.values.map(c => s"'${c.wireName}'").mkString(", ")}"
+            )
+          epoch  <- epochStr.toIntOption.toRight(s"epoch: '$epochStr' must be an integer")
+          cutoff <- scala.util
+            .Try(Instant.parse(cutoffStr))
+            .toEither
+            .left
+            .map(_ => s"cutoff: '$cutoffStr' must be an ISO-8601 instant")
+        yield (cat, epoch, cutoff)
+        parsed match
+          case Left(err)                   => BadRequest(err)
+          case Right((cat, epoch, cutoff)) =>
+            board
+              .botStrengthSnapshotAt(cat, epoch, cutoff)
+              .flatMap:
+                case Some(snap) => Ok(snap)
+                case None       => NotFound()
 
       // The account counterpart of `GET /bots/{team}/{name}`, keyed by the only public handle a person has. Not
       // `/players/{something}`: that shape is taken by the guest-history reads, whose path segment is a bare uuid.
@@ -359,10 +492,36 @@ object LeaderboardRoutes:
       ratings.categoryRatingsOf(RatedIdentity.User(account.id)),
       board.categoryTalliesFor(externalId),
       results.recentResultsFor(externalId, RecentGamesShown),
-      results.opponentsFor(List(externalId))
-    ).flatMapN: (totalGames, byCategory, talliesByCategory, recent, opponents) =>
-      val default = byCategory.getOrElse(RatingCategory.Default, Glicko.Initial)
-      val tally   = talliesByCategory.getOrElse(RatingCategory.Default, ResultTally.Empty)
+      results.opponentsFor(List(externalId)),
+      ratings.trainingStatesOf(account.id)
+    ).flatMapN: (totalGames, byCategory, talliesByCategory, recent, opponents, trainingStates) =>
+      val default         = byCategory.getOrElse(RatingCategory.Default, Glicko.Initial)
+      val tally           = talliesByCategory.getOrElse(RatingCategory.Default, ResultTally.Empty)
+      val trainingRatings = RatingCategory.values.toList.flatMap: cat =>
+        trainingStates
+          .get(cat)
+          .filter(_.games > 0)
+          .map: state =>
+            val (ciLow, ciHigh) = state.confidenceInterval95
+            TrainingCategoryRating(
+              category = cat.wireName,
+              rating = state.rating,
+              rd = state.deviation,
+              provisional = state.isProvisional,
+              ciLow = (ciLow * 10).round / 10.0,
+              ciHigh = (ciHigh * 10).round / 10.0,
+              intervalCalculation = "rating ± 1.96 · rd (95% confidence interval)",
+              domain = "training",
+              algorithm = "glicko2",
+              algorithmVersion = "v1",
+              epoch = 1,
+              cutoff = state.updatedAt,
+              computedAt = state.computedAt,
+              games = state.games,
+              wins = state.wins,
+              draws = state.draws,
+              losses = state.losses
+            )
       Ok(
         PlayerProfile(
           nickname = account.nickname,
@@ -375,6 +534,7 @@ object LeaderboardRoutes:
           losses = tally.losses,
           totalGames = totalGames,
           ratings = LeaderboardRoutes.categoryRatings(byCategory, talliesByCategory),
+          training = trainingRatings,
           opponents = opponents.map(playerOpponent),
           recent = recent.map(recentGame(externalId, _))
         )

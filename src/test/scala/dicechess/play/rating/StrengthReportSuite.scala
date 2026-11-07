@@ -220,12 +220,19 @@ class StrengthReportSuite extends munit.FunSuite:
     assertEquals(kvOptions.config.elo1, 25.0)
     assertEquals(kvOptions.config.alpha, 0.01)
     assertEquals(kvOptions.config.beta, 0.02)
+    assertEquals(kvOptions.saveSnapshot, false)
+
+    val dbOptions = LadderReportMain.parseOptions(List("savedb=true", "out=test.md"))
+    assertEquals(dbOptions.saveSnapshot, true)
+    val snapOptions = LadderReportMain.parseOptions(List("savesnapshot=yes"))
+    assertEquals(snapOptions.saveSnapshot, true)
 
     // Positional fallback
     val posArgs    = List("10.0", "30.0", "0.02", "0.03")
     val posOptions = LadderReportMain.parseOptions(posArgs)
     assertEquals(posOptions.out, None)
     assertEquals(posOptions.format, LadderReportMain.Format.Text)
+    assertEquals(posOptions.saveSnapshot, false)
     assertEquals(posOptions.config.elo0, 10.0)
     assertEquals(posOptions.config.elo1, 30.0)
     assertEquals(posOptions.config.alpha, 0.02)
@@ -293,3 +300,52 @@ class StrengthReportSuite extends munit.FunSuite:
     assert(md.contains("### Provisional Bots"))
     assert(md.contains("fewer than 50 games or fewer than 5 distinct opponents"))
     assert(md.contains("`[Provisional]`"))
+
+  test("LadderReportMain helpers: parsePlayerKey, resolveEffectiveAnchor, assembleLeaders, and renderReport"):
+    import dicechess.play.store.{LeaderboardEntry, ResultTally}
+
+    // parsePlayerKey
+    assertEquals(LadderReportMain.parsePlayerKey("oracle/v1"), (Some("oracle"), "v1"))
+    assertEquals(LadderReportMain.parsePlayerKey("standalone"), (None, "standalone"))
+
+    // resolveEffectiveAnchor
+    val defaultBlitz = AnchorSet.Default
+    assertEquals(LadderReportMain.resolveEffectiveAnchor(defaultBlitz, RatingCategory.Default), defaultBlitz)
+    val unanchoredRapid = LadderReportMain.resolveEffectiveAnchor(defaultBlitz, RatingCategory.Rapid)
+    assertEquals(unanchoredRapid.category, "rapid")
+    assertEquals(unanchoredRapid.epoch, 0)
+    val custom = AnchorSet("custom-blitz", 2, "blitz", Nil)
+    assertEquals(LadderReportMain.resolveEffectiveAnchor(custom, RatingCategory.Default), custom)
+
+    // resolveCutoff
+    val t1 = Instant.parse("2026-10-01T12:00:00Z")
+    val t2 = Instant.parse("2026-10-02T12:00:00Z")
+    assertEquals(LadderReportMain.resolveCutoff(Some(t1), Some(t2)), t1)
+    assertEquals(LadderReportMain.resolveCutoff(Some(t2), Some(t1)), t1)
+    assertEquals(LadderReportMain.resolveCutoff(Some(t1), None), t1)
+    assertEquals(LadderReportMain.resolveCutoff(None, Some(t2)), t2)
+
+    // assembleLeaders
+    val existing = List(
+      // v1: lower anchored elo (1600), but higher conservative rating (1800 - 2*50 = 1700)
+      LeaderboardEntry("oracle", "v1", 1800.0, 50.0, onLadder = true, ResultTally(6, 2, 2)),
+      // v2: higher anchored elo (1700), but lower conservative rating (1600 - 2*50 = 1500)
+      LeaderboardEntry("oracle", "v2", 1600.0, 50.0, onLadder = true, ResultTally(6, 2, 2)),
+      // provisional: filtered out because rd = 350 > 110
+      LeaderboardEntry("oracle", "provisional", 1750.0, 350.0, onLadder = true, ResultTally.Empty)
+    )
+    val leaders = LadderReportMain.assembleLeaders(existing, epoch = 1)
+    assertEquals(leaders.size, 2)
+    assertEquals(leaders.map(_.name), List("v1", "v2"), "sorted by conservative Glicko-2 rating, not anchored elo")
+    assertEquals(leaders.map(_.rank), List(1, 2), "contiguous ranks without gaps from excluded bots")
+    assertEquals(leaders.head.team, Some("oracle"))
+    assertEquals(leaders.head.epoch, Some(1))
+
+    // renderReport
+    val games   = pair("p1", -1)
+    val report  = StrengthReport.build(games, RatingCategory.Default)
+    val optText =
+      LadderReportMain.Options(StrengthReport.Config(), RatingCategory.Default, None, LadderReportMain.Format.Text)
+    val optMd = optText.copy(format = LadderReportMain.Format.Markdown)
+    assert(LadderReportMain.renderReport(report, optText).contains("Dice Chess ladder — strength report"))
+    assert(LadderReportMain.renderReport(report, optMd).contains("title: Bot Strength Report"))

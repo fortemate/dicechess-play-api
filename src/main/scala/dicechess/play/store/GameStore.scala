@@ -4,6 +4,7 @@ import cats.effect.IO
 import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.ingest.PlaysiteIngest
+import dicechess.play.rating.{RatingSnapshot, RatingSnapshotSummary}
 import scala.annotation.unused
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.syntax.*
@@ -760,7 +761,8 @@ final case class GameRatingChange(
     black: Option[SeatRatingChange],
     outcome: RatingOutcome = RatingOutcome.Legacy,
     reason: Option[String] = None,
-    domain: Option[RatingDomain] = None
+    domain: Option[RatingDomain] = None,
+    trainingReference: Option[dicechess.play.rating.TrainingReference] = None
 )
 
 trait RatingStore:
@@ -890,6 +892,14 @@ trait LeaderboardStore:
       limit: Int = LeaderboardStore.MaxBoardSize
   ): IO[List[LeaderboardEntry]]
 
+  def leaderboard(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[java.time.Instant]
+  ): IO[List[LeaderboardEntry]] =
+    asOfCutoff.fold(leaderboard(category, maxRd, limit))(_ => leaderboard(category, maxRd, limit))
+
   /** Every ACCOUNT whose rating in `category` has converged (#249) — the human half of the same board, same threshold,
     * same policy, same per-category scoping as [[leaderboard]].
     *
@@ -900,6 +910,14 @@ trait LeaderboardStore:
       maxRd: Double,
       limit: Int = LeaderboardStore.MaxBoardSize
   ): IO[List[PlayerLeaderboardEntry]]
+
+  def playerLeaderboard(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[java.time.Instant]
+  ): IO[List[PlayerLeaderboardEntry]] =
+    asOfCutoff.fold(playerLeaderboard(category, maxRd, limit))(_ => playerLeaderboard(category, maxRd, limit))
 
   /** The rated, decided W-D-L record of one participant (either seat), split by category in one query (#280) — what a
     * profile needs to put a W-D-L beside each of its per-category ratings. Categories the participant has no rated
@@ -919,7 +937,63 @@ trait LeaderboardStore:
     */
   def totalGamesFor(externalId: String): IO[Int]
 
+  /** Reads the latest/current public rating snapshot for `category` (#150). */
+  def latestBotStrengthSnapshot(@unused category: RatingCategory): IO[Option[RatingSnapshot]] = IO.pure(None)
+
+  /** Reads a specific public rating snapshot by category, epoch, and cutoff (#150). */
+  def botStrengthSnapshotAt(
+      @unused category: RatingCategory,
+      @unused epoch: Int,
+      @unused cutoff: java.time.Instant
+  ): IO[Option[RatingSnapshot]] = IO.pure(None)
+
+  /** Lists historical rating snapshots for `category`, newest first (#150). */
+  def listBotStrengthSnapshots(
+      @unused category: RatingCategory,
+      @unused epoch: Option[Int] = None
+  ): IO[List[RatingSnapshotSummary]] = IO.pure(Nil)
+
+  /** Saves and publishes an immutable rating snapshot (#150). */
+  def saveBotStrengthSnapshot(
+      @unused category: RatingCategory,
+      @unused epoch: Int,
+      @unused anchorSetVersion: String,
+      @unused cutoff: java.time.Instant,
+      @unused leaders: List[dicechess.play.server.LeaderRow]
+  ): IO[LeaderboardStore.SnapshotSaveResult] = IO.pure(LeaderboardStore.SnapshotSaveResult(0L, false))
+
+  /** Reads the data cutoff and computation time of the latest applied rated game in `category` (#150). */
+  def latestAppliedCutoff(
+      @unused category: RatingCategory
+  ): IO[(Option[java.time.Instant], Option[java.time.Instant])] =
+    IO.pure((None, None))
+
+  /** Atomically reads the live leaderboard entries and provenance from one database snapshot (#150). */
+  def liveLeaderboardView(
+      category: RatingCategory,
+      wantedBots: Boolean,
+      wantedPlayers: Boolean,
+      maxRd: Double,
+      limit: Int = LeaderboardStore.MaxBoardSize
+  ): IO[LeaderboardStore.LiveLeaderboardView] =
+    for
+      b <- if wantedBots then leaderboard(category, maxRd, limit) else IO.pure(Nil)
+      p <- if wantedPlayers then playerLeaderboard(category, maxRd, limit) else IO.pure(Nil)
+      s <- latestBotStrengthSnapshot(category)
+      c <- latestAppliedCutoff(category)
+    yield LeaderboardStore.LiveLeaderboardView(b, p, s, c._1, c._2)
+
 object LeaderboardStore:
+  final case class SnapshotSaveResult(id: Long, inserted: Boolean)
+
+  final case class LiveLeaderboardView(
+      bots: List[LeaderboardEntry],
+      players: List[PlayerLeaderboardEntry],
+      snapshot: Option[RatingSnapshot],
+      dataCutoff: Option[java.time.Instant],
+      computedAt: Option[java.time.Instant]
+  )
+
   /** Payload guard for the public leaderboard endpoint: the SQL query is bounded to this many rows, so the response
     * never grows without limit as the platform scales (#289). Sized to match Lichess's own top-list and to be an order
     * of magnitude above anything this platform will have soon — it is NOT a display cap; the SPA decides what to show.

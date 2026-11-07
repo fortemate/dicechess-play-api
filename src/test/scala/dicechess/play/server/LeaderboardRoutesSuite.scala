@@ -2,7 +2,7 @@ package dicechess.play.server
 
 import cats.effect.IO
 import dicechess.play.core.{GameId, Principal, RatingCategory}
-import dicechess.play.rating.Glicko
+import dicechess.play.rating.{Glicko, Glicko2, RatingSnapshot, RatingSnapshotSummary, TrainingState}
 import dicechess.play.store.*
 import io.circe.Json
 import io.circe.parser.parse
@@ -44,23 +44,79 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       totals: Map[String, Int],
       // The rated record, split by category (#280) — the profiles' scalar W-D-L is the default category's entry of
       // this map, not a second read.
-      categoryTallies: Map[String, Map[RatingCategory, ResultTally]]
+      categoryTallies: Map[String, Map[RatingCategory, ResultTally]],
+      snapshots: Map[RatingCategory, RatingSnapshot],
+      snapshotHistory: List[RatingSnapshot],
+      liveCutoffs: Map[RatingCategory, (Option[Instant], Option[Instant])]
   ): LeaderboardStore =
     new LeaderboardStore:
       def leaderboard(category: RatingCategory, maxRd: Double, limit: Int): IO[List[LeaderboardEntry]] =
+        leaderboard(category, maxRd, limit, None)
+      override def leaderboard(
+          category: RatingCategory,
+          maxRd: Double,
+          limit: Int,
+          asOfCutoff: Option[Instant]
+      ): IO[List[LeaderboardEntry]] =
         IO.pure(entries.getOrElse(category, Nil).filter(_.rd <= maxRd).take(limit))
       def playerLeaderboard(
           category: RatingCategory,
           maxRd: Double,
           limit: Int
       ): IO[List[PlayerLeaderboardEntry]] =
+        playerLeaderboard(category, maxRd, limit, None)
+      override def playerLeaderboard(
+          category: RatingCategory,
+          maxRd: Double,
+          limit: Int,
+          asOfCutoff: Option[Instant]
+      ): IO[List[PlayerLeaderboardEntry]] =
         IO.pure(players.getOrElse(category, Nil).filter(_.rd <= maxRd).take(limit))
+      override def latestAppliedCutoff(category: RatingCategory): IO[(Option[Instant], Option[Instant])] =
+        liveCutoffs.get(category) match
+          case Some(pair) => IO.pure(pair)
+          case None       => IO.pure((snapshots.get(category).map(_.cutoff), snapshots.get(category).map(_.computedAt)))
       def categoryTalliesFor(externalId: String): IO[Map[RatingCategory, ResultTally]] =
         IO.pure(categoryTallies.getOrElse(externalId, Map.empty))
       def totalGamesFor(externalId: String): IO[Int] = IO.pure(totals.getOrElse(externalId, 0))
+      override def latestBotStrengthSnapshot(category: RatingCategory): IO[Option[RatingSnapshot]] =
+        IO.pure(snapshots.get(category))
+      override def botStrengthSnapshotAt(
+          category: RatingCategory,
+          epoch: Int,
+          cutoff: Instant
+      ): IO[Option[RatingSnapshot]] =
+        IO.pure(
+          snapshotHistory
+            .find(s => s.category == category.wireName && s.epoch == epoch && s.cutoff == cutoff)
+            .orElse(snapshots.get(category).filter(s => s.epoch == epoch && s.cutoff == cutoff))
+        )
+      override def listBotStrengthSnapshots(
+          category: RatingCategory,
+          epoch: Option[Int]
+      ): IO[List[RatingSnapshotSummary]] =
+        val all = (snapshots.values.toList ++ snapshotHistory)
+          .filter(_.category == category.wireName)
+          .filter(s => epoch.forall(_ == s.epoch))
+        IO.pure(
+          all.map(s =>
+            RatingSnapshotSummary(
+              s.category,
+              s.epoch,
+              s.anchorSetVersion,
+              s.cutoff,
+              s.computedAt,
+              s.isCurrent,
+              s.leaders.size
+            )
+          )
+        )
 
   /** The per-category rating seam the profiles read (#280). Only `categoryRatingsOf` is reachable from these routes. */
-  private def stubRatings(known: Map[RatedIdentity, Map[RatingCategory, Glicko]]): RatingStore = new RatingStore:
+  private def stubRatings(
+      known: Map[RatedIdentity, Map[RatingCategory, Glicko]],
+      training: Map[String, Map[RatingCategory, TrainingState]]
+  ): RatingStore = new RatingStore:
     def unappliedRatedGames(limit: Int): IO[List[GameResultRow]]                              = IO.pure(Nil)
     def applyRatingUpdate(gameId: GameId, white: RatingUpdate, black: RatingUpdate): IO[Unit] = IO.unit
     def markRatingApplied(gameId: GameId, reason: String): IO[Unit]                           = IO.unit
@@ -69,6 +125,8 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       IO.pure(known.getOrElse(identity, Map.empty).getOrElse(category, Glicko.Initial))
     def categoryRatingsOf(identity: RatedIdentity): IO[Map[RatingCategory, Glicko]] =
       IO.pure(known.getOrElse(identity, Map.empty))
+    override def trainingStatesOf(userId: String): IO[Map[RatingCategory, TrainingState]] =
+      IO.pure(training.getOrElse(userId, Map.empty))
 
   private def stubResults(
       recent: Map[String, List[GameResultRow]],
@@ -114,7 +172,11 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       entriesByCategory: Map[RatingCategory, List[LeaderboardEntry]] = Map.empty,
       playersByCategory: Map[RatingCategory, List[PlayerLeaderboardEntry]] = Map.empty,
       ratings: Map[RatedIdentity, Map[RatingCategory, Glicko]] = Map.empty,
-      categoryTallies: Map[String, Map[RatingCategory, ResultTally]] = Map.empty
+      categoryTallies: Map[String, Map[RatingCategory, ResultTally]] = Map.empty,
+      snapshots: Map[RatingCategory, RatingSnapshot] = Map.empty,
+      snapshotHistory: List[RatingSnapshot] = Nil,
+      liveCutoffs: Map[RatingCategory, (Option[Instant], Option[Instant])] = Map.empty,
+      training: Map[String, Map[RatingCategory, TrainingState]] = Map.empty
   ): HttpApp[IO] =
     LeaderboardRoutes(
       stubBots(bots),
@@ -122,10 +184,13 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
         Map(RatingCategory.Default -> entries) ++ entriesByCategory,
         Map(RatingCategory.Default -> players) ++ playersByCategory,
         totals,
-        categoryTallies
+        categoryTallies,
+        snapshots,
+        snapshotHistory,
+        liveCutoffs
       ),
       stubResults(recent, opponents),
-      stubRatings(ratings),
+      stubRatings(ratings, training),
       users = Some(stubUsers(accounts))
     ).orNotFound
 
@@ -403,3 +468,237 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
         "ranks are contiguous from 1"
       )
     }
+
+  // ── Versioned snapshot read contract (#150) ──────────────────────────────────
+
+  private val sampleSnapshot = RatingSnapshot(
+    category = "blitz",
+    epoch = 1,
+    anchorSetVersion = "v1.0",
+    cutoff = at,
+    computedAt = at,
+    isCurrent = true,
+    leaders = List(
+      LeaderRow(
+        rank = 1,
+        kind = "bot",
+        team = Some("aws"),
+        name = "hunter-v30",
+        rating = 2905.89,
+        rd = 50.0,
+        onLadder = true,
+        games = 100,
+        wins = 90,
+        draws = 5,
+        losses = 5,
+        domain = Some("competitive"),
+        algorithm = Some("glicko2"),
+        epoch = Some(1),
+        orderingValue = Some(2805.89),
+        orderingRule = Some("conservative-rating"),
+        ciLow = Some(2807.9),
+        ciHigh = Some(3003.9)
+      ),
+      LeaderRow(
+        rank = 2,
+        kind = "bot",
+        team = Some("anchor"),
+        name = "greedy",
+        rating = 1390.0,
+        rd = 45.0,
+        onLadder = true,
+        games = 200,
+        wins = 100,
+        draws = 20,
+        losses = 80,
+        domain = Some("competitive"),
+        algorithm = Some("glicko2"),
+        epoch = Some(1),
+        orderingValue = Some(1300.0),
+        orderingRule = Some("conservative-rating"),
+        ciLow = Some(1301.8),
+        ciHigh = Some(1478.2)
+      )
+    )
+  )
+
+  test("GET /leaderboard serves versioned metadata while preserving competitive Glicko-2 ratings (#150)"):
+    val liveCutoff   = at.plusSeconds(3600)
+    val liveComputed = at.plusSeconds(7200)
+    val service      = app(
+      bots = Map(("aws", "hunter-v30") -> BotRating(onLadder = true, None)),
+      entries = List(LeaderboardEntry("aws", "hunter-v30", 2905.89, 50.0, onLadder = true, ResultTally(90, 5, 5))),
+      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
+      liveCutoffs = Map(RatingCategory.Blitz -> (Some(liveCutoff), Some(liveComputed)))
+    )
+    service.run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Leaderboard]).map { board =>
+      assertEquals(board.category, "blitz")
+      assertEquals(board.epoch, Some(1))
+      assertEquals(board.anchorSetVersion, Some("v1.0"))
+      assertEquals(board.cutoff, Some(liveCutoff), "cutoff should prefer live provenance over snapshot cutoff")
+      assertEquals(
+        board.computedAt,
+        Some(liveComputed),
+        "computedAt should prefer live provenance over snapshot computedAt"
+      )
+      assertEquals(board.leaders.map(_.name), List("hunter-v30"))
+      val hunter = board.leaders.head
+      assertEquals(hunter.team, Some("aws"))
+      assertEquals(hunter.rating, 2905.89, "competitive Glicko-2 rating preserved")
+      assertEquals(hunter.rd, 50.0)
+      assertEquals(hunter.domain, Some("competitive"))
+      assertEquals(hunter.algorithm, Some("glicko2"))
+      assertEquals(hunter.epoch, Some(1))
+      assertEquals(hunter.orderingValue, Some(Glicko2.conservativeRating(2905.89, 50.0)))
+      assertEquals(hunter.orderingRule, Some("conservative-rating"))
+      assertEquals(hunter.onLadder, true)
+      assertEquals((hunter.games, hunter.wins, hunter.draws, hunter.losses), (100, 90, 5, 5))
+    }
+
+  test("GET /players/by-nickname/{nick} serves versioned training estimates isolated from competitive ratings (#150)"):
+    val account     = UserAccount("0197f0a0-0000-7000-8000-000000000249", "SwiftRook7", at, Some(at), isActive = true)
+    val me          = Principal.User(account.id).externalId
+    val trainingMap = Map(
+      account.id -> Map(
+        RatingCategory.Blitz -> TrainingState(
+          rating = 1580.0,
+          deviation = 75.0,
+          volatility = 0.06,
+          games = 25,
+          wins = 15,
+          draws = 3,
+          losses = 7,
+          updatedAt = Some(at),
+          computedAt = Some(at.plusSeconds(3600))
+        )
+      )
+    )
+    val service = app(
+      accounts = List(account),
+      ratings = Map(RatedIdentity.User(account.id) -> Map(RatingCategory.Blitz -> Glicko(1600.0, 90.0, 0.06))),
+      categoryTallies = Map(me -> Map(RatingCategory.Blitz -> ResultTally(9, 1, 5))),
+      training = trainingMap
+    )
+    service
+      .run(Request[IO](Method.GET, uri"/players/by-nickname/SwiftRook7"))
+      .flatMap(_.as[PlayerProfile])
+      .map { profile =>
+        assertEquals(profile.rating, 1600.0, "competitive rating intact")
+        assertEquals(profile.training.size, 1)
+        val blitzTrain = profile.training.head
+        assertEquals(blitzTrain.category, "blitz")
+        assertEquals(blitzTrain.rating, 1580.0)
+        assertEquals(blitzTrain.rd, 75.0)
+        assertEquals(blitzTrain.provisional, false)
+        assertEquals(blitzTrain.domain, "training")
+        assertEquals(blitzTrain.algorithm, "glicko2")
+        assertEquals(blitzTrain.algorithmVersion, "v1")
+        assertEquals(blitzTrain.epoch, 1)
+        assertEquals(blitzTrain.intervalCalculation, "rating ± 1.96 · rd (95% confidence interval)")
+        assertEquals(blitzTrain.cutoff, Some(at))
+        assertEquals(blitzTrain.computedAt, Some(at.plusSeconds(3600)))
+        assertEquals((blitzTrain.games, blitzTrain.wins, blitzTrain.draws, blitzTrain.losses), (25, 15, 3, 7))
+        assertEquals(blitzTrain.ciLow, ((1580.0 - 1.96 * 75.0) * 10).round / 10.0)
+        assertEquals(blitzTrain.ciHigh, ((1580.0 + 1.96 * 75.0) * 10).round / 10.0)
+      }
+
+  test("GET /bots/{team}/{name} serves competitive ratings without leaking internal anchored strength report (#150)"):
+    val service = app(
+      bots = Map(("aws", "hunter-v30") -> BotRating(onLadder = true, None)),
+      ratings = Map(RatedIdentity.Bot("aws", "hunter-v30") -> Map(RatingCategory.Blitz -> Glicko(1650.0, 95.0, 0.058))),
+      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot)
+    )
+    for
+      resp    <- service.run(Request[IO](Method.GET, uri"/bots/aws/hunter-v30"))
+      profile <- resp.as[BotProfile]
+      json    <- resp.as[Json]
+    yield
+      assertEquals(profile.rating, 1650.0)
+      assertEquals(profile.rd, 95.0)
+      assert(!json.asObject.exists(_.contains("strength")), "strength report must remain internal")
+
+  test("GET /leaderboard/snapshots endpoints list and retrieve immutable snapshots (#150)"):
+    val historicalSnapshot = sampleSnapshot.copy(
+      cutoff = at.minusSeconds(86400),
+      isCurrent = false
+    )
+    val service = app(
+      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
+      snapshotHistory = List(historicalSnapshot)
+    )
+    val histCutoff = historicalSnapshot.cutoff.toString
+    val histUri    = org.http4s.Uri.unsafeFromString(s"/leaderboard/snapshots/blitz/1/$histCutoff")
+    val missingUri = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/blitz/1/2020-01-01T00:00:00Z")
+    val badEpUri   = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/blitz/notanint/2026-10-01T00:00:00Z")
+    val badCutUri  = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/blitz/1/notaninstant")
+    val badCatHUri = org.http4s.Uri.unsafeFromString("/leaderboard/snapshots/invalid/1/2026-10-01T00:00:00Z")
+    for
+      listResp   <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots?category=blitz"))
+      summaries  <- listResp.as[List[RatingSnapshotSummary]]
+      latestResp <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/blitz/latest"))
+      latestSnap <- latestResp.as[RatingSnapshot]
+      histResp   <- service.run(Request[IO](Method.GET, histUri))
+      histSnap   <- histResp.as[RatingSnapshot]
+      badCatResp <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/invalid/latest"))
+      missingLat <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots/rapid/latest"))
+      badListCat <- service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots?category=invalid"))
+      badEpoch   <- service.run(Request[IO](Method.GET, badEpUri))
+      badCutoff  <- service.run(Request[IO](Method.GET, badCutUri))
+      badHistCat <- service.run(Request[IO](Method.GET, badCatHUri))
+      missingH   <- service.run(Request[IO](Method.GET, missingUri))
+    yield
+      assertEquals(summaries.size, 2)
+      assertEquals(latestSnap.isCurrent, true)
+      assertEquals(latestSnap.leaders.size, 2)
+      assertEquals(histSnap.isCurrent, false)
+      assertEquals(badCatResp.status, Status.BadRequest)
+      assertEquals(missingLat.status, Status.NotFound)
+      assertEquals(badListCat.status, Status.BadRequest)
+      assertEquals(badEpoch.status, Status.BadRequest)
+      assertEquals(badCutoff.status, Status.BadRequest)
+      assertEquals(badHistCat.status, Status.BadRequest)
+      assertEquals(missingH.status, Status.NotFound)
+
+  test("LeaderboardStore default trait implementations (#150)"):
+    val defaultStore = new dicechess.play.store.LeaderboardStore:
+      def leaderboard(c: dicechess.play.core.RatingCategory, m: Double, l: Int)       = IO.pure(Nil)
+      def playerLeaderboard(c: dicechess.play.core.RatingCategory, m: Double, l: Int) = IO.pure(Nil)
+      def categoryTalliesFor(e: String)                                               = IO.pure(Map.empty)
+      def totalGamesFor(e: String)                                                    = IO.pure(0)
+    for
+      latest <- defaultStore.latestBotStrengthSnapshot(dicechess.play.core.RatingCategory.Blitz)
+      atSnap <- defaultStore.botStrengthSnapshotAt(dicechess.play.core.RatingCategory.Blitz, 1, at)
+      list   <- defaultStore.listBotStrengthSnapshots(dicechess.play.core.RatingCategory.Blitz)
+      saved  <- defaultStore.saveBotStrengthSnapshot(dicechess.play.core.RatingCategory.Blitz, 1, "v1", at, Nil)
+    yield
+      assertEquals(latest, None)
+      assertEquals(atSnap, None)
+      assertEquals(list, Nil)
+      assertEquals(saved, dicechess.play.store.LeaderboardStore.SnapshotSaveResult(0L, false))
+
+  test("GET /leaderboard/snapshots returns 400 for invalid non-integer epoch"):
+    val service = app()
+    service.run(Request[IO](Method.GET, uri"/leaderboard/snapshots?epoch=not-a-number")).map { resp =>
+      assertEquals(resp.status, Status.BadRequest)
+    }
+
+  test("LeaderRow preserves 'team: null' for players and omits empty snapshot metadata in raw JSON"):
+    import io.circe.syntax.*
+    val botRow = LeaderboardRoutes.botRow(
+      LeaderboardEntry("acme", "bot1", 1600.0, 50.0, onLadder = true, ResultTally.Empty),
+      snapshotEpoch = None
+    )
+    val playerRow =
+      LeaderboardRoutes.playerRow(
+        PlayerLeaderboardEntry("Player1", 1550.0, 60.0, ResultTally.Empty),
+        snapshotEpoch = None
+      )
+
+    val botJson    = botRow.asJson.noSpaces
+    val playerJson = playerRow.asJson.noSpaces
+
+    assert(botJson.contains("\"team\":\"acme\""), "bot row must contain team")
+    assert(playerJson.contains("\"team\":null"), "player row must retain 'team: null' for API consumers")
+    assert(!botJson.contains("\"epoch\""), "unset epoch must be omitted")
+    assert(!playerJson.contains("\"epoch\""), "unset epoch must be omitted")
+    assert(!botJson.contains("\"domain\""), "unset domain must be omitted")

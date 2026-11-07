@@ -35,6 +35,8 @@ const applicationTableNames = new Set(tables.map((t) => bare(t.name)));
 const FK_FREE_RATIONALES = {
 	admin_actions:
 		'is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone',
+	bot_strength_snapshots:
+		'holds version-pinned engine strength snapshots and benchmark ratings independently of dynamic bot registrations',
 	bots: 'is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly',
 	client_reports:
 		'holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design)',

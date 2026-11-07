@@ -5448,7 +5448,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  test("V12 migration backfills legacy null RD from ratings at migration time (#150)"):
+  test("V12 migration backfills legacy null RD for latest applied game from ratings at migration time (#150)"):
     withContainers { pg =>
       (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
         val team: String        = "v12-backfill-bot"
@@ -5465,43 +5465,102 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
                          ($team, 'bot-opp', ${cat.wireName}, 1450.0, 58.0, 0.06)
                   ON CONFLICT (team, name, category) DO UPDATE SET rd = EXCLUDED.rd""".update.run
               .transact(xa)
-          id <- GameId.random
-          _  <- db.save(id, endedResultFixture(botA, botB, rated = true))
-          _  <-
+
+          // Older game: should NOT be backfilled with later RD
+          idOld <- GameId.random
+          _     <- db.save(idOld, endedResultFixture(botA, botB, rated = true))
+          _     <-
             sql"""UPDATE play.game_results
-                  SET white_rating_after = 1750.0,
+                  SET finished_at = '2026-09-01T00:00:00Z'::timestamptz,
+                      rating_outcome = 'applied',
+                      white_rating_after = 1600.0,
+                      black_rating_after = 1400.0,
+                      white_rd_after = NULL,
+                      black_rd_after = NULL,
+                      white_rd_before = NULL,
+                      black_rd_before = NULL
+                  WHERE game_id = ${idOld.value}::uuid""".update.run
+              .transact(xa)
+
+          // Latest game: should be backfilled with rd_after from ratings
+          idLatest <- GameId.random
+          _        <- db.save(idLatest, endedResultFixture(botA, botB, rated = true))
+          _        <-
+            sql"""UPDATE play.game_results
+                  SET finished_at = '2026-10-01T00:00:00Z'::timestamptz,
+                      rating_outcome = 'applied',
+                      white_rating_after = 1750.0,
                       black_rating_after = 1450.0,
                       white_rd_after = NULL,
-                      black_rd_after = NULL
-                  WHERE game_id = ${id.value}::uuid""".update.run
+                      black_rd_after = NULL,
+                      white_rd_before = NULL,
+                      black_rd_before = NULL
+                  WHERE game_id = ${idLatest.value}::uuid""".update.run
               .transact(xa)
 
           // Run the V12 backfill logic
           _ <-
-            sql"""UPDATE play.game_results g
-                  SET white_rd_after = r.rd, white_rd_before = r.rd
-                  FROM play.bot_ratings r
-                  WHERE g.game_id = ${id.value}::uuid
-                    AND g.white_rd_after IS NULL
-                    AND g.category = r.category
-                    AND g.white_external_id = 'bot:team:' || r.team || ':' || r.name""".update.run
+            sql"""WITH latest_bot_games AS (
+                    SELECT DISTINCT ON (r.team, r.name, r.category)
+                      g.game_id,
+                      r.rd,
+                      CASE WHEN g.white_external_id = 'bot:team:' || r.team || ':' || r.name THEN 'white' ELSE 'black' END AS seat
+                    FROM play.bot_ratings r
+                    JOIN play.game_results g
+                      ON g.category = r.category
+                     AND g.rating_outcome IN ('applied', 'legacy')
+                     AND (
+                       (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
+                       OR
+                       (g.black_external_id = 'bot:team:' || r.team || ':' || r.name AND g.black_rating_after IS NOT NULL)
+                     )
+                    ORDER BY r.team, r.name, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+                  )
+                  UPDATE play.game_results g
+                  SET white_rd_after = l.rd
+                  FROM latest_bot_games l
+                  WHERE g.game_id = l.game_id
+                    AND l.seat = 'white'
+                    AND g.white_rd_after IS NULL""".update.run
               .transact(xa)
           _ <-
-            sql"""UPDATE play.game_results g
-                  SET black_rd_after = r.rd, black_rd_before = r.rd
-                  FROM play.bot_ratings r
-                  WHERE g.game_id = ${id.value}::uuid
-                    AND g.black_rd_after IS NULL
-                    AND g.category = r.category
-                    AND g.black_external_id = 'bot:team:' || r.team || ':' || r.name""".update.run
+            sql"""WITH latest_bot_games AS (
+                    SELECT DISTINCT ON (r.team, r.name, r.category)
+                      g.game_id,
+                      r.rd,
+                      CASE WHEN g.white_external_id = 'bot:team:' || r.team || ':' || r.name THEN 'white' ELSE 'black' END AS seat
+                    FROM play.bot_ratings r
+                    JOIN play.game_results g
+                      ON g.category = r.category
+                     AND g.rating_outcome IN ('applied', 'legacy')
+                     AND (
+                       (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
+                       OR
+                       (g.black_external_id = 'bot:team:' || r.team || ':' || r.name AND g.black_rating_after IS NOT NULL)
+                     )
+                    ORDER BY r.team, r.name, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+                  )
+                  UPDATE play.game_results g
+                  SET black_rd_after = l.rd
+                  FROM latest_bot_games l
+                  WHERE g.game_id = l.game_id
+                    AND l.seat = 'black'
+                    AND g.black_rd_after IS NULL""".update.run
               .transact(xa)
 
-          rds <-
-            sql"SELECT white_rd_after, black_rd_after FROM play.game_results WHERE game_id = ${id.value}::uuid"
+          latestRds <-
+            sql"SELECT white_rd_after, black_rd_after, white_rd_before, black_rd_before FROM play.game_results WHERE game_id = ${idLatest.value}::uuid"
+              .query[(Option[Double], Option[Double], Option[Double], Option[Double])]
+              .unique
+              .transact(xa)
+          _ = assertEquals(latestRds, (Some(52.0), Some(58.0), None, None))
+
+          oldRds <-
+            sql"SELECT white_rd_after, black_rd_after FROM play.game_results WHERE game_id = ${idOld.value}::uuid"
               .query[(Option[Double], Option[Double])]
               .unique
               .transact(xa)
-          _ = assertEquals(rds, (Some(52.0), Some(58.0)))
+          _ = assertEquals(oldRds, (None, None))
         yield ()
       }
     }

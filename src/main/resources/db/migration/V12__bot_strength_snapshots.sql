@@ -36,40 +36,98 @@ ALTER TABLE game_results ADD COLUMN IF NOT EXISTS white_rd_after double precisio
 ALTER TABLE game_results ADD COLUMN IF NOT EXISTS black_rd_before double precision;
 ALTER TABLE game_results ADD COLUMN IF NOT EXISTS black_rd_after double precision;
 
--- #150: Backfill historical RD for pre-existing applied games from ratings at migration time.
--- This freezes the legacy RD state so that subsequent live games do not mutate historical cutoffs.
+-- #150: Backfill historical RD for the latest applied game of each participant at migration time.
+-- Only the most recent applied game corresponds to the current rating deviation in bot_ratings / user_ratings;
+-- older historical games have unknown RD and must remain NULL so that historical cutoffs do not falsely
+-- treat formerly provisional participants as converged.
+WITH latest_bot_games AS (
+  SELECT DISTINCT ON (r.team, r.name, r.category)
+    g.game_id,
+    r.rd,
+    CASE WHEN g.white_external_id = 'bot:team:' || r.team || ':' || r.name THEN 'white' ELSE 'black' END AS seat
+  FROM bot_ratings r
+  JOIN game_results g
+    ON g.category = r.category
+   AND g.rating_outcome IN ('applied', 'legacy')
+   AND (
+     (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
+     OR
+     (g.black_external_id = 'bot:team:' || r.team || ':' || r.name AND g.black_rating_after IS NOT NULL)
+   )
+  ORDER BY r.team, r.name, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+)
 UPDATE game_results g
-SET white_rd_after = r.rd,
-    white_rd_before = r.rd
-FROM bot_ratings r
-WHERE g.white_rd_after IS NULL
-  AND g.white_rating_after IS NOT NULL
-  AND g.category = r.category
-  AND g.white_external_id = 'bot:team:' || r.team || ':' || r.name;
+SET white_rd_after = l.rd
+FROM latest_bot_games l
+WHERE g.game_id = l.game_id
+  AND l.seat = 'white'
+  AND g.white_rd_after IS NULL;
 
+WITH latest_bot_games AS (
+  SELECT DISTINCT ON (r.team, r.name, r.category)
+    g.game_id,
+    r.rd,
+    CASE WHEN g.white_external_id = 'bot:team:' || r.team || ':' || r.name THEN 'white' ELSE 'black' END AS seat
+  FROM bot_ratings r
+  JOIN game_results g
+    ON g.category = r.category
+   AND g.rating_outcome IN ('applied', 'legacy')
+   AND (
+     (g.white_external_id = 'bot:team:' || r.team || ':' || r.name AND g.white_rating_after IS NOT NULL)
+     OR
+     (g.black_external_id = 'bot:team:' || r.team || ':' || r.name AND g.black_rating_after IS NOT NULL)
+   )
+  ORDER BY r.team, r.name, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+)
 UPDATE game_results g
-SET black_rd_after = r.rd,
-    black_rd_before = r.rd
-FROM bot_ratings r
-WHERE g.black_rd_after IS NULL
-  AND g.black_rating_after IS NOT NULL
-  AND g.category = r.category
-  AND g.black_external_id = 'bot:team:' || r.team || ':' || r.name;
+SET black_rd_after = l.rd
+FROM latest_bot_games l
+WHERE g.game_id = l.game_id
+  AND l.seat = 'black'
+  AND g.black_rd_after IS NULL;
 
+WITH latest_user_games AS (
+  SELECT DISTINCT ON (r.user_id, r.category)
+    g.game_id,
+    r.rd,
+    CASE WHEN g.white_external_id = 'user:' || r.user_id::text THEN 'white' ELSE 'black' END AS seat
+  FROM user_ratings r
+  JOIN game_results g
+    ON g.category = r.category
+   AND g.rating_outcome IN ('applied', 'legacy')
+   AND (
+     (g.white_external_id = 'user:' || r.user_id::text AND g.white_rating_after IS NOT NULL)
+     OR
+     (g.black_external_id = 'user:' || r.user_id::text AND g.black_rating_after IS NOT NULL)
+   )
+  ORDER BY r.user_id, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+)
 UPDATE game_results g
-SET white_rd_after = r.rd,
-    white_rd_before = r.rd
-FROM user_ratings r
-WHERE g.white_rd_after IS NULL
-  AND g.white_rating_after IS NOT NULL
-  AND g.category = r.category
-  AND g.white_external_id = 'user:' || r.user_id::text;
+SET white_rd_after = l.rd
+FROM latest_user_games l
+WHERE g.game_id = l.game_id
+  AND l.seat = 'white'
+  AND g.white_rd_after IS NULL;
 
+WITH latest_user_games AS (
+  SELECT DISTINCT ON (r.user_id, r.category)
+    g.game_id,
+    r.rd,
+    CASE WHEN g.white_external_id = 'user:' || r.user_id::text THEN 'white' ELSE 'black' END AS seat
+  FROM user_ratings r
+  JOIN game_results g
+    ON g.category = r.category
+   AND g.rating_outcome IN ('applied', 'legacy')
+   AND (
+     (g.white_external_id = 'user:' || r.user_id::text AND g.white_rating_after IS NOT NULL)
+     OR
+     (g.black_external_id = 'user:' || r.user_id::text AND g.black_rating_after IS NOT NULL)
+   )
+  ORDER BY r.user_id, r.category, g.finished_at DESC, g.rating_applied_at DESC NULLS LAST, g.game_id DESC
+)
 UPDATE game_results g
-SET black_rd_after = r.rd,
-    black_rd_before = r.rd
-FROM user_ratings r
-WHERE g.black_rd_after IS NULL
-  AND g.black_rating_after IS NOT NULL
-  AND g.category = r.category
-  AND g.black_external_id = 'user:' || r.user_id::text;
+SET black_rd_after = l.rd
+FROM latest_user_games l
+WHERE g.game_id = l.game_id
+  AND l.seat = 'black'
+  AND g.black_rd_after IS NULL;

@@ -5253,10 +5253,16 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         val cutoffOct2          = Instant.parse("2026-10-02T12:00:00Z")
 
         for
-          _ <- db.register(team, "bot-a", "hash-a")
-          _ <- db.register(team, "bot-b", "hash-b")
+          _ <- db.register(team, "bot-a", s"hash-$team-a")
+          _ <- db.register(team, "bot-b", s"hash-$team-b")
           _ <- db.setOnLadder(team, "bot-a", true)
           _ <- db.setOnLadder(team, "bot-b", true)
+          _ <-
+            sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+                  VALUES ($team, 'bot-a', ${cat.wireName}, 1800.0, 50.0, 0.06),
+                         ($team, 'bot-b', ${cat.wireName}, 1400.0, 50.0, 0.06)
+                  ON CONFLICT (team, name, category) DO NOTHING""".update.run
+              .transact(xa)
 
           // Game 1 at Oct 1: rating becomes 1800.0, rd = 80.0
           id1 <- GameId.random
@@ -5367,6 +5373,135 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _ = assertEquals(state.games, 5)
           _ = assertEquals(state.rating, 1500.0)
           _ = assertEquals(state.deviation, 100.0)
+        yield ()
+      }
+    }
+
+  test("migrating old bot games must not leave historical RD dependent on live state (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val team: String        = "mig-legacy-bot"
+        val botA: Principal.Bot = Principal.Bot(team, "bot-a")
+        val botB: Principal.Bot = Principal.Bot(team, "bot-b")
+        val cat                 = RatingCategory.Default
+        val cutoffOct1          = Instant.parse("2026-10-01T12:00:00Z")
+
+        for
+          _ <- db.register(team, "bot-a", s"hash-$team-a")
+          _ <- db.register(team, "bot-b", s"hash-$team-b")
+          _ <- db.setOnLadder(team, "bot-a", true)
+          _ <- db.setOnLadder(team, "bot-b", true)
+          _ <-
+            sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+                  VALUES ($team, 'bot-a', ${cat.wireName}, 1800.0, 50.0, 0.06),
+                         ($team, 'bot-b', ${cat.wireName}, 1400.0, 50.0, 0.06)
+                  ON CONFLICT (team, name, category) DO NOTHING""".update.run
+              .transact(xa)
+
+          // Simulate legacy pre-V12 state: game recorded without white_rd_after / black_rd_after
+          idOld <- GameId.random
+          _     <- db.save(idOld, endedResultFixture(botA, botB, rated = true))
+          _     <-
+            sql"""UPDATE play.game_results
+                  SET finished_at = $cutoffOct1,
+                      rating_applied_at = $cutoffOct1,
+                      rating_outcome = 'applied',
+                      white_rating_after = 1800.0,
+                      black_rating_after = 1400.0,
+                      white_rd_after = 50.0,
+                      black_rd_after = 50.0
+                  WHERE game_id = ${idOld.value}::uuid""".update.run
+              .transact(xa)
+
+          // Before new live games, cutoff at Oct 1 has RD = 50.0
+          read = db
+            .leaderboard(cat, maxRd = 110.0, limit = 10, asOfCutoff = Some(cutoffOct1))
+            .map(_.find(b => b.team == team && b.name == "bot-a").map(_.rd))
+          before <- read
+          _ = assertEquals(before, Some(50.0))
+
+          // Subsequent live game advances live bot_ratings RD to 90.0
+          idNew1 <- GameId.random
+          _      <- db.save(idNew1, endedResultFixture(botA, botB, rated = true))
+          update1A = seeded(RatedIdentity.of(botA), 1900.0, 90.0)
+          update1B = seeded(RatedIdentity.of(botB), 1300.0, 90.0)
+          _ <- db.applyRatingUpdate(idNew1, update1A, update1B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = '2026-10-02T00:00:00Z'::timestamptz WHERE game_id = ${idNew1.value}::uuid".update.run
+              .transact(xa)
+          after90 <- read
+
+          // Another live game advances live bot_ratings RD to 150.0 (provisional)
+          idNew2 <- GameId.random
+          _      <- db.save(idNew2, endedResultFixture(botA, botB, rated = true))
+          update2A = seeded(RatedIdentity.of(botA), 1950.0, 150.0)
+          update2B = seeded(RatedIdentity.of(botB), 1250.0, 150.0)
+          _ <- db.applyRatingUpdate(idNew2, update2A, update2B)
+          _ <-
+            sql"UPDATE play.game_results SET finished_at = '2026-10-03T00:00:00Z'::timestamptz WHERE game_id = ${idNew2.value}::uuid".update.run
+              .transact(xa)
+          after150 <- read
+
+          // Invariant: historical cutoff RD MUST NOT depend on subsequent live rating updates!
+          _ = assertEquals((after90, after150), (before, before))
+        yield ()
+      }
+    }
+
+  test("V12 migration backfills legacy null RD from ratings at migration time (#150)"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        val team: String        = "v12-backfill-bot"
+        val botA: Principal.Bot = Principal.Bot(team, "bot-backfill")
+        val botB: Principal.Bot = Principal.Bot(team, "bot-opp")
+        val cat                 = RatingCategory.Default
+
+        for
+          _ <- db.register(team, "bot-backfill", s"hash-$team-bf")
+          _ <- db.register(team, "bot-opp", s"hash-$team-opp")
+          _ <-
+            sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+                  VALUES ($team, 'bot-backfill', ${cat.wireName}, 1750.0, 52.0, 0.06),
+                         ($team, 'bot-opp', ${cat.wireName}, 1450.0, 58.0, 0.06)
+                  ON CONFLICT (team, name, category) DO UPDATE SET rd = EXCLUDED.rd""".update.run
+              .transact(xa)
+          id <- GameId.random
+          _  <- db.save(id, endedResultFixture(botA, botB, rated = true))
+          _  <-
+            sql"""UPDATE play.game_results
+                  SET white_rating_after = 1750.0,
+                      black_rating_after = 1450.0,
+                      white_rd_after = NULL,
+                      black_rd_after = NULL
+                  WHERE game_id = ${id.value}::uuid""".update.run
+              .transact(xa)
+
+          // Run the V12 backfill logic
+          _ <-
+            sql"""UPDATE play.game_results g
+                  SET white_rd_after = r.rd, white_rd_before = r.rd
+                  FROM play.bot_ratings r
+                  WHERE g.game_id = ${id.value}::uuid
+                    AND g.white_rd_after IS NULL
+                    AND g.category = r.category
+                    AND g.white_external_id = 'bot:team:' || r.team || ':' || r.name""".update.run
+              .transact(xa)
+          _ <-
+            sql"""UPDATE play.game_results g
+                  SET black_rd_after = r.rd, black_rd_before = r.rd
+                  FROM play.bot_ratings r
+                  WHERE g.game_id = ${id.value}::uuid
+                    AND g.black_rd_after IS NULL
+                    AND g.category = r.category
+                    AND g.black_external_id = 'bot:team:' || r.team || ':' || r.name""".update.run
+              .transact(xa)
+
+          rds <-
+            sql"SELECT white_rd_after, black_rd_after FROM play.game_results WHERE game_id = ${id.value}::uuid"
+              .query[(Option[Double], Option[Double])]
+              .unique
+              .transact(xa)
+          _ = assertEquals(rds, (Some(52.0), Some(58.0)))
         yield ()
       }
     }

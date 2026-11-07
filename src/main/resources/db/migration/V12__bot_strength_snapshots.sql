@@ -35,3 +35,41 @@ ALTER TABLE game_results ADD COLUMN IF NOT EXISTS white_rd_before double precisi
 ALTER TABLE game_results ADD COLUMN IF NOT EXISTS white_rd_after double precision;
 ALTER TABLE game_results ADD COLUMN IF NOT EXISTS black_rd_before double precision;
 ALTER TABLE game_results ADD COLUMN IF NOT EXISTS black_rd_after double precision;
+
+-- #150: Backfill historical RD for pre-existing applied games from ratings at migration time.
+-- This freezes the legacy RD state so that subsequent live games do not mutate historical cutoffs.
+UPDATE game_results g
+SET white_rd_after = r.rd,
+    white_rd_before = r.rd
+FROM bot_ratings r
+WHERE g.white_rd_after IS NULL
+  AND g.white_rating_after IS NOT NULL
+  AND g.category = r.category
+  AND g.white_external_id = 'bot:team:' || r.team || ':' || r.name;
+
+UPDATE game_results g
+SET black_rd_after = r.rd,
+    black_rd_before = r.rd
+FROM bot_ratings r
+WHERE g.black_rd_after IS NULL
+  AND g.black_rating_after IS NOT NULL
+  AND g.category = r.category
+  AND g.black_external_id = 'bot:team:' || r.team || ':' || r.name;
+
+UPDATE game_results g
+SET white_rd_after = r.rd,
+    white_rd_before = r.rd
+FROM user_ratings r
+WHERE g.white_rd_after IS NULL
+  AND g.white_rating_after IS NOT NULL
+  AND g.category = r.category
+  AND g.white_external_id = 'user:' || r.user_id::text;
+
+UPDATE game_results g
+SET black_rd_after = r.rd,
+    black_rd_before = r.rd
+FROM user_ratings r
+WHERE g.black_rd_after IS NULL
+  AND g.black_rating_after IS NOT NULL
+  AND g.category = r.category
+  AND g.black_external_id = 'user:' || r.user_id::text;

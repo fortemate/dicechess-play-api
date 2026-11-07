@@ -3190,7 +3190,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       case Some(cut) =>
         sql"""SELECT b.team, b.name,
                      COALESCE(latest_game.rating_after, 1500.0) AS effective_rating,
-                     COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) AS effective_rd,
+                     COALESCE(latest_game.rd_after, 350.0) AS effective_rd,
                      b.on_ladder,
                      COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
               FROM play.bots b
@@ -3242,9 +3242,9 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                 ) sides
                 GROUP BY external_id
               ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
-              WHERE (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) <= $maxRd
-              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) DESC,
-                       (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) ASC,
+              WHERE COALESCE(latest_game.rd_after, 350.0) <= $maxRd
+              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (COALESCE(latest_game.rd_after, 350.0)) DESC,
+                       (COALESCE(latest_game.rd_after, 350.0)) ASC,
                        b.team, b.name
               LIMIT ${limit.toLong}"""
           .query[(String, String, Double, Double, Boolean, Int, Int, Int)]
@@ -3318,7 +3318,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       case Some(cut) =>
         sql"""SELECT u.nickname,
                      COALESCE(latest_game.rating_after, 1500.0) AS effective_rating,
-                     COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END) AS effective_rd,
+                     COALESCE(latest_game.rd_after, 350.0) AS effective_rd,
                      COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
               FROM play.users u
               JOIN play.user_ratings r ON r.user_id = u.id AND r.category = ${category.wireName}
@@ -3368,9 +3368,9 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                 ) sides
                 GROUP BY external_id
               ) t ON t.external_id = 'user:' || u.id::text
-              WHERE (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) <= $maxRd AND u.is_active
-              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) DESC,
-                       (COALESCE(latest_game.rd_after, CASE WHEN latest_game.rating_after IS NOT NULL THEN r.rd ELSE 350.0 END)) ASC,
+              WHERE COALESCE(latest_game.rd_after, 350.0) <= $maxRd AND u.is_active
+              ORDER BY (COALESCE(latest_game.rating_after, 1500.0)) - ${Glicko2.ConservativeOrderingK} * (COALESCE(latest_game.rd_after, 350.0)) DESC,
+                       (COALESCE(latest_game.rd_after, 350.0)) ASC,
                        u.nickname
               LIMIT ${limit.toLong}"""
           .query[(String, Double, Double, Int, Int, Int)]

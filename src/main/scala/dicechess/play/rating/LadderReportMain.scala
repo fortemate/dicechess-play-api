@@ -3,7 +3,7 @@ package dicechess.play.rating
 import cats.effect.{ExitCode, IO, IOApp}
 import dicechess.play.core.RatingCategory
 import dicechess.play.server.{LeaderRow, LeaderboardRoutes}
-import dicechess.play.store.{GameResultRow, LeaderboardEntry, PgGameStore}
+import dicechess.play.store.{GameResultRow, LeaderboardEntry, LeaderboardStore, PgGameStore}
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
@@ -114,6 +114,53 @@ object LadderReportMain extends IOApp:
       row.copy(rank = index + 1)
     }
 
+  private[rating] def resolveCutoff(corpusCutoff: Option[Instant], appliedCutoff: Option[Instant]): Instant =
+    (corpusCutoff, appliedCutoff) match
+      case (Some(cc), Some(ac)) => if cc.isBefore(ac) then cc else ac
+      case (Some(cc), None)     => cc
+      case (None, Some(ac))     => ac
+      case (None, None)         => Instant.now()
+
+  private def logSaveResult(
+      saveResult: LeaderboardStore.SnapshotSaveResult,
+      category: RatingCategory,
+      cutoff: Instant
+  ): IO[Unit] =
+    val msg =
+      if saveResult.inserted then
+        s"[ladder-report] saved new bot strength snapshot (id=${saveResult.id}) for category ${category.wireName}"
+      else
+        s"[ladder-report] retained existing immutable snapshot (id=${saveResult.id}) for category ${category.wireName} at cutoff $cutoff"
+    IO.println(msg)
+
+  private def doPublishSnapshot(
+      store: PgGameStore,
+      options: Options,
+      rows: List[GameResultRow],
+      effectiveAnchor: AnchorSet
+  ): IO[Unit] =
+    val categoryRows = rows.filter(r => RatingCategory.ofStored(r.timeControl).contains(options.category))
+    val corpusCutoff = categoryRows.flatMap(r => Option(r.finishedAt)).maxOption
+    for
+      appliedPair <- store.latestAppliedCutoff(options.category)
+      cutoff = resolveCutoff(corpusCutoff, appliedPair._1)
+      existingBots <- store.leaderboard(
+        options.category,
+        maxRd = Glicko2.ProvisionalDeviationThreshold,
+        limit = 500,
+        asOfCutoff = Some(cutoff)
+      )
+      leaders = assembleLeaders(existingBots, effectiveAnchor.epoch)
+      saveResult <- store.saveBotStrengthSnapshot(
+        category = options.category,
+        epoch = effectiveAnchor.epoch,
+        anchorSetVersion = effectiveAnchor.version,
+        cutoff = cutoff,
+        leaders = leaders
+      )
+      _ <- logSaveResult(saveResult, options.category, cutoff)
+    yield ()
+
   private[rating] def publishSnapshot(
       store: PgGameStore,
       options: Options,
@@ -127,41 +174,7 @@ object LadderReportMain extends IOApp:
         IO.println(
           s"[ladder-report] snapshot publication refused: category ${options.category.wireName} is uncalibrated or lacks scale anchors (epoch ${effectiveAnchor.epoch})"
         )
-      else
-        val categoryRows = rows.filter(r => RatingCategory.ofStored(r.timeControl).contains(options.category))
-        val corpusCutoff = categoryRows.flatMap(r => Option(r.finishedAt)).maxOption
-        for
-          appliedCutoffPair <- store.latestAppliedCutoff(options.category)
-          appliedCutoffOpt = appliedCutoffPair._1
-          cutoff           = (corpusCutoff, appliedCutoffOpt) match
-            case (Some(cc), Some(ac)) => if cc.isBefore(ac) then cc else ac
-            case (Some(cc), None)     => cc
-            case (None, Some(ac))     => ac
-            case (None, None)         => Instant.now()
-          existingBots <- store.leaderboard(
-            options.category,
-            maxRd = Glicko2.ProvisionalDeviationThreshold,
-            limit = 500,
-            asOfCutoff = Some(cutoff)
-          )
-          leaders = assembleLeaders(existingBots, effectiveAnchor.epoch)
-          saveResult <- store.saveBotStrengthSnapshot(
-            category = options.category,
-            epoch = effectiveAnchor.epoch,
-            anchorSetVersion = effectiveAnchor.version,
-            cutoff = cutoff,
-            leaders = leaders
-          )
-          _ <-
-            if saveResult.inserted then
-              IO.println(
-                s"[ladder-report] saved new bot strength snapshot (id=${saveResult.id}) for category ${options.category.wireName}"
-              )
-            else
-              IO.println(
-                s"[ladder-report] retained existing immutable snapshot (id=${saveResult.id}) for category ${options.category.wireName} at cutoff $cutoff"
-              )
-        yield ()
+      else doPublishSnapshot(store, options, rows, effectiveAnchor)
 
   def run(args: List[String]): IO[ExitCode] =
     val options = parseOptions(args)

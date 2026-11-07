@@ -317,6 +317,14 @@ class StrengthReportSuite extends munit.FunSuite:
     val custom = AnchorSet("custom-blitz", 2, "blitz", Nil)
     assertEquals(LadderReportMain.resolveEffectiveAnchor(custom, RatingCategory.Default), custom)
 
+    // resolveCutoff
+    val t1 = Instant.parse("2026-10-01T12:00:00Z")
+    val t2 = Instant.parse("2026-10-02T12:00:00Z")
+    assertEquals(LadderReportMain.resolveCutoff(Some(t1), Some(t2)), t1)
+    assertEquals(LadderReportMain.resolveCutoff(Some(t2), Some(t1)), t1)
+    assertEquals(LadderReportMain.resolveCutoff(Some(t1), None), t1)
+    assertEquals(LadderReportMain.resolveCutoff(None, Some(t2)), t2)
+
     // assembleLeaders
     val existing = List(
       // v1: lower anchored elo (1600), but higher conservative rating (1800 - 2*50 = 1700)

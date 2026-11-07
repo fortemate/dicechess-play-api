@@ -766,6 +766,17 @@ final case class GameRatingChange(
 )
 
 trait RatingStore:
+  /** Capture the active projection generation before any rating reads. Persistent stores reject a write if
+    * migration/pause changed that generation before commit; in-memory stores need no migration fence.
+    */
+  def withRatingEpoch[A](action: IO[A]): IO[A] = action
+
+  /** After activation, the running writer must implement the exact policy/model/anchor contract. */
+  def validateRatingEpochRuntime(@unused policy: RatingPolicy): IO[Unit] = IO.unit
+
+  /** Provenance for active training/profile estimates; absent before an epoch is selected. */
+  def activeRatingEpoch: IO[Option[RatingEpochMetadata]] = IO.pure(None)
+
   /** Rated games not yet applied to any rating, oldest `finished_at` first — the head of the claim queue. */
   def unappliedRatedGames(limit: Int): IO[List[GameResultRow]]
 
@@ -776,6 +787,10 @@ trait RatingStore:
     * The two sides may live in DIFFERENT tables (an account vs a bot, #248), and each side now also writes its
     * per-category state (#280) into a third. The atomicity guarantee is therefore per GAME, not per table: one
     * transaction spanning every write plus the row.
+    *
+    * Requires an existing pending `game_results` row. A missing or already-applied game is a no-op for projections and
+    * recorded movements; repeating a successful application never counts or applies it twice. This is not a
+    * general-purpose rating setter.
     */
   def applyRatingUpdate(gameId: GameId, white: RatingUpdate, black: RatingUpdate): IO[Unit]
 
@@ -843,9 +858,16 @@ trait RatingStore:
       @unused finishedAt: java.time.Instant
   ): IO[Unit] = IO.unit
 
-/** A bot's rated, decided W-D-L record from `game_results` (undecided/casual games are excluded — this is the ladder
-  * record, not a lifetime activity counter).
-  */
+/** Selected projection provenance, independent of which historical snapshots have been published. */
+final case class RatingEpochMetadata(
+    epoch: Int,
+    modelVersion: String,
+    anchorSetVersion: String,
+    cutoff: java.time.Instant,
+    computedAt: java.time.Instant
+)
+
+/** Competitive decided record: active-epoch baseline plus future games after activation, legacy history otherwise. */
 final case class ResultTally(wins: Int, draws: Int, losses: Int):
   def games: Int = wins + draws + losses
 

@@ -105,7 +105,7 @@ object Main extends IOApp.Simple:
               .eval(BotStore.inMemory)
               .map(bots => (GameStore.noop, bots, None, http, webhookTransport, IO.never))
           case Some(dbConfig) =>
-            PgGameStore.resource(dbConfig).map { store =>
+            PgGameStore.resource(dbConfig).evalTap(_.validateRatingEpochRuntime(RatingPolicy.fromEnv)).map { store =>
               val deliverer = IngestDeliverer.configFromEnv match
                 case None =>
                   cats.effect.std

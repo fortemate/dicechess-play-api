@@ -473,28 +473,7 @@ object StrengthReport:
     val rankingStatus =
       if rankEntries.isEmpty then List("", s"> ${emptyAdmissionMessage(report)}") else Nil
 
-    val provisionalSection = if report.anchored.provisional.nonEmpty then
-      List(
-        "",
-        "### Provisional Bots",
-        "",
-        "> [!note]",
-        s"> These bots lack sufficient game/opponent counts, calibration or uncertainty evidence. Anchor identity does not waive admission. Their estimates are provisional.",
-        "",
-        "| Bot | Relative Elo | 95% Confidence Interval | Games | Opponents |",
-        "|:---|:---:|:---:|:---:|:---:|"
-      ) ++ report.anchored.provisional.map { r =>
-        line(
-          "| `%s` `[Provisional]`%s | %+.1f | %s | %d | %d |",
-          r.player,
-          if r.isAnchor then " `[Anchor]`" else "",
-          r.elo,
-          intervalText(r),
-          r.games,
-          r.opponents
-        )
-      }
-    else Nil
+    val provisionalSection = markdownProvisionalSection(report)
 
     val disconnectedSection = if report.anchored.disconnected.nonEmpty then
       List(
@@ -541,3 +520,27 @@ object StrengthReport:
 
     (frontmatter ++ summary ++ rankingHeader ++ rankingRows ++ rankingStatus ++ provisionalSection ++ disconnectedSection ++ sprtHeader ++ sprtRows)
       .mkString("\n")
+
+  private def markdownProvisionalSection(report: StrengthReport): List[String] =
+    if report.anchored.provisional.nonEmpty then
+      List(
+        "",
+        "### Provisional Bots",
+        "",
+        "> [!note]",
+        s"> These bots lack sufficient game/opponent counts, calibration or uncertainty evidence. Anchor identity does not waive admission. Their estimates are provisional.",
+        "",
+        "| Bot | Relative Elo | 95% Confidence Interval | Games | Opponents |",
+        "|:---|:---:|:---:|:---:|:---:|"
+      ) ++ report.anchored.provisional.map { r =>
+        line(
+          "| `%s` `[Provisional]`%s | %+.1f | %s | %d | %d |",
+          r.player,
+          if r.isAnchor then " `[Anchor]`" else "",
+          r.elo,
+          intervalText(r),
+          r.games,
+          r.opponents
+        )
+      }
+    else Nil

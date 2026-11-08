@@ -38,6 +38,9 @@ erDiagram
     games
     nickname_history
     outbox
+    rating_epoch_control
+    rating_epoch_counts
+    rating_epoch_runs
     released_nicknames
     rematch_commands
     rematch_sessions
@@ -56,6 +59,7 @@ erDiagram
     bots ||--o{ bot_webhook_stats : ""
     bots ||--o| bot_webhooks : ""
     games ||--o| outbox : ""
+    rating_epoch_runs ||--o{ rating_epoch_control : ""
     rematch_sessions ||--o{ rematch_commands : ""
     rematch_sessions ||--o| rematch_successors : ""
     rematch_successors ||--o| rematch_sessions : ""
@@ -65,7 +69,7 @@ erDiagram
     users ||--o{ user_training_ratings : ""
 ```
 
-Only foreign keys appear as edges. Fourteen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bot_strength_snapshots` holds version-pinned engine strength snapshots and benchmark ratings independently of dynamic bot registrations, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `nickname_history` and `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
+Only foreign keys appear as edges. Sixteen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bot_strength_snapshots` holds version-pinned engine strength snapshots and benchmark ratings independently of dynamic bot registrations, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `nickname_history` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `rating_epoch_counts` uses public-history participant identities for active epoch baselines; lifecycle triggers remove deleted participants without foreign keys into retained history, `rating_epoch_runs` preserves immutable migration plans and rollback evidence independently of participant lifecycle changes, `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
 
 ## Tables
 
@@ -333,12 +337,14 @@ Indexes:
 | `white_rd_after` | `double precision` | yes | — | — |
 | `black_rd_before` | `double precision` | yes | — | — |
 | `black_rd_after` | `double precision` | yes | — | — |
+| `rating_epoch` | `integer` | yes | — | — |
 
 Check constraints:
 
 - `CHECK (((black_kind IS NULL) OR (black_kind = ANY (ARRAY['human'::text, 'bot'::text, 'guest'::text]))))`
 - `CHECK ((origin = ANY (ARRAY['showcase'::text, 'ladder'::text, 'catalog'::text, 'lobby'::text, 'direct'::text, 'legacy'::text])))`
 - `CHECK ((rating_domain = ANY (ARRAY['competitive'::text, 'training'::text, 'casual'::text, 'legacy'::text])))`
+- `CHECK ((rating_epoch > 0))`
 - `CHECK ((rating_outcome = ANY (ARRAY['pending'::text, 'applied'::text, 'skipped'::text, 'casual'::text, 'legacy'::text])))`
 - `CHECK (((rating_outcome = 'skipped'::text) = (rating_skip_reason IS NOT NULL)))`
 - `CHECK (((training_reference_source IS NULL) OR (rating_domain = 'training'::text)))`
@@ -354,6 +360,7 @@ END)`
 Indexes:
 
 - `game_results_black_finished_idx` — `CREATE INDEX game_results_black_finished_idx ON public.game_results USING btree (black_external_id, finished_at DESC)`
+- `game_results_epoch_cutoff_idx` — `CREATE INDEX game_results_epoch_cutoff_idx ON public.game_results USING btree (rating_epoch, category, finished_at DESC) WHERE (rating_epoch IS NOT NULL)`
 - `game_results_ladder_idx` — `CREATE INDEX game_results_ladder_idx ON public.game_results USING btree (ladder) WHERE ladder`
 - `game_results_origin_finished_idx` — `CREATE INDEX game_results_origin_finished_idx ON public.game_results USING btree (origin, finished_at DESC)`
 - `game_results_outcome_category_idx` — `CREATE INDEX game_results_outcome_category_idx ON public.game_results USING btree (rating_outcome, category) WHERE (result IS NOT NULL)`
@@ -419,6 +426,82 @@ Indexes:
 
 - `outbox_due_idx` — `CREATE INDEX outbox_due_idx ON public.outbox USING btree (next_attempt_at) WHERE ((delivered_at IS NULL) AND (NOT failed_permanently))`
 - `outbox_pkey` — `CREATE UNIQUE INDEX outbox_pkey ON public.outbox USING btree (game_id)`
+
+### `rating_epoch_control`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `singleton` | `boolean` | no | `true` | PK |
+| `revision` | `bigint` | no | `0` | — |
+| `paused` | `boolean` | no | `false` | — |
+| `active_epoch` | `integer` | yes | — | — |
+| `active_run_id` | `uuid` | yes | — | FK → rating_epoch_runs(run_id) |
+| `changed_at` | `timestamp with time zone` | no | `now()` | — |
+
+Check constraints:
+
+- `CHECK ((active_epoch > 0))`
+- `CHECK (((active_epoch IS NULL) = (active_run_id IS NULL)))`
+- `CHECK (singleton)`
+
+Indexes:
+
+- `rating_epoch_control_pkey` — `CREATE UNIQUE INDEX rating_epoch_control_pkey ON public.rating_epoch_control USING btree (singleton)`
+
+### `rating_epoch_counts`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `participant_external_id` | `text` | no | — | PK |
+| `category` | `text` | no | — | PK |
+| `games` | `bigint` | no | — | — |
+| `wins` | `bigint` | no | — | — |
+| `draws` | `bigint` | no | — | — |
+| `losses` | `bigint` | no | — | — |
+
+Check constraints:
+
+- `CHECK ((category = ANY (ARRAY['bullet'::text, 'blitz'::text, 'rapid'::text])))`
+- `CHECK ((games = ((wins + draws) + losses)))`
+- `CHECK ((draws >= 0))`
+- `CHECK ((games >= 0))`
+- `CHECK ((losses >= 0))`
+- `CHECK ((wins >= 0))`
+
+Indexes:
+
+- `rating_epoch_counts_pkey` — `CREATE UNIQUE INDEX rating_epoch_counts_pkey ON public.rating_epoch_counts USING btree (participant_external_id, category)`
+
+### `rating_epoch_runs`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `run_id` | `uuid` | no | — | PK |
+| `plan_sha256` | `text` | no | — | unique |
+| `phase` | `text` | no | — | — |
+| `source_revision` | `bigint` | no | — | — |
+| `source_state_sha256` | `text` | no | — | — |
+| `target_epoch` | `integer` | no | — | — |
+| `cutoff` | `timestamp with time zone` | no | — | — |
+| `anchor_set_version` | `text` | no | — | — |
+| `plan` | `jsonb` | no | — | — |
+| `before_state` | `jsonb` | yes | — | — |
+| `before_state_sha256` | `text` | yes | — | — |
+| `after_state_sha256` | `text` | yes | — | — |
+| `applied_revision` | `bigint` | yes | — | — |
+| `staged_at` | `timestamp with time zone` | no | `now()` | — |
+| `applied_at` | `timestamp with time zone` | yes | — | — |
+| `rolled_back_at` | `timestamp with time zone` | yes | — | — |
+
+Check constraints:
+
+- `CHECK ((phase = ANY (ARRAY['staged'::text, 'applied'::text, 'rolled_back'::text])))`
+- `CHECK ((target_epoch > 0))`
+
+Indexes:
+
+- `rating_epoch_runs_pkey` — `CREATE UNIQUE INDEX rating_epoch_runs_pkey ON public.rating_epoch_runs USING btree (run_id)`
+- `rating_epoch_runs_plan_sha256_key` — `CREATE UNIQUE INDEX rating_epoch_runs_plan_sha256_key ON public.rating_epoch_runs USING btree (plan_sha256)`
 
 ### `released_nicknames`
 

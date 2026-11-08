@@ -493,8 +493,9 @@ object LeaderboardRoutes:
       board.categoryTalliesFor(externalId),
       results.recentResultsFor(externalId, RecentGamesShown),
       results.opponentsFor(List(externalId)),
-      ratings.trainingStatesOf(account.id)
-    ).flatMapN: (totalGames, byCategory, talliesByCategory, recent, opponents, trainingStates) =>
+      ratings.trainingStatesOf(account.id),
+      ratings.activeRatingEpoch
+    ).flatMapN: (totalGames, byCategory, talliesByCategory, recent, opponents, trainingStates, activeEpoch) =>
       val default         = byCategory.getOrElse(RatingCategory.Default, Glicko.Initial)
       val tally           = talliesByCategory.getOrElse(RatingCategory.Default, ResultTally.Empty)
       val trainingRatings = RatingCategory.values.toList.flatMap: cat =>
@@ -514,7 +515,7 @@ object LeaderboardRoutes:
               domain = "training",
               algorithm = "glicko2",
               algorithmVersion = "v1",
-              epoch = 1,
+              epoch = activeEpoch.fold(1)(_.epoch),
               cutoff = state.updatedAt,
               computedAt = state.computedAt,
               games = state.games,

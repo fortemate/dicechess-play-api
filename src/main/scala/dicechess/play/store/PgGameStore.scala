@@ -1,7 +1,7 @@
 package dicechess.play.store
 
 import cats.data.NonEmptyList
-import cats.effect.{IO, Resource}
+import cats.effect.{IO, IOLocal, Resource}
 import cats.effect.std.Console
 import cats.syntax.all.*
 import doobie.*
@@ -21,6 +21,7 @@ import dicechess.play.core.{
   RatingCategory,
   RatingDomain,
   RatingOutcome,
+  RatingPolicy,
   Seat,
   Side,
   Termination,
@@ -61,8 +62,11 @@ import scala.concurrent.duration.*
   * `anchorSet` is the calibration a training row's bot reference is captured against when `save` writes the row (#189)
   * — the same set the rating batch is built with.
   */
-final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
-    extends GameStore
+final class PgGameStore private (
+    private[store] val xa: HikariTransactor[IO],
+    anchorSet: AnchorSet,
+    ratingEpochRevision: IOLocal[Option[Long]]
+) extends GameStore
     with OutboxStore
     with ClientReportStore
     with BotStore
@@ -88,6 +92,77 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     SlowStatementThreshold,
     UniqueViolation
   }
+
+  override def withRatingEpoch[A](action: IO[A]): IO[A] =
+    sql"SELECT revision, paused FROM play.rating_epoch_control WHERE singleton"
+      .query[(Long, Boolean)]
+      .unique
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .flatMap { (revision, paused) =>
+        if paused then IO.raiseError(new IllegalStateException("rating epoch writes are paused"))
+        else
+          Resource
+            .make(
+              ratingEpochRevision.get.flatTap(_ => ratingEpochRevision.set(Some(revision)))
+            )(ratingEpochRevision.set)
+            .use(_ => action)
+      }
+
+  /** Validate the generation captured before rating reads while holding the control row until commit. Old unfenced
+    * callers are supported only before the first activation. The transaction-local token is checked independently by
+    * projection triggers, including writes from an older application binary.
+    */
+  private def ratingEpochWrite[A](action: ConnectionIO[A]): IO[A] =
+    ratingEpochRevision.get.flatMap { expected =>
+      val tx = for
+        state <- sql"SELECT revision, paused, active_epoch FROM play.rating_epoch_control WHERE singleton FOR UPDATE"
+          .query[(Long, Boolean, Option[Int])]
+          .unique
+        (revision, paused, active) = state
+        _ <-
+          if paused || expected.exists(_ != revision) || (active.isDefined && expected.isEmpty) then
+            new IllegalStateException("rating epoch is paused, stale, or unfenced").raiseError[ConnectionIO, Unit]
+          else ().pure[ConnectionIO]
+        _      <- sql"SELECT set_config('play.rating_epoch_revision', ${revision.toString}, true)".query[String].unique
+        result <- action
+        _      <-
+          sql"UPDATE play.rating_epoch_control SET revision = revision + 1, changed_at = now() WHERE singleton".update.run
+      yield result
+      tx.transact(xa).timeout(SaveTimeout)
+    }
+
+  override def activeRatingEpoch: IO[Option[RatingEpochMetadata]] =
+    sql"""SELECT c.active_epoch, r.plan #>> '{config,modelVersion}', r.anchor_set_version, r.cutoff, r.applied_at
+           FROM play.rating_epoch_control c JOIN play.rating_epoch_runs r ON r.run_id = c.active_run_id
+           WHERE c.singleton AND c.active_epoch IS NOT NULL"""
+      .query[(Int, String, String, Instant, Instant)]
+      .option
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .map(_.map { case (epoch, model, anchors, cutoff, computedAt) =>
+        RatingEpochMetadata(epoch, model, anchors, cutoff, computedAt)
+      })
+
+  override def validateRatingEpochRuntime(policy: RatingPolicy): IO[Unit] =
+    sql"""SELECT r.plan #>> '{config,modelVersion}', r.plan #>> '{config,policyVersion}', r.anchor_set_version
+           FROM play.rating_epoch_control c JOIN play.rating_epoch_runs r ON r.run_id = c.active_run_id
+           WHERE c.singleton AND c.active_epoch IS NOT NULL"""
+      .query[(String, String, String)]
+      .option
+      .transact(xa)
+      .timeout(SaveTimeout)
+      .flatMap {
+        case None                                   => IO.unit
+        case Some((model, expectedPolicy, anchors)) =>
+          if model == dicechess.play.rating.migration.RatingEpochPlan.ModelVersion &&
+            expectedPolicy == policy.version.toString && anchors == anchorSet.version
+          then IO.unit
+          else
+            IO.raiseError(
+              new IllegalStateException("active rating epoch requires its declared runtime model, policy and anchors")
+            )
+      }
 
   /** Pool telemetry and diagnostics (#120). */
   def currentPoolStats(sampleAcquire: Boolean = false): IO[PgGameStore.PoolStats] =
@@ -2842,13 +2917,70 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       .map(_.map(PgGameStore.toRow))
 
   def applyRatingUpdate(gameId: GameId, white: RatingUpdate, black: RatingUpdate): IO[Unit] =
-    (updateCategoryGlicko(white) *> updateCategoryGlicko(black) *>
-      stampApplied(gameId, Some(white), Some(black)))
-      .transact(xa)
-      .timeout(SaveTimeout)
+    ratingEpochWrite {
+      mayApplyInCurrentEpoch(gameId).flatMap { allowed =>
+        (updateCategoryGlicko(white) *> updateCategoryGlicko(black) *>
+          incrementEpochCount(gameId, white) *> incrementEpochCount(gameId, black) *>
+          stampApplied(gameId, Some(white), Some(black))).whenA(allowed)
+      }
+    }
 
   def markRatingApplied(gameId: GameId, reason: String): IO[Unit] =
-    stampApplied(gameId, None, None, skipReason = Some(reason)).transact(xa).timeout(SaveTimeout)
+    ratingEpochWrite {
+      sql"SELECT rating_applied_at IS NULL FROM play.game_results WHERE game_id = ${gameId.value}::uuid FOR UPDATE"
+        .query[Boolean]
+        .option
+        .flatMap { pending =>
+          stampApplied(gameId, None, None, skipReason = Some(reason)).whenA(pending.contains(true))
+        }
+    }
+
+  /** A late source-epoch result must not seed a new projection even if it was inserted after cutover. Original
+    * creation-time classification and already-recorded movements are never rewritten.
+    */
+  private def mayApplyInCurrentEpoch(gameId: GameId): ConnectionIO[Boolean] =
+    sql"""SELECT g.rating_applied_at IS NULL, c.active_epoch,
+                  g.rating_policy_version = 2 AND g.finished_at > r.cutoff
+           FROM play.game_results g CROSS JOIN play.rating_epoch_control c
+           LEFT JOIN play.rating_epoch_runs r ON r.run_id = c.active_run_id
+           WHERE g.game_id = ${gameId.value}::uuid AND c.singleton
+           FOR UPDATE OF g"""
+      .query[(Boolean, Option[Int], Option[Boolean])]
+      .option
+      .flatMap {
+        case Some((true, Some(_), eligible)) if !eligible.contains(true) =>
+          stampApplied(gameId, None, None, Some("game predates the active rating epoch or its eligibility policy")).as(
+            false
+          )
+        case Some((true, _, _)) => true.pure[ConnectionIO]
+        case _                  => false.pure[ConnectionIO]
+      }
+
+  private def incrementEpochCount(gameId: GameId, update: RatingUpdate): ConnectionIO[Unit] =
+    val externalId = update.identity match
+      case RatedIdentity.Bot(team, name) => Principal.Bot(team, name).externalId
+      case RatedIdentity.User(id)        => Principal.User(id).externalId
+    val parentExists = update.identity match
+      case RatedIdentity.Bot(team, name) =>
+        fr"EXISTS (SELECT 1 FROM play.bots WHERE team = $team AND name = $name)"
+      case RatedIdentity.User(id) =>
+        fr"EXISTS (SELECT 1 FROM play.users WHERE id = $id::uuid)"
+    // The parent may have been removed since the batch's participant read; do not recreate its counts.
+    (fr"""INSERT INTO play.rating_epoch_counts (participant_external_id, category, games, wins, draws, losses)
+           SELECT $externalId, ${update.category.wireName}, 1,
+                  CASE WHEN (g.white_external_id = $externalId AND g.result = 1)
+                             OR (g.black_external_id = $externalId AND g.result = -1) THEN 1 ELSE 0 END,
+                  CASE WHEN g.result = 0 THEN 1 ELSE 0 END,
+                  CASE WHEN (g.white_external_id = $externalId AND g.result = -1)
+                             OR (g.black_external_id = $externalId AND g.result = 1) THEN 1 ELSE 0 END
+           FROM play.game_results g CROSS JOIN play.rating_epoch_control c
+           WHERE g.game_id = ${gameId.value}::uuid AND g.result IS NOT NULL
+             AND c.singleton AND c.active_epoch IS NOT NULL AND """ ++ parentExists ++
+      fr""" ON CONFLICT (participant_external_id, category) DO UPDATE SET
+             games = play.rating_epoch_counts.games + 1,
+             wins = play.rating_epoch_counts.wins + EXCLUDED.wins,
+             draws = play.rating_epoch_counts.draws + EXCLUDED.draws,
+             losses = play.rating_epoch_counts.losses + EXCLUDED.losses""").update.run.void
 
   /** The recorded movement, or `None` for an id with no result row. `applied` reads the V6 stamp rather than the
     * presence of the V17 numbers, because those two genuinely differ: a skipped game is applied AND has no numbers, and
@@ -3041,6 +3173,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
         val claimRow: ConnectionIO[Int] =
           sql"""UPDATE play.game_results
                 SET rating_applied_at = now(),
+                    rating_epoch = (SELECT active_epoch FROM play.rating_epoch_control WHERE singleton),
                     white_rating_before = $wBefore,
                     white_rating_after = $wAfter,
                     black_rating_before = $bBefore,
@@ -3049,10 +3182,11 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
                     rating_skip_reason = NULL
                 WHERE game_id = ${gameId.value}::uuid AND rating_applied_at IS NULL""".update.run
 
-        claimRow
-          .flatMap(claimed => updateTrainingState(id).whenA(claimed > 0))
-          .transact(xa)
-          .timeout(SaveTimeout)
+        ratingEpochWrite {
+          mayApplyInCurrentEpoch(gameId).flatMap { allowed =>
+            claimRow.flatMap(claimed => updateTrainingState(id).whenA(claimed > 0)).whenA(allowed)
+          }
+        }
       }
     )
 
@@ -3105,6 +3239,7 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       if white.isDefined && black.isDefined then RatingOutcome.Applied.wireName else RatingOutcome.Skipped.wireName
     sql"""UPDATE play.game_results
           SET rating_applied_at = now(),
+              rating_epoch = (SELECT active_epoch FROM play.rating_epoch_control WHERE singleton),
               white_rating_before = ${before(white)},
               white_rating_after = ${after(white)},
               black_rating_before = ${before(black)},
@@ -3144,6 +3279,37 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     leaderboardSql(category, maxRd, limit, asOfCutoff).transact(xa).timeout(SaveTimeout)
 
   private def leaderboardSql(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[Instant]
+  ): ConnectionIO[List[LeaderboardEntry]] =
+    activeRatingEpochSql.flatMap {
+      case None                            => legacyLeaderboardSql(category, maxRd, limit, asOfCutoff)
+      case Some(_) if asOfCutoff.isDefined =>
+        new IllegalArgumentException("Use immutable snapshots for earlier rating epochs/cutoffs").raiseError
+      case Some(_) =>
+        sql"""SELECT b.team, b.name, r.rating, r.rd, b.on_ladder,
+                      COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
+               FROM play.bots b JOIN play.bot_ratings r
+                 ON r.team = b.team AND r.name = b.name AND r.category = ${category.wireName}
+               LEFT JOIN play.rating_epoch_counts t
+                 ON t.participant_external_id = 'bot:team:' || b.team || ':' || b.name
+                AND t.category = r.category
+               WHERE r.rd <= $maxRd
+               ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC, r.rd, b.team, b.name
+               LIMIT ${limit.toLong}"""
+          .query[(String, String, Double, Double, Boolean, Int, Int, Int)]
+          .to[List]
+          .map(_.map { case (team, name, rating, rd, onLadder, wins, draws, losses) =>
+            LeaderboardEntry(team, name, rating, rd, onLadder, ResultTally(wins, draws, losses))
+          })
+    }
+
+  private def activeRatingEpochSql: ConnectionIO[Option[Int]] =
+    sql"SELECT active_epoch FROM play.rating_epoch_control WHERE singleton".query[Option[Int]].unique
+
+  private def legacyLeaderboardSql(
       category: RatingCategory,
       maxRd: Double,
       limit: Int,
@@ -3278,6 +3444,33 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       limit: Int,
       asOfCutoff: Option[Instant]
   ): ConnectionIO[List[PlayerLeaderboardEntry]] =
+    activeRatingEpochSql.flatMap {
+      case None                            => legacyPlayerLeaderboardSql(category, maxRd, limit, asOfCutoff)
+      case Some(_) if asOfCutoff.isDefined =>
+        new IllegalArgumentException("Use immutable snapshots for earlier rating epochs/cutoffs").raiseError
+      case Some(_) =>
+        sql"""SELECT u.nickname, r.rating, r.rd,
+                      COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
+               FROM play.users u JOIN play.user_ratings r
+                 ON r.user_id = u.id AND r.category = ${category.wireName}
+               LEFT JOIN play.rating_epoch_counts t
+                 ON t.participant_external_id = 'user:' || u.id::text AND t.category = r.category
+               WHERE r.rd <= $maxRd AND u.is_active
+               ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC, r.rd, u.nickname
+               LIMIT ${limit.toLong}"""
+          .query[(String, Double, Double, Int, Int, Int)]
+          .to[List]
+          .map(_.map { case (nickname, rating, rd, wins, draws, losses) =>
+            PlayerLeaderboardEntry(nickname, rating, rd, ResultTally(wins, draws, losses))
+          })
+    }
+
+  private def legacyPlayerLeaderboardSql(
+      category: RatingCategory,
+      maxRd: Double,
+      limit: Int,
+      asOfCutoff: Option[Instant]
+  ): ConnectionIO[List[PlayerLeaderboardEntry]] =
     asOfCutoff match
       case None =>
         sql"""SELECT u.nickname, r.rating, r.rd,
@@ -3385,6 +3578,22 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     * rated belong to no scale to be counted on.
     */
   def categoryTalliesFor(externalId: String): IO[Map[RatingCategory, ResultTally]] =
+    activeRatingEpochSql
+      .flatMap {
+        case None    => legacyCategoryTalliesSql(externalId)
+        case Some(_) =>
+          sql"""SELECT category, wins, draws, losses FROM play.rating_epoch_counts
+               WHERE participant_external_id = $externalId"""
+            .query[(String, Int, Int, Int)]
+            .to[List]
+            .map(_.flatMap { case (category, wins, draws, losses) =>
+              RatingCategory.fromWireName(category).map(_ -> ResultTally(wins, draws, losses))
+            }.toMap)
+      }
+      .transact(xa)
+      .timeout(SaveTimeout)
+
+  private def legacyCategoryTalliesSql(externalId: String): ConnectionIO[Map[RatingCategory, ResultTally]] =
     // The tally is the COMPETITIVE record. A training row (#149) is stamped `applied` because the batch really
     // did apply a training update, so filtering on the outcome alone would start counting human-vs-bot games
     // in this record — the one thing ADR 008's domain separation exists to prevent.
@@ -3401,8 +3610,6 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
           GROUP BY 1"""
       .query[(String, Int, Int, Int)]
       .to[List]
-      .transact(xa)
-      .timeout(SaveTimeout)
       .map(_.flatMap { case (category, wins, draws, losses) =>
         // `flatMap` over the parse, not `get`: the column is generated by `rating_category`, so it can only hold a
         // name this server knows — but a value it cannot name must drop out of a public tally rather than crash the
@@ -3445,6 +3652,20 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     tx.transact(xa).timeout(SaveTimeout)
 
   private def latestBotStrengthSnapshotMetadataSql(category: RatingCategory): ConnectionIO[Option[RatingSnapshot]] =
+    activeRatingEpochSql.flatMap {
+      case None        => legacyLatestSnapshotMetadataSql(category)
+      case Some(epoch) =>
+        sql"""SELECT r.anchor_set_version, r.cutoff, r.applied_at
+               FROM play.rating_epoch_control c JOIN play.rating_epoch_runs r ON r.run_id = c.active_run_id
+               WHERE c.singleton"""
+          .query[(String, Instant, Instant)]
+          .option
+          .map(_.map { case (anchors, cutoff, computedAt) =>
+            RatingSnapshot(category.wireName, epoch, anchors, cutoff, computedAt, true, Nil)
+          })
+    }
+
+  private def legacyLatestSnapshotMetadataSql(category: RatingCategory): ConnectionIO[Option[RatingSnapshot]] =
     sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current
           FROM play.bot_strength_snapshots
           WHERE category = ${category.wireName} AND is_current = TRUE
@@ -3460,6 +3681,8 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
     sql"""SELECT category, epoch, anchor_set_version, cutoff, computed_at, is_current, payload
           FROM play.bot_strength_snapshots
           WHERE category = ${category.wireName} AND is_current = TRUE
+            AND ((SELECT active_epoch FROM play.rating_epoch_control WHERE singleton) IS NULL
+                 OR epoch = (SELECT active_epoch FROM play.rating_epoch_control WHERE singleton))
           ORDER BY epoch DESC, computed_at DESC
           LIMIT 1"""
       .query[(String, Int, String, Instant, Instant, Boolean, Json)]
@@ -3518,6 +3741,21 @@ final class PgGameStore private (xa: HikariTransactor[IO], anchorSet: AnchorSet)
       })
 
   private def latestAppliedCutoffSql(category: RatingCategory): ConnectionIO[(Option[Instant], Option[Instant])] =
+    activeRatingEpochSql.flatMap {
+      case None        => legacyLatestAppliedCutoffSql(category)
+      case Some(epoch) =>
+        sql"""SELECT GREATEST(r.cutoff, g.cutoff), GREATEST(r.applied_at, g.computed_at)
+               FROM play.rating_epoch_control c JOIN play.rating_epoch_runs r ON r.run_id = c.active_run_id
+               LEFT JOIN (
+                 SELECT MAX(finished_at) AS cutoff, MAX(rating_applied_at) AS computed_at
+                 FROM play.game_results WHERE rating_epoch = $epoch AND category = ${category.wireName}
+                   AND rating_outcome = 'applied' AND rating_domain <> 'training'
+               ) g ON true WHERE c.singleton"""
+          .query[(Option[Instant], Option[Instant])]
+          .unique
+    }
+
+  private def legacyLatestAppliedCutoffSql(category: RatingCategory): ConnectionIO[(Option[Instant], Option[Instant])] =
     sql"""SELECT MAX(finished_at), MAX(COALESCE(rating_applied_at, finished_at))
           FROM play.game_results
           WHERE category = ${category.wireName}
@@ -4285,9 +4523,10 @@ object PgGameStore:
     */
   def resource(config: Config, anchorSet: AnchorSet = AnchorSet.Default): Resource[IO, PgGameStore] =
     for
-      _         <- Resource.eval(migrate(config))
-      connectEC <- ExecutionContexts.fixedThreadPool[IO](config.poolSize)
-      xa        <- HikariTransactor.newHikariTransactor[IO](
+      _             <- Resource.eval(migrate(config))
+      epochRevision <- Resource.eval(IOLocal(Option.empty[Long]))
+      connectEC     <- ExecutionContexts.fixedThreadPool[IO](config.poolSize)
+      xa            <- HikariTransactor.newHikariTransactor[IO](
         driverClassName = "org.postgresql.Driver",
         url = config.url,
         user = config.user,
@@ -4301,7 +4540,7 @@ object PgGameStore:
           ds.setConnectionTimeout(5000)
         }
       })
-    yield new PgGameStore(xa, anchorSet)
+    yield new PgGameStore(xa, anchorSet, epochRevision)
 
   /** Boot-time connect races are normal (compose may start the app before Postgres accepts connections; the
     * testcontainers port-forward on Rancher lags a moment), so the initial migration retries briefly before failing the

@@ -89,40 +89,43 @@ final class RatingBatch private (
     * `requestedRated = false`, so the roster gated a set of games that could never reach this batch at all (#279).
     */
   private def applyGame(row: GameResultRow): IO[Unit] =
-    (participantOf(row.whiteExternalId), participantOf(row.blackExternalId)).flatMapN { (white, black) =>
-      (white, black, row.result.flatMap(RatingBatch.scores)) match
-        case (Some(w), Some(b), _) if w.identity == b.identity =>
-          skip(row, "self-play carries no rating information")
-        case (Some(w), Some(b), Some((whiteScore, blackScore))) =>
-          (RatingBatch.ineligible(w, b), RatingCategory.ofStored(row.timeControl)) match
-            case (Some(why), _) => skip(row, why)
-            // Unreachable for a game created after #280 — `GameRegistry.isRated` marks such a game casual, so it never
-            // enters this queue. Reachable exactly once, for whatever was already queued when that shipped, and for a
-            // stored control this server can no longer parse. Both want the same answer.
-            case (None, None) =>
-              skip(row, s"uncategorised time control '${row.timeControl}' belongs to no rating scale")
-            case (None, Some(category)) =>
-              // The STORED domain decides, never the seats' kinds. A row classified before #146 carries
-              // `rating_domain = 'legacy'`, which decodes to `None`, and V9 promised such rows are never
-              // reinterpreted: inferring "human versus bot means training" from the participants would break exactly
-              // that promise, because a legacy human-vs-bot game moved canonical ratings when it was played and that
-              // is what it stays.
-              (policy, row.ratingDomain) match
-                case (RatingPolicy.Matrix, Some(RatingDomain.Training)) =>
-                  applyTrainingGame(row, category, w, b, whiteScore)
-                // A training row reaching the queue under the legacy policy means the epoch was rolled back (#151).
-                // Applying it competitively would move the very ratings the matrix epoch deliberately kept still.
-                case (RatingPolicy.Legacy, Some(RatingDomain.Training)) =>
-                  skip(row, "training-domain row is not applied under the legacy policy")
-                case (_, Some(RatingDomain.Casual)) =>
-                  skip(row, "casual row carries no rating in any domain")
-                case _ =>
-                  applyCompetitiveGame(row, category, w, b, whiteScore, blackScore)
-        case (Some(_), Some(_), None) => skip(row, "no definite result")
-        case _                        =>
-          // All three causes named: an operator reading this for a deleted account (#237 makes that reachable — the
-          // user: id outlives the row) must not be told it was a guest.
-          skip(row, "a participant has no rating state (a guest, an unregistered bot, or a deleted account)")
+    ratingStore.withRatingEpoch {
+      ratingStore.validateRatingEpochRuntime(policy) *>
+        (participantOf(row.whiteExternalId), participantOf(row.blackExternalId)).flatMapN { (white, black) =>
+          (white, black, row.result.flatMap(RatingBatch.scores)) match
+            case (Some(w), Some(b), _) if w.identity == b.identity =>
+              skip(row, "self-play carries no rating information")
+            case (Some(w), Some(b), Some((whiteScore, blackScore))) =>
+              (RatingBatch.ineligible(w, b), RatingCategory.ofStored(row.timeControl)) match
+                case (Some(why), _) => skip(row, why)
+                // Unreachable for a game created after #280 — `GameRegistry.isRated` marks such a game casual, so it never
+                // enters this queue. Reachable exactly once, for whatever was already queued when that shipped, and for a
+                // stored control this server can no longer parse. Both want the same answer.
+                case (None, None) =>
+                  skip(row, s"uncategorised time control '${row.timeControl}' belongs to no rating scale")
+                case (None, Some(category)) =>
+                  // The STORED domain decides, never the seats' kinds. A row classified before #146 carries
+                  // `rating_domain = 'legacy'`, which decodes to `None`, and V9 promised such rows are never
+                  // reinterpreted: inferring "human versus bot means training" from the participants would break exactly
+                  // that promise, because a legacy human-vs-bot game moved canonical ratings when it was played and that
+                  // is what it stays.
+                  (policy, row.ratingDomain) match
+                    case (RatingPolicy.Matrix, Some(RatingDomain.Training)) =>
+                      applyTrainingGame(row, category, w, b, whiteScore)
+                    // A training row reaching the queue under the legacy policy means the epoch was rolled back (#151).
+                    // Applying it competitively would move the very ratings the matrix epoch deliberately kept still.
+                    case (RatingPolicy.Legacy, Some(RatingDomain.Training)) =>
+                      skip(row, "training-domain row is not applied under the legacy policy")
+                    case (_, Some(RatingDomain.Casual)) =>
+                      skip(row, "casual row carries no rating in any domain")
+                    case _ =>
+                      applyCompetitiveGame(row, category, w, b, whiteScore, blackScore)
+            case (Some(_), Some(_), None) => skip(row, "no definite result")
+            case _                        =>
+              // All three causes named: an operator reading this for a deleted account (#237 makes that reachable — the
+              // user: id outlives the row) must not be told it was a guest.
+              skip(row, "a participant has no rating state (a guest, an unregistered bot, or a deleted account)")
+        }
     }
 
   private def applyCompetitiveGame(

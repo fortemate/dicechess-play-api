@@ -20,7 +20,7 @@ const schema = JSON.parse(readFileSync(schemaPath, 'utf8'));
 const isApplicationTable = (t) => !t.name.endsWith('flyway_schema_history');
 
 const byName = (a, b) => a.name.localeCompare(b.name);
-const bare = (name) => name.replace(/^public\./, '');
+const bare = (name) => name.replace(/^(?:public|play)\./, '');
 
 const tables = schema.tables.filter(isApplicationTable).sort(byName);
 const applicationTableNames = new Set(tables.map((t) => bare(t.name)));
@@ -47,6 +47,10 @@ const FK_FREE_RATIONALES = {
 		'must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished',
 	released_nicknames:
 		'must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished',
+	rating_epoch_counts:
+		'uses public-history participant identities for active epoch baselines; lifecycle triggers remove deleted participants without foreign keys into retained history',
+	rating_epoch_runs:
+		'preserves immutable migration plans and rollback evidence independently of participant lifecycle changes',
 	showcase_claims:
 		'holds short-lived rate-limiting claims that outlive or precede individual games',
 	showcase_table:

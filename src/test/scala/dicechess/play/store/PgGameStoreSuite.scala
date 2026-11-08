@@ -3142,11 +3142,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _ <- db.register("lb-suite", "weak", "hash-lb-weak")
           _ <- db.register("lb-suite", "fresh", "hash-lb-fresh") // untouched: RD 350 = provisional
           _ <- db.setOnLadder("lb-suite", "strong", true)
-          // Converge both veterans' ratings. The stamped game id is random and matches no game_results row, so the
-          // stamp inside applyRatingUpdate is a no-op — this is purely "set two bots' glicko state atomically".
-          fakeId <- GameId.random
-          _      <- db.applyRatingUpdate(
-            fakeId,
+          // Converge the fixture projections without fabricating a recorded game.
+          _ <- seedRatingProjections(db)(
             seeded(RatedIdentity.of(strong), 1700.0, 80.0),
             seeded(RatedIdentity.of(weak), 1400.0, 90.0)
           )
@@ -3189,12 +3186,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         for
           _ <- states.traverse_((name, _, _) => db.register(team, name, s"hash-$name"))
           _ <- states.traverse_ { (name, rating, rd) =>
-            // The stamped game id matches no game_results row, so this is purely "set the glicko state" — the same
-            // idiom as the test above; the second seat is a throwaway self-overwrite of the first bot's own state.
-            GameId.random.flatMap { fakeId =>
-              val update = seeded(RatedIdentity.of(Principal.Bot(team, name)), rating, rd)
-              db.applyRatingUpdate(fakeId, update, update)
-            }
+            seedRatingProjections(db)(seeded(RatedIdentity.of(Principal.Bot(team, name)), rating, rd))
           }
           board <- db.leaderboard(RatingCategory.Default, maxRd = 110.0).map(_.filter(_.team == team))
         yield assertEquals(
@@ -3216,10 +3208,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         for
           _ <- bots.traverse_((name, _, _) => db.register(team, name, s"hash-$name-289"))
           _ <- bots.traverse_ { (name, rating, rd) =>
-            GameId.random.flatMap { fakeId =>
-              val update = seeded(RatedIdentity.of(Principal.Bot(team, name)), rating, rd)
-              db.applyRatingUpdate(fakeId, update, update)
-            }
+            seedRatingProjections(db)(seeded(RatedIdentity.of(Principal.Bot(team, name)), rating, rd))
           }
           board <- db.leaderboard(RatingCategory.Default, maxRd = 110.0, limit = 1)
         yield
@@ -3242,20 +3231,14 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _         <- db.register(botTeam, "second-bot", "hash-sbot-289")
           accBest   <- db.upsertOnLogin("google", "sub-merge-best", None, IO.pure("BestPlayer"))
           accSecond <- db.upsertOnLogin("google", "sub-merge-second", None, IO.pure("SecondPlayer"))
-          _         <- GameId.random.flatMap { id =>
-            db.applyRatingUpdate(
-              id,
-              seeded(RatedIdentity.of(Principal.Bot(botTeam, "best-bot")), 6200.0, 20.0),  // conservative 6160
-              seeded(RatedIdentity.of(Principal.Bot(botTeam, "second-bot")), 6100.0, 20.0) // conservative 6060
-            )
-          }
-          _ <- GameId.random.flatMap { id =>
-            db.applyRatingUpdate(
-              id,
-              seeded(RatedIdentity.User(accBest.id), 6180.0, 20.0),
-              seeded(RatedIdentity.User(accSecond.id), 6080.0, 20.0)
-            )
-          }
+          _         <- seedRatingProjections(db)(
+            seeded(RatedIdentity.of(Principal.Bot(botTeam, "best-bot")), 6200.0, 20.0),  // conservative 6160
+            seeded(RatedIdentity.of(Principal.Bot(botTeam, "second-bot")), 6100.0, 20.0) // conservative 6060
+          )
+          _ <- seedRatingProjections(db)(
+            seeded(RatedIdentity.User(accBest.id), 6180.0, 20.0),
+            seeded(RatedIdentity.User(accSecond.id), 6080.0, 20.0)
+          )
           // SQL LIMIT 2 on each population: our 4 entries rank above everything else in the container.
           // bots window = [best-bot (6160), second-bot (6060)].
           // players window = [BestPlayer (6140), SecondPlayer (6040)].
@@ -3289,10 +3272,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _       <- db.register("sr-suite", "veteran", "hash-sr-vet")
           _       <- db.register("sr-suite", "fresh", "hash-sr-fresh") // untouched: RD 350 = provisional
           account <- db.upsertOnLogin("google", "sub-sr-1", None, IO.pure("SettledNick"))
-          // Converge the veteran and the account in one atomic write; the stamped id matches no game_results row.
-          fakeId <- GameId.random
-          _      <- db.applyRatingUpdate(
-            fakeId,
+          // Converge the veteran and account fixtures in one projection transaction.
+          _ <- seedRatingProjections(db)(
             seeded(RatedIdentity.of(veteran), 1642.0, 80.0),
             seeded(RatedIdentity.User(account.id), 1756.0, 90.0)
           )
@@ -3430,9 +3411,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           _       <- db.register("wiring-suite", "rated-opponent", "hash-wiring-rated")
           account <- db.upsertOnLogin("google", "sub-wiring-1", None, IO.pure("WiringNick"))
           // Both sides converge out of provisional, or the leaderboard's visibility rule hides them here.
-          stampId <- GameId.random
-          _       <- db.applyRatingUpdate(
-            stampId,
+          _ <- seedRatingProjections(db)(
             seeded(RatedIdentity.of(bot), 1480.0, 70.0),
             seeded(RatedIdentity.User(account.id), 1620.0, 60.0)
           )
@@ -3460,12 +3439,10 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         // `settledRatingsByExternalId` builds a query at all.
         val bot: Principal.Bot = Principal.Bot("wiring-suite", "casual-opponent")
         for
-          _       <- db.register("wiring-suite", "casual-opponent", "hash-wiring-casual")
-          stampId <- GameId.random
-          _       <- db.applyRatingUpdate(
-            stampId,
+          _ <- db.register("wiring-suite", "casual-opponent", "hash-wiring-casual")
+          _ <- seedRatingProjections(db)(
             seeded(RatedIdentity.of(bot), 1390.0, 65.0),
-            // No such account: the stamp lands nowhere, by design.
+            // No parent account: the fixture seed leaves its projection absent.
             seeded(RatedIdentity.User(UUID.randomUUID().toString), 1500.0, 350.0)
           )
           registry <- wiredRegistry(db)
@@ -3510,9 +3487,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         for
           _       <- db.register("wiring-suite", "resume-opponent", "hash-wiring-resume")
           account <- db.upsertOnLogin("google", "sub-wiring-2", None, IO.pure("ResumeNick"))
-          stampId <- GameId.random
-          _       <- db.applyRatingUpdate(
-            stampId,
+          _       <- seedRatingProjections(db)(
             seeded(RatedIdentity.of(bot), 1710.0, 55.0),
             seeded(RatedIdentity.User(account.id), 1805.0, 50.0)
           )
@@ -4029,15 +4004,13 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
     withContainers { pg =>
       store(pg).use { db =>
         for
-          _      <- db.register("admin-order", "bravo", "hash-admin-order-bravo")
-          _      <- db.register("admin-order", "alpha", "hash-admin-order-alpha")
-          _      <- db.register("admin-order", "strongest", "hash-admin-order-strong")
-          fakeId <- GameId.random
+          _ <- db.register("admin-order", "bravo", "hash-admin-order-bravo")
+          _ <- db.register("admin-order", "alpha", "hash-admin-order-alpha")
+          _ <- db.register("admin-order", "strongest", "hash-admin-order-strong")
           // The seeds are identical (1500 for all three), so the rating leg needs one forged value. It goes into
           // `bot_ratings` now (#280): the listing reads the default category, and a bot with no row there reads as
           // the fresh 1500 — which is exactly what the other two are.
-          _ <- db.applyRatingUpdate(
-            fakeId,
+          _ <- seedRatingProjections(db)(
             seeded(RatedIdentity.Bot("admin-order", "strongest"), 1900.0, 60.0),
             seeded(RatedIdentity.Bot("admin-order", "alpha"), 1500.0, 350.0)
           )
@@ -4256,13 +4229,12 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
     withContainers { pg =>
       (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
         for
-          converged     <- db.upsertOnLogin("google", "sub-board-conv", None, IO.pure("BoardConverged"))
-          provisional   <- db.upsertOnLogin("google", "sub-board-prov", None, IO.pure("BoardProvisional"))
-          opponent      <- db.upsertOnLogin("google", "sub-board-opp", None, IO.pure("BoardOpponent"))
-          ratedId       <- GameId.random
-          casualId      <- GameId.random
-          blockedGameId <- GameId.random
-          _             <- db.save(
+          converged   <- db.upsertOnLogin("google", "sub-board-conv", None, IO.pure("BoardConverged"))
+          provisional <- db.upsertOnLogin("google", "sub-board-prov", None, IO.pure("BoardProvisional"))
+          opponent    <- db.upsertOnLogin("google", "sub-board-opp", None, IO.pure("BoardOpponent"))
+          ratedId     <- GameId.random
+          casualId    <- GameId.random
+          _           <- db.save(
             ratedId,
             endedResultFixture(Principal.User(converged.id), Principal.User(opponent.id), rated = true)
           )
@@ -4279,10 +4251,9 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
           // A CONVERGED but deactivated account: the `is_active` half of the filter would otherwise be untested, and
           // the public board relies on it to keep a blocked player off the list.
           blocked <- db.upsertOnLogin("google", "sub-board-blocked", None, IO.pure("BoardBlocked"))
-          _       <- db.applyRatingUpdate(
-            gameId = blockedGameId,
-            white = seeded(RatedIdentity.User(blocked.id), 1700.0, 85.0),
-            black = seeded(RatedIdentity.User(opponent.id), 1450.0, 95.0)
+          _       <- seedRatingProjections(db)(
+            seeded(RatedIdentity.User(blocked.id), 1700.0, 85.0),
+            seeded(RatedIdentity.User(opponent.id), 1450.0, 95.0)
           )
           _     <- sql"UPDATE play.users SET is_active = false WHERE id = ${blocked.id}::uuid".update.run.transact(xa)
           board <- db.playerLeaderboard(RatingCategory.Default, maxRd = Glicko2.ProvisionalDeviationThreshold)
@@ -4343,9 +4314,28 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
-  /** One participant's rating forced to a chosen value through the production write path — the only way to set one
-    * outside the batch.
-    */
+  /** Set fixture projections atomically without inventing a game or altering its recorded rating decision. */
+  private def seedRatingProjections(db: PgGameStore)(updates: RatingUpdate*): IO[Unit] =
+    updates.toList
+      .traverse_ { update =>
+        val g = update.after
+        update.identity match
+          case RatedIdentity.Bot(team, name) =>
+            sql"""INSERT INTO play.bot_ratings (team, name, category, rating, rd, vol)
+                 SELECT team, name, ${update.category.wireName}, ${g.rating}, ${g.deviation}, ${g.volatility}
+                 FROM play.bots WHERE team = $team AND name = $name
+                 ON CONFLICT (team, name, category) DO UPDATE
+                 SET rating = EXCLUDED.rating, rd = EXCLUDED.rd, vol = EXCLUDED.vol""".update.run.void
+          case RatedIdentity.User(id) =>
+            sql"""INSERT INTO play.user_ratings (user_id, category, rating, rd, vol)
+                 SELECT id, ${update.category.wireName}, ${g.rating}, ${g.deviation}, ${g.volatility}
+                 FROM play.users WHERE id = $id::uuid
+                 ON CONFLICT (user_id, category) DO UPDATE
+                 SET rating = EXCLUDED.rating, rd = EXCLUDED.rd, vol = EXCLUDED.vol""".update.run.void
+      }
+      .transact(db.xa)
+
+  /** An unrounded, per-category fixture state or an update for an actual recorded-game contract test. */
   private def seeded(identity: RatedIdentity, rating: Double, rd: Double): RatingUpdate =
     val after = Glicko(rating, rd, 0.05)
     RatingUpdate(identity, RatingCategory.Default, Glicko.Initial, after)
@@ -4620,16 +4610,13 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
               markApplied(xa, id) // the record counts applied games only (#146)
           )
         for
-          _     <- db.register(team, "fast", "hash-cat-board-fast")
-          _     <- db.register(team, "slow", "hash-cat-board-slow")
-          stamp <- GameId.random
+          _ <- db.register(team, "fast", "hash-cat-board-fast")
+          _ <- db.register(team, "slow", "hash-cat-board-slow")
           // Converged on BOTH scales, so neither board hides them and the difference below is the tally, not the filter.
-          _ <- db.applyRatingUpdate(
-            stamp,
+          _ <- seedRatingProjections(db)(
             seeded(RatedIdentity.of(fast), 1700.0, 60.0),
             seeded(RatedIdentity.of(slow), 1400.0, 65.0)
           )
-          stamp2 <- GameId.random
           rapidW = RatingUpdate(
             RatedIdentity.of(fast),
             RatingCategory.Rapid,
@@ -4642,7 +4629,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             Glicko.Initial,
             Glicko(1440.0, 75.0, 0.05)
           )
-          _ <- db.applyRatingUpdate(stamp2, rapidW, rapidB)
+          _ <- seedRatingProjections(db)(rapidW, rapidB)
           // Two Blitz wins for `fast`, one Rapid win for `slow` — three rated games, two different scales.
           _     <- game(fast, slow, TimeControl.Fischer(300, 3))
           _     <- game(fast, slow, TimeControl.SuddenDeath(300))

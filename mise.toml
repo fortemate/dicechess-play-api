@@ -115,3 +115,7 @@ run = "npm run build"
 [tasks."contrib-docs:schema"]
 description = "🗄️  Regenerate the schema reference from the Flyway migrations (needs Docker)"
 run = "./scripts/generate-schema-docs.sh"
+
+[tasks."rating:epoch"]
+description = "Plan or explicitly manage reversible rating epochs (#151); plan uses files only, database commands require an operator-selected schema-ready database"
+run = "scripts/rating-epoch.sh"

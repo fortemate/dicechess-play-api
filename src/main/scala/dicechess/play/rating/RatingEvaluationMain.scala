@@ -2,6 +2,7 @@ package dicechess.play.rating
 
 import cats.effect.{ExitCode, IO, IOApp}
 import cats.syntax.all.*
+import dicechess.play.rating.BradleyTerry.FitResult
 import dicechess.play.rating.RatingEvaluation.{ModelSpec, Windows}
 import dicechess.play.rating.RatingModels.{BradleyTerrySpec, GlickoSpec, WhrSpec}
 import io.circe.parser.decode
@@ -51,27 +52,52 @@ object RatingEvaluationMain extends IOApp:
   private def evaluate(options: Options): IO[ExitCode] =
     IO.blocking(readAll[RatingReplay.Game](options.corpus)).flatMap {
       case Left(problem) => IO.println(s"[evaluate] $problem").as(ExitCode.Error)
-      case Right(rows)   =>
-        for
-          _         <- IO.println(s"[evaluate] ${rows.size} rows; running ${options.specs.size} models")
-          report    <- IO.blocking(RatingEvaluation.evaluate(rows, options.specs, options.config))
-          synthetic <-
-            if options.synthetic then
-              IO.blocking(
-                RatingEvaluationFixture
-                  .evaluate(RatingEvaluationFixture.Stationary, options.specs, 1 to options.syntheticSeeds)
-              ).map(Some(_))
-            else IO.pure(Option.empty[RatingEvaluationFixture.Summary])
-          provenance <- IO.blocking(provenanceOf(options))
-          complete = report.copy(provenance = Some(provenance), synthetic = synthetic)
-          outDir <- IO.blocking(Files.createDirectories(options.out))
-          _      <- IO.blocking(Files.writeString(outDir.resolve("evaluation.json"), complete.asJson.spaces2, UTF_8))
-          rendered = RatingEvaluation.render(complete)
-          _ <- IO.blocking(Files.writeString(outDir.resolve("evaluation.txt"), rendered + "\n", UTF_8))
-          _ <- IO.println(rendered)
-          _ <- IO.println(s"[evaluate] wrote ${outDir.toAbsolutePath}")
-        yield ExitCode.Success
+      case Right(rows)   => evaluateRows(rows, options)
     }
+
+  private def evaluateRows(rows: List[RatingReplay.Game], options: Options): IO[ExitCode] =
+    for
+      _         <- IO.println(s"[evaluate] ${rows.size} rows; running ${options.specs.size} models")
+      fitted    <- IO.blocking(RatingEvaluation.evaluate(rows, options.specs, options.config))
+      completed <- fitted match
+        case Left(problem) => IO.pure(Left(problem))
+        case Right(report) => completeReport(report, options)
+      exit <- completed match
+        case Left(problem) => IO.println(s"[evaluate] ${problem.message}").as(ExitCode.Error)
+        case Right(report) => writeReport(report, options)
+    yield exit
+
+  private def completeReport(
+      report: RatingEvaluation.Report,
+      options: Options
+  ): IO[FitResult[RatingEvaluation.Report]] =
+    val synthetic: IO[FitResult[Option[RatingEvaluationFixture.Summary]]] =
+      if options.synthetic then
+        IO.blocking(
+          RatingEvaluationFixture.evaluate(
+            RatingEvaluationFixture.Stationary,
+            options.specs,
+            1 to options.syntheticSeeds
+          )
+        ).map(_.map(Some(_)))
+      else IO.pure(Right(Option.empty[RatingEvaluationFixture.Summary]))
+    synthetic.flatMap {
+      case Left(problem)  => IO.pure(Left(problem))
+      case Right(summary) =>
+        IO.blocking(provenanceOf(options)).map { provenance =>
+          Right(report.copy(provenance = Some(provenance), synthetic = summary))
+        }
+    }
+
+  private def writeReport(complete: RatingEvaluation.Report, options: Options): IO[ExitCode] =
+    for
+      outDir <- IO.blocking(Files.createDirectories(options.out))
+      _      <- IO.blocking(Files.writeString(outDir.resolve("evaluation.json"), complete.asJson.spaces2, UTF_8))
+      rendered = RatingEvaluation.render(complete)
+      _ <- IO.blocking(Files.writeString(outDir.resolve("evaluation.txt"), rendered + "\n", UTF_8))
+      _ <- IO.println(rendered)
+      _ <- IO.println(s"[evaluate] wrote ${outDir.toAbsolutePath}")
+    yield ExitCode.Success
 
   private val Usage: String =
     "[evaluate] usage: corpus=<games.jsonl[.gz]> out=<dir> [models=grid|baseline] [model=<spec> ...] " +

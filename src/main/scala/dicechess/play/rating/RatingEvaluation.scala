@@ -1,6 +1,7 @@
 package dicechess.play.rating
 
 import cats.syntax.all.*
+import dicechess.play.rating.BradleyTerry.{FitFailure, FitResult}
 import dicechess.play.rating.RatingModels.{Estimate, Model, Observation}
 import io.circe.derivation.ConfiguredCodec
 
@@ -183,36 +184,47 @@ object RatingEvaluation:
   )
 
   /** Drive one model chronologically over the prepared corpus. */
-  def run(prepared: Prepared, spec: ModelSpec, constants: Set[String], category: String): Run =
+  def run(prepared: Prepared, spec: ModelSpec, constants: Set[String], category: String): FitResult[Run] =
     drive(prepared.games.map(_.observation), spec.build, constants, category)
 
   /** The chronological driver: day by day, forecast before observe, `constants` sampled at each day's start (and once
     * more after the last day, under the key `lastDay + 1`) for drift and coverage reporting.
     */
-  def drive(observations: IndexedSeq[Observation], model: Model, constants: Set[String], category: String): Run =
+  def drive(
+      observations: IndexedSeq[Observation],
+      model: Model,
+      constants: Set[String],
+      category: String
+  ): FitResult[Run] =
     val forecasts        = new Array[Double](observations.length)
     val byDay            = mutable.Map.empty[Int, Map[String, Estimate]]
     val started          = System.nanoTime()
     var maxDay           = 0L
     var index            = 0
     var day              = -1
+    var failure          = Option.empty[FitFailure]
     def closeDay(): Unit = if day >= 0 then model.endDay(day)
-    while index < observations.length do
+    while index < observations.length && failure.isEmpty do
       val observation = observations(index)
       val d           = observation.day
       if d != day then
         val dayStarted = System.nanoTime()
         closeDay()
         day = d
-        model.startDay(day)
-        byDay.update(day, constants.iterator.flatMap(id => model.estimate(id, category).map(id -> _)).toMap)
-        maxDay = math.max(maxDay, (System.nanoTime() - dayStarted) / 1000000L)
-      forecasts(index) = model.forecast(observation)
-      model.observe(observation)
-      index += 1
-    closeDay()
-    byDay.update(day + 1, constants.iterator.flatMap(id => model.estimate(id, category).map(id -> _)).toMap)
-    Run(model.name, forecasts, (System.nanoTime() - started) / 1000000L, maxDay, byDay.toMap)
+        model.startDay(day) match
+          case Left(problem) => failure = Some(problem)
+          case Right(_)      =>
+            byDay.update(day, constants.iterator.flatMap(id => model.estimate(id, category).map(id -> _)).toMap)
+            maxDay = math.max(maxDay, (System.nanoTime() - dayStarted) / 1000000L)
+      if failure.isEmpty then
+        forecasts(index) = model.forecast(observation)
+        model.observe(observation)
+        index += 1
+    failure.toLeft(()).map { _ =>
+      closeDay()
+      byDay.update(day + 1, constants.iterator.flatMap(id => model.estimate(id, category).map(id -> _)).toMap)
+      Run(model.name, forecasts, (System.nanoTime() - started) / 1000000L, maxDay, byDay.toMap)
+    }
 
   // ── Scoring ───────────────────────────────────────────────────────────────────
 
@@ -363,23 +375,24 @@ object RatingEvaluation:
     * window stays unreported until the runner is told to report it, which is how the preregistration's single look at
     * the test interval is enforced operationally.
     */
-  def evaluate(rows: Seq[RatingReplay.Game], specs: List[ModelSpec], config: Config): Report =
+  def evaluate(rows: Seq[RatingReplay.Game], specs: List[ModelSpec], config: Config): FitResult[Report] =
     val prepared = prepare(rows, config.windows, config.constants)
-    val runs     = specs.map(run(prepared, _, config.constants, config.category))
-    val baseline = runs.headOption
-    val models   = runs.map(r => modelReport(prepared, r, baseline.filter(_ ne r), config))
-    Report(
-      windows = config.windows,
-      firstDay = prepared.firstDay,
-      days = prepared.days,
-      forecastGames = prepared.games.length,
-      excludedRows = prepared.excludedRows,
-      constants = config.constants.toList.sorted,
-      reportedWindows = config.reportedWindows,
-      bootstrapResamples = config.bootstrapResamples,
-      seed = config.seed,
-      models = models
-    )
+    specs.traverse(run(prepared, _, config.constants, config.category)).map { runs =>
+      val baseline = runs.headOption
+      val models   = runs.map(r => modelReport(prepared, r, baseline.filter(_ ne r), config))
+      Report(
+        windows = config.windows,
+        firstDay = prepared.firstDay,
+        days = prepared.days,
+        forecastGames = prepared.games.length,
+        excludedRows = prepared.excludedRows,
+        constants = config.constants.toList.sorted,
+        reportedWindows = config.reportedWindows,
+        bootstrapResamples = config.bootstrapResamples,
+        seed = config.seed,
+        models = models
+      )
+    }
 
   private def modelReport(prepared: Prepared, run: Run, baseline: Option[Run], config: Config): ModelReport =
     val games      = prepared.games

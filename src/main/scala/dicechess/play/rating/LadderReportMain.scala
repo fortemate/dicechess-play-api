@@ -15,7 +15,9 @@ import java.time.Instant
   *
   * Run: `mise run ladder:report [elo0 elo1 alpha beta]` (positional defaults 0 20 0.05 0.05)
   * `mise run ladder:report -- [out=path.md] [format=markdown|text] [category=blitz] [iterations=1000] [elo0=0] [elo1=20] [alpha=0.05] [beta=0.05]`
-  * with `PLAY_DB_URL` set — read-only against the database. All analysis logic lives in the separately unit-tested
+  * `whiteadvantage=<elo>` sets the color offset; `maxciwidth=<elo>` supplies the approved uncertainty policy. Without
+  * an explicit width policy all estimates remain provisional. These options affect only the internal report. Run with
+  * `PLAY_DB_URL` set — read-only against the database. All analysis logic lives in the separately unit-tested
   * `Sprt`/`BradleyTerry`/`StrengthReport`; this file is a thin shell (and is name-excluded from coverage like
   * `Main.scala`).
   */
@@ -32,49 +34,51 @@ object LadderReportMain extends IOApp:
       saveSnapshot: Boolean = false
   )
 
-  def parseOptions(args: List[String]): Options =
-    val hasKeyVal = args.exists(_.contains('='))
-    if hasKeyVal then
+  def parseOptions(args: List[String]): Either[String, Options] =
+    if args.exists(_.contains('=')) then
       val pairs = args.flatMap { arg =>
         arg.split("=", 2) match
           case Array(k, v) => Some(k.trim.toLowerCase -> v.trim)
           case _           => None
       }.toMap
+      keyValueOptions(pairs)
+    else
+      StrengthReport.Config
+        .fromValues(
+          elo0Raw = args.headOption,
+          elo1Raw = args.lift(1),
+          alphaRaw = args.lift(2),
+          betaRaw = args.lift(3),
+          bootstrapIterationsRaw = None
+        )
+        .map(config => Options(config, RatingCategory.Default, None, Format.Text, saveSnapshot = false))
 
-      // The validated parser (#181): an absent, unparseable or out-of-range knob falls back to its default, and an
-      // inverted elo0/elo1 pair falls back as a pair instead of producing verdicts that look valid and mean nothing.
-      val config = StrengthReport.Config.fromValues(
+  private def keyValueOptions(pairs: Map[String, String]): Either[String, Options] =
+    val category     = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)
+    val saveSnapshot = pairs
+      .get("savesnapshot")
+      .orElse(pairs.get("savedb"))
+      .orElse(pairs.get("snapshot"))
+      .exists(v => v == "true" || v == "1" || v == "yes")
+    for
+      config <- StrengthReport.Config.fromValues(
         elo0Raw = pairs.get("elo0"),
         elo1Raw = pairs.get("elo1"),
         alphaRaw = pairs.get("alpha"),
         betaRaw = pairs.get("beta"),
         bootstrapIterationsRaw = pairs.get("iterations").orElse(pairs.get("bootstrap")),
-        windowDaysRaw = pairs.get("window").orElse(pairs.get("windowdays"))
+        windowDaysRaw = pairs.get("window").orElse(pairs.get("windowdays")),
+        modelPolicy = StrengthReport.Config.ModelPolicyInput(pairs.get("whiteadvantage"), pairs.get("maxciwidth"))
       )
+      out <- scala.util.Try(pairs.get("out").map(Paths.get(_))).toEither.left.map(_ => "out must be a valid file path")
+    yield Options(config, category, out, parseFormat(pairs.get("format"), out), saveSnapshot)
 
-      val category     = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)
-      val out          = pairs.get("out").map(Paths.get(_))
-      val saveSnapshot = pairs
-        .get("savesnapshot")
-        .orElse(pairs.get("savedb"))
-        .orElse(pairs.get("snapshot"))
-        .exists(v => v == "true" || v == "1" || v == "yes")
-      val format = pairs.get("format").map(_.toLowerCase) match
-        case Some("markdown") | Some("md")                           => Format.Markdown
-        case Some("text") | Some("txt")                              => Format.Text
-        case _ if out.exists(_.getFileName.toString.endsWith(".md")) => Format.Markdown
-        case _                                                       => Format.Text
-
-      Options(config, category, out, format, saveSnapshot)
-    else
-      val config = StrengthReport.Config.fromValues(
-        elo0Raw = args.headOption,
-        elo1Raw = args.lift(1),
-        alphaRaw = args.lift(2),
-        betaRaw = args.lift(3),
-        bootstrapIterationsRaw = None
-      )
-      Options(config, RatingCategory.Default, None, Format.Text, saveSnapshot = false)
+  private def parseFormat(raw: Option[String], out: Option[Path]): Format =
+    raw.map(_.toLowerCase) match
+      case Some("markdown") | Some("md")                                                        => Format.Markdown
+      case Some("text") | Some("txt")                                                           => Format.Text
+      case _ if out.exists(path => Option(path.getFileName).exists(_.toString.endsWith(".md"))) => Format.Markdown
+      case _                                                                                    => Format.Text
 
   private[rating] def renderReport(report: StrengthReport, options: Options): String =
     options.format match
@@ -177,20 +181,23 @@ object LadderReportMain extends IOApp:
       else doPublishSnapshot(store, options, rows, effectiveAnchor)
 
   def run(args: List[String]): IO[ExitCode] =
-    val options = parseOptions(args)
+    IO.defer {
+      parseOptions(args) match
+        case Left(error)    => IO.println(s"[ladder-report] $error").as(ExitCode.Error)
+        case Right(options) => runWithOptions(options)
+    }
+
+  private def runWithOptions(options: Options): IO[ExitCode] =
     PgGameStore.configFromEnv match
-      case None =>
-        IO.println("[ladder-report] PLAY_DB_URL unset: nothing to report on").as(ExitCode.Error)
+      case None           => IO.println("[ladder-report] PLAY_DB_URL unset: nothing to report on").as(ExitCode.Error)
       case Some(dbConfig) =>
-        PgGameStore
-          .resource(dbConfig)
-          .use { store =>
-            for
-              rows <- store.finishedRatedSince(Instant.EPOCH) // every rated game ever — the corpus IS the input
-              report  = StrengthReport.build(rows, options.category, options.config)
-              content = renderReport(report, options)
-              _ <- writeReport(content, options)
-              _ <- publishSnapshot(store, options, rows, report)
-            yield ()
-          }
+        PgGameStore.resource(dbConfig).use { store =>
+          store.finishedRatedSince(Instant.EPOCH).flatMap(rows => renderAndPublish(store, options, rows))
+        }
+
+  private def renderAndPublish(store: PgGameStore, options: Options, rows: List[GameResultRow]): IO[ExitCode] =
+    StrengthReport.build(rows, options.category, options.config) match
+      case Left(error)   => IO.println(s"[ladder-report] strength fit failed: ${error.message}").as(ExitCode.Error)
+      case Right(report) =>
+        writeReport(renderReport(report, options), options) *> publishSnapshot(store, options, rows, report)
           .as(ExitCode.Success)

@@ -1,5 +1,7 @@
 package dicechess.play.rating
 
+import cats.syntax.all.*
+import dicechess.play.rating.BradleyTerry.FitResult
 import dicechess.play.rating.RatingEvaluation.ModelSpec
 import dicechess.play.rating.RatingModels.Observation
 import io.circe.derivation.ConfiguredCodec
@@ -100,50 +102,84 @@ object RatingEvaluationFixture:
 
   private val Z95 = 1.959964
 
-  def evaluate(scenario: Scenario, specs: List[ModelSpec], seeds: Range): Summary =
-    val everyone = scenario.everyone
-    val ids      = everyone.map(_.id).toSet
-    val eloOf    = everyone.map(b => b.id -> b.elo).toMap
-    val gone     = scenario.departures.values.flatten.toSet
-    val veterans = scenario.bots.map(_.id).filterNot(gone.contains)
-    val perModel = specs.map { spec =>
-      var estimates = 0L
-      var withSd    = 0L
-      var covered   = 0L
-      var absError  = 0.0
-      var driftMax  = 0.0
-      var driftSum  = 0.0
-      var driftN    = 0L
-      var name      = ""
-      seeds.foreach { seed =>
-        val run = RatingEvaluation.drive(simulate(scenario, seed.toLong), spec.build, ids, Category)
-        name = run.name
-        val finalDay = run.constantsByDay.keys.max
-        val end      = run.constantsByDay(finalDay).filter((id, _) => !gone.contains(id))
-        if end.nonEmpty then
-          val estMean  = end.values.map(_.rating).sum / end.size
-          val trueMean = end.keys.map(eloOf).sum / end.size
-          end.foreach { (id, estimate) =>
-            val error = (estimate.rating - estMean) - (eloOf(id) - trueMean)
-            estimates += 1
-            absError += math.abs(error)
-            estimate.sd.foreach { sd =>
-              withSd += 1
-              if math.abs(error) <= Z95 * sd then covered += 1
-            }
-          }
-        val before = run.constantsByDay.getOrElse(scenario.changeDay, Map.empty)
-        veterans.foreach { id =>
-          for
-            b <- before.get(id)
-            e <- end.get(id)
-          do
-            val d = math.abs(e.rating - b.rating)
-            driftMax = math.max(driftMax, d)
-            driftSum += d
-            driftN += 1
-        }
+  final private case class Population(
+      scenario: Scenario,
+      ids: Set[String],
+      eloOf: Map[String, Double],
+      gone: Set[String],
+      veterans: Vector[String]
+  )
+
+  def evaluate(scenario: Scenario, specs: List[ModelSpec], seeds: Range): FitResult[Summary] =
+    val everyone   = scenario.everyone
+    val ids        = everyone.map(_.id).toSet
+    val eloOf      = everyone.map(b => b.id -> b.elo).toMap
+    val gone       = scenario.departures.values.flatten.toSet
+    val veterans   = scenario.bots.map(_.id).filterNot(gone.contains)
+    val population = Population(scenario, ids, eloOf, gone, veterans)
+    specs
+      .traverse(spec => evaluateModel(population, spec, seeds))
+      .map(Summary(scenario.name, seeds.size, _))
+
+  private def evaluateModel(population: Population, spec: ModelSpec, seeds: Range): FitResult[ModelCoverage] =
+    val coverage = new CoverageAccumulator(population)
+    seeds.toList
+      .traverse_ { seed =>
+        RatingEvaluation
+          .drive(simulate(population.scenario, seed.toLong), spec.build, population.ids, Category)
+          .map(coverage.record)
       }
+      .map(_ => coverage.result)
+
+  /** Each seed contributes in order to the same accumulator; failed fits never produce a partial summary. */
+  final private class CoverageAccumulator(population: Population):
+    private var estimates = 0L
+    private var withSd    = 0L
+    private var covered   = 0L
+    private var absError  = 0.0
+    private var driftMax  = 0.0
+    private var driftSum  = 0.0
+    private var driftN    = 0L
+    private var name      = ""
+
+    def record(run: RatingEvaluation.Run): Unit =
+      name = run.name
+      val finalDay = run.constantsByDay.keys.max
+      val end      = run.constantsByDay(finalDay).filter((id, _) => !population.gone.contains(id))
+      recordCoverage(end)
+      val before = run.constantsByDay.getOrElse(population.scenario.changeDay, Map.empty)
+      recordDrift(before, end)
+
+    private def recordCoverage(end: Map[String, RatingModels.Estimate]): Unit =
+      if end.nonEmpty then
+        val estMean  = end.values.map(_.rating).sum / end.size
+        val trueMean = end.keys.map(population.eloOf).sum / end.size
+        end.foreach { (id, estimate) =>
+          val error = (estimate.rating - estMean) - (population.eloOf(id) - trueMean)
+          recordEstimate(error, estimate)
+        }
+
+    private def recordEstimate(error: Double, estimate: RatingModels.Estimate): Unit =
+      estimates += 1
+      absError += math.abs(error)
+      estimate.sd.foreach { sd =>
+        withSd += 1
+        if math.abs(error) <= Z95 * sd then covered += 1
+      }
+
+    private def recordDrift(before: Map[String, RatingModels.Estimate], end: Map[String, RatingModels.Estimate]): Unit =
+      population.veterans.foreach { id =>
+        for
+          b <- before.get(id)
+          e <- end.get(id)
+        do
+          val d = math.abs(e.rating - b.rating)
+          driftMax = math.max(driftMax, d)
+          driftSum += d
+          driftN += 1
+      }
+
+    def result: ModelCoverage =
       ModelCoverage(
         model = name,
         estimates = estimates,
@@ -153,8 +189,6 @@ object RatingEvaluationFixture:
         maxConstantDrift = driftMax,
         meanConstantDrift = if driftN == 0 then 0.0 else driftSum / driftN
       )
-    }
-    Summary(scenario.name, seeds.size, perModel)
 
   def render(summary: Summary): List[String] =
     val head = List(

@@ -1,7 +1,6 @@
 package dicechess.play.rating
 
 import dicechess.play.core.{Principal, RatingCategory}
-import dicechess.play.rating.GraphConnectivity.AdmissionStatus
 import dicechess.play.store.GameResultRow
 
 import java.time.Instant
@@ -75,16 +74,35 @@ object StrengthReport:
       anchorSet: AnchorSet = AnchorSet.Default,
       windowDays: Option[Int] = None,
       minGamesForAdmission: Int = GraphConnectivity.DefaultMinGames,
-      minOpponentsForAdmission: Int = GraphConnectivity.DefaultMinOpponents
-  )
+      minOpponentsForAdmission: Int = GraphConnectivity.DefaultMinOpponents,
+      whiteAdvantageElo: Double = AnchoredStrength.Config.Default.whiteAdvantageElo,
+      maxCiWidthElo: Option[Double] = None
+  ):
+    // Validate at construction, including CLI parsing, before any corpus is loaded.
+    private[rating] val anchoredConfig: AnchoredStrength.Config = AnchoredStrength.Config(
+      anchorSet = anchorSet,
+      minGamesForAdmission = minGamesForAdmission,
+      minOpponentsForAdmission = minOpponentsForAdmission,
+      bootstrapIterations = bootstrapIterations,
+      seed = seed,
+      whiteAdvantageElo = whiteAdvantageElo,
+      maxCiWidthElo = maxCiWidthElo
+    )
 
   object Config:
     val Default: Config = Config()
 
+    /** Raw model-policy overrides form one validated policy, separate from the legacy SPRT tuning inputs. */
+    final case class ModelPolicyInput(
+        whiteAdvantageRaw: Option[String] = None,
+        maxCiWidthRaw: Option[String] = None
+    )
+
     /** Parse from explicit optional raw values (#181), which are the ladder report's arguments
-      * (`LadderReportMain.parseOptions`) — every knob falls back to [[Default]] on an absent or unparseable value.
-      * Every one of them is a tuning knob, never a switch. `seed` is deliberately not among them: it governs bootstrap
-      * reproducibility, not statistical trust, so a run has no legitimate reason to change it.
+      * (`LadderReportMain.parseOptions`). Legacy SPRT knobs fall back on invalid input; explicit color/uncertainty
+      * policy values fail validation instead of silently selecting a different model. An absent width disables
+      * admission. `seed` is deliberately not among them: it governs bootstrap reproducibility, not statistical trust,
+      * so a run has no legitimate reason to change it.
       *
       * `alpha`/`beta` are filtered to the open interval `(0, 1)`: they are error rates that feed `math.log` in
       * [[Sprt.test]], so `0` or `1` would silently produce an infinite or `NaN` LLR forever rather than fail loudly.
@@ -96,18 +114,48 @@ object StrengthReport:
         alphaRaw: Option[String],
         betaRaw: Option[String],
         bootstrapIterationsRaw: Option[String],
-        windowDaysRaw: Option[String] = None
-    ): Config =
+        windowDaysRaw: Option[String] = None,
+        modelPolicy: ModelPolicyInput = ModelPolicyInput()
+    ): Either[String, Config] =
       val (elo0, elo1) = eloPair(elo0Raw, elo1Raw)
-      Config(
+      for
+        white <- parsePolicy(
+          "whiteadvantage",
+          modelPolicy.whiteAdvantageRaw,
+          validColor,
+          "must be finite and have a representable positive color multiplier"
+        )
+        width <- parsePolicy("maxciwidth", modelPolicy.maxCiWidthRaw, _ > 0.0, "must be finite and positive")
+      yield Config(
         elo0 = elo0,
         elo1 = elo1,
         alpha = alphaRaw.flatMap(_.toDoubleOption).filter(a => a > 0.0 && a < 1.0).getOrElse(Default.alpha),
         beta = betaRaw.flatMap(_.toDoubleOption).filter(b => b > 0.0 && b < 1.0).getOrElse(Default.beta),
         bootstrapIterations =
           bootstrapIterationsRaw.flatMap(_.toIntOption).filter(_ > 0).getOrElse(Default.bootstrapIterations),
-        windowDays = windowDaysRaw.flatMap(_.toIntOption).filter(_ > 0)
+        windowDays = windowDaysRaw.flatMap(_.toIntOption).filter(_ > 0),
+        whiteAdvantageElo = white.getOrElse(Default.whiteAdvantageElo),
+        maxCiWidthElo = width
       )
+
+    // Diagnostics name the key and constraint, never echo arbitrary input that might contain a credential.
+    private def parsePolicy(
+        key: String,
+        raw: Option[String],
+        valid: Double => Boolean,
+        requirement: String
+    ): Either[String, Option[Double]] =
+      raw match
+        case None        => Right(None)
+        case Some(value) =>
+          value.toDoubleOption
+            .filter(v => v.isFinite && valid(v))
+            .map(Some(_))
+            .toRight(s"$key $requirement")
+
+    private def validColor(value: Double): Boolean =
+      val multiplier = math.pow(10.0, value / 400.0)
+      multiplier.isFinite && multiplier > 0.0
 
     /** `elo0`/`elo1` are [[Sprt.test]]'s ordered H0/H1 bounds ("stronger by <= elo0" vs "stronger by >= elo1"): parsing
       * them independently — each falling back to its own default on its own — can silently produce an inverted or
@@ -140,7 +188,7 @@ object StrengthReport:
       rows: List[GameResultRow],
       category: RatingCategory,
       config: Config = Config()
-  ): StrengthReport =
+  ): BradleyTerry.FitResult[StrengthReport] =
     // If windowDays is specified, filter rows to trailing window from the latest game
     val (activeRows, windowExcluded) = config.windowDays match
       case Some(days) =>
@@ -226,31 +274,21 @@ object StrengthReport:
       completePairs.map(_.map(toBtGame)) ++ singleGames.map(g => List(toBtGame(g)))
 
     val effectiveAnchorSet =
-      if config.anchorSet.category == category.wireName then config.anchorSet
-      else if config.anchorSet == AnchorSet.Default then AnchorSet.unanchored(category.wireName)
-      else
-        throw new IllegalArgumentException(
-          s"AnchorSet category '${config.anchorSet.category}' does not match report category '${category.wireName}'"
-        )
+      if config.anchorSet.category == category.wireName then Right(config.anchorSet)
+      else if config.anchorSet == AnchorSet.Default then Right(AnchorSet.unanchored(category.wireName))
+      else Left(BradleyTerry.FitFailure("anchor set category must match the report category"))
 
-    val anchoredConfig = AnchoredStrength.Config(
-      anchorSet = effectiveAnchorSet,
-      minGamesForAdmission = config.minGamesForAdmission,
-      minOpponentsForAdmission = config.minOpponentsForAdmission,
-      bootstrapIterations = config.bootstrapIterations,
-      seed = config.seed
-    )
-
-    val anchoredResult = AnchoredStrength.evaluate(bootstrapGroups, anchoredConfig)
-
-    StrengthReport(
+    for
+      anchorSet <- effectiveAnchorSet
+      result    <- AnchoredStrength.evaluate(bootstrapGroups, config.anchoredConfig.copy(anchorSet = anchorSet))
+    yield StrengthReport(
       category = category,
       pairwise = pairwise,
-      ranking = anchoredResult.allConnected,
+      ranking = result.allConnected,
       completePairs = completePairs.size,
       singles = singleGames.size,
       excludedRows = excluded.size + windowExcluded.size,
-      anchored = anchoredResult
+      anchored = result
     )
 
   private def toBtGame(game: BotGame): BradleyTerry.Game =
@@ -263,6 +301,15 @@ object StrengthReport:
     */
   private def line(pattern: String, args: Any*): String =
     String.format(java.util.Locale.ROOT, pattern, args.map(_.asInstanceOf[Object])*)
+
+  private def intervalText(row: AnchoredStrength.RankedBot): String =
+    if row.ciLow.isFinite && row.ciHigh.isFinite then line("[%+7.1f, %+7.1f]", row.ciLow, row.ciHigh)
+    else "unavailable"
+
+  private def emptyAdmissionMessage(report: StrengthReport): String =
+    if report.anchored.maxCiWidthElo.isEmpty then
+      "No bots admitted: admission disabled (maximum CI width policy is unset)."
+    else "No bots admitted: no estimate satisfies the admission requirements."
 
   /** The owner-facing plain-text rendering (the runner prints this verbatim). */
   def render(report: StrengthReport, config: Config): String =
@@ -280,6 +327,10 @@ object StrengthReport:
         config.elo1,
         config.alpha
       ),
+      s"model: ${report.anchored.modelVersion}; white advantage: ${report.anchored.whiteAdvantageElo}; " +
+        s"max CI width: ${report.anchored.maxCiWidthElo.fold("unset (admission disabled)")(_.toString)}; " +
+        s"bootstrap iterations: ${report.anchored.bootstrapIterations}; seed: ${report.anchored.seed}; " +
+        s"minimum games/opponents: ${report.anchored.minGamesForAdmission}/${report.anchored.minOpponentsForAdmission}",
       ""
     )
     val pairLines = report.pairwise.map { p =>
@@ -313,33 +364,30 @@ object StrengthReport:
         "",
         s"--- Pool ranking (Bradley-Terry, anchor set ${report.anchored.anchorSetVersion}, epoch ${report.anchored.epoch}$calib) ---"
       )
-    else List("", "--- Pool ranking (Bradley-Terry, relative elo, bootstrap 95% CI) ---")
+    else List("", "--- Pool ranking (Bradley-Terry, relative elo, bootstrap 95% CI) ---", emptyAdmissionMessage(report))
 
-    val rankRows  = if report.anchored.admitted.nonEmpty then report.anchored.admitted else report.ranking
+    val rankRows  = report.anchored.admitted
     val rankLines = rankRows.zipWithIndex.map { (r, i) =>
-      val badge =
-        if r.isAnchor then " [Anchor]"
-        else if report.anchored.admitted.isEmpty && r.status.isInstanceOf[AdmissionStatus.Provisional] then
-          " [Provisional]"
-        else ""
-      val los = r.losVsNext.map(v => line("  LOS vs next %.1f%%", v * 100)).getOrElse("")
+      val badge = if r.isAnchor then " [Anchor]" else ""
+      val los   = r.losVsNext.map(v => line("  LOS vs next %.1f%%", v * 100)).getOrElse("")
       line("%2d. %-18s%-15s %+7.1f  [%+7.1f, %+7.1f]%s", i + 1, r.player, badge, r.elo, r.ciLow, r.ciHigh, los)
     }
 
     val provisionalLines = if report.anchored.provisional.nonEmpty then
       List(
         "",
-        s"--- Provisional bots (< ${config.minGamesForAdmission} games or < ${config.minOpponentsForAdmission} opponents) ---"
+        s"--- Provisional bots (insufficient counts, calibration or uncertainty evidence) ---"
       ) ++
         report.anchored.provisional.map { r =>
           line(
-            " -  %-18s %+7.1f  [%+7.1f, %+7.1f]  (%d games, %d opponents)",
+            " -  %-18s [Provisional]%s %+7.1f  %s  (%d games, %d opponents; %d valid bootstrap samples)",
             r.player,
+            if r.isAnchor then " [Anchor]" else "",
             r.elo,
-            r.ciLow,
-            r.ciHigh,
+            intervalText(r),
             r.games,
-            r.opponents
+            r.opponents,
+            r.validBootstrapSamples
           )
         }
     else Nil
@@ -386,6 +434,9 @@ object StrengthReport:
       s"- **Rating scale:** `${report.category.wireName}`",
       scaleInfo,
       windowInfo,
+      s"- **Model version:** `${report.anchored.modelVersion}`",
+      s"- **White advantage Elo:** ${report.anchored.whiteAdvantageElo}",
+      s"- **Maximum CI width Elo:** ${report.anchored.maxCiWidthElo.fold("unset (admission disabled)")(_.toString)}",
       line(
         "- **Observations:** %d complete pairs, %d singles (excluded rows: %d)",
         report.completePairs,
@@ -398,7 +449,9 @@ object StrengthReport:
         config.elo1,
         config.alpha
       ),
-      line("- **Bootstrap resampling:** %d iterations", config.bootstrapIterations),
+      line("- **Bootstrap resampling:** %d iterations", report.anchored.bootstrapIterations),
+      s"- **Bootstrap seed:** ${report.anchored.seed}",
+      s"- **Minimum games/opponents:** ${report.anchored.minGamesForAdmission}/${report.anchored.minOpponentsForAdmission}",
       s"- **Generated at:** `${generatedAt.toString}`",
       ""
     )
@@ -409,31 +462,18 @@ object StrengthReport:
       "| Rank | Bot | Relative Elo | 95% Confidence Interval | LOS vs Next |",
       "|:---:|:---|:---:|:---:|:---:|"
     )
-    val rankEntries = if report.anchored.admitted.nonEmpty then report.anchored.admitted else report.ranking
+    val rankEntries = report.anchored.admitted
     val rankingRows = rankEntries.zipWithIndex.map { (r, i) =>
       val anchorBadge =
-        if r.isAnchor then " `[Anchor]`"
-        else if report.anchored.admitted.isEmpty && r.status.isInstanceOf[AdmissionStatus.Provisional] then
-          " `[Provisional]`"
-        else ""
+        if r.isAnchor then " `[Anchor]`" else ""
       val los = r.losVsNext.map(v => line("%.1f%%", v * 100)).getOrElse("—")
       line("| %d | `%s`%s | %+.1f | [%+.1f, %+.1f] | %s |", i + 1, r.player, anchorBadge, r.elo, r.ciLow, r.ciHigh, los)
     }
 
-    val provisionalSection = if report.anchored.provisional.nonEmpty then
-      List(
-        "",
-        "### Provisional Bots",
-        "",
-        "> [!note]",
-        s"> These bots have fewer than ${config.minGamesForAdmission} games or fewer than ${config.minOpponentsForAdmission} distinct opponents. Their estimates are provisional.",
-        "",
-        "| Bot | Relative Elo | 95% Confidence Interval | Games | Opponents |",
-        "|:---|:---:|:---:|:---:|:---:|"
-      ) ++ report.anchored.provisional.map { r =>
-        line("| `%s` | %+.1f | [%+.1f, %+.1f] | %d | %d |", r.player, r.elo, r.ciLow, r.ciHigh, r.games, r.opponents)
-      }
-    else Nil
+    val rankingStatus =
+      if rankEntries.isEmpty then List("", s"> ${emptyAdmissionMessage(report)}") else Nil
+
+    val provisionalSection = markdownProvisionalSection(report)
 
     val disconnectedSection = if report.anchored.disconnected.nonEmpty then
       List(
@@ -478,5 +518,29 @@ object StrengthReport:
       )
     }
 
-    (frontmatter ++ summary ++ rankingHeader ++ rankingRows ++ provisionalSection ++ disconnectedSection ++ sprtHeader ++ sprtRows)
+    (frontmatter ++ summary ++ rankingHeader ++ rankingRows ++ rankingStatus ++ provisionalSection ++ disconnectedSection ++ sprtHeader ++ sprtRows)
       .mkString("\n")
+
+  private def markdownProvisionalSection(report: StrengthReport): List[String] =
+    if report.anchored.provisional.nonEmpty then
+      List(
+        "",
+        "### Provisional Bots",
+        "",
+        "> [!note]",
+        s"> These bots lack sufficient game/opponent counts, calibration or uncertainty evidence. Anchor identity does not waive admission. Their estimates are provisional.",
+        "",
+        "| Bot | Relative Elo | 95% Confidence Interval | Games | Opponents |",
+        "|:---|:---:|:---:|:---:|:---:|"
+      ) ++ report.anchored.provisional.map { r =>
+        line(
+          "| `%s` `[Provisional]`%s | %+.1f | %s | %d | %d |",
+          r.player,
+          if r.isAnchor then " `[Anchor]`" else "",
+          r.elo,
+          intervalText(r),
+          r.games,
+          r.opponents
+        )
+      }
+    else Nil

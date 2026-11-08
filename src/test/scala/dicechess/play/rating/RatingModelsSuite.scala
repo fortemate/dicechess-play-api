@@ -9,6 +9,20 @@ import dicechess.play.rating.RatingModels.*
   */
 class RatingModelsSuite extends munit.FunSuite:
 
+  private def fitted[A](result: BradleyTerry.FitResult[A]): A = result.fold(problem => fail(problem.message), identity)
+
+  test("a failed daily fit returns Left and commits no partially refreshed categories"):
+    val model = BradleyTerryModel(BradleyTerrySpec())
+    fitted(model.startDay(0))
+    model.observe(Observation(0, "blitz", "a", "b", 1.0))
+    fitted(model.startDay(1))
+    val prior = model.estimate("a", "blitz")
+    model.observe(Observation(1, "rapid", "a", "c", 1.0))
+    model.observe(Observation(1, "blitz", "a", "b", Double.NaN))
+    assert(model.startDay(2).left.exists(_.message.contains("observations")))
+    assertEquals(model.estimate("a", "blitz"), prior)
+    assertEquals(model.estimate("a", "rapid"), None)
+
   private val A = "bot:team:fx:a"
   private val B = "bot:team:fx:b"
   private val C = "bot:team:fx:c"
@@ -18,7 +32,7 @@ class RatingModelsSuite extends munit.FunSuite:
 
   test("one-game-period Glicko-2 matches the production update from both pre-game states"):
     val model = GlickoModel(GlickoSpec())
-    model.startDay(0)
+    fitted(model.startDay(0))
     val first = game(0, A, B, 1.0)
     assertEqualsDouble(model.forecast(first), 0.5, 1e-12, "two fresh states are an even game")
     model.observe(first)
@@ -31,7 +45,7 @@ class RatingModelsSuite extends munit.FunSuite:
 
   test("daily periods hold the state until the day closes, then apply the day as one period"):
     val model = GlickoModel(GlickoSpec(daily = true))
-    model.startDay(0)
+    fitted(model.startDay(0))
     model.observe(game(0, A, B, 1.0))
     assertEqualsDouble(model.forecast(game(0, A, B, 1.0)), 0.5, 1e-12, "mid-day forecasts use the start-of-day state")
     model.observe(game(0, A, B, 1.0))
@@ -44,21 +58,21 @@ class RatingModelsSuite extends munit.FunSuite:
 
   test("idle inflation widens the deviation by calendar days without a game, capped at the initial 350"):
     val model = GlickoModel(GlickoSpec(idleEloPerSqrtDay = 30.0))
-    model.startDay(0)
+    fitted(model.startDay(0))
     model.observe(game(0, A, B, 1.0))
     val settled = model.estimate(A, "blitz").get.sd.get
-    model.startDay(4)
+    fitted(model.startDay(4))
     model.forecast(game(4, A, B, 1.0))
     val inflated = model.estimate(A, "blitz").get.sd.get
     assertEqualsDouble(inflated, math.sqrt(settled * settled + 30.0 * 30.0 * 4), 1e-9)
-    model.startDay(4000)
+    fitted(model.startDay(4000))
     model.forecast(game(4000, A, B, 1.0))
     assertEqualsDouble(model.estimate(A, "blitz").get.sd.get, Glicko.Initial.deviation, 1e-9)
 
   test("an anchored identity never moves, its opponents still learn"):
     val anchor = Glicko(1500.0, 50.0, 0.06)
     val model  = GlickoModel(GlickoSpec(anchors = Map(A -> anchor)))
-    model.startDay(0)
+    fitted(model.startDay(0))
     (1 to 20).foreach(_ => model.observe(game(0, A, B, 0.0)))
     assertEquals(model.estimate(A, "blitz"), Some(Estimate(anchor.rating, Some(anchor.deviation))))
     assert(model.estimate(B, "blitz").get.rating > 1500.0)
@@ -66,11 +80,11 @@ class RatingModelsSuite extends munit.FunSuite:
 
   test("the daily Bradley–Terry model is symmetric, refits at day start, and learns a stationary pool's order"):
     val model = BradleyTerryModel(BradleyTerrySpec())
-    model.startDay(0)
+    fitted(model.startDay(0))
     assertEqualsDouble(model.forecast(game(0, A, B, 1.0)), 0.5, 1e-12, "unseen players sit at the pool mean")
     val rng = new scala.util.Random(7)
     (0 until 2).foreach { day =>
-      model.startDay(day)
+      fitted(model.startDay(day))
       (0 until 300).foreach { _ =>
         val (w, b) = if rng.nextBoolean() then (A, C) else (B, C)
         val p      = if w == A then 0.8 else 0.6
@@ -79,7 +93,7 @@ class RatingModelsSuite extends munit.FunSuite:
       }
       model.endDay(day)
     }
-    model.startDay(2)
+    fitted(model.startDay(2))
     val pa = model.forecast(game(2, A, C, 1.0))
     val pb = model.forecast(game(2, B, C, 1.0))
     assert(pa > pb && pb > 0.5, s"A > B > C expected, got $pa, $pb")
@@ -89,14 +103,14 @@ class RatingModelsSuite extends munit.FunSuite:
 
   test("a windowed Bradley–Terry forgets games outside the window"):
     val model = BradleyTerryModel(BradleyTerrySpec(Some(2)))
-    model.startDay(0)
+    fitted(model.startDay(0))
     (0 until 50).foreach(_ => model.observe(game(0, A, B, 1.0)))
     model.endDay(0)
-    model.startDay(1)
+    fitted(model.startDay(1))
     assert(model.forecast(game(1, A, B, 1.0)) > 0.9)
     model.observe(game(10, B, A, 0.5))
     model.endDay(10)
-    model.startDay(11)
+    fitted(model.startDay(11))
     assertEqualsDouble(model.forecast(game(11, A, B, 1.0)), 0.5, 1e-9, "only the day-10 draw is inside the window")
     assertEquals(model.name, "bt(window=2)")
 
@@ -121,7 +135,7 @@ class RatingModelsSuite extends munit.FunSuite:
     val model = WhrModel(WhrSpec(30.0))
     val rng   = new scala.util.Random(11)
     (0 until 5).foreach { day =>
-      model.startDay(day)
+      fitted(model.startDay(day))
       (0 until 200).foreach { _ =>
         val score = if rng.nextDouble() < 0.75 then 1.0 else 0.0
         model.observe(game(day, A, B, score))

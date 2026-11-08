@@ -11,6 +11,29 @@ import java.time.{Instant, LocalDate}
   */
 class RatingEvaluationSuite extends munit.FunSuite:
 
+  private def fitted[A](result: BradleyTerry.FitResult[A]): A = result.fold(problem => fail(problem.message), identity)
+
+  test("the chronological driver aborts before forecasting or observing a day whose fit failed"):
+    val problem       = BradleyTerry.FitFailure("fixture fit did not converge")
+    var forecastCount = 0
+    var observedCount = 0
+    val model         = new RatingModels.Model:
+      val name                                             = "failing-fixture"
+      def startDay(day: Int): BradleyTerry.FitResult[Unit] = if day == 1 then Left(problem) else Right(())
+      def forecast(o: RatingModels.Observation): Double    =
+        forecastCount += 1
+        0.75
+      def observe(o: RatingModels.Observation): Unit                            = observedCount += 1
+      def endDay(day: Int): Unit                                                = ()
+      def estimate(id: String, category: String): Option[RatingModels.Estimate] = None
+    val observations = Vector.tabulate(3)(day => RatingModels.Observation(day, "blitz", "a", "b", 1.0))
+    assertEquals(drive(observations, model, Set.empty, "blitz"), Left(problem))
+    assertEquals(forecastCount, 1)
+    assertEquals(observedCount, 1)
+
+  private def evaluationSuccess(rows: Seq[RatingReplay.Game], specs: List[ModelSpec], config: Config): Report =
+    fitted(RatingEvaluation.evaluate(rows, specs, config))
+
   private val A     = "bot:team:fx:a"
   private val B     = "bot:team:fx:b"
   private val C     = "bot:team:fx:c"
@@ -139,7 +162,7 @@ class RatingEvaluationSuite extends munit.FunSuite:
       ModelSpec.BradleyTerry(RatingModels.BradleyTerrySpec())
     )
     val config = Config(windows = windows, constants = Set(A), bootstrapResamples = 50)
-    val report = evaluate(rows, specs, config)
+    val report = evaluationSuccess(rows, specs, config)
     assertEquals(report.models.map(_.name).head, "glicko(tau=0.30,idle=0,period=game)")
     assertEquals(report.models.head.versusBaseline, Map.empty)
     val whr = report.models(1)
@@ -151,7 +174,7 @@ class RatingEvaluationSuite extends munit.FunSuite:
     assert(text.contains("baseline"))
     assert(text.contains("drift bot:team:fx:a"))
     assert(!text.contains("--- test /"))
-    val everything = evaluate(rows, specs.take(1), config.copy(reportedWindows = Windows.All))
+    val everything = evaluationSuccess(rows, specs.take(1), config.copy(reportedWindows = Windows.All))
     assertEquals(everything.models.head.metrics.keySet, Set(Windows.Training, Windows.Validation, Windows.Test))
 
   test("the synthetic fixture is deterministic per seed and the coverage summary renders"):
@@ -167,14 +190,16 @@ class RatingEvaluationSuite extends munit.FunSuite:
     assert(once.exists(o => o.day >= 3 && (o.white == "bot:team:fx:n1" || o.black == "bot:team:fx:n1")))
     assert(!once.exists(o => o.day >= 4 && (o.white == "bot:team:fx:b" || o.black == "bot:team:fx:b")))
     assertEquals(scenario.changeDay, 3)
-    val summary = RatingEvaluationFixture.evaluate(
-      scenario,
-      List(
-        ModelSpec.Glicko(GlickoSpec()),
-        ModelSpec.Whr(WhrSpec(30.0)),
-        ModelSpec.BradleyTerry(RatingModels.BradleyTerrySpec())
-      ),
-      1 to 2
+    val summary = fitted(
+      RatingEvaluationFixture.evaluate(
+        scenario,
+        List(
+          ModelSpec.Glicko(GlickoSpec()),
+          ModelSpec.Whr(WhrSpec(30.0)),
+          ModelSpec.BradleyTerry(RatingModels.BradleyTerrySpec())
+        ),
+        1 to 2
+      )
     )
     assertEquals(summary.seeds, 2)
     val glicko = summary.models.head
@@ -186,7 +211,8 @@ class RatingEvaluationSuite extends munit.FunSuite:
     assert(lines.exists(_.contains("synthetic coverage")))
     assert(lines.exists(_.contains("n/a")))
     val withSynthetic =
-      evaluate(Nil, List(ModelSpec.Glicko(GlickoSpec())), Config(windows = windows)).copy(synthetic = Some(summary))
+      evaluationSuccess(Nil, List(ModelSpec.Glicko(GlickoSpec())), Config(windows = windows))
+        .copy(synthetic = Some(summary))
     assert(render(withSynthetic).contains("stationary-pool-change"))
 
   test("Windows.of and the preregistered split"):

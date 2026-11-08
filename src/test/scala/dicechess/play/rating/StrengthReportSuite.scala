@@ -96,14 +96,16 @@ class StrengthReportSuite extends munit.FunSuite:
     assertEquals(report.pairwise, Nil)
     assertEquals(report.ranking, Nil)
 
-  test("a dominant corpus yields an SPRT accept and a matching Bradley-Terry order"):
+  test("a dominant corpus yields an SPRT accept and matching provisional strength estimates"):
     val rows   = (1 to 30).toList.flatMap(i => pair(s"p$i", secondResult = -1)) // v3 sweeps 30 pairs
     val report = StrengthReport.build(rows, RatingCategory.Default, StrengthReport.Config(bootstrapIterations = 100))
     val m      = report.pairwise.head
     // Perspective v1 loses everything: H0 accepted from v1's side = v3 is the stronger one.
     assertEquals(m.result.verdict, Sprt.Verdict.AcceptH0)
-    assertEquals(report.ranking.head.player, "oracle/v3")
-    assert(report.ranking.head.elo > report.ranking.last.elo)
+    val winner = report.ranking.find(_.player == "oracle/v3").get
+    val loser  = report.ranking.find(_.player == "oracle/v1").get
+    assert(winner.elo > loser.elo)
+    assertEquals(report.anchored.admitted, Nil, "unanchored evidence has estimates but no admitted ranks")
 
   test("a game from another category is excluded and counted, not folded into the report (#280)"):
     // Same two bots, same result, only the control differs: 10+10 is Rapid, so a Blitz report must not see it. The
@@ -290,7 +292,7 @@ class StrengthReportSuite extends munit.FunSuite:
 
     val text =
       StrengthReport.render(report, StrengthReport.Config(minGamesForAdmission = 50, minOpponentsForAdmission = 5))
-    assert(text.contains("--- Provisional bots (< 50 games or < 5 opponents) ---"))
+    assert(text.contains("--- Provisional bots (insufficient counts, calibration or uncertainty evidence) ---"))
     assert(text.contains("[Provisional]"))
 
     val md = StrengthReport.renderMarkdown(
@@ -298,7 +300,7 @@ class StrengthReportSuite extends munit.FunSuite:
       StrengthReport.Config(minGamesForAdmission = 50, minOpponentsForAdmission = 5)
     )
     assert(md.contains("### Provisional Bots"))
-    assert(md.contains("fewer than 50 games or fewer than 5 distinct opponents"))
+    assert(md.contains("lack sufficient game/opponent counts, calibration or uncertainty evidence"))
     assert(md.contains("`[Provisional]`"))
 
   test("LadderReportMain helpers: parsePlayerKey, resolveEffectiveAnchor, assembleLeaders, and renderReport"):
@@ -349,3 +351,48 @@ class StrengthReportSuite extends munit.FunSuite:
     val optMd = optText.copy(format = LadderReportMain.Format.Markdown)
     assert(LadderReportMain.renderReport(report, optText).contains("Dice Chess ladder — strength report"))
     assert(LadderReportMain.renderReport(report, optMd).contains("title: Bot Strength Report"))
+
+  test("report CLI binds versioned color and uncertainty policy and rejects malformed explicit overrides"):
+    val options = LadderReportMain.parseOptions(List("whiteadvantage=90", "maxciwidth=80", "iterations=160"))
+    assertEquals(options.config.whiteAdvantageElo, 90.0)
+    assertEquals(options.config.maxCiWidthElo, Some(80.0))
+    val report = StrengthReport.build(pair("fixture", -1), RatingCategory.Default, options.config)
+    assertEquals(report.anchored.whiteAdvantageElo, 90.0)
+    assertEquals(report.anchored.maxCiWidthElo, Some(80.0))
+    assertEquals(report.anchored.bootstrapIterations, 160)
+    val text = StrengthReport.render(report, options.config)
+    val md   = StrengthReport.renderMarkdown(report, options.config)
+    assert(text.contains(AnchoredStrength.ModelVersion))
+    assert(text.contains("white advantage: 90.0"))
+    assert(text.contains("max CI width: 80.0"))
+    assert(md.contains(AnchoredStrength.ModelVersion))
+    assert(md.contains("**White advantage Elo:** 90.0"))
+    assert(md.contains("**Maximum CI width Elo:** 80.0"))
+    Seq(
+      "whiteadvantage=NaN",
+      "whiteadvantage=Infinity",
+      "whiteadvantage=garbage",
+      "whiteadvantage=1e308",
+      "maxciwidth=NaN",
+      "maxciwidth=Infinity",
+      "maxciwidth=garbage",
+      "maxciwidth=0",
+      "maxciwidth=-1"
+    ).foreach { arg =>
+      intercept[IllegalArgumentException](LadderReportMain.parseOptions(List(arg)))
+    }
+
+  test("missing bootstrap remains visibly unavailable and provisional estimates never fall back into rank tables"):
+    val cfg    = StrengthReport.Config(bootstrapIterations = 0)
+    val report = StrengthReport.build(pair("fixture", -1), RatingCategory.Default, cfg)
+    assertEquals(report.anchored.admitted, Nil)
+    val text = StrengthReport.render(report, cfg)
+    val md   = StrengthReport.renderMarkdown(report, cfg)
+    assert(text.contains("admission disabled"))
+    assert(text.contains("unavailable"))
+    assert(!text.contains("NaN"))
+    assert(!text.linesIterator.exists(_.matches(" *[0-9]+\\..*")))
+    val rankingTable = md.split("### Provisional Bots")(0).split("## Pool Ranking")(1)
+    assert(!rankingTable.contains("`oracle/v1`"))
+    assert(md.contains("unavailable"))
+    assert(!md.contains("NaN"))

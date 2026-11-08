@@ -93,10 +93,11 @@ class AnchoredStrengthSuite extends munit.FunSuite:
   test("Anchor calibration offset aligns present anchors to AnchorSet target Elos"):
     // Benchmark games: greedy vs aggressive evenly matched (score 0.5 each)
     val groups = (1 to 50).map(_ => Seq(game(anchorGreedy, anchorAggr, 0.5)))
-    val res    = AnchoredStrength.evaluate(groups, AnchoredStrength.Config(bootstrapIterations = 50))
+    val res    =
+      AnchoredStrength.evaluate(groups, AnchoredStrength.Config(bootstrapIterations = 50, whiteAdvantageElo = 0.0))
 
-    val greedyElo = res.admitted.find(_.player == anchorGreedy).get.elo
-    val aggrElo   = res.admitted.find(_.player == anchorAggr).get.elo
+    val greedyElo = res.allConnected.find(_.player == anchorGreedy).get.elo
+    val aggrElo   = res.allConnected.find(_.player == anchorAggr).get.elo
 
     // For AnchorSet.V1_0, greedy target is -125.0, aggr target is -35.0 (mean = -80.0).
     // Because they scored 0.5 evenly, both get the mean anchor Elo -80.0.
@@ -114,7 +115,7 @@ class AnchoredStrengthSuite extends munit.FunSuite:
     }
 
     val resBase = AnchoredStrength.evaluate(baseGroups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 123L))
-    val establishedBaseElo = resBase.admitted.find(_.player == "bot/established").get.elo
+    val establishedBaseElo = resBase.allConnected.find(_.player == "bot/established").get.elo
 
     // Now introduce a weak newcomer bot/rookie playing against anchorGreedy
     val rookieGroups   = (1 to 30).map(_ => Seq(game("bot/rookie", anchorGreedy, 0.1)))
@@ -122,7 +123,7 @@ class AnchoredStrengthSuite extends munit.FunSuite:
 
     val resCombined =
       AnchoredStrength.evaluate(combinedGroups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 123L))
-    val establishedCombinedElo = resCombined.admitted.find(_.player == "bot/established").get.elo
+    val establishedCombinedElo = resCombined.allConnected.find(_.player == "bot/established").get.elo
 
     // Without anchors, adding a 10% scoring rookie would shift mean-0 Bradley-Terry ratings.
     // With AnchoredStrength, established bot rating remains stable within small virtual-smoothing tolerance (< 5 Elo).
@@ -168,7 +169,14 @@ class AnchoredStrengthSuite extends munit.FunSuite:
 
   test("Bootstrap resampling preserves CRN pairing units and produces ordered 95% CIs"):
     val crnGroups = (1 to 20).map(_ => crnPair("bot/a", "bot/b", 0.6, 0.6))
-    val res       = AnchoredStrength.evaluate(crnGroups, AnchoredStrength.Config(bootstrapIterations = 100, seed = 99L))
+    val res       = AnchoredStrength.evaluate(
+      crnGroups,
+      AnchoredStrength.Config(
+        anchorSet = AnchorSet("paired-fixture", 1, "blitz", List(Anchor("bot/a", 0.0))),
+        bootstrapIterations = 100,
+        seed = 99L
+      )
+    )
 
     assertEquals(res.allConnected.size, 2)
     res.allConnected.foreach { r =>
@@ -248,7 +256,7 @@ class AnchoredStrengthSuite extends munit.FunSuite:
     assert(resAnchored.appliedOffset.isDefined)
     assert(resAnchored.isCalibrated, "Should be calibrated when an anchor is present")
 
-  test("Bootstrap LOS pairs replicates without index shifting and reflects superiority"):
+  test("Uncalibrated provisional estimates do not publish neighbour superiority"):
     // bot/strong clearly beats bot/weak (80% score over 40 games)
     val games = (1 to 40).map(_ => Seq(game("bot/strong", "bot/weak", 0.8)))
     val res   =
@@ -258,5 +266,4 @@ class AnchoredStrengthSuite extends munit.FunSuite:
       )
 
     val strong = res.allConnected.find(_.player == "bot/strong").get
-    assert(strong.losVsNext.isDefined)
-    assert(strong.losVsNext.get > 0.95, s"Strong bot LOS should be > 0.95, got ${strong.losVsNext.get}")
+    assertEquals(strong.losVsNext, None, "uncalibrated/provisional observations do not publish superiority ranks")

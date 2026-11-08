@@ -15,7 +15,9 @@ import java.time.Instant
   *
   * Run: `mise run ladder:report [elo0 elo1 alpha beta]` (positional defaults 0 20 0.05 0.05)
   * `mise run ladder:report -- [out=path.md] [format=markdown|text] [category=blitz] [iterations=1000] [elo0=0] [elo1=20] [alpha=0.05] [beta=0.05]`
-  * with `PLAY_DB_URL` set — read-only against the database. All analysis logic lives in the separately unit-tested
+  * `whiteadvantage=<elo>` sets the color offset; `maxciwidth=<elo>` supplies the approved uncertainty policy. Without
+  * an explicit width policy all estimates remain provisional. These options affect only the internal report. with
+  * `PLAY_DB_URL` set — read-only against the database. All analysis logic lives in the separately unit-tested
   * `Sprt`/`BradleyTerry`/`StrengthReport`; this file is a thin shell (and is name-excluded from coverage like
   * `Main.scala`).
   */
@@ -49,7 +51,9 @@ object LadderReportMain extends IOApp:
         alphaRaw = pairs.get("alpha"),
         betaRaw = pairs.get("beta"),
         bootstrapIterationsRaw = pairs.get("iterations").orElse(pairs.get("bootstrap")),
-        windowDaysRaw = pairs.get("window").orElse(pairs.get("windowdays"))
+        windowDaysRaw = pairs.get("window").orElse(pairs.get("windowdays")),
+        whiteAdvantageRaw = pairs.get("whiteadvantage"),
+        maxCiWidthRaw = pairs.get("maxciwidth")
       )
 
       val category     = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)

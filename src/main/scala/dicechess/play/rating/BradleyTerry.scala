@@ -43,10 +43,18 @@ object BradleyTerry:
   private val MaxIterations = 1000
   private val Tolerance     = 1e-10
 
-  /** Relative Elo per player (mean 0), fitted by MM over the given games. Empty input → empty map. */
-  def ratings(games: Seq[Game]): Map[String, Double] =
+  /** Relative Elo per player (mean 0). With a nonzero color offset each tuple is (white, black, white score). MM fits
+    * the likelihood, with a bounded Newton fallback if its convergence guard is not reached. Numerical failure is
+    * explicit rather than returning an unconverged estimate. Empty input yields an empty map.
+    */
+  def ratings(games: Seq[Game], whiteAdvantageElo: Double = 0.0): Map[String, Double] =
+    val colorStrength = math.pow(10.0, whiteAdvantageElo / 400.0)
+    require(
+      whiteAdvantageElo.isFinite && colorStrength.isFinite && colorStrength > 0.0,
+      "whiteAdvantageElo must have a finite, positive strength multiplier"
+    )
     val corpus = Corpus.of(Seq(games))
-    corpus.fit(Array(0))
+    corpus.fit(Array(0), colorStrength)
 
   /** The ranked pool with bootstrap 95% CIs and neighbour LOS. `groups` are the resampling units (see the object doc);
     * `seed` makes the whole report reproducible.
@@ -111,7 +119,7 @@ object BradleyTerry:
       * has to be known before the matrix can be sized and seeded, and seeding has to happen before the games are added
       * (`Smoothing/2 + s` and `s + Smoothing/2` are not the same double).
       */
-    def fit(selection: Array[Int]): Map[String, Double] =
+    def fit(selection: Array[Int], colorStrength: Double = 1.0): Map[String, Double] =
       val total   = players.length
       val present = markPresentPlayers(selection, total)
       val localOf = new Array[Int](total)
@@ -120,10 +128,25 @@ object BradleyTerry:
       if n < 2 then (0 until total).filter(present(_)).map(i => players(i) -> 0.0).toMap
       else
         val points    = buildPointsMatrix(selection, localOf, n)
-        val strengths = BradleyTerry.mm(points, n)
-        val elos      = strengths.map(strength => 400.0 * math.log10(strength))
-        val mean      = elos.sum / n
+        val strengths =
+          if colorStrength == 1.0 then BradleyTerry.mm(points, n)
+          else BradleyTerry.colorMm(points, buildWhiteGames(selection, localOf, n), colorStrength, n)
+        val elos = strengths.map(strength => 400.0 * math.log10(strength))
+        val mean = elos.sum / n
         buildRankedMap(present, localOf, elos, mean, total)
+
+    // Orientation is essential: aggregating only total games per unordered pair loses the color offset.
+    private def buildWhiteGames(selection: Array[Int], localOf: Array[Int], n: Int): Array[Array[Double]] =
+      val counts = Array.ofDim[Double](n, n)
+      selection.foreach { group =>
+        var t = groupStart(group)
+        while t < groupStart(group + 1) do
+          val a = localOf(playerA(t))
+          val b = localOf(playerB(t))
+          if a != b then counts(a)(b) += 1.0
+          t += 1
+      }
+      counts
 
     private def markPresentPlayers(selection: Array[Int], total: Int): Array[Boolean] =
       val present = new Array[Boolean](total)
@@ -231,7 +254,44 @@ object BradleyTerry:
       strengths = unscaled
       iteration += 1
 
-    strengths
+    if moved <= Tolerance && strengths.forall(s => s.isFinite && s > 0.0) then strengths
+    else
+      val neutralGames = Array.tabulate(n, n)((i, j) => if i == j then 0.0 else (gamesBetween(i)(j) - Smoothing) / 2.0)
+      BradleyTerryNewton.fit(points, neutralGames, 1.0, Smoothing, strengths)
+
+  /** Generalized MM for P(white) = c*pWhite/(c*pWhite+pBlack). Virtual draws remain color-neutral. The numerator is
+    * observed fractional points plus smoothing; the denominator is the likelihood's exposure term for each seat. The
+    * zero-offset path above retains the original fit exactly.
+    */
+  private def colorMm(
+      points: Array[Array[Double]],
+      whiteGames: Array[Array[Double]],
+      colorStrength: Double,
+      n: Int
+  ): Array[Double] =
+    val totalPoints = Array.tabulate(n)(i => points(i).sum)
+    var strengths   = Array.fill(n)(1.0)
+    var iteration   = 0
+    var moved       = Double.MaxValue
+    while iteration < MaxIterations && moved > Tolerance do
+      val next = new Array[Double](n)
+      var i    = 0
+      while i < n do
+        var denominator = 0.0
+        var j           = 0
+        while j < n do
+          if i != j then
+            denominator += Smoothing / (strengths(i) + strengths(j))
+            denominator += whiteGames(i)(j) / (strengths(i) + strengths(j) / colorStrength)
+            denominator += whiteGames(j)(i) / (colorStrength * strengths(j) + strengths(i))
+          j += 1
+        next(i) = totalPoints(i) / denominator
+        i += 1
+      moved = normalizeAndMeasureDelta(next, strengths, n)
+      strengths = next
+      iteration += 1
+    if moved <= Tolerance && strengths.forall(s => s.isFinite && s > 0.0) then strengths
+    else BradleyTerryNewton.fit(points, whiteGames, colorStrength, Smoothing, strengths)
 
   private def computeNextStrengths(
       gamesBetween: Array[Array[Double]],

@@ -19,6 +19,10 @@ import scala.util.Random
   */
 object AnchoredStrength:
 
+  val ModelVersion = "anchored-bt-color-ci-v2"
+  // At least one observation in each 2.5% percentile tail; this is a resolution guard, not a coverage claim.
+  private[rating] val MinimumBootstrapSamples = 40
+
   type Game = BradleyTerry.Game
 
   final case class Config(
@@ -27,8 +31,25 @@ object AnchoredStrength:
       minOpponentsForAdmission: Int = GraphConnectivity.DefaultMinOpponents,
       bootstrapIterations: Int = 1000,
       seed: Long = 42L,
-      whiteAdvantageElo: Double = 25.0
-  )
+      whiteAdvantageElo: Double = 25.0,
+      maxCiWidthElo: Option[Double] = None
+  ):
+    require(minGamesForAdmission > 0 && minOpponentsForAdmission > 0, "admission counts must be positive")
+    require(
+      anchorSet.anchors.forall(a => a.targetElo.isFinite && a.weight.isFinite && a.weight > 0.0),
+      "anchor targets and positive weights must be finite"
+    )
+    require(
+      anchorSet.anchors.map(_.identity).distinct.size == anchorSet.anchors.size,
+      "anchor identities must be unique"
+    )
+    require(bootstrapIterations >= 0, "bootstrapIterations must be non-negative")
+    private val colorStrength = math.pow(10.0, whiteAdvantageElo / 400.0)
+    require(
+      whiteAdvantageElo.isFinite && colorStrength.isFinite && colorStrength > 0.0,
+      "whiteAdvantageElo must have a finite, positive strength multiplier"
+    )
+    require(maxCiWidthElo.forall(w => w.isFinite && w > 0.0), "maxCiWidthElo must be finite and positive")
 
   object Config:
     val Default: Config = Config()
@@ -42,7 +63,8 @@ object AnchoredStrength:
       status: AdmissionStatus,
       isAnchor: Boolean,
       games: Int,
-      opponents: Int
+      opponents: Int,
+      validBootstrapSamples: Int = 0
   )
 
   final case class Result(
@@ -52,11 +74,19 @@ object AnchoredStrength:
       provisional: List[RankedBot],
       disconnected: List[RankedBot],
       connectivity: GraphConnectivity.Result,
-      appliedOffset: Option[Double] = None
+      appliedOffset: Option[Double] = None,
+      modelVersion: String = ModelVersion,
+      whiteAdvantageElo: Double = Config.Default.whiteAdvantageElo,
+      maxCiWidthElo: Option[Double] = None,
+      bootstrapIterations: Int = 0,
+      calibrationOffsets: Map[String, Double] = Map.empty,
+      seed: Long = Config.Default.seed,
+      minGamesForAdmission: Int = Config.Default.minGamesForAdmission,
+      minOpponentsForAdmission: Int = Config.Default.minOpponentsForAdmission
   ):
-    val isCalibrated: Boolean = appliedOffset.isDefined
+    val isCalibrated: Boolean = appliedOffset.isDefined || calibrationOffsets.nonEmpty
 
-    /** Combined ranking of admitted followed by provisional bots. */
+    /** Admitted ranking followed by alphabetically ordered provisional estimates. */
     val allConnected: List[RankedBot] = admitted ++ provisional
 
   /** Fits the anchored strength model over the given observation groups.
@@ -70,7 +100,11 @@ object AnchoredStrength:
       groups: Seq[Seq[Game]],
       config: Config = Config.Default
   ): Result =
-    val flatGames    = groups.flatten
+    val flatGames = groups.flatten
+    require(
+      flatGames.forall((w, b, score) => w != b && score.isFinite && score >= 0.0 && score <= 1.0),
+      "observations must have distinct participants and finite scores in [0, 1]"
+    )
     val connectivity = GraphConnectivity.analyze(
       flatGames.map(g => (g._1, g._2)),
       config.anchorSet.identities,
@@ -105,28 +139,42 @@ object AnchoredStrength:
           )
         },
         connectivity = connectivity,
-        appliedOffset = None
+        appliedOffset = None,
+        whiteAdvantageElo = config.whiteAdvantageElo,
+        maxCiWidthElo = config.maxCiWidthElo,
+        bootstrapIterations = config.bootstrapIterations,
+        seed = config.seed,
+        minGamesForAdmission = config.minGamesForAdmission,
+        minOpponentsForAdmission = config.minOpponentsForAdmission
       )
     else
-      // 1. Raw Bradley-Terry fit over the connected component
-      val rawBaseRatings = BradleyTerry.ratings(connectedGroups.flatten)
-
-      // 2. Compute anchor calibration offset
-      val scaleOffsetOpt = config.anchorSet.scaleOffset(rawBaseRatings)
-      val scaleOffset    = scaleOffsetOpt.getOrElse(0.0)
-
-      val anchoredBase = rawBaseRatings.map { case (player, rawElo) =>
-        player -> (rawElo - scaleOffset)
-      }
+      // Independently calibrate each real component; smoothing must not bridge separate anchor islands.
+      val (anchoredBase, calibrationOffsets) = fitComponents(connectedGroups.flatten, config)
+      val scaleOffsetOpt = if connectivity.components.size == 1 then calibrationOffsets.values.headOption else None
 
       // 3. Bootstrap resampling for 95% CIs and LOS
-      val (ciLows, ciHighs, sampleValues) = computeBootstrap(connectedGroups, config, scaleOffset)
+      val (ciLows, ciHighs, sampleValues) = computeBootstrap(connectedGroups, config)
 
-      // 4. Build RankedBot entries
+      val statuses = connectivity.statuses.map { (player, graphStatus) =>
+        val games     = connectivity.gameCounts.getOrElse(player, 0)
+        val opponents = connectivity.opponentCounts.getOrElse(player, 0)
+        val samples   = sampleValues.get(player).fold(0)(_.count(_.isFinite))
+        val status    =
+          if graphStatus == AdmissionStatus.Disconnected then graphStatus
+          else if calibrationOffsets.contains(player) && games >= config.minGamesForAdmission &&
+            opponents >= config.minOpponentsForAdmission &&
+            intervalAdmits(ciLows.get(player), ciHighs.get(player), samples, config)
+          then AdmissionStatus.Admitted
+          else AdmissionStatus.Provisional(games, opponents)
+        player -> status
+      }
+      val finalConnectivity = connectivity.copy(statuses = statuses)
+
+      // 4. Build RankedBot entries. Anchor identity never substitutes for admission evidence.
       def makeRanked(player: String, nextPlayer: Option[String]): RankedBot =
         val elo    = anchoredBase.getOrElse(player, 0.0)
-        val ciLow  = ciLows.getOrElse(player, elo)
-        val ciHigh = ciHighs.getOrElse(player, elo)
+        val ciLow  = ciLows.getOrElse(player, Double.NaN)
+        val ciHigh = ciHighs.getOrElse(player, Double.NaN)
 
         val los = nextPlayer.flatMap { next =>
           (sampleValues.get(player), sampleValues.get(next)) match
@@ -138,7 +186,7 @@ object AnchoredStrength:
               while i < n do
                 val a = repA(i)
                 val b = repB(i)
-                if !a.isNaN && !b.isNaN then
+                if a.isFinite && b.isFinite then
                   total += 1
                   if a > b then wins += 1
                 i += 1
@@ -153,30 +201,29 @@ object AnchoredStrength:
           ciLow = ciLow,
           ciHigh = ciHigh,
           losVsNext = los,
-          status = connectivity.statuses.getOrElse(player, AdmissionStatus.Disconnected),
+          status = statuses.getOrElse(player, AdmissionStatus.Disconnected),
           isAnchor = config.anchorSet.identities.contains(player),
           games = connectivity.gameCounts.getOrElse(player, 0),
-          opponents = connectivity.opponentCounts.getOrElse(player, 0)
+          opponents = connectivity.opponentCounts.getOrElse(player, 0),
+          validBootstrapSamples = sampleValues.get(player).fold(0)(_.count(_.isFinite))
         )
 
       // Split into Admitted and Provisional
       val admittedPlayers = connectivity.anchorConnectedPlayers
-        .filter(p => anchoredBase.contains(p) && connectivity.isAdmitted(p))
+        .filter(p => anchoredBase.contains(p) && finalConnectivity.isAdmitted(p))
         .toList
-        .sortBy(p => -anchoredBase(p))
+        .sortBy(p => (-anchoredBase(p), p))
 
       val admittedRanked = admittedPlayers.zipWithIndex.map { case (p, idx) =>
         makeRanked(p, admittedPlayers.lift(idx + 1))
       }
 
       val provisionalPlayers = connectivity.anchorConnectedPlayers
-        .filter(p => anchoredBase.contains(p) && connectivity.isProvisional(p))
+        .filter(p => anchoredBase.contains(p) && finalConnectivity.isProvisional(p))
         .toList
-        .sortBy(p => -anchoredBase(p))
+        .sorted
 
-      val provisionalRanked = provisionalPlayers.zipWithIndex.map { case (p, idx) =>
-        makeRanked(p, provisionalPlayers.lift(idx + 1))
-      }
+      val provisionalRanked = provisionalPlayers.map(p => makeRanked(p, None))
 
       val disconnectedRanked = connectivity.disconnectedPlayers.toList.sorted.map { p =>
         RankedBot(
@@ -198,15 +245,36 @@ object AnchoredStrength:
         admitted = admittedRanked,
         provisional = provisionalRanked,
         disconnected = disconnectedRanked,
-        connectivity = connectivity,
-        appliedOffset = scaleOffsetOpt
+        connectivity = finalConnectivity,
+        appliedOffset = scaleOffsetOpt,
+        whiteAdvantageElo = config.whiteAdvantageElo,
+        maxCiWidthElo = config.maxCiWidthElo,
+        bootstrapIterations = config.bootstrapIterations,
+        calibrationOffsets = calibrationOffsets,
+        seed = config.seed,
+        minGamesForAdmission = config.minGamesForAdmission,
+        minOpponentsForAdmission = config.minOpponentsForAdmission
       )
+
+  private def fitComponents(games: Seq[Game], config: Config): (Map[String, Double], Map[String, Double]) =
+    val graph       = GraphConnectivity.analyze(games.map(g => (g._1, g._2)), config.anchorSet.identities)
+    val componentOf = graph.components.zipWithIndex.flatMap((players, i) => players.map(_ -> i)).toMap
+    val ratings     = mutable.Map.empty[String, Double]
+    val offsets     = mutable.Map.empty[String, Double]
+    games.groupBy(g => componentOf(g._1)).toList.sortBy(_._1).foreach { (_, componentGames) =>
+      val raw    = BradleyTerry.ratings(componentGames, config.whiteAdvantageElo)
+      val offset = config.anchorSet.scaleOffset(raw).filter(_.isFinite)
+      raw.foreach { (player, elo) =>
+        ratings(player) = elo - offset.getOrElse(0.0)
+        offset.foreach(o => offsets(player) = o)
+      }
+    }
+    (ratings.toMap, offsets.toMap)
 
   /** Runs bootstrap resampling over the observation units. */
   private def computeBootstrap(
       groups: Seq[Seq[Game]],
-      config: Config,
-      baseOffset: Double
+      config: Config
   ): (Map[String, Double], Map[String, Double], Map[String, Array[Double]]) =
     val groupArray = groups.toArray
     val groupCount = groupArray.length
@@ -229,13 +297,14 @@ object AnchoredStrength:
           sampleGroups(i) = groupArray(rng.nextInt(groupCount))
           i += 1
 
-        val rawSample = BradleyTerry.ratings(sampleGroups.flatten.toSeq)
-        // Recalibrate each bootstrap sample by its present anchors; fall back to baseOffset
-        val sampleOffset = config.anchorSet.scaleOffset(rawSample).getOrElse(baseOffset)
-
-        rawSample.foreach { case (player, rawElo) =>
-          val arr = playerReplicates.get(player)
-          if arr.isDefined then arr.get(b) = rawElo - sampleOffset
+        val sampleGames              = sampleGroups.flatten.toSeq
+        val (sampleRatings, offsets) =
+          try fitComponents(sampleGames, config)
+          catch
+            case _: BradleyTerryNewton.FitFailure => (Map.empty[String, Double], Map.empty[String, Double])
+        // A lost anchor/bridge cannot be replaced with the base offset or a smoothing-created comparison.
+        sampleRatings.foreach { case (player, elo) =>
+          if offsets.contains(player) && elo.isFinite then playerReplicates(player)(b) = elo
         }
         b += 1
 
@@ -247,11 +316,22 @@ object AnchoredStrength:
       val highsMap = mutable.Map.empty[String, Double]
 
       players.foreach { p =>
-        val present = playerReplicates(p).filterNot(_.isNaN)
+        val present = playerReplicates(p).filter(_.isFinite)
         val sorted  = present.sorted
-        if sorted.nonEmpty then
+        if sorted.length >= MinimumBootstrapSamples && sorted.length == config.bootstrapIterations then
           lowsMap(p) = percentile(sorted, 0.025)
           highsMap(p) = percentile(sorted, 0.975)
       }
 
       (lowsMap.toMap, highsMap.toMap, playerReplicates.toMap)
+
+  /** Missing/conditional bootstrap evidence never grants admission. The width policy is operator supplied; absent
+    * policy means provisional. All requested replicates must be on the calibrated comparison graph.
+    */
+  private[rating] def intervalAdmits(low: Option[Double], high: Option[Double], samples: Int, config: Config): Boolean =
+    samples >= MinimumBootstrapSamples && samples == config.bootstrapIterations &&
+      (for
+        lo    <- low
+        hi    <- high
+        limit <- config.maxCiWidthElo
+      yield lo.isFinite && hi.isFinite && lo <= hi && (hi - lo).isFinite && hi - lo <= limit).getOrElse(false)

@@ -52,8 +52,10 @@ object LadderReportMain extends IOApp:
         betaRaw = pairs.get("beta"),
         bootstrapIterationsRaw = pairs.get("iterations").orElse(pairs.get("bootstrap")),
         windowDaysRaw = pairs.get("window").orElse(pairs.get("windowdays")),
-        whiteAdvantageRaw = pairs.get("whiteadvantage"),
-        maxCiWidthRaw = pairs.get("maxciwidth")
+        modelPolicy = StrengthReport.Config.ModelPolicyInput(
+          whiteAdvantageRaw = pairs.get("whiteadvantage"),
+          maxCiWidthRaw = pairs.get("maxciwidth")
+        )
       )
 
       val category     = pairs.get("category").flatMap(RatingCategory.fromWireName).getOrElse(RatingCategory.Default)

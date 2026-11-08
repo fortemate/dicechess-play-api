@@ -93,6 +93,12 @@ object StrengthReport:
   object Config:
     val Default: Config = Config()
 
+    /** Raw model-policy overrides form one validated policy, separate from the legacy SPRT tuning inputs. */
+    final case class ModelPolicyInput(
+        whiteAdvantageRaw: Option[String] = None,
+        maxCiWidthRaw: Option[String] = None
+    )
+
     /** Parse from explicit optional raw values (#181), which are the ladder report's arguments
       * (`LadderReportMain.parseOptions`). Legacy SPRT knobs fall back on invalid input; explicit color/uncertainty
       * policy values fail validation instead of silently selecting a different model. An absent width disables
@@ -110,8 +116,7 @@ object StrengthReport:
         betaRaw: Option[String],
         bootstrapIterationsRaw: Option[String],
         windowDaysRaw: Option[String] = None,
-        whiteAdvantageRaw: Option[String] = None,
-        maxCiWidthRaw: Option[String] = None
+        modelPolicy: ModelPolicyInput = ModelPolicyInput()
     ): Config =
       val (elo0, elo1) = eloPair(elo0Raw, elo1Raw)
       Config(
@@ -122,8 +127,8 @@ object StrengthReport:
         bootstrapIterations =
           bootstrapIterationsRaw.flatMap(_.toIntOption).filter(_ > 0).getOrElse(Default.bootstrapIterations),
         windowDays = windowDaysRaw.flatMap(_.toIntOption).filter(_ > 0),
-        whiteAdvantageElo = whiteAdvantageRaw.map(parseFinite).getOrElse(Default.whiteAdvantageElo),
-        maxCiWidthElo = maxCiWidthRaw.map(parseFinite)
+        whiteAdvantageElo = modelPolicy.whiteAdvantageRaw.map(parseFinite).getOrElse(Default.whiteAdvantageElo),
+        maxCiWidthElo = modelPolicy.maxCiWidthRaw.map(parseFinite)
       )
 
     // Explicit model-policy overrides must not silently revert to a different policy on a typo.
@@ -441,10 +446,7 @@ object StrengthReport:
     val rankEntries = report.anchored.admitted
     val rankingRows = rankEntries.zipWithIndex.map { (r, i) =>
       val anchorBadge =
-        if r.isAnchor then " `[Anchor]`"
-        else if report.anchored.admitted.isEmpty && r.status.isInstanceOf[AdmissionStatus.Provisional] then
-          " `[Provisional]`"
-        else ""
+        if r.isAnchor then " `[Anchor]`" else ""
       val los = r.losVsNext.map(v => line("%.1f%%", v * 100)).getOrElse("—")
       line("| %d | `%s`%s | %+.1f | [%+.1f, %+.1f] | %s |", i + 1, r.player, anchorBadge, r.elo, r.ciLow, r.ciHigh, los)
     }

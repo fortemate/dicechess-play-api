@@ -20,6 +20,8 @@ import java.time.temporal.ChronoUnit
   */
 class AnchoredStrengthSuite extends munit.FunSuite:
 
+  private def fitted[A](result: BradleyTerry.FitResult[A]): A = result.fold(problem => fail(problem.message), identity)
+
   private val anchorGreedy = "cloudflare/greedy"
   private val anchorAggr   = "anchor/aggressive"
 
@@ -94,7 +96,9 @@ class AnchoredStrengthSuite extends munit.FunSuite:
     // Benchmark games: greedy vs aggressive evenly matched (score 0.5 each)
     val groups = (1 to 50).map(_ => Seq(game(anchorGreedy, anchorAggr, 0.5)))
     val res    =
-      AnchoredStrength.evaluate(groups, AnchoredStrength.Config(bootstrapIterations = 50, whiteAdvantageElo = 0.0))
+      fitted(
+        AnchoredStrength.evaluate(groups, AnchoredStrength.Config(bootstrapIterations = 50, whiteAdvantageElo = 0.0))
+      )
 
     val greedyElo = res.allConnected.find(_.player == anchorGreedy).get.elo
     val aggrElo   = res.allConnected.find(_.player == anchorAggr).get.elo
@@ -114,7 +118,8 @@ class AnchoredStrengthSuite extends munit.FunSuite:
       )
     }
 
-    val resBase = AnchoredStrength.evaluate(baseGroups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 123L))
+    val resBase =
+      fitted(AnchoredStrength.evaluate(baseGroups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 123L)))
     val establishedBaseElo = resBase.allConnected.find(_.player == "bot/established").get.elo
 
     // Now introduce a weak newcomer bot/rookie playing against anchorGreedy
@@ -122,7 +127,7 @@ class AnchoredStrengthSuite extends munit.FunSuite:
     val combinedGroups = baseGroups ++ rookieGroups
 
     val resCombined =
-      AnchoredStrength.evaluate(combinedGroups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 123L))
+      fitted(AnchoredStrength.evaluate(combinedGroups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 123L)))
     val establishedCombinedElo = resCombined.allConnected.find(_.player == "bot/established").get.elo
 
     // Without anchors, adding a 10% scoring rookie would shift mean-0 Bradley-Terry ratings.
@@ -140,7 +145,8 @@ class AnchoredStrengthSuite extends munit.FunSuite:
       )
     }
 
-    val res1 = AnchoredStrength.evaluate(period1Groups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 42L))
+    val res1 =
+      fitted(AnchoredStrength.evaluate(period1Groups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 42L)))
     val challengerElo1 = res1.allConnected.find(_.player == "bot/challenger").get.elo
     val stableElo1     = res1.allConnected.find(_.player == "bot/stable").get.elo
 
@@ -154,7 +160,8 @@ class AnchoredStrengthSuite extends munit.FunSuite:
       )
     }
 
-    val res2 = AnchoredStrength.evaluate(period2Groups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 42L))
+    val res2 =
+      fitted(AnchoredStrength.evaluate(period2Groups, AnchoredStrength.Config(bootstrapIterations = 50, seed = 42L)))
     val challengerElo2 = res2.allConnected.find(_.player == "bot/challenger").get.elo
     val stableElo2     = res2.allConnected.find(_.player == "bot/stable").get.elo
 
@@ -169,12 +176,14 @@ class AnchoredStrengthSuite extends munit.FunSuite:
 
   test("Bootstrap resampling preserves CRN pairing units and produces ordered 95% CIs"):
     val crnGroups = (1 to 20).map(_ => crnPair("bot/a", "bot/b", 0.6, 0.6))
-    val res       = AnchoredStrength.evaluate(
-      crnGroups,
-      AnchoredStrength.Config(
-        anchorSet = AnchorSet("paired-fixture", 1, "blitz", List(Anchor("bot/a", 0.0))),
-        bootstrapIterations = 100,
-        seed = 99L
+    val res       = fitted(
+      AnchoredStrength.evaluate(
+        crnGroups,
+        AnchoredStrength.Config(
+          anchorSet = AnchorSet("paired-fixture", 1, "blitz", List(Anchor("bot/a", 0.0))),
+          bootstrapIterations = 100,
+          seed = 99L
+        )
       )
     )
 
@@ -220,18 +229,22 @@ class AnchoredStrengthSuite extends munit.FunSuite:
     val allGames = oldGames ++ recentGames
 
     // Whole history static report: averages loss period with win period
-    val staticReport = StrengthReport.build(
-      allGames,
-      RatingCategory.Default,
-      StrengthReport.Config(windowDays = None, bootstrapIterations = 50)
+    val staticReport = fitted(
+      StrengthReport.build(
+        allGames,
+        RatingCategory.Default,
+        StrengthReport.Config(windowDays = None, bootstrapIterations = 50)
+      )
     )
     val staticLearnerElo = staticReport.ranking.find(_.player == "acme/learner").get.elo
 
     // Time-aware trailing 30 days window: excludes the 60-day-old losses, shows current strength
-    val windowReport = StrengthReport.build(
-      allGames,
-      RatingCategory.Default,
-      StrengthReport.Config(windowDays = Some(30), bootstrapIterations = 50)
+    val windowReport = fitted(
+      StrengthReport.build(
+        allGames,
+        RatingCategory.Default,
+        StrengthReport.Config(windowDays = Some(30), bootstrapIterations = 50)
+      )
     )
     val windowLearnerElo = windowReport.ranking.find(_.player == "acme/learner").get.elo
 
@@ -244,14 +257,16 @@ class AnchoredStrengthSuite extends munit.FunSuite:
   test("isCalibrated correctly reflects presence of anchors in the connected component"):
     // Unanchored games: only custom bots playing each other
     val unanchoredGames = (1 to 20).map(_ => Seq(game("bot/alpha", "bot/beta", 0.6)))
-    val resUnanchored   = AnchoredStrength.evaluate(unanchoredGames, AnchoredStrength.Config(bootstrapIterations = 20))
+    val resUnanchored   =
+      fitted(AnchoredStrength.evaluate(unanchoredGames, AnchoredStrength.Config(bootstrapIterations = 20)))
 
     assertEquals(resUnanchored.appliedOffset, None)
     assert(!resUnanchored.isCalibrated, "Should not be calibrated without anchors in the component")
 
     // Anchored games: anchorGreedy plays against bot/alpha
     val anchoredGames = unanchoredGames ++ (1 to 20).map(_ => Seq(game("bot/alpha", anchorGreedy, 0.5)))
-    val resAnchored   = AnchoredStrength.evaluate(anchoredGames, AnchoredStrength.Config(bootstrapIterations = 20))
+    val resAnchored   =
+      fitted(AnchoredStrength.evaluate(anchoredGames, AnchoredStrength.Config(bootstrapIterations = 20)))
 
     assert(resAnchored.appliedOffset.isDefined)
     assert(resAnchored.isCalibrated, "Should be calibrated when an anchor is present")
@@ -260,9 +275,11 @@ class AnchoredStrengthSuite extends munit.FunSuite:
     // bot/strong clearly beats bot/weak (80% score over 40 games)
     val games = (1 to 40).map(_ => Seq(game("bot/strong", "bot/weak", 0.8)))
     val res   =
-      AnchoredStrength.evaluate(
-        games,
-        AnchoredStrength.Config(bootstrapIterations = 100, seed = 42L, minGamesForAdmission = 10)
+      fitted(
+        AnchoredStrength.evaluate(
+          games,
+          AnchoredStrength.Config(bootstrapIterations = 100, seed = 42L, minGamesForAdmission = 10)
+        )
       )
 
     val strong = res.allConnected.find(_.player == "bot/strong").get

@@ -4,6 +4,8 @@ import dicechess.play.rating.GraphConnectivity.AdmissionStatus
 
 /** Synthetic regression oracles: all policy values here are fixture values, not deployment settings. */
 class AnchoredStrengthRegressionSuite extends munit.FunSuite:
+
+  private def fitted[A](result: BradleyTerry.FitResult[A]): A = result.fold(problem => fail(problem.message), identity)
   private val anchors = AnchorSet("fixture-v1", 7, "blitz", List(Anchor("ref/a", 0.0), Anchor("ref/b", 0.0)))
   private val config  = AnchoredStrength.Config(
     anchorSet = anchors,
@@ -15,6 +17,34 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     (result.allConnected ++ result.disconnected).find(_.player == player).get
   private def probability(delta: Double): Double = 1.0 / (1.0 + math.pow(10.0, -delta / 400.0))
 
+  test("numeric bootstrap failures remain missing even when every resample contains all scale anchors"):
+    val forward = Seq(("a", "b", 0.0), ("b", "c", 0.0), ("c", "d", 0.0))
+    val reverse = Seq(("b", "a", 0.0), ("c", "b", 0.0), ("d", "c", 0.0))
+    // A finite fixture multiplier near the floating-point limit: the balanced base fit succeeds, but
+    // a resample containing only one direction cannot produce finite normalized strengths.
+    val h = 123200.0
+    assert(BradleyTerry.ratings(forward ++ reverse, h).isRight)
+    assert(BradleyTerry.ratings(forward ++ forward, h).isLeft)
+    val references = AnchorSet("fixture-numeric", 1, "blitz", List(Anchor("a", 0.0), Anchor("d", 0.0)))
+    val cfg        = config.copy(
+      anchorSet = references,
+      minGamesForAdmission = 1,
+      minOpponentsForAdmission = 1,
+      bootstrapIterations = 40,
+      whiteAdvantageElo = h,
+      maxCiWidthElo = Some(10000.0),
+      seed = 42L
+    )
+    val result = fitted(AnchoredStrength.evaluate(Seq(forward, reverse), cfg))
+    assertEquals(result.allConnected.size, 4)
+    assertEquals(result.admitted, Nil)
+    result.allConnected.foreach { bot =>
+      assert(bot.validBootstrapSamples > 0 && bot.validBootstrapSamples < cfg.bootstrapIterations)
+      assert(bot.ciLow.isNaN && bot.ciHigh.isNaN)
+      assert(bot.status.isInstanceOf[AdmissionStatus.Provisional])
+      assert(!result.connectivity.isAdmitted(bot.player))
+    }
+
   test("color likelihood recovers equal strength despite unequal color exposure"):
     val h     = 120.0
     val games = (1 to 400).flatMap(_ =>
@@ -24,17 +54,17 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
         ("b", "c", probability(h))
       )
     )
-    val corrected = BradleyTerry.ratings(games, h)
+    val corrected = fitted(BradleyTerry.ratings(games, h))
     corrected.values.foreach(v => assert(math.abs(v) < 1.0, s"equal strength attributed to color: $corrected"))
-    val biased = BradleyTerry.ratings(games)
+    val biased = fitted(BradleyTerry.ratings(games))
     assert(biased("a") - biased("c") > 100.0)
-    val swapped = BradleyTerry.ratings(games.map((w, b, s) => (b, w, 1.0 - s)), -h)
+    val swapped = fitted(BradleyTerry.ratings(games.map((w, b, s) => (b, w, 1.0 - s)), -h))
     corrected.foreach((p, v) => assertEqualsDouble(swapped(p), v, 1e-7))
 
   test("zero color offset agrees with the two-player smoothed likelihood oracle"):
     val games              = Seq(("a", "b", 1.0), ("a", "b", 1.0), ("b", "a", 0.0), ("b", "a", 1.0))
     val expectedDifference = 400.0 * math.log10(3.25 / 1.25)
-    val ratings            = BradleyTerry.ratings(games, 0.0)
+    val ratings            = fitted(BradleyTerry.ratings(games, 0.0))
     assertEqualsDouble(ratings("a"), expectedDifference / 2.0, 1e-6)
     assertEqualsDouble(ratings("b"), -expectedDifference / 2.0, 1e-6)
 
@@ -50,14 +80,14 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     }
     val cfg =
       config.copy(whiteAdvantageElo = 95.0, maxCiWidthElo = Some(10000.0), minOpponentsForAdmission = 1, seed = 19L)
-    val result = AnchoredStrength.evaluate(groups, cfg)
+    val result = fitted(AnchoredStrength.evaluate(groups, cfg))
     assertEquals(result.admitted.size, 3, "the neighbour LOS assertions must exercise admitted pairs")
-    val base       = BradleyTerry.ratings(groups.flatten, cfg.whiteAdvantageElo)
+    val base       = fitted(BradleyTerry.ratings(groups.flatten, cfg.whiteAdvantageElo))
     val baseOffset = anchors.scaleOffset(base).get
     val rng        = new scala.util.Random(cfg.seed)
     val samples    = Vector.fill(cfg.bootstrapIterations) {
       val picked = Vector.fill(groups.size)(groups(rng.nextInt(groups.size))).flatten
-      val raw    = BradleyTerry.ratings(picked, cfg.whiteAdvantageElo)
+      val raw    = fitted(BradleyTerry.ratings(picked, cfg.whiteAdvantageElo))
       val offset = anchors.scaleOffset(raw).get
       raw.view.mapValues(_ - offset).toMap
     }
@@ -77,8 +107,8 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     assertEquals(result.modelVersion, AnchoredStrength.ModelVersion)
     assertEquals(result.whiteAdvantageElo, cfg.whiteAdvantageElo)
     assertEquals(result.maxCiWidthElo, cfg.maxCiWidthElo)
-    assertEquals(result, AnchoredStrength.evaluate(groups, cfg))
-    val symmetric = AnchoredStrength.evaluate(groups, cfg.copy(whiteAdvantageElo = 0.0))
+    assertEquals(result, fitted(AnchoredStrength.evaluate(groups, cfg)))
+    val symmetric = fitted(AnchoredStrength.evaluate(groups, cfg.copy(whiteAdvantageElo = 0.0)))
     // Symmetric color exposure still changes likelihood curvature and hence the interval.
     assert(math.abs(row(result, "candidate").ciHigh - row(symmetric, "candidate").ciHigh) > 0.01)
 
@@ -88,7 +118,7 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
         ("candidate", if i % 2 == 0 then "ref/a" else "ref/b", if i % 3 == 0 then 0.0 else 1.0)
       )
     )
-    val sparse = AnchoredStrength.evaluate(groups, config)
+    val sparse = fitted(AnchoredStrength.evaluate(groups, config))
     val bot    = row(sparse, "candidate")
     assertEquals(bot.games, 30)
     assertEquals(bot.opponents, 2)
@@ -96,13 +126,13 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     assertEquals(bot.status, AdmissionStatus.Provisional(30, 2))
     assert(!sparse.connectivity.isAdmitted("candidate"))
     assertEquals(bot.losVsNext, None)
-    val dense    = AnchoredStrength.evaluate(Vector.fill(25)(groups).flatten, config)
+    val dense    = fitted(AnchoredStrength.evaluate(Vector.fill(25)(groups).flatten, config))
     val admitted = row(dense, "candidate")
     assert(admitted.ciHigh - admitted.ciLow <= config.maxCiWidthElo.get)
     assertEquals(admitted.status, AdmissionStatus.Admitted)
     assert(dense.connectivity.isAdmitted("candidate"))
     assertEquals(
-      row(AnchoredStrength.evaluate(groups, config.copy(maxCiWidthElo = None)), "candidate").status,
+      row(fitted(AnchoredStrength.evaluate(groups, config.copy(maxCiWidthElo = None))), "candidate").status,
       AdmissionStatus.Provisional(30, 2)
     )
 
@@ -123,7 +153,7 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
   test("disabled or insufficient bootstrap cannot collapse a missing interval to the point estimate"):
     val groups = Vector.fill(30)(Seq(("ref/a", "ref/b", 0.5), ("candidate", "ref/a", 0.5)))
     Seq(0, 1, 39).foreach { n =>
-      val result = AnchoredStrength.evaluate(groups, config.copy(bootstrapIterations = n))
+      val result = fitted(AnchoredStrength.evaluate(groups, config.copy(bootstrapIterations = n)))
       assertEquals(result.admitted, Nil)
       if n == 0 then
         assert(row(result, "candidate").ciLow.isNaN)
@@ -132,7 +162,7 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     }
 
   test("anchor identity never waives count or uncertainty admission"):
-    val result    = AnchoredStrength.evaluate(Seq(Seq(("ref/a", "candidate", 0.5))), config)
+    val result    = fitted(AnchoredStrength.evaluate(Seq(Seq(("ref/a", "candidate", 0.5))), config))
     val reference = row(result, "ref/a")
     assert(reference.isAnchor)
     assertEquals(reference.status, AdmissionStatus.Provisional(1, 1))
@@ -142,7 +172,7 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
   test("lost bootstrap bridges cannot manufacture anchored samples from smoothing or a base offset"):
     val groups    = Seq(Seq(("ref/a", "bridge", 0.5))) ++ Vector.fill(29)(Seq(("bridge", "candidate", 0.5)))
     val cfg       = config.copy(minGamesForAdmission = 1, minOpponentsForAdmission = 1, maxCiWidthElo = Some(10000.0))
-    val result    = AnchoredStrength.evaluate(groups, cfg)
+    val result    = fitted(AnchoredStrength.evaluate(groups, cfg))
     val candidate = row(result, "candidate")
     assert(candidate.validBootstrapSamples > 0)
     assert(candidate.validBootstrapSamples < cfg.bootstrapIterations)
@@ -154,8 +184,8 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     val cfg       = config.copy(anchorSet = anchorSet)
     val first     = Vector.fill(40)(Seq(("ref/a", "candidate/a", 0.5)))
     val second    = Vector.fill(40)(Seq(("ref/b", "candidate/b", 0.5)))
-    val alone     = AnchoredStrength.evaluate(first, cfg)
-    val combined  = AnchoredStrength.evaluate(first ++ second, cfg)
+    val alone     = fitted(AnchoredStrength.evaluate(first, cfg))
+    val combined  = fitted(AnchoredStrength.evaluate(first ++ second, cfg))
     assertEqualsDouble(row(alone, "candidate/a").elo, -200.0, 1e-8)
     assertEqualsDouble(row(combined, "candidate/a").elo, row(alone, "candidate/a").elo, 1e-8)
     assertEqualsDouble(row(combined, "candidate/b").elo, 300.0, 1e-8)
@@ -165,7 +195,7 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
   test("unanchored islands remain disconnected when real references are present"):
     val groups = Vector.fill(40)(Seq(("ref/a", "candidate", 0.5))) ++
       Vector.fill(40)(Seq(("island/a", "island/b", 1.0)))
-    val result = AnchoredStrength.evaluate(groups, config)
+    val result = fitted(AnchoredStrength.evaluate(groups, config))
     assertEquals(result.disconnected.map(_.player), List("island/a", "island/b"))
     assert(result.disconnected.forall(_.status == AdmissionStatus.Disconnected))
     assert(!result.allConnected.exists(_.player.startsWith("island/")))
@@ -173,7 +203,7 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
   test("invalid configurations and malformed observations fail explicitly"):
     Seq(Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity, Double.MaxValue, -Double.MaxValue).foreach { h =>
       intercept[IllegalArgumentException](config.copy(whiteAdvantageElo = h))
-      intercept[IllegalArgumentException](BradleyTerry.ratings(Seq(("a", "b", 0.5)), h))
+      assert(BradleyTerry.ratings(Seq(("a", "b", 0.5)), h).left.exists(_.message.contains("whiteAdvantageElo")))
     }
     Seq(0.0, -1.0, Double.NaN, Double.PositiveInfinity).foreach { width =>
       intercept[IllegalArgumentException](config.copy(maxCiWidthElo = Some(width)))
@@ -182,13 +212,13 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     intercept[IllegalArgumentException](config.copy(minGamesForAdmission = 0))
     intercept[IllegalArgumentException](config.copy(minOpponentsForAdmission = 0))
     Seq(("a", "a", 0.5), ("a", "b", Double.NaN), ("a", "b", -0.1), ("a", "b", 1.1)).foreach { game =>
-      intercept[IllegalArgumentException](AnchoredStrength.evaluate(Seq(Seq(game)), config))
+      assert(AnchoredStrength.evaluate(Seq(Seq(game)), config).left.exists(_.message.contains("observations")))
     }
 
   test("high-count separated results converge rather than publishing an iteration-limited fit"):
     val games = Vector.fill(3000)(Seq(("a", "b", 1.0), ("b", "c", 1.0), ("a", "c", 1.0))).flatten
     Seq(0.0, 95.0, -95.0, -1200.0).foreach { h =>
-      val ratings = BradleyTerry.ratings(games, h)
+      val ratings = fitted(BradleyTerry.ratings(games, h))
       assertEqualsDouble(ratings("b"), 0.0, 1e-5)
       assertEqualsDouble(ratings("a"), -ratings("c"), 1e-5)
       // Independent likelihood score equation for a, with neutral virtual-draw weight per pair.
@@ -198,26 +228,35 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
       assertEqualsDouble(expected, 6000.5, 1e-6)
     }
 
-  test("Newton fallback rejects invalid or numerically singular likelihoods explicitly"):
+  test("Newton fallback returns typed failures for invalid or numerically singular likelihoods"):
     val points = Array(Array(0.0, 0.25), Array(0.25, 0.0))
     val games  = Array.ofDim[Double](2, 2)
-    intercept[BradleyTerryNewton.FitFailure] {
-      BradleyTerryNewton.fit(points, games, 1.0, 0.5, Array(Double.NaN, 1.0))
-    }
-    intercept[BradleyTerryNewton.FitFailure] {
-      BradleyTerryNewton.fit(points, games, 0.0, 0.5, Array(1.0, 1.0))
-    }
-    intercept[BradleyTerryNewton.FitFailure] {
-      BradleyTerryNewton.fit(points, games, 1.0, 0.0, Array(1.0, 1.0))
-    }
+    assert(BradleyTerryNewton.fit(points, games, 1.0, 0.5, Array(Double.NaN, 1.0)).isLeft)
+    assert(BradleyTerryNewton.fit(points, games, 0.0, 0.5, Array(1.0, 1.0)).isLeft)
+    assert(BradleyTerryNewton.fit(points, games, 1.0, 0.0, Array(1.0, 1.0)).isLeft)
     assertEquals(
-      BradleyTerryNewton
-        .fit(Array.empty[Array[Double]], Array.empty[Array[Double]], 1.0, 0.5, Array.emptyDoubleArray)
-        .toList,
+      fitted(
+        BradleyTerryNewton.fit(
+          Array.empty[Array[Double]],
+          Array.empty[Array[Double]],
+          1.0,
+          0.5,
+          Array.emptyDoubleArray
+        )
+      ).toList,
       Nil
     )
-    assertEquals(BradleyTerryNewton.fit(Array(Array(0.0)), Array(Array(0.0)), 1.0, 0.5, Array(2.0)).toList, List(1.0))
+    assertEquals(
+      fitted(
+        BradleyTerryNewton.fit(
+          Array(Array(0.0)),
+          Array(Array(0.0)),
+          1.0,
+          0.5,
+          Array(2.0)
+        )
+      ).toList,
+      List(1.0)
+    )
     val extreme = Array(Double.MaxValue, Double.MinPositiveValue)
-    intercept[BradleyTerryNewton.FitFailure] {
-      BradleyTerryNewton.fit(points, games, 1.0, 0.5, extreme)
-    }
+    assert(BradleyTerryNewton.fit(points, games, 1.0, 0.5, extreme).isLeft)

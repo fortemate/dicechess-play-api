@@ -1,5 +1,8 @@
 package dicechess.play.rating
 
+import cats.syntax.all.*
+import dicechess.play.rating.BradleyTerry.FitResult
+
 import scala.collection.mutable
 
 /** The forecasting models the chronological evaluation ([[RatingEvaluation]], #148) compares. Every model is an ONLINE
@@ -31,8 +34,10 @@ object RatingModels:
   trait Model:
     def name: String
 
-    /** The driver has moved to `day`; nothing of that day has been seen yet. */
-    def startDay(day: Int): Unit
+    /** The driver has moved to `day`; nothing of that day has been seen yet. A failed fit stops the run before
+      * forecasts.
+      */
+    def startDay(day: Int): FitResult[Unit]
 
     /** P(white scores) from the state before the game. */
     def forecast(o: Observation): Double
@@ -77,7 +82,9 @@ object RatingModels:
       val anchor = if spec.anchors.isEmpty then "" else s",anchors=${spec.anchors.size}"
       f"glicko(tau=${spec.tau}%.2f,idle=${spec.idleEloPerSqrtDay}%.0f,period=$period$anchor)"
 
-    def startDay(day: Int): Unit = today = day
+    def startDay(day: Int): FitResult[Unit] =
+      today = day
+      Right(())
 
     private def stateOf(id: String, category: String): State =
       states.getOrElseUpdate((id, category), new State(spec.anchors.getOrElse(id, Glicko.Initial), today))
@@ -138,13 +145,18 @@ object RatingModels:
 
     val name: String = s"bt(window=${spec.windowDays.fold("all")(_.toString)})"
 
-    def startDay(day: Int): Unit =
-      dirty.foreach { category =>
-        val rows     = history.getOrElse(category, mutable.ArrayBuffer.empty[Row])
-        val selected = spec.windowDays.fold(rows.toSeq)(n => rows.view.filter(_.day >= day - n).toSeq)
-        fitted = fitted.updated(category, BradleyTerry.ratings(selected.map(r => (r.a, r.b, r.scoreA))))
-      }
-      dirty = Set.empty
+    def startDay(day: Int): FitResult[Unit] =
+      dirty.toList
+        .foldLeftM(fitted) { (next, category) =>
+          val rows     = history.getOrElse(category, mutable.ArrayBuffer.empty[Row])
+          val selected = spec.windowDays.fold(rows.toSeq)(n => rows.view.filter(_.day >= day - n).toSeq)
+          BradleyTerry.ratings(selected.map(r => (r.a, r.b, r.scoreA))).map(result => next.updated(category, result))
+        }
+        .map { next =>
+          // Commit every category together: a failed fit cannot leave partially refreshed model state.
+          fitted = next
+          dirty = Set.empty
+        }
 
     def forecast(o: Observation): Double =
       val ratings = fitted.getOrElse(o.category, Map.empty)
@@ -196,7 +208,7 @@ object RatingModels:
     private def playerOf(id: String, category: String): Player =
       players.getOrElseUpdate((category, id), new Player)
 
-    def startDay(day: Int): Unit = ()
+    def startDay(day: Int): FitResult[Unit] = Right(())
 
     def forecast(o: Observation): Double =
       val a = players.get((o.category, o.white)).fold(0.0)(_.last)

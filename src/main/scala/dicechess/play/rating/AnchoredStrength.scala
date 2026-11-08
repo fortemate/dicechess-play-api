@@ -1,5 +1,7 @@
 package dicechess.play.rating
 
+import cats.syntax.all.*
+import dicechess.play.rating.BradleyTerry.{FitFailure, FitResult}
 import dicechess.play.rating.GraphConnectivity.AdmissionStatus
 
 import scala.collection.mutable
@@ -99,12 +101,14 @@ object AnchoredStrength:
   def evaluate(
       groups: Seq[Seq[Game]],
       config: Config = Config.Default
-  ): Result =
-    val flatGames = groups.flatten
-    require(
-      flatGames.forall((w, b, score) => w != b && score.isFinite && score >= 0.0 && score <= 1.0),
-      "observations must have distinct participants and finite scores in [0, 1]"
-    )
+  ): FitResult[Result] =
+    val valid = groups.flatten.forall((w, b, score) => w != b && score.isFinite && score >= 0.0 && score <= 1.0)
+    Either
+      .cond(valid, (), FitFailure("observations must have distinct participants and finite scores in [0, 1]"))
+      .flatMap(_ => evaluateValid(groups, config))
+
+  private def evaluateValid(groups: Seq[Seq[Game]], config: Config): FitResult[Result] =
+    val flatGames    = groups.flatten
     val connectivity = GraphConnectivity.analyze(
       flatGames.map(g => (g._1, g._2)),
       config.anchorSet.identities,
@@ -120,12 +124,114 @@ object AnchoredStrength:
     }
 
     if connectedGroups.isEmpty then
-      Result(
-        epoch = config.anchorSet.epoch,
-        anchorSetVersion = config.anchorSet.version,
-        admitted = Nil,
-        provisional = Nil,
-        disconnected = connectivity.disconnectedPlayers.toList.sorted.map { p =>
+      Right(
+        Result(
+          epoch = config.anchorSet.epoch,
+          anchorSetVersion = config.anchorSet.version,
+          admitted = Nil,
+          provisional = Nil,
+          disconnected = connectivity.disconnectedPlayers.toList.sorted.map { p =>
+            RankedBot(
+              player = p,
+              elo = 0.0,
+              ciLow = 0.0,
+              ciHigh = 0.0,
+              losVsNext = None,
+              status = AdmissionStatus.Disconnected,
+              isAnchor = config.anchorSet.identities.contains(p),
+              games = connectivity.gameCounts.getOrElse(p, 0),
+              opponents = connectivity.opponentCounts.getOrElse(p, 0)
+            )
+          },
+          connectivity = connectivity,
+          appliedOffset = None,
+          whiteAdvantageElo = config.whiteAdvantageElo,
+          maxCiWidthElo = config.maxCiWidthElo,
+          bootstrapIterations = config.bootstrapIterations,
+          seed = config.seed,
+          minGamesForAdmission = config.minGamesForAdmission,
+          minOpponentsForAdmission = config.minOpponentsForAdmission
+        )
+      )
+    else
+      // Independently calibrate each real component; smoothing must not bridge separate anchor islands.
+      fitComponents(connectedGroups.flatten, config).map { (anchoredBase, calibrationOffsets) =>
+        val scaleOffsetOpt = if connectivity.components.size == 1 then calibrationOffsets.values.headOption else None
+
+        // 3. Bootstrap resampling for 95% CIs and LOS
+        val (ciLows, ciHighs, sampleValues) = computeBootstrap(connectedGroups, config)
+
+        val statuses = connectivity.statuses.map { (player, graphStatus) =>
+          val games     = connectivity.gameCounts.getOrElse(player, 0)
+          val opponents = connectivity.opponentCounts.getOrElse(player, 0)
+          val samples   = sampleValues.get(player).fold(0)(_.count(_.isFinite))
+          val status    =
+            if graphStatus == AdmissionStatus.Disconnected then graphStatus
+            else if calibrationOffsets.contains(player) && games >= config.minGamesForAdmission &&
+              opponents >= config.minOpponentsForAdmission &&
+              intervalAdmits(ciLows.get(player), ciHighs.get(player), samples, config)
+            then AdmissionStatus.Admitted
+            else AdmissionStatus.Provisional(games, opponents)
+          player -> status
+        }
+        val finalConnectivity = connectivity.copy(statuses = statuses)
+
+        // 4. Build RankedBot entries. Anchor identity never substitutes for admission evidence.
+        def makeRanked(player: String, nextPlayer: Option[String]): RankedBot =
+          val elo    = anchoredBase.getOrElse(player, 0.0)
+          val ciLow  = ciLows.getOrElse(player, Double.NaN)
+          val ciHigh = ciHighs.getOrElse(player, Double.NaN)
+
+          val los = nextPlayer.flatMap { next =>
+            (sampleValues.get(player), sampleValues.get(next)) match
+              case (Some(repA), Some(repB)) =>
+                val n     = math.min(repA.length, repB.length)
+                var wins  = 0
+                var total = 0
+                var i     = 0
+                while i < n do
+                  val a = repA(i)
+                  val b = repB(i)
+                  if a.isFinite && b.isFinite then
+                    total += 1
+                    if a > b then wins += 1
+                  i += 1
+                if total == 0 then None
+                else Some(wins.toDouble / total)
+              case _ => None
+          }
+
+          RankedBot(
+            player = player,
+            elo = elo,
+            ciLow = ciLow,
+            ciHigh = ciHigh,
+            losVsNext = los,
+            status = statuses.getOrElse(player, AdmissionStatus.Disconnected),
+            isAnchor = config.anchorSet.identities.contains(player),
+            games = connectivity.gameCounts.getOrElse(player, 0),
+            opponents = connectivity.opponentCounts.getOrElse(player, 0),
+            validBootstrapSamples = sampleValues.get(player).fold(0)(_.count(_.isFinite))
+          )
+
+        // Split into Admitted and Provisional
+        val admittedPlayers = connectivity.anchorConnectedPlayers
+          .filter(p => anchoredBase.contains(p) && finalConnectivity.isAdmitted(p))
+          .toList
+          .sortBy(p => (-anchoredBase(p), p))
+
+        val admittedRanked = admittedPlayers.zipWithIndex.map { case (p, idx) =>
+          makeRanked(p, admittedPlayers.lift(idx + 1))
+        }
+
+        val provisionalPlayers = connectivity.anchorConnectedPlayers
+          .filter(p => anchoredBase.contains(p) && finalConnectivity.isProvisional(p))
+          .toList
+          .sorted
+
+        val provisionalRanked = provisionalPlayers.map(p => makeRanked(p, None))
+
+        val disconnectedRanked = connectivity.disconnectedPlayers.toList.sorted.map { p =>
           RankedBot(
             player = p,
             elo = 0.0,
@@ -137,139 +243,45 @@ object AnchoredStrength:
             games = connectivity.gameCounts.getOrElse(p, 0),
             opponents = connectivity.opponentCounts.getOrElse(p, 0)
           )
-        },
-        connectivity = connectivity,
-        appliedOffset = None,
-        whiteAdvantageElo = config.whiteAdvantageElo,
-        maxCiWidthElo = config.maxCiWidthElo,
-        bootstrapIterations = config.bootstrapIterations,
-        seed = config.seed,
-        minGamesForAdmission = config.minGamesForAdmission,
-        minOpponentsForAdmission = config.minOpponentsForAdmission
-      )
-    else
-      // Independently calibrate each real component; smoothing must not bridge separate anchor islands.
-      val (anchoredBase, calibrationOffsets) = fitComponents(connectedGroups.flatten, config)
-      val scaleOffsetOpt = if connectivity.components.size == 1 then calibrationOffsets.values.headOption else None
-
-      // 3. Bootstrap resampling for 95% CIs and LOS
-      val (ciLows, ciHighs, sampleValues) = computeBootstrap(connectedGroups, config)
-
-      val statuses = connectivity.statuses.map { (player, graphStatus) =>
-        val games     = connectivity.gameCounts.getOrElse(player, 0)
-        val opponents = connectivity.opponentCounts.getOrElse(player, 0)
-        val samples   = sampleValues.get(player).fold(0)(_.count(_.isFinite))
-        val status    =
-          if graphStatus == AdmissionStatus.Disconnected then graphStatus
-          else if calibrationOffsets.contains(player) && games >= config.minGamesForAdmission &&
-            opponents >= config.minOpponentsForAdmission &&
-            intervalAdmits(ciLows.get(player), ciHighs.get(player), samples, config)
-          then AdmissionStatus.Admitted
-          else AdmissionStatus.Provisional(games, opponents)
-        player -> status
-      }
-      val finalConnectivity = connectivity.copy(statuses = statuses)
-
-      // 4. Build RankedBot entries. Anchor identity never substitutes for admission evidence.
-      def makeRanked(player: String, nextPlayer: Option[String]): RankedBot =
-        val elo    = anchoredBase.getOrElse(player, 0.0)
-        val ciLow  = ciLows.getOrElse(player, Double.NaN)
-        val ciHigh = ciHighs.getOrElse(player, Double.NaN)
-
-        val los = nextPlayer.flatMap { next =>
-          (sampleValues.get(player), sampleValues.get(next)) match
-            case (Some(repA), Some(repB)) =>
-              val n     = math.min(repA.length, repB.length)
-              var wins  = 0
-              var total = 0
-              var i     = 0
-              while i < n do
-                val a = repA(i)
-                val b = repB(i)
-                if a.isFinite && b.isFinite then
-                  total += 1
-                  if a > b then wins += 1
-                i += 1
-              if total == 0 then None
-              else Some(wins.toDouble / total)
-            case _ => None
         }
 
-        RankedBot(
-          player = player,
-          elo = elo,
-          ciLow = ciLow,
-          ciHigh = ciHigh,
-          losVsNext = los,
-          status = statuses.getOrElse(player, AdmissionStatus.Disconnected),
-          isAnchor = config.anchorSet.identities.contains(player),
-          games = connectivity.gameCounts.getOrElse(player, 0),
-          opponents = connectivity.opponentCounts.getOrElse(player, 0),
-          validBootstrapSamples = sampleValues.get(player).fold(0)(_.count(_.isFinite))
-        )
-
-      // Split into Admitted and Provisional
-      val admittedPlayers = connectivity.anchorConnectedPlayers
-        .filter(p => anchoredBase.contains(p) && finalConnectivity.isAdmitted(p))
-        .toList
-        .sortBy(p => (-anchoredBase(p), p))
-
-      val admittedRanked = admittedPlayers.zipWithIndex.map { case (p, idx) =>
-        makeRanked(p, admittedPlayers.lift(idx + 1))
-      }
-
-      val provisionalPlayers = connectivity.anchorConnectedPlayers
-        .filter(p => anchoredBase.contains(p) && finalConnectivity.isProvisional(p))
-        .toList
-        .sorted
-
-      val provisionalRanked = provisionalPlayers.map(p => makeRanked(p, None))
-
-      val disconnectedRanked = connectivity.disconnectedPlayers.toList.sorted.map { p =>
-        RankedBot(
-          player = p,
-          elo = 0.0,
-          ciLow = 0.0,
-          ciHigh = 0.0,
-          losVsNext = None,
-          status = AdmissionStatus.Disconnected,
-          isAnchor = config.anchorSet.identities.contains(p),
-          games = connectivity.gameCounts.getOrElse(p, 0),
-          opponents = connectivity.opponentCounts.getOrElse(p, 0)
+        Result(
+          epoch = config.anchorSet.epoch,
+          anchorSetVersion = config.anchorSet.version,
+          admitted = admittedRanked,
+          provisional = provisionalRanked,
+          disconnected = disconnectedRanked,
+          connectivity = finalConnectivity,
+          appliedOffset = scaleOffsetOpt,
+          whiteAdvantageElo = config.whiteAdvantageElo,
+          maxCiWidthElo = config.maxCiWidthElo,
+          bootstrapIterations = config.bootstrapIterations,
+          calibrationOffsets = calibrationOffsets,
+          seed = config.seed,
+          minGamesForAdmission = config.minGamesForAdmission,
+          minOpponentsForAdmission = config.minOpponentsForAdmission
         )
       }
 
-      Result(
-        epoch = config.anchorSet.epoch,
-        anchorSetVersion = config.anchorSet.version,
-        admitted = admittedRanked,
-        provisional = provisionalRanked,
-        disconnected = disconnectedRanked,
-        connectivity = finalConnectivity,
-        appliedOffset = scaleOffsetOpt,
-        whiteAdvantageElo = config.whiteAdvantageElo,
-        maxCiWidthElo = config.maxCiWidthElo,
-        bootstrapIterations = config.bootstrapIterations,
-        calibrationOffsets = calibrationOffsets,
-        seed = config.seed,
-        minGamesForAdmission = config.minGamesForAdmission,
-        minOpponentsForAdmission = config.minOpponentsForAdmission
-      )
-
-  private def fitComponents(games: Seq[Game], config: Config): (Map[String, Double], Map[String, Double]) =
+  private def fitComponents(games: Seq[Game], config: Config): FitResult[(Map[String, Double], Map[String, Double])] =
     val graph       = GraphConnectivity.analyze(games.map(g => (g._1, g._2)), config.anchorSet.identities)
     val componentOf = graph.components.zipWithIndex.flatMap((players, i) => players.map(_ -> i)).toMap
     val ratings     = mutable.Map.empty[String, Double]
     val offsets     = mutable.Map.empty[String, Double]
-    games.groupBy(g => componentOf(g._1)).toList.sortBy(_._1).foreach { (_, componentGames) =>
-      val raw    = BradleyTerry.ratings(componentGames, config.whiteAdvantageElo)
-      val offset = config.anchorSet.scaleOffset(raw).filter(_.isFinite)
-      raw.foreach { (player, elo) =>
-        ratings(player) = elo - offset.getOrElse(0.0)
-        offset.foreach(o => offsets(player) = o)
+    games
+      .groupBy(g => componentOf(g._1))
+      .toList
+      .sortBy(_._1)
+      .traverse_ { (_, componentGames) =>
+        BradleyTerry.ratings(componentGames, config.whiteAdvantageElo).map { raw =>
+          val offset = config.anchorSet.scaleOffset(raw).filter(_.isFinite)
+          raw.foreach { (player, elo) =>
+            ratings(player) = elo - offset.getOrElse(0.0)
+            offset.foreach(o => offsets(player) = o)
+          }
+        }
       }
-    }
-    (ratings.toMap, offsets.toMap)
+      .map(_ => (ratings.toMap, offsets.toMap))
 
   /** Runs bootstrap resampling over the observation units. */
   private def computeBootstrap(
@@ -298,10 +310,8 @@ object AnchoredStrength:
           i += 1
 
         val sampleGames              = sampleGroups.flatten.toSeq
-        val (sampleRatings, offsets) =
-          try fitComponents(sampleGames, config)
-          catch
-            case _: BradleyTerryNewton.FitFailure => (Map.empty[String, Double], Map.empty[String, Double])
+        val (sampleRatings, offsets) = fitComponents(sampleGames, config)
+          .getOrElse((Map.empty[String, Double], Map.empty[String, Double]))
         // A lost anchor/bridge cannot be replaced with the base offset or a smoothing-created comparison.
         sampleRatings.foreach { case (player, elo) =>
           if offsets.contains(player) && elo.isFinite then playerReplicates(player)(b) = elo

@@ -5,6 +5,15 @@ package dicechess.play.rating
   */
 class BradleyTerrySuite extends munit.FunSuite:
 
+  private def fitted[A](result: BradleyTerry.FitResult[A]): A = result.fold(problem => fail(problem.message), identity)
+
+  test("invalid likelihood inputs return typed failures rather than throwing or inventing ratings"):
+    assert(BradleyTerry.ratings(Seq(("a", "b", 0.5)), Double.NaN).left.exists(_.message.contains("whiteAdvantageElo")))
+    val malformed = Seq(("a", "b", Double.NaN))
+    assert(BradleyTerry.ratings(malformed).left.exists(_.message.contains("observations")))
+    assert(BradleyTerry.rankedWithBootstrap(Seq(malformed)).left.exists(_.message.contains("observations")))
+    assert(BradleyTerry.rankedWithBootstrap(Nil, iterations = -1).isLeft)
+
   private def repeat(game: BradleyTerry.Game, times: Int): Seq[BradleyTerry.Game] = Seq.fill(times)(game)
 
   private val dominanceGames =
@@ -13,28 +22,28 @@ class BradleyTerrySuite extends munit.FunSuite:
       repeat(("a", "c", 1.0), 9) ++ repeat(("a", "c", 0.0), 1)    // a crushes c 9:1
 
   test("a transitive dominance corpus ranks a > b > c with mean-zero relative Elo"):
-    val elo = BradleyTerry.ratings(dominanceGames)
+    val elo = fitted(BradleyTerry.ratings(dominanceGames))
     assert(elo("a") > elo("b") && elo("b") > elo("c"), s"expected a > b > c, got $elo")
     assertEqualsDouble(elo.values.sum, 0.0, 1e-6)
 
   test("a perfectly symmetric matchup lands both players on zero"):
-    val elo = BradleyTerry.ratings(repeat(("x", "y", 1.0), 5) ++ repeat(("x", "y", 0.0), 5))
+    val elo = fitted(BradleyTerry.ratings(repeat(("x", "y", 1.0), 5) ++ repeat(("x", "y", 0.0), 5)))
     assertEqualsDouble(elo("x"), 0.0, 1e-6)
     assertEqualsDouble(elo("y"), 0.0, 1e-6)
 
   test("draws count half a win each way"):
-    val elo = BradleyTerry.ratings(repeat(("x", "y", 0.5), 10))
+    val elo = fitted(BradleyTerry.ratings(repeat(("x", "y", 0.5), 10)))
     assertEqualsDouble(elo("x"), elo("y"), 1e-6)
 
   test("the virtual draw keeps an undefeated player's rating finite"):
-    val elo = BradleyTerry.ratings(repeat(("champ", "victim", 1.0), 50))
+    val elo = fitted(BradleyTerry.ratings(repeat(("champ", "victim", 1.0), 50)))
     assert(elo("champ").isFinite && elo("champ") > 0)
     assert(elo("victim").isFinite && elo("victim") < 0)
 
   test("bootstrap is deterministic for a fixed seed and orders CIs sanely"):
     val groups = dominanceGames.grouped(2).toSeq
-    val first  = BradleyTerry.rankedWithBootstrap(groups, iterations = 200, seed = 7L)
-    val second = BradleyTerry.rankedWithBootstrap(groups, iterations = 200, seed = 7L)
+    val first  = fitted(BradleyTerry.rankedWithBootstrap(groups, iterations = 200, seed = 7L))
+    val second = fitted(BradleyTerry.rankedWithBootstrap(groups, iterations = 200, seed = 7L))
     assertEquals(first, second, "same seed must reproduce the identical report")
     assertEquals(first.map(_.player), List("a", "b", "c"))
     first.foreach { row =>
@@ -44,7 +53,7 @@ class BradleyTerrySuite extends munit.FunSuite:
 
   test("LOS against the next rank is high when the gap is decisive"):
     val lopsided = repeat(("a", "b", 1.0), 40) ++ repeat(("a", "b", 0.0), 2)
-    val ranked   = BradleyTerry.rankedWithBootstrap(lopsided.grouped(2).toSeq, iterations = 300, seed = 11L)
+    val ranked   = fitted(BradleyTerry.rankedWithBootstrap(lopsided.grouped(2).toSeq, iterations = 300, seed = 11L))
     assertEquals(ranked.head.player, "a")
     assert(ranked.head.losVsNext.exists(_ > 0.95), s"expected decisive LOS, got ${ranked.head.losVsNext}")
 
@@ -79,7 +88,7 @@ class BradleyTerrySuite extends munit.FunSuite:
       ("carol", 3.438752686306725, -144.32867782314693, 160.77211715151589, Some(1.0)),
       ("dave", -198.89858517722757, -323.90795132933715, -155.79970059805692, None)
     )
-    val actual = BradleyTerry.rankedWithBootstrap(goldenGroups, iterations = 100, seed = 2026L)
+    val actual = fitted(BradleyTerry.rankedWithBootstrap(goldenGroups, iterations = 100, seed = 2026L))
     assertEquals(actual.map(_.player), expected.map(_._1), "the ranking order itself must not move")
     actual.zip(expected).foreach { case (row, (player, elo, ciLow, ciHigh, los)) =>
       assertEqualsDouble(row.elo, elo, 1e-9, s"$player elo")
@@ -104,12 +113,12 @@ class BradleyTerrySuite extends munit.FunSuite:
       "gamma" -> -3.1801685864093105,
       "delta" -> -206.36668288059482
     )
-    val elos = BradleyTerry.ratings(lopsidedGames)
+    val elos = fitted(BradleyTerry.ratings(lopsidedGames))
     assertEquals(elos.keySet, expected.keySet)
     expected.foreach { (player, wantElo) =>
       assertEqualsDouble(elos(player), wantElo, 1e-9, s"$player elo drift")
     }
 
   test("empty and single-player inputs degrade gracefully"):
-    assertEquals(BradleyTerry.ratings(Nil), Map.empty[String, Double])
-    assertEquals(BradleyTerry.rankedWithBootstrap(Nil, iterations = 10, seed = 1L), Nil)
+    assertEquals(fitted(BradleyTerry.ratings(Nil)), Map.empty[String, Double])
+    assertEquals(fitted(BradleyTerry.rankedWithBootstrap(Nil, iterations = 10, seed = 1L)), Nil)

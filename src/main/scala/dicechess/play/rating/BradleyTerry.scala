@@ -1,5 +1,7 @@
 package dicechess.play.rating
 
+import cats.syntax.all.*
+
 /** Bradley-Terry pool ranking (E.1, #120) — the Ordo-style batch complement to the pairwise SPRT: one relative-Elo
   * number per bot, fitted jointly over every rated game, with bootstrap confidence intervals and LOS between
   * neighbours. Pure math: no IO; randomness only through an explicit seed.
@@ -25,6 +27,9 @@ package dicechess.play.rating
   */
 object BradleyTerry:
 
+  final case class FitFailure(message: String)
+  type FitResult[A] = Either[FitFailure, A]
+
   /** One game: `(playerA, playerB, scoreA)` with scoreA ∈ {0, 0.5, 1}. */
   type Game = (String, String, Double)
 
@@ -47,53 +52,70 @@ object BradleyTerry:
     * the likelihood, with a bounded Newton fallback if its convergence guard is not reached. Numerical failure is
     * explicit rather than returning an unconverged estimate. Empty input yields an empty map.
     */
-  def ratings(games: Seq[Game], whiteAdvantageElo: Double = 0.0): Map[String, Double] =
+  def ratings(games: Seq[Game], whiteAdvantageElo: Double = 0.0): FitResult[Map[String, Double]] =
     val colorStrength = math.pow(10.0, whiteAdvantageElo / 400.0)
-    require(
-      whiteAdvantageElo.isFinite && colorStrength.isFinite && colorStrength > 0.0,
-      "whiteAdvantageElo must have a finite, positive strength multiplier"
-    )
-    val corpus = Corpus.of(Seq(games))
-    corpus.fit(Array(0), colorStrength)
+    for
+      _ <- Either.cond(
+        whiteAdvantageElo.isFinite && colorStrength.isFinite && colorStrength > 0.0,
+        (),
+        FitFailure("whiteAdvantageElo must have a finite, positive strength multiplier")
+      )
+      _      <- validateGames(games)
+      result <- Corpus.of(Seq(games)).fit(Array(0), colorStrength)
+    yield result
 
-  /** The ranked pool with bootstrap 95% CIs and neighbour LOS. `groups` are the resampling units (see the object doc);
-    * `seed` makes the whole report reproducible.
+  private def validateGames(games: Seq[Game]): FitResult[Unit] =
+    Either.cond(
+      games.forall((a, b, score) => a != b && score.isFinite && score >= 0.0 && score <= 1.0),
+      (),
+      FitFailure("observations must have distinct participants and finite scores in [0, 1]")
+    )
+
+  /** The ranked pool with bootstrap 95% CIs and neighbour LOS. Every numerical fit must succeed; a failed fit cannot be
+    * replaced with a fabricated ranking. `groups` are the seeded resampling units.
     */
   def rankedWithBootstrap(
       groups: Seq[Seq[Game]],
       iterations: Int = 1000,
       seed: Long = 42L
-  ): List[Ranked] =
-    val corpus = Corpus.of(groups)
-    val base   = corpus.fit(Array.range(0, corpus.groupCount))
-    if base.isEmpty then Nil
-    else
-      val order = base.toList.sortBy(-_._2).map(_._1)
+  ): FitResult[List[Ranked]] =
+    for
+      _ <- validateGames(groups.flatten)
+      _ <- Either.cond(iterations >= 0, (), FitFailure("bootstrap iterations must be non-negative"))
+      corpus = Corpus.of(groups)
+      base   <- corpus.fit(Array.range(0, corpus.groupCount))
+      ranked <-
+        if base.isEmpty then Right(Nil)
+        else bootstrapSamples(corpus, iterations, seed).map(samples => rankSamples(base, samples))
+    yield ranked
 
-      val rng = new scala.util.Random(seed)
-      // One reusable draw buffer for every iteration: the fit reads it and keeps nothing, so `iterations` separate
-      // arrays would be pure garbage. The draw order — one `nextInt` per group, ascending — is part of the seeded
-      // contract, not an implementation detail.
-      val picks   = new Array[Int](corpus.groupCount)
-      val samples = Vector.fill(iterations):
+  private def bootstrapSamples(corpus: Corpus, iterations: Int, seed: Long): FitResult[Vector[Map[String, Double]]] =
+    val rng = new scala.util.Random(seed)
+    // Reusing the draw buffer preserves the original ascending seeded draw order.
+    val picks = new Array[Int](corpus.groupCount)
+    Vector
+      .fill(iterations) {
         var k = 0
         while k < picks.length do
           picks(k) = rng.nextInt(corpus.groupCount)
           k += 1
         corpus.fit(picks)
+      }
+      .sequence
 
-      def percentile(sorted: Vector[Double], p: Double): Double =
-        if sorted.isEmpty then 0.0
-        else sorted(math.min(sorted.size - 1, math.max(0, math.round(p * (sorted.size - 1)).toInt)))
-
-      order.zipWithIndex.map: (player, rank) =>
-        val values = samples.flatMap(_.get(player)).sorted
-        val los    = order
-          .lift(rank + 1)
-          .map: next =>
-            val both = samples.flatMap(s => s.get(player).zip(s.get(next)))
-            if both.isEmpty then 0.5 else both.count(_ > _).toDouble / both.size
-        Ranked(player, base(player), percentile(values, 0.025), percentile(values, 0.975), los)
+  private def rankSamples(base: Map[String, Double], samples: Vector[Map[String, Double]]): List[Ranked] =
+    val order                                                 = base.toList.sortBy(-_._2).map(_._1)
+    def percentile(sorted: Vector[Double], p: Double): Double =
+      if sorted.isEmpty then 0.0
+      else sorted(math.min(sorted.size - 1, math.max(0, math.round(p * (sorted.size - 1)).toInt)))
+    order.zipWithIndex.map: (player, rank) =>
+      val values = samples.flatMap(_.get(player)).sorted
+      val los    = order
+        .lift(rank + 1)
+        .map: next =>
+          val both = samples.flatMap(s => s.get(player).zip(s.get(next)))
+          if both.isEmpty then 0.5 else both.count(_ > _).toDouble / both.size
+      Ranked(player, base(player), percentile(values, 0.025), percentile(values, 0.975), los)
 
   /** The corpus as integers: every player name resolved once to its index in `players` (distinct and sorted, so an
     * ascending scan of indices is an ascending scan of names), every game flattened into three parallel arrays, and
@@ -119,21 +141,23 @@ object BradleyTerry:
       * has to be known before the matrix can be sized and seeded, and seeding has to happen before the games are added
       * (`Smoothing/2 + s` and `s + Smoothing/2` are not the same double).
       */
-    def fit(selection: Array[Int], colorStrength: Double = 1.0): Map[String, Double] =
+    def fit(selection: Array[Int], colorStrength: Double = 1.0): FitResult[Map[String, Double]] =
       val total   = players.length
       val present = markPresentPlayers(selection, total)
       val localOf = new Array[Int](total)
       val n       = assignLocalIndices(present, localOf, total)
 
-      if n < 2 then (0 until total).filter(present(_)).map(i => players(i) -> 0.0).toMap
+      if n < 2 then Right((0 until total).filter(present(_)).map(i => players(i) -> 0.0).toMap)
       else
         val points    = buildPointsMatrix(selection, localOf, n)
         val strengths =
           if colorStrength == 1.0 then BradleyTerry.mm(points, n)
           else BradleyTerry.colorMm(points, buildWhiteGames(selection, localOf, n), colorStrength, n)
-        val elos = strengths.map(strength => 400.0 * math.log10(strength))
-        val mean = elos.sum / n
-        buildRankedMap(present, localOf, elos, mean, total)
+        strengths.map { fitted =>
+          val elos = fitted.map(strength => 400.0 * math.log10(strength))
+          val mean = elos.sum / n
+          buildRankedMap(present, localOf, elos, mean, total)
+        }
 
     // Orientation is essential: aggregating only total games per unordered pair loses the color offset.
     private def buildWhiteGames(selection: Array[Int], localOf: Array[Int], n: Int): Array[Array[Double]] =
@@ -241,7 +265,7 @@ object BradleyTerry:
     * fit, the intermediate collections dominated. Every accumulation still runs in ascending index order, which is what
     * keeps the result identical to the comprehension it replaced.
     */
-  private def mm(points: Array[Array[Double]], n: Int): Array[Double] =
+  private def mm(points: Array[Array[Double]], n: Int): FitResult[Array[Double]] =
     val gamesBetween = Array.tabulate(n, n)((i, j) => points(i)(j) + points(j)(i))
     val totalPoints  = Array.tabulate(n)(i => points(i).sum)
 
@@ -254,7 +278,7 @@ object BradleyTerry:
       strengths = unscaled
       iteration += 1
 
-    if moved <= Tolerance && strengths.forall(s => s.isFinite && s > 0.0) then strengths
+    if moved <= Tolerance && strengths.forall(s => s.isFinite && s > 0.0) then Right(strengths)
     else
       val neutralGames = Array.tabulate(n, n)((i, j) => if i == j then 0.0 else (gamesBetween(i)(j) - Smoothing) / 2.0)
       BradleyTerryNewton.fit(points, neutralGames, 1.0, Smoothing, strengths)
@@ -268,7 +292,7 @@ object BradleyTerry:
       whiteGames: Array[Array[Double]],
       colorStrength: Double,
       n: Int
-  ): Array[Double] =
+  ): FitResult[Array[Double]] =
     val totalPoints = Array.tabulate(n)(i => points(i).sum)
     var strengths   = Array.fill(n)(1.0)
     var iteration   = 0
@@ -290,7 +314,7 @@ object BradleyTerry:
       moved = normalizeAndMeasureDelta(next, strengths, n)
       strengths = next
       iteration += 1
-    if moved <= Tolerance && strengths.forall(s => s.isFinite && s > 0.0) then strengths
+    if moved <= Tolerance && strengths.forall(s => s.isFinite && s > 0.0) then Right(strengths)
     else BradleyTerryNewton.fit(points, whiteGames, colorStrength, Smoothing, strengths)
 
   private def computeNextStrengths(

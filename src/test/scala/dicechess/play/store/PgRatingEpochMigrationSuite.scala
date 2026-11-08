@@ -342,7 +342,7 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
     }
   }
 
-  test("malformed bot bindings and projection identities return typed refusals without database changes") {
+  test("plan validation returns typed refusals for malformed bot bindings and projection identities") {
     fixture { (db, tool) =>
       val identity = game.white.externalId
       val invalid  = Vector(

@@ -1,6 +1,8 @@
 package dicechess.play.rating.migration
 
 import cats.effect.{ExitCode, IO, IOApp}
+import cats.data.EitherT
+import cats.syntax.all.*
 import dicechess.play.rating.migration.RatingEpochPlan.*
 import dicechess.play.rating.migration.RatingEpochPlan.given
 import dicechess.play.store.{PgGameStore, PgRatingEpochMigration}
@@ -10,7 +12,7 @@ import io.circe.parser.decode
 import io.circe.syntax.*
 
 import java.io.{BufferedReader, InputStreamReader}
-import java.nio.charset.{CodingErrorAction, StandardCharsets}
+import java.nio.charset.{CharacterCodingException, CodingErrorAction, StandardCharsets}
 import java.nio.file.{Files, LinkOption, Path, Paths, StandardCopyOption, StandardOpenOption}
 import java.security.{DigestInputStream, MessageDigest}
 import java.util.UUID
@@ -48,7 +50,6 @@ object RatingEpochMigrationMain extends IOApp:
 
   final case class Options(command: String, values: Map[String, String])
   final case class PlanFiles(config: Path, source: Path, artifacts: Path, out: Path)
-  final private case class InputFailure(problem: String) extends RuntimeException(problem)
 
   def parseOptions(args: List[String]): Either[String, Options] =
     val keys = Map(
@@ -80,91 +81,141 @@ object RatingEpochMigrationMain extends IOApp:
 
   private def hex(bytes: Array[Byte]): String    = bytes.map(b => f"${b & 0xff}%02x").mkString
   private def sha256(bytes: Array[Byte]): String = hex(MessageDigest.getInstance("SHA-256").digest(bytes))
-  private def refuse(problem: String): Nothing   = throw InputFailure(problem)
+  private def ensure(condition: Boolean, problem: String): Either[String, Unit] =
+    Either.cond(condition, (), problem)
 
-  private def document(path: Path, limit: Int = MaxDocumentBytes): String =
+  private def document(path: Path, limit: Int = MaxDocumentBytes): Either[String, String] =
     if !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) then
-      refuse("input document is missing or is not a regular file")
-    val input = Files.newInputStream(path)
-    try
-      val bytes = input.readNBytes(limit + 1)
-      if bytes.length > limit then refuse("input document exceeds byte limit")
-      Utf8
-        .newDecoder()
-        .onMalformedInput(CodingErrorAction.REPORT)
-        .onUnmappableCharacter(CodingErrorAction.REPORT)
-        .decode(java.nio.ByteBuffer.wrap(bytes))
-        .toString
-    finally input.close()
+      Left("input document is missing or is not a regular file")
+    else
+      val input = Files.newInputStream(path)
+      try
+        val bytes = input.readNBytes(limit + 1)
+        if bytes.length > limit then Left("input document exceeds byte limit")
+        else
+          try
+            Right(
+              Utf8
+                .newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(bytes))
+                .toString
+            )
+          catch case _: CharacterCodingException => Left("input document is not valid UTF-8")
+      finally input.close()
 
-  private def json[A: io.circe.Decoder](path: Path): A =
-    decode[A](document(path)).fold(_ => refuse("input document does not match its versioned JSON contract"), identity)
+  private def json[A: io.circe.Decoder](path: Path): Either[String, A] =
+    document(path).flatMap(text =>
+      decode[A](text).leftMap(_ => "input document does not match its versioned JSON contract")
+    )
 
   final private class ArtifactVerifier(dir: Path, onRead: Path => Unit):
     final private case class Verified(document: EvidenceArtifact, gameIds: Set[String])
     private val cache = new java.util.LinkedHashMap[String, Verified](32, 0.75f, true)
 
-    private def load(expectedHash: String): Verified =
-      if !expectedHash.matches("[0-9a-f]{64}") then refuse("invalid evidence artifact SHA-256")
-      Option(cache.get(expectedHash)).getOrElse {
-        val path = dir.resolve(s"$expectedHash.json")
-        onRead(path)
-        val bytes = document(path).getBytes(Utf8)
-        if sha256(bytes) != expectedHash then refuse("evidence artifact bytes do not match their SHA-256")
-        val evidence = decode[EvidenceArtifact](new String(bytes, Utf8))
-          .fold(_ => refuse("invalid evidence artifact document"), identity)
-        val verified = Verified(evidence, evidence.gameIds.toSet)
-        cache.put(expectedHash, verified)
-        if cache.size() > 32 then cache.remove(cache.keySet().iterator().next())
-        verified
-      }
+    private def load(expectedHash: String): Either[String, Verified] =
+      if !expectedHash.matches("[0-9a-f]{64}") then Left("invalid evidence artifact SHA-256")
+      else
+        Option(cache.get(expectedHash)) match
+          case Some(verified) => Right(verified)
+          case None           =>
+            val path = dir.resolve(s"$expectedHash.json")
+            onRead(path)
+            for
+              text <- document(path)
+              _    <- ensure(
+                sha256(text.getBytes(Utf8)) == expectedHash,
+                "evidence artifact bytes do not match their SHA-256"
+              )
+              evidence <- decode[EvidenceArtifact](text).leftMap(_ => "invalid evidence artifact document")
+            yield
+              val verified = Verified(evidence, evidence.gameIds.toSet)
+              cache.put(expectedHash, verified)
+              if cache.size() > 32 then cache.remove(cache.keySet().iterator().next())
+              verified
 
-    def verify(expectedHash: String, role: String, gameId: Option[String], epoch: Int): EvidenceArtifact =
-      val verified = load(expectedHash)
-      val evidence = verified.document
-      if evidence.formatVersion != 1 || evidence.acceptedBy.trim.isEmpty || evidence.statement.trim.isEmpty ||
-        evidence.roles.isEmpty || evidence.roles.exists(r => !Roles.contains(r)) || !evidence.roles.contains(role)
-      then refuse("evidence artifact has no accepted assertion for the referenced use")
-      if gameId.exists(id => !verified.gameIds.contains(id)) then
-        refuse("evidence artifact does not cover the source game")
-      if role == "reset" && !evidence.targetEpoch.contains(epoch) then
-        refuse("reset approval does not cover the target epoch")
-      evidence
+    def verify(
+        expectedHash: String,
+        role: String,
+        gameId: Option[String],
+        epoch: Int
+    ): Either[String, EvidenceArtifact] =
+      for
+        verified <- load(expectedHash)
+        evidence = verified.document
+        _ <- ensure(
+          evidence.formatVersion == 1 && evidence.acceptedBy.trim.nonEmpty && evidence.statement.trim.nonEmpty &&
+            evidence.roles.nonEmpty && evidence.roles.forall(Roles.contains) && evidence.roles.contains(role),
+          "evidence artifact has no accepted assertion for the referenced use"
+        )
+        _ <- ensure(gameId.forall(verified.gameIds.contains), "evidence artifact does not cover the source game")
+        _ <- ensure(
+          role != "reset" || evidence.targetEpoch.contains(epoch),
+          "reset approval does not cover the target epoch"
+        )
+      yield evidence
 
-  private def verifyGame(game: SourceGame, verifier: ArtifactVerifier, epoch: Int): Unit =
-    game.classification.foreach(e => verifier.verify(e.artifactSha256, "classification", Some(game.gameId), epoch))
-    Vector(game.white, game.black)
-      .flatMap(_.continuity)
-      .foreach(e => verifier.verify(e.artifactSha256, "continuity", Some(game.gameId), epoch))
-    game.ownership.foreach(e => verifier.verify(e.artifactSha256, "ownership", Some(game.gameId), epoch))
-    game.orderEvidence.foreach(e => verifier.verify(e.artifactSha256, "order", Some(game.gameId), epoch))
+  private def verifyGame(game: SourceGame, verifier: ArtifactVerifier, epoch: Int): Either[String, Unit] =
+    val proofs = game.classification.toVector.map(_.artifactSha256 -> "classification") ++
+      Vector(game.white, game.black).flatMap(_.continuity).map(_.artifactSha256 -> "continuity") ++
+      game.ownership.toVector.map(_.artifactSha256 -> "ownership") ++
+      game.orderEvidence.toVector.map(_.artifactSha256 -> "order")
+    proofs.traverse_((hash, role) => verifier.verify(hash, role, Some(game.gameId), epoch).void)
 
   final private class JsonLines(reader: BufferedReader):
-    private var cached: Option[String]     = None
-    private var ended                      = false
-    private var line                       = 0L
-    private def readLine(): Option[String] =
+    private var ended                                      = false
+    private var line                                       = 0L
+    private def readLine(): Either[String, Option[String]] =
       val text = new StringBuilder
       var next = reader.read()
-      if next < 0 then None
+      if next < 0 then Right(None)
       else
-        while next >= 0 && next != '\n' do
-          if text.length >= MaxLineChars then refuse("source JSONL line exceeds character limit")
+        while next >= 0 && next != '\n' && text.length < MaxLineChars do
           text.append(next.toChar)
           next = reader.read()
-        Some(text.toString.stripSuffix("\r"))
-    val iterator: Iterator[SourceGame] = new Iterator[SourceGame]:
-      def hasNext: Boolean =
-        if cached.isEmpty && !ended then
-          cached = readLine()
-          ended = cached.isEmpty
-        !ended
-      def next(): SourceGame =
-        if !hasNext then throw new NoSuchElementException("source exhausted")
-        val value = cached.get
-        cached = None
-        line += 1
-        decode[SourceGame](value).fold(_ => refuse(s"invalid source JSONL row at line $line"), identity)
+        if next >= 0 && next != '\n' then Left("source JSONL line exceeds character limit")
+        else Right(Some(text.toString.stripSuffix("\r")))
+
+    private def next(): Either[String, Option[SourceGame]] =
+      line += 1
+      try
+        readLine().flatMap(
+          _.traverse(text => decode[SourceGame](text).leftMap(_ => s"invalid source JSONL row at line $line"))
+        )
+      catch case _: CharacterCodingException => Left(s"source JSONL is not valid UTF-8 at line $line")
+
+    val iterator: Iterator[Either[String, SourceGame]] = Iterator.unfold(()) { _ =>
+      if ended then None
+      else
+        next() match
+          case Left(problem) =>
+            ended = true
+            Some(Left(problem) -> ())
+          case Right(None) =>
+            ended = true
+            None
+          case Right(Some(game)) => Some(Right(game) -> ())
+    }
+
+  private def verifyReset(config: Config, verifier: ArtifactVerifier): Either[String, Unit] =
+    config.approvedReset.traverse_ { approval =>
+      for
+        evidence <- verifier.verify(approval.artifactSha256, "reset", None, config.targetEpoch)
+        _        <- ensure(
+          evidence.acceptedBy == approval.approvedBy && evidence.statement == approval.reason,
+          "reset approval identity/reason differs from its artifact"
+        )
+        _ <- ensure(
+          evidence.sourceSha256.contains(config.sourceSha256) && evidence.modelVersion.contains(config.modelVersion) &&
+            evidence.anchorSetVersion.contains(config.anchorSetVersion) && evidence.scope.contains(
+              "all-rating-domains-and-categories"
+            ) &&
+            evidence.databaseSourceSha256 == config.databaseSourceSha256,
+          "reset approval does not bind the source, model, anchors and full rating scope"
+        )
+      yield ()
+    }
 
   /** Recompute all decisions from exact input bytes. A source hash or artifact mismatch never yields a plan. */
   def reconstruct(
@@ -173,49 +224,62 @@ object RatingEpochMigrationMain extends IOApp:
       artifacts: Path,
       onLedger: LedgerEntry => Unit = _ => (),
       onArtifactRead: Path => Unit = _ => ()
-  ): Plan =
+  ): Either[String, Plan] =
     val verifier = new ArtifactVerifier(artifacts, onArtifactRead)
-    config.approvedReset.foreach { approval =>
-      val evidence = verifier.verify(approval.artifactSha256, "reset", None, config.targetEpoch)
-      if evidence.acceptedBy != approval.approvedBy || evidence.statement != approval.reason then
-        refuse("reset approval identity/reason differs from its artifact")
-      if !evidence.sourceSha256.contains(config.sourceSha256) || !evidence.modelVersion.contains(config.modelVersion) ||
-        !evidence.anchorSetVersion.contains(config.anchorSetVersion) || !evidence.scope.contains(
-          "all-rating-domains-and-categories"
-        ) ||
-        evidence.databaseSourceSha256 != config.databaseSourceSha256
-      then refuse("reset approval does not bind the source, model, anchors and full rating scope")
-    }
-    if !Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS) then
-      refuse("source JSONL is missing or is not a regular file")
+    for
+      _ <- verifyReset(config, verifier)
+      _ <- ensure(
+        Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS),
+        "source JSONL is missing or is not a regular file"
+      )
+      plan <- reconstructSource(config, source, verifier, onLedger)
+    yield plan
+
+  private def reconstructSource(
+      config: Config,
+      source: Path,
+      verifier: ArtifactVerifier,
+      onLedger: LedgerEntry => Unit
+  ): Either[String, Plan] =
     val hash    = MessageDigest.getInstance("SHA-256")
     val input   = new DigestInputStream(Files.newInputStream(source), hash)
     val decoder =
       Utf8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
     val reader = new BufferedReader(new InputStreamReader(input, decoder))
     try
-      val rows = new JsonLines(reader).iterator.map { game =>
-        verifyGame(game, verifier, config.targetEpoch)
-        game
-      }
-      val plan = build(config, rows, onLedger).fold(refuse, identity)
-      if hex(hash.digest()) != config.sourceSha256 then refuse("source JSONL bytes do not match config.sourceSha256")
-      validate(plan).fold(refuse, identity)
-      plan
+      val rows = new JsonLines(reader).iterator.map(_.flatMap { game =>
+        verifyGame(game, verifier, config.targetEpoch).as(game)
+      })
+      for
+        plan <- buildChecked(config, rows, onLedger)
+        _    <- ensure(hex(hash.digest()) == config.sourceSha256, "source JSONL bytes do not match config.sourceSha256")
+        _    <- validate(plan)
+      yield plan
     finally reader.close()
 
   /** Reserve a new directory before writing. On failure only temporary files created by this call are removed; existing
     * files/directories are never replaced. A failed export never publishes a plan.json.
     */
-  def writePlan(files: PlanFiles): Plan =
-    val config = json[Config](files.config)
+  def writePlan(files: PlanFiles): Either[String, Plan] =
+    json[Config](files.config).flatMap(config => writeReservedPlan(files, config))
+
+  private def cleanup(files: PlanFiles, temporary: Vector[Path]): Unit =
+    temporary.foreach(p => Files.deleteIfExists(p))
+    // Retain any published auxiliary files after a failed rename for inspection.
+    val contents = Files.list(files.out)
+    val empty    = try !contents.findAny().isPresent
+    finally contents.close()
+    if empty then Files.delete(files.out)
+
+  private def writeReservedPlan(files: PlanFiles, config: Config): Either[String, Plan] =
     Files.createDirectory(files.out)
     val ledger     = files.out.resolve("ledger.jsonl.tmp")
     val planFile   = files.out.resolve("plan.json.tmp")
     val digestFile = files.out.resolve("plan.sha256.tmp")
+    var published  = false
     try
       val writer = Files.newBufferedWriter(ledger, Utf8, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
-      val plan   = try
+      val result = try
         reconstruct(
           config,
           files.source,
@@ -225,54 +289,54 @@ object RatingEpochMigrationMain extends IOApp:
             writer.newLine()
         )
       finally writer.close()
-      Files.writeString(
-        planFile,
-        plan.asJson.spaces2 + "\n",
-        Utf8,
-        StandardOpenOption.CREATE_NEW,
-        StandardOpenOption.WRITE
-      )
-      Files.writeString(
-        digestFile,
-        planDigest(plan) + "\n",
-        Utf8,
-        StandardOpenOption.CREATE_NEW,
-        StandardOpenOption.WRITE
-      )
-      Files.move(ledger, files.out.resolve("ledger.jsonl"), StandardCopyOption.ATOMIC_MOVE)
-      Files.move(digestFile, files.out.resolve("plan.sha256"), StandardCopyOption.ATOMIC_MOVE)
-      Files.move(planFile, files.out.resolve("plan.json"), StandardCopyOption.ATOMIC_MOVE)
-      plan
-    catch
-      case NonFatal(error) =>
-        Vector(ledger, planFile, digestFile).foreach(p => Files.deleteIfExists(p))
-        // The directory can contain published auxiliary files after a failed rename; retain them for inspection.
-        val contents = Files.list(files.out)
-        val empty    = try !contents.findAny().isPresent
-        finally contents.close()
-        if empty then Files.delete(files.out)
-        throw error
+      result.map { plan =>
+        Files.writeString(
+          planFile,
+          plan.asJson.spaces2 + "\n",
+          Utf8,
+          StandardOpenOption.CREATE_NEW,
+          StandardOpenOption.WRITE
+        )
+        Files.writeString(
+          digestFile,
+          planDigest(plan) + "\n",
+          Utf8,
+          StandardOpenOption.CREATE_NEW,
+          StandardOpenOption.WRITE
+        )
+        Files.move(ledger, files.out.resolve("ledger.jsonl"), StandardCopyOption.ATOMIC_MOVE)
+        Files.move(digestFile, files.out.resolve("plan.sha256"), StandardCopyOption.ATOMIC_MOVE)
+        Files.move(planFile, files.out.resolve("plan.json"), StandardCopyOption.ATOMIC_MOVE)
+        published = true
+        plan
+      }
+    finally if !published then cleanup(files, Vector(ledger, planFile, digestFile))
 
-  def readPlan(path: Path): Plan =
-    val plan = decode[Plan](document(path, MaxPlanBytes)).fold(_ => refuse("invalid plan JSON"), identity)
-    validate(plan).fold(refuse, identity)
-    plan
+  def readPlan(path: Path): Either[String, Plan] =
+    for
+      text <- document(path, MaxPlanBytes)
+      plan <- decode[Plan](text).leftMap(_ => "invalid plan JSON")
+      _    <- validate(plan)
+    yield plan
 
-  private def verifyPlan(options: Options): Plan =
+  private[migration] def verifyPlan(options: Options): Either[String, Plan] =
     val values = options.values
-    val plan   = readPlan(Paths.get(values("plan")))
-    if !plan.config.databaseSourceSha256.contains(values(SourceSha256Option)) then
-      refuse("plan must bind the exact probed database source fingerprint before staging")
-    if planDigest(plan) != values(PlanSha256Option) then refuse("plan digest differs from the accepted immutable plan")
-    val rebuilt = reconstruct(plan.config, Paths.get(values("source")), Paths.get(values("artifacts")))
-    if planDigest(rebuilt) != planDigest(plan) then refuse("plan does not reproduce from its source/evidence artifacts")
-    plan
+    for
+      plan <- readPlan(Paths.get(values("plan")))
+      _    <- ensure(
+        plan.config.databaseSourceSha256.contains(values(SourceSha256Option)),
+        "plan must bind the exact probed database source fingerprint before staging"
+      )
+      _ <- ensure(planDigest(plan) == values(PlanSha256Option), "plan digest differs from the accepted immutable plan")
+      rebuilt <- reconstruct(plan.config, Paths.get(values("source")), Paths.get(values("artifacts")))
+      _ <- ensure(planDigest(rebuilt) == planDigest(plan), "plan does not reproduce from its source/evidence artifacts")
+    yield plan
 
   def run(args: List[String]): IO[ExitCode] = parseOptions(args) match
     case Left(problem)  => IO.println(s"[rating-epoch] $problem").as(ExitCode.Error)
     case Right(options) =>
       val operation = if options.command == "plan" then
-        IO.blocking {
+        EitherT(IO.blocking {
           writePlan(
             PlanFiles(
               Paths.get(options.values("config")),
@@ -281,14 +345,13 @@ object RatingEpochMigrationMain extends IOApp:
               Paths.get(options.values("out"))
             )
           )
-        }.flatMap(plan =>
+        }).semiflatMap(plan =>
           IO.println(
             s"[rating-epoch] plan=${planDigest(plan)} activatable=${plan.activatable} rows=${plan.rows.size} unknown=${plan.counts.unknownRows}"
           ).as(if plan.activatable then ExitCode.Success else ExitCode(3))
         )
       else database(options).as(ExitCode.Success)
-      operation.handleErrorWith {
-        case InputFailure(problem)                   => IO.println(s"[rating-epoch] $problem").as(ExitCode.Error)
+      operation.foldF(problem => IO.println(s"[rating-epoch] $problem").as(ExitCode.Error), IO.pure).handleErrorWith {
         case PgRatingEpochMigration.Refusal(problem) => IO.println(s"[rating-epoch] $problem").as(ExitCode.Error)
         case NonFatal(_)                             =>
           IO.println("[rating-epoch] operation failed; no success is implied; inspect the isolated operator run")
@@ -296,28 +359,32 @@ object RatingEpochMigrationMain extends IOApp:
         case other => IO.raiseError(other)
       }
 
-  private def database(options: Options): IO[Unit] =
+  private def database(options: Options): EitherT[IO, String, Unit] =
     PgGameStore.configFromEnv match
-      case None         => IO.raiseError(InputFailure("PLAY_DB_URL is required for database commands"))
+      case None         => EitherT.leftT[IO, Unit]("PLAY_DB_URL is required for database commands")
       case Some(config) =>
         val xa =
           Transactor.fromDriverManager[IO]("org.postgresql.Driver", config.url, config.user, config.password, None)
-        val executor = PgRatingEpochMigration.fromTransactor(xa)
-        val values   = options.values
-        def revision = values("revision").toLong
-        def runId    = UUID.fromString(values("run"))
+        val executor                                          = PgRatingEpochMigration.fromTransactor(xa)
+        val values                                            = options.values
+        def revision                                          = values("revision").toLong
+        def runId                                             = UUID.fromString(values("run"))
+        def lift(action: IO[Unit]): EitherT[IO, String, Unit] = EitherT.liftF(action)
         options.command match
-          case "probe"  => executor.probe.flatMap(value => IO.println(value.asJson.noSpaces))
-          case "pause"  => executor.setPaused(revision, true).flatMap(value => IO.println(value.asJson.noSpaces))
-          case "resume" => executor.setPaused(revision, false).flatMap(value => IO.println(value.asJson.noSpaces))
+          case "probe"  => lift(executor.probe.flatMap(value => IO.println(value.asJson.noSpaces)))
+          case "pause"  => lift(executor.setPaused(revision, true).flatMap(value => IO.println(value.asJson.noSpaces)))
+          case "resume" => lift(executor.setPaused(revision, false).flatMap(value => IO.println(value.asJson.noSpaces)))
           case "stage"  =>
-            IO.blocking(verifyPlan(options))
-              .flatMap(plan => executor.stage(plan, revision, values(SourceSha256Option)))
-              .flatMap(value => IO.println(value.asJson.noSpaces))
+            EitherT(IO.blocking(verifyPlan(options)))
+              .semiflatMap(plan => executor.stage(plan, revision, values(SourceSha256Option)))
+              .semiflatMap(value => IO.println(value.asJson.noSpaces))
           case "activate" =>
-            executor
-              .activate(runId, revision, values(PlanSha256Option))
-              .flatMap(value => IO.println(value.asJson.noSpaces))
-          case "rollback" => executor.rollback(runId, revision).flatMap(value => IO.println(value.asJson.noSpaces))
-          case "status"   => executor.status(runId).flatMap(value => IO.println(value.asJson.noSpaces))
-          case _          => IO.raiseError(InputFailure("unsupported database command"))
+            lift(
+              executor
+                .activate(runId, revision, values(PlanSha256Option))
+                .flatMap(value => IO.println(value.asJson.noSpaces))
+            )
+          case "rollback" =>
+            lift(executor.rollback(runId, revision).flatMap(value => IO.println(value.asJson.noSpaces)))
+          case "status" => lift(executor.status(runId).flatMap(value => IO.println(value.asJson.noSpaces)))
+          case _        => EitherT.leftT[IO, Unit]("unsupported database command")

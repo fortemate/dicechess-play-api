@@ -141,6 +141,30 @@ class RatingEpochPlanSuite extends FunSuite:
     )
     assertEquals(validate(output), Right(()))
 
+  test("each training application carries its captured reference and historical bot binding for either human color"):
+    val whiteReference = TrainingReference(TrainingReferenceSource.BotRating, Glicko(1620, 45, 0.07))
+    val blackReference =
+      TrainingReference(TrainingReferenceSource.Anchor("synthetic-other-v3", 3), Glicko(1840, 80, 0.05))
+    val first  = game("white-human", userA, botA).copy(reference = CapturedTrainingReference.Recorded(whiteReference))
+    val second = game("black-human", botB, userA, start.plusSeconds(86400), result = Some(-1))
+      .copy(reference = CapturedTrainingReference.Recorded(blackReference))
+    val (output, entries) = ledger(first, second)
+    val afterFirst = TrainingEstimate.update(TrainingState.Initial, whiteReference.glicko, true, 1, first.finishedAt)
+    val expected   = TrainingEstimate.update(afterFirst, blackReference.glicko, false, 1, second.finishedAt)
+    assertEquals(output.rows.map(_.glicko), Vector(expected.glicko))
+    assertEquals(output.rows.map(p => (p.games, p.wins, p.draws, p.losses)), Vector((2, 2, 0, 0)))
+    assertEquals(output.trainingBotIdentities, Set(botA.externalId, botB.externalId))
+    assertEquals(
+      output.identityIncarnations,
+      Map(
+        botA.externalId -> "10000000-0000-0000-0000-000000000001",
+        botB.externalId -> "10000000-0000-0000-0000-000000000002"
+      )
+    )
+    assertEquals(entries.map(_.decision), Vector(Decision.Training, Decision.Training))
+    assertNotEquals(entries.head.sourceSha256, entries.last.sourceSha256)
+    assertEquals(validate(output), Right(()))
+
   test("missing legacy classification, continuity, ownership and reference are unknown, not invented"):
     val training = game(white = userA)
     val inputs   = Vector(
@@ -250,6 +274,35 @@ class RatingEpochPlanSuite extends FunSuite:
       assertEquals(plan(input).counts.unknownRows, 1L)
     }
 
+  test("training reference absence and invalid provenance preserve their exact nonmutating decisions"):
+    val references = Vector(
+      (CapturedTrainingReference.NotRecorded, Decision.Unknown, "training_reference_not_recorded"),
+      (CapturedTrainingReference.Unavailable, Decision.Excluded, "training_reference_unavailable"),
+      (
+        CapturedTrainingReference.Recorded(TrainingReference(TrainingReferenceSource.Anchor("", 1), Glicko.Initial)),
+        Decision.Unknown,
+        "training_reference_invalid"
+      ),
+      (
+        CapturedTrainingReference.Recorded(
+          TrainingReference(TrainingReferenceSource.Anchor("synthetic", 0), Glicko.Initial)
+        ),
+        Decision.Unknown,
+        "training_reference_invalid"
+      )
+    )
+    for
+      (captured, decision, reason) <- references
+      humanIsWhite                 <- Vector(true, false)
+    do
+      val input             = if humanIsWhite then game(white = userA) else game(black = userA)
+      val (output, entries) = ledger(input.copy(reference = captured))
+      assertEquals(output.rows, Vector.empty)
+      assertEquals(output.identityIncarnations, Map.empty[String, String])
+      assertEquals(output.trainingBotIdentities, Set.empty[String])
+      assertEquals(entries.map(_.decision), Vector(decision))
+      assertEquals(entries.map(_.reasons), Vector(Vector(reason)))
+
   test("reset is a separate approved empty projection and never disguises a partial rebuild"):
     val approval = ApprovedReset("Synthetic documented restart", "synthetic-owner", evidence)
     val entries  = Vector.newBuilder[LedgerEntry]
@@ -277,6 +330,31 @@ class RatingEpochPlanSuite extends FunSuite:
     assert(build(config, Iterator(game(at = start.plusSeconds(1)), game())).isLeft)
     assert(build(config.copy(modelVersion = "unknown"), Iterator.empty).isLeft)
     assert(!plan().activatable)
+
+  test("checked streaming input stops at its first source error and returns no partial plan"):
+    val problem  = "synthetic source line 3: invalid JSON"
+    val entries  = Vector.newBuilder[LedgerEntry]
+    var consumed = 0
+    val source   = Vector(
+      Right(game("a")),
+      Right(game("b", at = start.plusSeconds(1))),
+      Left(problem),
+      Right(game("c", at = start.plusSeconds(2)))
+    ).iterator.map { row =>
+      consumed += 1
+      row
+    }
+    assertEquals(buildChecked(config, source, entries += _), Left(problem))
+    assertEquals(consumed, 3)
+    assertEquals(entries.result().map(_.gameId), Vector("a"))
+
+  test("checked streaming success preserves the public builder plan and ledger"):
+    val games                       = Vector(game("a"), game("b", at = start.plusSeconds(1)))
+    val entries                     = Vector.newBuilder[LedgerEntry]
+    val checked                     = buildChecked(config, games.iterator.map(Right(_)), entries += _)
+    val (expected, expectedEntries) = ledger(games*)
+    assertEquals(checked, Right(expected))
+    assertEquals(entries.result(), expectedEntries)
 
   test("planning leaves source values unchanged and produces stable digests and JSON round trips"):
     val inputs      = Vector(game("a"), game("b", at = start.plusSeconds(1)))

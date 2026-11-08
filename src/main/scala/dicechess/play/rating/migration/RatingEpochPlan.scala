@@ -319,16 +319,38 @@ object RatingEpochPlan:
         .when(seat.externalId.startsWith("guest:"))(seat.externalId.stripPrefix("guest:"))
         .flatMap(id => Principal.guest(id).toOption)
 
-  private def continuity(seat: SourceSeat): Boolean = seat.continuity.exists { evidence =>
-    validDigest(evidence.artifactSha256) && (seat.kind != ParticipantKind.Bot || evidence.incarnation.exists(
-      canonicalUuid
-    ))
-  }
+  final private case class BotBinding(externalId: String, incarnation: String)
+  final private case class Application(category: RatingCategory, scores: (Double, Double), bots: Vector[BotBinding])
 
-  private type Assessment = (Decision, Vector[String])
-  private def unknown(reason: String): Assessment  = (Decision.Unknown, Vector(reason))
-  private def exclude(reason: String): Assessment  = (Decision.Excluded, Vector(reason))
-  private def mutates(decision: Decision): Boolean = decision == Decision.Competitive || decision == Decision.Training
+  private def continuity(seat: SourceSeat): Option[Vector[BotBinding]] =
+    seat.continuity.filter(e => validDigest(e.artifactSha256)).flatMap { evidence =>
+      if seat.kind == ParticipantKind.Bot then
+        evidence.incarnation.filter(canonicalUuid).map(id => Vector(BotBinding(seat.externalId, id)))
+      else Some(Vector.empty)
+    }
+
+  private enum Assessment:
+    case Unchanged(decision: Decision, reasons: Vector[String])
+    case Competitive(application: Application)
+    case Training(application: Application, reference: TrainingReference)
+
+    def mutation: Option[Application] = this match
+      case Competitive(value) => Some(value)
+      case Training(value, _) => Some(value)
+      case Unchanged(_, _)    => None
+
+  private def unknown(reason: String): Assessment = Assessment.Unchanged(Decision.Unknown, Vector(reason))
+  private def exclude(reason: String): Assessment = Assessment.Unchanged(Decision.Excluded, Vector(reason))
+
+  private def application(
+      game: SourceGame,
+      category: RatingCategory,
+      scores: (Double, Double)
+  ): Option[Application] =
+    for
+      white <- continuity(game.white)
+      black <- continuity(game.black)
+    yield Application(category, scores, white ++ black)
 
   private def validTrainingReference(reference: TrainingReference): Boolean =
     val validSource = reference.source match
@@ -336,39 +358,48 @@ object RatingEpochPlan:
       case TrainingReferenceSource.Anchor(version, epoch) => version.trim.nonEmpty && epoch > 0
     validSource && validGlicko(reference.glicko)
 
-  private def assessReference(reference: CapturedTrainingReference): Assessment = reference match
-    case CapturedTrainingReference.NotRecorded     => unknown("training_reference_not_recorded")
-    case CapturedTrainingReference.Unavailable     => exclude("training_reference_unavailable")
-    case CapturedTrainingReference.Recorded(value) =>
-      if validTrainingReference(value) then (Decision.Training, Vector.empty)
-      else unknown("training_reference_invalid")
+  private def assessReference(reference: CapturedTrainingReference, application: Application): Assessment =
+    reference match
+      case CapturedTrainingReference.NotRecorded     => unknown("training_reference_not_recorded")
+      case CapturedTrainingReference.Unavailable     => exclude("training_reference_unavailable")
+      case CapturedTrainingReference.Recorded(value) =>
+        if validTrainingReference(value) then Assessment.Training(application, value)
+        else unknown("training_reference_invalid")
 
-  private def assessTraining(game: SourceGame): Assessment = game.ownership match
+  private def assessTraining(game: SourceGame, application: Application): Assessment = game.ownership match
     case None                                              => unknownOwnership
     case Some(owner) if !validDigest(owner.artifactSha256) => unknownOwnership
     case Some(owner) if owner.ownBot                       => exclude("own_bot")
-    case Some(_)                                           => assessReference(game.reference)
+    case Some(_)                                           => assessReference(game.reference, application)
 
   private def unknownOwnership: Assessment = unknown("historical_ownership_unknown")
 
   private def assessSkipped(game: SourceGame): Assessment = game.skipReason.filter(_.trim.nonEmpty) match
-    case Some(reason) => (Decision.Excluded, Vector("recorded_skip", reason))
+    case Some(reason) => Assessment.Unchanged(Decision.Excluded, Vector("recorded_skip", reason))
     case None         => unknown("skip_reason_missing")
 
-  private def assessApplication(game: SourceGame, domain: RatingDomain): Assessment =
+  private def assessApplication(
+      game: SourceGame,
+      domain: RatingDomain,
+      category: RatingCategory,
+      scores: (Double, Double)
+  ): Assessment =
     if !game.applied || game.outcome == RatingOutcome.Pending then unknown("application_incomplete")
     else if game.outcome == RatingOutcome.Skipped then assessSkipped(game)
     else if game.outcome != RatingOutcome.Applied then unknown("application_not_proven")
-    else if !continuity(game.white) || !continuity(game.black) then unknown("identity_continuity_unknown")
-    else if domain == RatingDomain.Competitive then (Decision.Competitive, Vector.empty)
-    else assessTraining(game)
+    else
+      application(game, category, scores) match
+        case None                                              => unknown("identity_continuity_unknown")
+        case Some(value) if domain == RatingDomain.Competitive => Assessment.Competitive(value)
+        case Some(value)                                       => assessTraining(game, value)
 
   private def assessClassified(
       game: SourceGame,
       evidence: ClassificationEvidence,
       white: Principal,
       black: Principal,
-      control: TimeControl
+      control: TimeControl,
+      scores: (Double, Double)
   ): Assessment =
     val expected = RatingPolicy.classify(
       RatingPolicy.Matrix,
@@ -382,9 +413,12 @@ object RatingEpochPlan:
     if expected.rated != evidence.rated || expected.domain != evidence.domain then
       unknown("classification_matrix_mismatch")
     else if expected.domain == RatingDomain.Casual then exclude("matrix_casual")
-    else assessApplication(game, expected.domain)
+    else
+      RatingCategory.of(control) match
+        case Some(category) => assessApplication(game, expected.domain, category, scores)
+        case None           => unknown("time_control_uncategorized")
 
-  private def assessClassification(game: SourceGame): Assessment =
+  private def assessClassification(game: SourceGame, scores: (Double, Double)): Assessment =
     (game.classification, principal(game.white), principal(game.black), TimeControl.parse(game.timeControl)) match
       case (None, _, _, _) => unknown("classification_not_recorded")
       case (Some(evidence), _, _, _) if evidence.policyVersion != RatingPolicy.Matrix.version =>
@@ -394,15 +428,17 @@ object RatingEpochPlan:
       case (_, None, _, _) | (_, _, None, _)                         => unknown("identity_kind_or_shape_unknown")
       case (_, _, _, None)                                           => unknown("time_control_unparseable")
       case (Some(evidence), Some(white), Some(black), Some(control)) =>
-        assessClassified(game, evidence, white, black, control)
+        assessClassified(game, evidence, white, black, control, scores)
 
   private def assess(game: SourceGame, cutoff: Instant): Assessment =
     if game.gameId.trim.isEmpty then unknown("missing_game_id")
     else if game.finishedAt.isAfter(cutoff) then exclude("after_cutoff")
     else if game.white.externalId == game.black.externalId then unknown("self_pairing")
-    else if game.termination == "aborted" || game.result.flatMap(RatingBatch.scores).isEmpty then
-      exclude("no_sporting_result")
-    else assessClassification(game)
+    else if game.termination == "aborted" then exclude("no_sporting_result")
+    else
+      game.result.flatMap(RatingBatch.scores) match
+        case None         => exclude("no_sporting_result")
+        case Some(scores) => assessClassification(game, scores)
 
   /** Structural failures (limits/order) return Left and the caller must discard any streamed ledger. Unknown evidence
     * yields a nonactivatable Rebuild plan. ApprovedReset is a separate empty projection, never a partial rebuild.
@@ -412,7 +448,14 @@ object RatingEpochPlan:
       source: Iterator[SourceGame],
       onLedger: LedgerEntry => Unit = _ => ()
   ): Either[String, Plan] =
-    validateConfig(config).flatMap(_ => new PlanBuilder(config, onLedger).run(source))
+    buildChecked(config, source.map(Right(_)), onLedger)
+
+  private[migration] def buildChecked(
+      config: Config,
+      source: Iterator[Either[String, SourceGame]],
+      onLedger: LedgerEntry => Unit = _ => ()
+  ): Either[String, Plan] =
+    validateConfig(config).flatMap(_ => new PlanBuilder(config, onLedger).runChecked(source))
 
   final private class PlanBuilder(config: Config, onLedger: LedgerEntry => Unit):
     private val mode         = if config.approvedReset.isDefined then Mode.ApprovedReset else Mode.Rebuild
@@ -500,61 +543,64 @@ object RatingEpochPlan:
         Some(row.lastPlayedAt)
       )
 
-    private def applyTraining(game: SourceGame, category: RatingCategory, scores: (Double, Double)): Boolean =
+    private def applyTraining(
+        game: SourceGame,
+        application: Application,
+        reference: TrainingReference
+    ): Boolean =
+      val category     = application.category
       val humanIsWhite = game.white.kind == ParticipantKind.Human
       val human        = if humanIsWhite then game.white else game.black
-      val score        = if humanIsWhite then scores._1 else scores._2
+      val score        = if humanIsWhite then application.scores._1 else application.scores._2
       val state        =
         states.get((human.externalId, category, RatingDomain.Training)).fold(TrainingState.Initial)(trainingState)
-      val reference = game.reference match
-        case CapturedTrainingReference.Recorded(value) => value.glicko
-        case _ => throw new IllegalStateException("assessed training row lacks its recorded reference")
-      val next = TrainingEstimate.update(state, reference, humanIsWhite, score, game.finishedAt).glicko
+      val next = TrainingEstimate.update(state, reference.glicko, humanIsWhite, score, game.finishedAt).glicko
       if !validGlicko(next) then false
       else
         updateSeat(game, human, category, RatingDomain.Training, next, score)
         true
 
-    private def applyGame(game: SourceGame, decision: Decision): Boolean =
-      val category = RatingCategory.ofStored(game.timeControl).get
-      val scores   = RatingBatch.scores(game.result.get).get
-      if decision == Decision.Competitive then applyCompetitive(game, category, scores)
-      else applyTraining(game, category, scores)
-
-    private def changesIncarnation(game: SourceGame): Boolean =
-      Vector(game.white, game.black).filter(_.kind == ParticipantKind.Bot).exists { seat =>
-        seat.continuity.flatMap(_.incarnation).exists(i => incarnations.get(seat.externalId).exists(_ != i))
+    private def changesIncarnation(application: Application): Boolean =
+      application.bots.exists { binding =>
+        incarnations.get(binding.externalId).exists(_ != binding.incarnation)
       }
 
-    private def recordBotBindings(game: SourceGame, decision: Decision): Unit =
-      Vector(game.white, game.black).filter(_.kind == ParticipantKind.Bot).foreach { seat =>
-        incarnations.update(seat.externalId, seat.continuity.flatMap(_.incarnation).get)
-        if decision == Decision.Training then trainingBots.add(seat.externalId)
+    private def recordBotBindings(application: Application, decision: Decision): Unit =
+      application.bots.foreach { binding =>
+        incarnations.update(binding.externalId, binding.incarnation)
+        if decision == Decision.Training then trainingBots.add(binding.externalId)
       }
 
-    private def applyKnownGame(game: SourceGame, decision: Decision, reasons: Vector[String]): Unit =
-      if applyGame(game, decision) then
-        recordBotBindings(game, decision)
-        emit(game, decision, reasons)
+    private def applyKnownGame(game: SourceGame, application: Application, decision: Decision)(
+        applied: => Boolean
+    ): Unit =
+      if applied then
+        recordBotBindings(application, decision)
+        emit(game, decision, Vector.empty)
       else emit(game, Decision.Unknown, Vector("nonfinite_projection"))
 
-    private def processNewGame(game: SourceGame, decision: Decision, reasons: Vector[String], ordered: Boolean): Unit =
-      if mutates(decision) && !ordered then emit(game, Decision.Unknown, Vector("tied_application_order_unknown"))
-      else if mutates(decision) && changesIncarnation(game) then
-        emit(game, Decision.Unknown, Vector("multiple_bot_incarnations"))
-      else if mutates(decision) then applyKnownGame(game, decision, reasons)
-      else emit(game, decision, reasons)
+    private def processNewGame(game: SourceGame, assessment: Assessment, ordered: Boolean): Unit =
+      assessment match
+        case _ if assessment.mutation.isDefined && !ordered =>
+          emit(game, Decision.Unknown, Vector("tied_application_order_unknown"))
+        case _ if assessment.mutation.exists(changesIncarnation) =>
+          emit(game, Decision.Unknown, Vector("multiple_bot_incarnations"))
+        case Assessment.Competitive(value) =>
+          applyKnownGame(game, value, Decision.Competitive)(applyCompetitive(game, value.category, value.scores))
+        case Assessment.Training(value, reference) =>
+          applyKnownGame(game, value, Decision.Training)(applyTraining(game, value, reference))
+        case Assessment.Unchanged(decision, reasons) => emit(game, decision, reasons)
 
     private def processAssessed(game: SourceGame, assessment: Assessment, ordered: Boolean): Unit =
-      if mode == Mode.ApprovedReset then
-        emit(game, Decision.Reset, Vector("approved_reset", config.approvedReset.get.reason))
-      else if seen.contains(game.gameId) then emit(game, Decision.Unknown, Vector("duplicate_game_id"))
-      else
-        seen.add(game.gameId)
-        processNewGame(game, assessment._1, assessment._2, ordered)
+      config.approvedReset match
+        case Some(approval)                     => emit(game, Decision.Reset, Vector("approved_reset", approval.reason))
+        case None if seen.contains(game.gameId) => emit(game, Decision.Unknown, Vector("duplicate_game_id"))
+        case None                               =>
+          seen.add(game.gameId)
+          processNewGame(game, assessment, ordered)
 
     private def orderedMutations(assessed: Vector[(SourceGame, Assessment)]): Boolean =
-      val mutating = assessed.filter { case (_, (decision, _)) => mutates(decision) }
+      val mutating = assessed.filter { case (_, assessment) => assessment.mutation.isDefined }
       val evidence = mutating.flatMap(_._1.orderEvidence)
       mutating.size <= 1 || (evidence.size == mutating.size &&
         evidence.forall(e => e.sequence >= 0 && validDigest(e.artifactSha256)) &&
@@ -607,8 +653,11 @@ object RatingEpochPlan:
         trainingBots.toSet
       )
 
-    def run(source: Iterator[SourceGame]): Either[String, Plan] =
-      while failure.isEmpty && source.hasNext do accept(source.next())
+    def runChecked(source: Iterator[Either[String, SourceGame]]): Either[String, Plan] =
+      while failure.isEmpty && source.hasNext do
+        source.next() match
+          case Left(problem) => failure = Some(problem)
+          case Right(game)   => accept(game)
       if failure.isEmpty then flush()
       failure match
         case Some(problem) => Left(problem)

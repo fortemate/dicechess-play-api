@@ -115,7 +115,7 @@ final class PgRatingEpochMigration private (xa: Transactor[IO]):
   def stage(plan: RatingEpochPlan.Plan, expectedRevision: Long, expectedSourceSha256: String): IO[RunStatus] =
     val hash  = RatingEpochPlan.planDigest(plan)
     val id    = UUID.nameUUIDFromBytes(s"rating-epoch:$hash".getBytes(UTF_8))
-    val valid = RatingEpochPlan.validate(plan).leftMap(new IllegalArgumentException(_)).liftTo[ConnectionIO]
+    val valid = RatingEpochPlan.validate(plan).leftMap(Refusal.apply).liftTo[ConnectionIO]
     val tx    = for
       _ <- lock
       _ <- valid
@@ -160,17 +160,17 @@ final class PgRatingEpochMigration private (xa: Transactor[IO]):
 
   private def checkIdentities(plan: RatingEpochPlan.Plan): ConnectionIO[Unit] =
     plan.identityIncarnations.toList.traverse_ { (externalId, incarnation) =>
-      val bot =
-        Principal.fromBotExternalId(externalId).getOrElse(throw new IllegalArgumentException("invalid bot identity"))
-      sql"SELECT incarnation_id FROM play.bots WHERE team = ${bot.team} AND name = ${bot.name}"
-        .query[UUID]
-        .option
-        .flatMap(found =>
-          requireState(
-            found.contains(UUID.fromString(incarnation)),
-            "historical bot incarnation is not the current identity"
+      val parsed =
+        (Principal.fromBotExternalId(externalId), scala.util.Try(UUID.fromString(incarnation)).toOption).tupled
+          .toRight(Refusal("invalid bot identity"))
+      parsed.liftTo[ConnectionIO].flatMap { (bot, expected) =>
+        sql"SELECT incarnation_id FROM play.bots WHERE team = ${bot.team} AND name = ${bot.name}"
+          .query[UUID]
+          .option
+          .flatMap(found =>
+            requireState(found.contains(expected), "historical bot incarnation is not the current identity")
           )
-        )
+      }
     } *> plan.rows.flatMap(row => Principal.fromUserExternalId(row.externalId)).distinct.toList.traverse_ { user =>
       sql"SELECT EXISTS(SELECT 1 FROM play.users WHERE id = $user::uuid AND is_active)"
         .query[Boolean]
@@ -210,11 +210,14 @@ final class PgRatingEpochMigration private (xa: Transactor[IO]):
           sql"""INSERT INTO play.user_ratings (user_id,category,rating,rd,vol)
                  VALUES ($user::uuid,$category,${g.rating},${g.deviation},${g.volatility})""".update.run.void
         case None =>
-          val bot = Principal
+          Principal
             .fromBotExternalId(row.externalId)
-            .getOrElse(throw new IllegalArgumentException("invalid bot projection"))
-          sql"""INSERT INTO play.bot_ratings (team,name,category,rating,rd,vol)
+            .toRight(Refusal("invalid bot projection"))
+            .liftTo[ConnectionIO]
+            .flatMap { bot =>
+              sql"""INSERT INTO play.bot_ratings (team,name,category,rating,rd,vol)
                  VALUES (${bot.team},${bot.name},$category,${g.rating},${g.deviation},${g.volatility})""".update.run.void
+            }
       projection *> (if row.domain == RatingDomain.Competitive then
                        sql"""INSERT INTO play.rating_epoch_counts (participant_external_id,category,games,wins,draws,losses)
                VALUES (${row.externalId},$category,${row.games.toLong},${row.wins.toLong},${row.draws.toLong},${row.losses.toLong})""".update.run.void

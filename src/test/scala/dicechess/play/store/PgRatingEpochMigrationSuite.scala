@@ -1,6 +1,6 @@
 package dicechess.play.store
 
-import cats.effect.IO
+import cats.effect.{IO, Resource}
 import cats.syntax.all.*
 import com.dimafeng.testcontainers.PostgreSQLContainer
 import com.dimafeng.testcontainers.munit.TestContainerForAll
@@ -71,6 +71,22 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
 
   private def admin[A](db: PgGameStore)(action: ConnectionIO[A]): IO[A] =
     (sql"SELECT set_config('play.rating_epoch_admin','on',true)".query[String].unique *> action).transact(db.xa)
+
+  private def publicationFailure(db: PgGameStore): Resource[IO, Unit] =
+    val install = for
+      _ <- doobie.Fragment
+        .const("""CREATE FUNCTION play.synthetic_epoch_failure() RETURNS trigger LANGUAGE plpgsql AS
+                 $$ BEGIN RAISE EXCEPTION 'synthetic interruption'; END $$""")
+        .update
+        .run
+      _ <- sql"""CREATE TRIGGER synthetic_epoch_failure BEFORE INSERT ON play.bot_strength_snapshots
+                 FOR EACH ROW EXECUTE FUNCTION play.synthetic_epoch_failure()""".update.run
+    yield ()
+    val remove = for
+      _ <- sql"DROP TRIGGER synthetic_epoch_failure ON play.bot_strength_snapshots".update.run
+      _ <- sql"DROP FUNCTION play.synthetic_epoch_failure()".update.run
+    yield ()
+    Resource.make(install.transact(db.xa))(_ => remove.transact(db.xa))
 
   private def fixture[A](action: (PgGameStore, PgRatingEpochMigration) => IO[A]): IO[A] = withContainers { pg =>
     PgGameStore.resource(PgGameStore.Config(pg.jdbcUrl, pg.username, pg.password)).use { db =>
@@ -177,26 +193,39 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
     fixture { (db, tool) =>
       for
         (paused, run) <- staged(tool)
-        _             <- doobie.Fragment
-          .const("""CREATE FUNCTION play.synthetic_epoch_failure() RETURNS trigger LANGUAGE plpgsql AS
-                   $$ BEGIN RAISE EXCEPTION 'synthetic interruption'; END $$""")
-          .update
-          .run
-          .transact(db.xa)
-        _ <- sql"""CREATE TRIGGER synthetic_epoch_failure BEFORE INSERT ON play.bot_strength_snapshots
-                   FOR EACH ROW EXECUTE FUNCTION play.synthetic_epoch_failure()""".update.run.transact(db.xa)
-        failed  <- tool.activate(run.runId, paused.revision, run.planSha256).attempt
-        after   <- tool.probe
-        stage   <- tool.status(run.runId)
-        _       <- sql"DROP TRIGGER synthetic_epoch_failure ON play.bot_strength_snapshots".update.run.transact(db.xa)
-        _       <- sql"DROP FUNCTION play.synthetic_epoch_failure()".update.run.transact(db.xa)
+        _             <- publicationFailure(db).use { _ =>
+          for
+            failed <- tool.activate(run.runId, paused.revision, run.planSha256).attempt
+            after  <- tool.probe
+            stage  <- tool.status(run.runId)
+          yield
+            assert(failed.isLeft)
+            assertEquals(after, paused)
+            assertEquals(stage.phase, "staged")
+            assertEquals(stage.beforeStateSha256, None)
+        }
         applied <- tool.activate(run.runId, paused.revision, run.planSha256)
+      yield assertEquals(applied.phase, "applied")
+    }
+  }
+
+  test("publication failure trigger is removed when its test body fails") {
+    fixture { (db, _) =>
+      val bodyFailure = new RuntimeException("synthetic test body failure")
+      val insert      = admin(db) {
+        sql"""INSERT INTO play.bot_strength_snapshots(category,epoch,anchor_set_version,cutoff,is_current,payload)
+                 VALUES ('blitz',99,'cleanup-synthetic',$cutoff,false,'{"leaders":[]}'::jsonb)""".update.run
+      }
+      for
+        failed <- publicationFailure(db).use { _ =>
+          insert.attempt.flatMap { interrupted =>
+            IO(assert(interrupted.isLeft)) *> IO.raiseError[Unit](bodyFailure)
+          }
+        }.attempt
+        inserted <- insert
       yield
-        assert(failed.isLeft)
-        assertEquals(after, paused)
-        assertEquals(stage.phase, "staged")
-        assertEquals(stage.beforeStateSha256, None)
-        assertEquals(applied.phase, "applied")
+        assertEquals(failed, Left(bodyFailure))
+        assertEquals(inserted, 1)
     }
   }
 
@@ -310,6 +339,37 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
         assertEquals(RatingEpochPlan.validate(mismatched), Right(()))
         assert(rejected.isLeft)
         assertEquals(after, paused)
+    }
+  }
+
+  test("plan validation returns typed refusals for malformed bot bindings and projection identities") {
+    fixture { (db, tool) =>
+      val identity = game.white.externalId
+      val invalid  = Vector(
+        rebuilt.copy(identityIncarnations = rebuilt.identityIncarnations.updated(identity, "not-a-uuid")),
+        rebuilt.copy(identityIncarnations = rebuilt.identityIncarnations - identity + ("invalid-bot" -> white)),
+        rebuilt.copy(rows =
+          rebuilt.rows.map(row => if row.externalId == identity then row.copy(externalId = "invalid-bot") else row)
+        )
+      )
+      for
+        initial <- tool.probe
+        paused  <- tool.setPaused(initial.revision, true)
+        refused <- invalid.traverse { plan =>
+          tool
+            .stage(
+              plan.copy(config = plan.config.copy(databaseSourceSha256 = Some(paused.sourceSha256))),
+              paused.revision,
+              paused.sourceSha256
+            )
+            .attempt
+        }
+        after <- tool.probe
+        runs  <- sql"SELECT count(*) FROM play.rating_epoch_runs".query[Long].unique.transact(db.xa)
+      yield
+        assert(refused.forall { case Left(_: PgRatingEpochMigration.Refusal) => true; case _ => false })
+        assertEquals(after, paused)
+        assertEquals(runs, 0L)
     }
   }
 

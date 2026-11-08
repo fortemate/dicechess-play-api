@@ -48,8 +48,10 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
         ("ref/b", "candidate", 1.0 - score)
       )
     }
-    val cfg        = config.copy(whiteAdvantageElo = 95.0, maxCiWidthElo = Some(10000.0), seed = 19L)
-    val result     = AnchoredStrength.evaluate(groups, cfg)
+    val cfg =
+      config.copy(whiteAdvantageElo = 95.0, maxCiWidthElo = Some(10000.0), minOpponentsForAdmission = 1, seed = 19L)
+    val result = AnchoredStrength.evaluate(groups, cfg)
+    assertEquals(result.admitted.size, 3, "the neighbour LOS assertions must exercise admitted pairs")
     val base       = BradleyTerry.ratings(groups.flatten, cfg.whiteAdvantageElo)
     val baseOffset = anchors.scaleOffset(base).get
     val rng        = new scala.util.Random(cfg.seed)

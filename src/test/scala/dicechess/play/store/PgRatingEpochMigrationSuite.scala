@@ -21,6 +21,7 @@ import io.circe.generic.semiauto.deriveDecoder
 import io.circe.parser.parse
 
 import java.time.Instant
+import java.net.URI
 import java.util.UUID
 
 /** Synthetic rehearsal against the production migrations and a real PostgreSQL database. */
@@ -88,7 +89,12 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
     yield ()
     Resource.make(install.transact(db.xa))(_ => remove.transact(db.xa))
 
-  private def fixture[A](action: (PgGameStore, PgRatingEpochMigration) => IO[A]): IO[A] = withContainers { pg =>
+  private def fixture[A](action: (PgGameStore, PgRatingEpochMigration) => IO[A]): IO[A] =
+    fixtureWithPostgres((_, db, tool) => action(db, tool))
+
+  private def fixtureWithPostgres[A](
+      action: (PostgreSQLContainer, PgGameStore, PgRatingEpochMigration) => IO[A]
+  ): IO[A] = withContainers { pg =>
     PgGameStore.resource(PgGameStore.Config(pg.jdbcUrl, pg.username, pg.password)).use { db =>
       val seed = for
         _ <-
@@ -114,9 +120,35 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
         _ <- sql"""INSERT INTO play.bot_strength_snapshots(category,epoch,anchor_set_version,cutoff,is_current,payload)
                    VALUES ('blitz',1,'source-synthetic',$cutoff,true,'{"leaders":[]}'::jsonb)""".update.run
       yield ()
-      admin(db)(seed) *> action(db, PgRatingEpochMigration.fromStore(db))
+      admin(db)(seed) *> action(pg, db, PgRatingEpochMigration.fromStore(db))
     }
   }
+
+  private def postgresCommand(pg: PostgreSQLContainer, arguments: String*): IO[Unit] =
+    IO.blocking(pg.container.execInContainer(arguments*)).flatMap { result =>
+      if result.getExitCode == 0 then IO.unit
+      else IO.raiseError(new RuntimeException("PostgreSQL container utility failed"))
+    }
+
+  private def isolatedDatabase(pg: PostgreSQLContainer)(action: String => IO[Unit]): IO[Unit] =
+    val suffix = UUID.randomUUID().toString.replace("-", "")
+    val target = s"epoch_restore_$suffix"
+    val dump   = s"/tmp/epoch_restore_$suffix.dump"
+    val uri    = URI.create(pg.jdbcUrl.stripPrefix("jdbc:"))
+    val source = uri.getPath.stripPrefix("/")
+    Resource
+      .make(postgresCommand(pg, "createdb", "--username", pg.username, target)) { _ =>
+        postgresCommand(pg, "dropdb", "--if-exists", "--username", pg.username, target).attempt.flatMap { dropped =>
+          postgresCommand(pg, "rm", "-f", dump).attempt.flatMap(removed => (dropped *> removed).liftTo[IO])
+        }
+      }
+      .use { _ =>
+        val targetUrl =
+          s"jdbc:${new URI(uri.getScheme, uri.getUserInfo, uri.getHost, uri.getPort, s"/$target", uri.getQuery, uri.getFragment)}"
+        postgresCommand(pg, "pg_dump", "--format=custom", s"--file=$dump", "--username", pg.username, source) *>
+          postgresCommand(pg, "pg_restore", "--exit-on-error", s"--dbname=$target", "--username", pg.username, dump) *>
+          action(targetUrl)
+      }
 
   private def staged(
       tool: PgRatingEpochMigration,
@@ -145,6 +177,113 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
         assertEquals(after.sourceSha256, original.sourceSha256)
         assertEquals(run.phase, "staged")
         assert(after.activeEpoch.isEmpty)
+    }
+  }
+
+  test("a fresh executor acknowledges an applied activation without changing state") {
+    fixture { (db, tool) =>
+      for
+        (paused, run) <- staged(tool)
+        applied       <- tool.activate(run.runId, paused.revision, run.planSha256)
+        beforeProbe   <- tool.probe
+        beforeStatus  <- tool.status(run.runId)
+        reopened = PgRatingEpochMigration.fromStore(db)
+        acknowledged <- reopened.activate(run.runId, paused.revision, run.planSha256)
+        afterProbe   <- reopened.probe
+        afterStatus  <- reopened.status(run.runId)
+      yield
+        assertEquals(applied.phase, "applied")
+        assertEquals(acknowledged, beforeStatus)
+        assertEquals(afterStatus, beforeStatus)
+        assertEquals(afterProbe, beforeProbe)
+    }
+  }
+
+  test("a database dump restores an applied paused epoch for a fresh executor and guarded rollback") {
+    fixtureWithPostgres { (pg, db, tool) =>
+      val history =
+        sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id".query[String].to[List].transact(db.xa)
+      val snapshots =
+        sql"SELECT jsonb_build_object('category',category,'epoch',epoch,'anchorSet',anchor_set_version,'cutoff',cutoff,'payload',payload)::text FROM play.bot_strength_snapshots ORDER BY category,epoch"
+          .query[String]
+          .to[List]
+          .transact(db.xa)
+      val projections =
+        sql"""SELECT jsonb_build_object(
+               'bots',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY team,name,category) FROM play.bot_ratings r),'[]'::jsonb),
+               'users',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_ratings r),'[]'::jsonb),
+               'training',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_training_ratings r),'[]'::jsonb),
+               'counts',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.rating_epoch_counts r),'[]'::jsonb))::text"""
+          .query[String]
+          .unique
+          .transact(db.xa)
+      for
+        (paused, run)       <- staged(tool)
+        expectedProjections <- projections
+        applied             <- tool.activate(run.runId, paused.revision, run.planSha256)
+        active              <- tool.probe
+        expectedHistory     <- history
+        expectedSnapshots   <- snapshots
+        _                   <- isolatedDatabase(pg) { targetUrl =>
+          PgGameStore.resource(PgGameStore.Config(targetUrl, pg.username, pg.password)).use { restoredDb =>
+            val reopened = PgRatingEpochMigration.fromStore(restoredDb)
+            for
+              restoredStatus  <- reopened.status(run.runId)
+              restoredProbe   <- reopened.probe
+              restoredHistory <- sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id"
+                .query[String]
+                .to[List]
+                .transact(restoredDb.xa)
+              restoredSnapshots <-
+                sql"SELECT jsonb_build_object('category',category,'epoch',epoch,'anchorSet',anchor_set_version,'cutoff',cutoff,'payload',payload)::text FROM play.bot_strength_snapshots ORDER BY category,epoch"
+                  .query[String]
+                  .to[List]
+                  .transact(restoredDb.xa)
+              rolled       <- reopened.rollback(run.runId, restoredProbe.revision)
+              after        <- reopened.probe
+              afterHistory <- sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id"
+                .query[String]
+                .to[List]
+                .transact(restoredDb.xa)
+              afterSnapshots <-
+                sql"SELECT jsonb_build_object('category',category,'epoch',epoch,'anchorSet',anchor_set_version,'cutoff',cutoff,'payload',payload)::text FROM play.bot_strength_snapshots ORDER BY category,epoch"
+                  .query[String]
+                  .to[List]
+                  .transact(restoredDb.xa)
+              sourceCurrent <- sql"SELECT is_current FROM play.bot_strength_snapshots WHERE epoch=1"
+                .query[Boolean]
+                .unique
+                .transact(restoredDb.xa)
+              targetFlags <- sql"SELECT is_current FROM play.bot_strength_snapshots WHERE epoch=42 ORDER BY category"
+                .query[Boolean]
+                .to[List]
+                .transact(restoredDb.xa)
+              restoredProjections <- sql"""SELECT jsonb_build_object(
+                       'bots',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY team,name,category) FROM play.bot_ratings r),'[]'::jsonb),
+                       'users',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_ratings r),'[]'::jsonb),
+                       'training',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_training_ratings r),'[]'::jsonb),
+                       'counts',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.rating_epoch_counts r),'[]'::jsonb))::text"""
+                .query[String]
+                .unique
+                .transact(restoredDb.xa)
+            yield
+              assertEquals(applied.phase, "applied")
+              assert(active.paused)
+              assertEquals(restoredStatus, applied)
+              assertEquals(restoredProbe, active)
+              assertEquals(restoredHistory, expectedHistory)
+              assertEquals(restoredSnapshots, expectedSnapshots)
+              assertEquals(rolled.phase, "rolled_back")
+              assertEquals(after.activeEpoch, None)
+              assert(after.paused)
+              assertEquals(afterHistory, expectedHistory)
+              assertEquals(afterSnapshots, expectedSnapshots)
+              assertEquals(restoredProjections, expectedProjections)
+              assert(sourceCurrent)
+              assertEquals(targetFlags, List(false, false, false))
+          }
+        }
+      yield ()
     }
   }
 

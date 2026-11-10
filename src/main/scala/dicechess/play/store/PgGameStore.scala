@@ -2908,6 +2908,7 @@ final class PgGameStore private (
                  server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
           FROM play.game_results
           WHERE (rated = true OR rating_domain = 'training') AND rating_applied_at IS NULL
+            AND termination <> 'aborted'
           ORDER BY finished_at ASC
           LIMIT ${limit.toLong}"""
       .query[PgGameStore.ResultTuple]

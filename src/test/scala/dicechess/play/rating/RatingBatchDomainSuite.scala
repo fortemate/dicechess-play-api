@@ -206,6 +206,32 @@ class RatingBatchDomainSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  test("technical aborts in training remain terminal casual after the rating worker drains"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        for
+          player <- db.upsertOnLogin("fixture", "aborted-training", None, IO.pure("AbortedTrainer"))
+          _      <- db.register("anchor", "random", "hash-aborted-anchor")
+          id     <- GameId.random
+          snapshot = trainingFixture(Principal.User(player.id), Principal.Bot("anchor", "random"))
+            .copy(status = GameStatus.Ended(GameOver(GameResult.Win(Side.White), Termination.Aborted)))
+          _           <- db.save(id, snapshot)
+          before      <- db.ratingChangeFor(id)
+          queue       <- db.unappliedRatedGames(100)
+          _           <- matrixBatch(db).flatMap(_.tick)
+          after       <- db.ratingChangeFor(id)
+          training    <- db.trainingStatesOf(player.id)
+          competitive <- db.categoryRatingsOf(RatedIdentity.User(player.id))
+        yield
+          assertEquals(before.map(_.outcome), Some(RatingOutcome.Casual))
+          assert(!queue.exists(_.gameId == id), "a technical abort must never enter the drain")
+          assertEquals(after, before, "a worker tick must not stamp an abort skipped or applied")
+          assertEquals(after.map(_.applied), Some(false))
+          assert(training.isEmpty)
+          assert(competitive.isEmpty)
+      }
+    }
+
   test("under matrix policy, human playing against their own bot is skipped with reason"):
     withContainers { pg =>
       store(pg).use { db =>

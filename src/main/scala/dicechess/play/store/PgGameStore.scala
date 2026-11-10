@@ -2908,6 +2908,7 @@ final class PgGameStore private (
                  server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
           FROM play.game_results
           WHERE (rated = true OR rating_domain = 'training') AND rating_applied_at IS NULL
+            AND termination <> 'aborted'
           ORDER BY finished_at ASC
           LIMIT ${limit.toLong}"""
       .query[PgGameStore.ResultTuple]
@@ -4226,8 +4227,8 @@ object PgGameStore:
       ladder: Boolean,
       // The classification columns (#146). Kinds come from the principals' identity shape — a fact of the row. The
       // domain and policy version come from the snapshot and are `legacy`/0 for a snapshot written before they
-      // existed: unknown is recorded as unknown. `ratingOutcome` starts `pending` for a rated row (the batch has not
-      // visited it) and `casual` for one that will never be queued; the batch writes `applied`/`skipped`.
+      // existed: unknown is recorded as unknown. `ratingOutcome` starts `pending` for competitive or training work
+      // the batch has not visited, and `casual` for one that will never be queued; the batch writes `applied`/`skipped`.
       whiteKind: String,
       blackKind: String,
       ratedRequested: Option[Boolean],
@@ -4268,7 +4269,11 @@ object PgGameStore:
             // never enters the queue.
             ratingDomain = snapshot.ratingDomain.map(_.wireName).getOrElse(PgGameStore.LegacyDomain),
             ratingPolicyVersion = snapshot.ratingPolicyVersion.getOrElse(0),
-            ratingOutcome = if rated then RatingOutcome.Pending.wireName else RatingOutcome.Casual.wireName
+            // Training is deliberately not competitive-rated, but still awaits the asynchronous training worker.
+            ratingOutcome =
+              if !aborted && (rated || snapshot.ratingDomain.contains(RatingDomain.Training)) then
+                RatingOutcome.Pending.wireName
+              else RatingOutcome.Casual.wireName
           )
         }
 

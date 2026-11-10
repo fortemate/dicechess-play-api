@@ -222,6 +222,22 @@ class RatingAcceptanceSuite extends munit.CatsEffectSuite with TestContainerForA
               Principal.Bot("fixture", "reference"),
               TimeControl.Fischer(300, 3)
             )
+            trainingPending <- read(app, s"/games/${training.value}/rating")
+            pendingResponse <- app.run(
+              Request[IO](Method.GET, Uri.unsafeFromString(s"/games/${training.value}/rating"))
+            )
+            _ <- IO:
+              assertEquals(trainingPending.hcursor.get[Boolean]("applied"), Right(false))
+              assertEquals(trainingPending.hcursor.get[String]("outcome"), Right("pending"))
+              assertEquals(trainingPending.hcursor.get[String]("ratingDomain"), Right("training"))
+              assertEquals(
+                trainingPending.hcursor.downField("trainingReference").get[String]("source"),
+                Right("anchor")
+              )
+              assert(
+                pendingResponse.headers.headers
+                  .exists(h => h.name.toString.equalsIgnoreCase("Cache-Control") && h.value == "no-store")
+              )
             _              <- batch.tick
             trained        <- read(app, s"/games/${training.value}/rating")
             trainedProfile <- read(app, "/players/by-nickname/AcceptanceAlice")
@@ -230,6 +246,10 @@ class RatingAcceptanceSuite extends munit.CatsEffectSuite with TestContainerForA
               assertEquals(trained.hcursor.get[String]("ratingDomain"), Right("training"))
               assertEquals(trained.hcursor.get[String]("outcome"), Right("applied"))
               assertEquals(trained.hcursor.downField("trainingReference").get[String]("source"), Right("anchor"))
+              assertEquals(
+                trained.hcursor.downField("trainingReference").focus,
+                trainingPending.hcursor.downField("trainingReference").focus
+              )
               val states = trainedProfile.hcursor.get[List[Json]]("training").toOption.get
               assertEquals(states.size, 1)
               assertEquals(states.head.hcursor.get[String]("category"), Right("blitz"))

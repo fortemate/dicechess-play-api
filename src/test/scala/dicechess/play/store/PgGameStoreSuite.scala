@@ -2356,11 +2356,13 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             .unique
             .transact(xa)
         for
-          rated  <- GameId.random
-          casual <- GameId.random
-          legacy <- GameId.random
-          abort  <- GameId.random
-          _      <- db.save(
+          rated         <- GameId.random
+          training      <- GameId.random
+          casual        <- GameId.random
+          trainingAbort <- GameId.random
+          legacy        <- GameId.random
+          abort         <- GameId.random
+          _             <- db.save(
             rated,
             endedResultFixture(human, bot, rated = true).copy(
               ratedRequested = Some(true),
@@ -2369,7 +2371,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             )
           )
           _ <- db.save(
-            casual,
+            training,
             endedResultFixture(bot, human, rated = false).copy(
               ratedRequested = Some(true),
               ratingDomain = Some(RatingDomain.Training),
@@ -2377,6 +2379,14 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             )
           )
           // A snapshot from before the classification existed: no keys at all.
+          _ <- db.save(casual, endedResultFixture(human, bot).copy(ratingDomain = Some(RatingDomain.Casual)))
+          _ <- db.save(
+            trainingAbort,
+            endedResultFixture(human, bot, termination = Termination.Aborted).copy(
+              ratingDomain = Some(RatingDomain.Training),
+              ratingPolicyVersion = Some(2)
+            )
+          )
           _ <- db.save(legacy, endedResultFixture(Principal.Guest("b146-guest"), bot, rated = true))
           _ <- db.save(
             abort,
@@ -2386,13 +2396,17 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
               ratingPolicyVersion = Some(1)
             )
           )
-          r <- columns(rated)
-          c <- columns(casual)
-          l <- columns(legacy)
-          a <- columns(abort)
+          r  <- columns(rated)
+          t  <- columns(training)
+          c  <- columns(casual)
+          ta <- columns(trainingAbort)
+          l  <- columns(legacy)
+          a  <- columns(abort)
         yield
           assertEquals(r, ("human", "bot", Some(true), "competitive", 1, "pending", None))
-          assertEquals(c, ("bot", "human", Some(true), "training", 2, "casual", None), "training: recorded, not queued")
+          assertEquals(t, ("bot", "human", Some(true), "training", 2, "pending", None), "training awaits its worker")
+          assertEquals(c._6, "casual", "genuine casual games are terminal")
+          assertEquals(ta._6, "casual", "aborted training has no sporting outcome")
           assertEquals(l, ("guest", "bot", None, "legacy", 0, "pending", None), "unknown stays unknown, kinds derive")
           assertEquals(a._6, "casual", "a technical abort has no sporting outcome and is never queued")
           assertEquals(a._4, "competitive", "…but its creation-time classification is kept as the fact it is")

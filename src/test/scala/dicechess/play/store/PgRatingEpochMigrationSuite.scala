@@ -9,7 +9,7 @@ import dicechess.play.rating.{CapturedTrainingReference, Glicko, TrainingReferen
 import dicechess.play.rating.migration.RatingEpochPlan
 import dicechess.play.rating.migration.RatingEpochPlan.*
 import dicechess.play.server.{Leaderboard, LeaderboardRoutes}
-import doobie.ConnectionIO
+import doobie.{ConnectionIO, Transactor}
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 import munit.CatsEffectSuite
@@ -73,6 +73,31 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
   private def admin[A](db: PgGameStore)(action: ConnectionIO[A]): IO[A] =
     (sql"SELECT set_config('play.rating_epoch_admin','on',true)".query[String].unique *> action).transact(db.xa)
 
+  private def historyOf(xa: Transactor[IO]): IO[List[String]] =
+    sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id".query[String].to[List].transact(xa)
+
+  private def snapshotsOf(xa: Transactor[IO]): IO[List[String]] =
+    sql"SELECT jsonb_build_object('category',category,'epoch',epoch,'anchorSet',anchor_set_version,'cutoff',cutoff,'payload',payload)::text FROM play.bot_strength_snapshots ORDER BY category,epoch"
+      .query[String]
+      .to[List]
+      .transact(xa)
+
+  private def projectionsOf(xa: Transactor[IO]): IO[String] =
+    sql"""SELECT jsonb_build_object(
+           'bots',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY team,name,category) FROM play.bot_ratings r),'[]'::jsonb),
+           'users',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_ratings r),'[]'::jsonb),
+           'training',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_training_ratings r),'[]'::jsonb),
+           'counts',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.rating_epoch_counts r),'[]'::jsonb))::text"""
+      .query[String]
+      .unique
+      .transact(xa)
+
+  private def assertProjectionCollectionsPopulated(value: String): Unit =
+    val json = parse(value).toOption.get
+    List("bots", "users", "training", "counts").foreach { collection =>
+      assert(json.hcursor.get[List[Json]](collection).toOption.exists(_.nonEmpty), s"$collection projection is empty")
+    }
+
   private def publicationFailure(db: PgGameStore): Resource[IO, Unit] =
     val install = for
       _ <- doobie.Fragment
@@ -127,7 +152,13 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
   private def postgresCommand(pg: PostgreSQLContainer, arguments: String*): IO[Unit] =
     IO.blocking(pg.container.execInContainer(arguments*)).flatMap { result =>
       if result.getExitCode == 0 then IO.unit
-      else IO.raiseError(new RuntimeException("PostgreSQL container utility failed"))
+      else
+        val utility = arguments.headOption.getOrElse("unknown utility")
+        IO.raiseError(
+          new RuntimeException(
+            s"PostgreSQL utility $utility failed with exit code ${result.getExitCode}: ${result.getStderr}"
+          )
+        )
     }
 
   private def isolatedDatabase(pg: PostgreSQLContainer)(action: String => IO[Unit]): IO[Unit] =
@@ -201,70 +232,85 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
 
   test("a database dump restores an applied paused epoch for a fresh executor and guarded rollback") {
     fixtureWithPostgres { (pg, db, tool) =>
-      val history =
-        sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id".query[String].to[List].transact(db.xa)
-      val snapshots =
-        sql"SELECT jsonb_build_object('category',category,'epoch',epoch,'anchorSet',anchor_set_version,'cutoff',cutoff,'payload',payload)::text FROM play.bot_strength_snapshots ORDER BY category,epoch"
-          .query[String]
-          .to[List]
-          .transact(db.xa)
-      val projections =
-        sql"""SELECT jsonb_build_object(
-               'bots',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY team,name,category) FROM play.bot_ratings r),'[]'::jsonb),
-               'users',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_ratings r),'[]'::jsonb),
-               'training',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_training_ratings r),'[]'::jsonb),
-               'counts',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.rating_epoch_counts r),'[]'::jsonb))::text"""
-          .query[String]
-          .unique
-          .transact(db.xa)
+      val competitiveUser = UUID.randomUUID()
+      val trainingUser    = UUID.randomUUID()
+      val competitiveGame = game.copy(
+        gameId = "fixture-human-competitive",
+        finishedAt = cutoff.minusSeconds(2),
+        origin = GameOrigin.Legacy,
+        ladder = false,
+        white = SourceSeat(s"user:$competitiveUser", ParticipantKind.Human, Some(IdentityContinuity(evidence))),
+        black = SourceSeat(s"user:$trainingUser", ParticipantKind.Human, Some(IdentityContinuity(evidence))),
+        classification = Some(ClassificationEvidence(2, true, true, RatingDomain.Competitive, evidence))
+      )
+      val trainingGame = game.copy(
+        gameId = "fixture-human-training",
+        finishedAt = cutoff.minusSeconds(3),
+        origin = GameOrigin.Legacy,
+        ladder = false,
+        white = SourceSeat(s"user:$trainingUser", ParticipantKind.Human, Some(IdentityContinuity(evidence))),
+        classification = Some(ClassificationEvidence(2, true, false, RatingDomain.Training, evidence)),
+        reference = CapturedTrainingReference.Recorded(
+          TrainingReference(TrainingReferenceSource.Anchor("synthetic-anchors", 1), Glicko(1550, 60, 0.06))
+        )
+      )
+      val plan = RatingEpochPlan.build(config, Iterator(trainingGame, competitiveGame, game)).toOption.get
+      val seedSourceProjections = admin(db) {
+        sql"""INSERT INTO play.users(id,nickname) VALUES
+               ($competitiveUser,'epoch-migration-competitive'),($trainingUser,'epoch-migration-training')""".update.run *>
+          sql"""INSERT INTO play.user_ratings(user_id,category,rating,rd,vol)
+                 VALUES ($competitiveUser,'blitz',1234,91,0.08)""".update.run *>
+          sql"""INSERT INTO play.user_training_ratings
+                 (user_id,category,rating,rd,vol,games,wins,draws,losses,updated_at,computed_at)
+                 VALUES ($trainingUser,'blitz',1321,88,0.07,3,2,1,0,$cutoff,$cutoff)""".update.run *>
+          sql"""INSERT INTO play.rating_epoch_counts
+                 (participant_external_id,category,games,wins,draws,losses)
+                 VALUES (${s"user:$competitiveUser"},'blitz',4,2,0,2)""".update.run
+      }
       for
-        (paused, run)       <- staged(tool)
-        expectedProjections <- projections
-        applied             <- tool.activate(run.runId, paused.revision, run.planSha256)
-        active              <- tool.probe
-        expectedHistory     <- history
-        expectedSnapshots   <- snapshots
-        _                   <- isolatedDatabase(pg) { targetUrl =>
+        _                 <- seedSourceProjections
+        sourceState       <- projectionsOf(db.xa)
+        _                 <- IO(assertProjectionCollectionsPopulated(sourceState))
+        (paused, run)     <- staged(tool, plan)
+        applied           <- tool.activate(run.runId, paused.revision, run.planSha256)
+        active            <- tool.probe
+        activeProjections <- projectionsOf(db.xa)
+        expectedHistory   <- historyOf(db.xa)
+        expectedSnapshots <- snapshotsOf(db.xa)
+        _                 <- IO(assertProjectionCollectionsPopulated(activeProjections))
+        _                 <- IO {
+          val source = parse(sourceState).toOption.get
+          val active = parse(activeProjections).toOption.get
+          List("bots", "users", "training", "counts").foreach { collection =>
+            assertNotEquals(
+              active.hcursor.downField(collection).focus,
+              source.hcursor.downField(collection).focus,
+              s"$collection projection did not change during activation"
+            )
+          }
+        }
+        _ <- isolatedDatabase(pg) { targetUrl =>
           PgGameStore.resource(PgGameStore.Config(targetUrl, pg.username, pg.password)).use { restoredDb =>
             val reopened = PgRatingEpochMigration.fromStore(restoredDb)
             for
-              restoredStatus  <- reopened.status(run.runId)
-              restoredProbe   <- reopened.probe
-              restoredHistory <- sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id"
-                .query[String]
-                .to[List]
-                .transact(restoredDb.xa)
-              restoredSnapshots <-
-                sql"SELECT jsonb_build_object('category',category,'epoch',epoch,'anchorSet',anchor_set_version,'cutoff',cutoff,'payload',payload)::text FROM play.bot_strength_snapshots ORDER BY category,epoch"
-                  .query[String]
-                  .to[List]
-                  .transact(restoredDb.xa)
-              rolled       <- reopened.rollback(run.runId, restoredProbe.revision)
-              after        <- reopened.probe
-              afterHistory <- sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id"
-                .query[String]
-                .to[List]
-                .transact(restoredDb.xa)
-              afterSnapshots <-
-                sql"SELECT jsonb_build_object('category',category,'epoch',epoch,'anchorSet',anchor_set_version,'cutoff',cutoff,'payload',payload)::text FROM play.bot_strength_snapshots ORDER BY category,epoch"
-                  .query[String]
-                  .to[List]
-                  .transact(restoredDb.xa)
-              sourceCurrent <- sql"SELECT is_current FROM play.bot_strength_snapshots WHERE epoch=1"
+              restoredStatus            <- reopened.status(run.runId)
+              restoredProbe             <- reopened.probe
+              restoredActiveProjections <- projectionsOf(restoredDb.xa)
+              restoredHistory           <- historyOf(restoredDb.xa)
+              restoredSnapshots         <- snapshotsOf(restoredDb.xa)
+              _                         <- IO(assertEquals(restoredActiveProjections, activeProjections))
+              rolled                    <- reopened.rollback(run.runId, restoredProbe.revision)
+              after                     <- reopened.probe
+              restoredSourceProjections <- projectionsOf(restoredDb.xa)
+              afterHistory              <- historyOf(restoredDb.xa)
+              afterSnapshots            <- snapshotsOf(restoredDb.xa)
+              sourceCurrent             <- sql"SELECT is_current FROM play.bot_strength_snapshots WHERE epoch=1"
                 .query[Boolean]
                 .unique
                 .transact(restoredDb.xa)
               targetFlags <- sql"SELECT is_current FROM play.bot_strength_snapshots WHERE epoch=42 ORDER BY category"
                 .query[Boolean]
                 .to[List]
-                .transact(restoredDb.xa)
-              restoredProjections <- sql"""SELECT jsonb_build_object(
-                       'bots',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY team,name,category) FROM play.bot_ratings r),'[]'::jsonb),
-                       'users',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_ratings r),'[]'::jsonb),
-                       'training',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_training_ratings r),'[]'::jsonb),
-                       'counts',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.rating_epoch_counts r),'[]'::jsonb))::text"""
-                .query[String]
-                .unique
                 .transact(restoredDb.xa)
             yield
               assertEquals(applied.phase, "applied")
@@ -276,9 +322,9 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
               assertEquals(rolled.phase, "rolled_back")
               assertEquals(after.activeEpoch, None)
               assert(after.paused)
+              assertEquals(restoredSourceProjections, sourceState)
               assertEquals(afterHistory, expectedHistory)
               assertEquals(afterSnapshots, expectedSnapshots)
-              assertEquals(restoredProjections, expectedProjections)
               assert(sourceCurrent)
               assertEquals(targetFlags, List(false, false, false))
           }
@@ -289,8 +335,7 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
 
   test("reset activation and exact rollback preserve recorded history and source snapshot") {
     fixture { (db, tool) =>
-      val history =
-        sql"SELECT to_jsonb(g)::text FROM play.game_results g ORDER BY game_id".query[String].to[List].transact(db.xa)
+      val history = historyOf(db.xa)
       for
         original         <- tool.probe
         before           <- history

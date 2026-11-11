@@ -19,7 +19,8 @@ final case class TurnRecord(
     dice: List[Int],
     moves: List[String],
     fenAfter: String,
-    thinkingTimeMs: Option[Long] = None
+    thinkingTimeMs: Option[Long] = None,
+    labChoice: Option[LaboratoryProtocol.HistoryChoice] = None
 )
 
 object TurnRecord:
@@ -89,8 +90,13 @@ final case class GameSnapshot(
     // Whether a draw offer is currently pending (#327). `None` when no offer is pending.
     pendingDrawOffer: Option[Seat] = None,
     // The seat that last offered a draw, for the alternation anti-spam rule (#327).
-    lastDrawOfferer: Option[Seat] = None
+    lastDrawOfferer: Option[Seat] = None,
+    variant: Option[LaboratoryProtocol.VariantIdentity] = None,
+    lab: Option[LaboratoryStorage.State] = None
 ):
+  /** Absence is resolved only by this known legacy storage shape, never by a new laboratory creation request. */
+  def effectiveVariant: LaboratoryProtocol.VariantIdentity = variant.getOrElse(LaboratoryProtocol.Classic)
+
   def ended: Boolean = status match
     case GameStatus.Ended(_) => true
     case GameStatus.Active   => false
@@ -107,12 +113,43 @@ object GameSnapshot:
   // Private storage codecs (NOT the public wire): reuse the protocol's shapes where they exist, and encode
   // seat-keyed maps by case name so a snapshot stays readable in psql.
   import dicechess.play.wire.Codecs.given
+  import dicechess.play.wire.LaboratoryCodecs
+  import dicechess.play.wire.LaboratoryCodecs.given
 
   private given KeyEncoder[Seat] = KeyEncoder.encodeKeyString.contramap(_.toString)
   private given KeyDecoder[Seat] = KeyDecoder.instance(s => Seat.values.find(_.toString == s))
 
-  given Codec[TurnRecord]   = deriveCodec
-  given Codec[GameSnapshot] = deriveCodec
+  private val turnCodec: Codec[TurnRecord]          = deriveCodec
+  given LaboratoryCodecs.ValidatedCodec[TurnRecord] = LaboratoryCodecs.checked(
+    Codec.from(
+      turnCodec,
+      Encoder.instance(t => turnCodec(t).mapObject(obj => if t.labChoice.isEmpty then obj.remove("labChoice") else obj))
+    )
+  )(LaboratoryStorage.validateTurnRecord)
+
+  private val snapshotCodec: Codec[GameSnapshot]      = deriveCodec
+  given LaboratoryCodecs.ValidatedCodec[GameSnapshot] = LaboratoryCodecs.checked(
+    Codec.from(
+      Decoder.instance(c =>
+        for
+          snapshot <- snapshotCodec(c)
+          _        <-
+            if c.value.asObject.exists(_.contains("variant")) then
+              c.get[LaboratoryProtocol.VariantIdentity]("variant").void
+            else Right(())
+          _ <-
+            if c.value.asObject.exists(_.contains("lab")) then c.get[LaboratoryStorage.State]("lab").void
+            else Right(())
+        yield snapshot
+      ),
+      Encoder.instance(s =>
+        snapshotCodec(s).mapObject { obj =>
+          val withVariant = if s.variant.isEmpty then obj.remove("variant") else obj
+          if s.lab.isEmpty then withVariant.remove("lab") else withVariant
+        }
+      )
+    )
+  )(LaboratoryStorage.validateSnapshot)
 
 /** Persistence seam for game snapshots. `save` upserts by game id; `loadActive` returns every game to resume on boot.
   */

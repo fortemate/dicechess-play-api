@@ -312,10 +312,16 @@ final class PgGameStore private (
     * projected out of the JSON so reconciliation and aggregation never have to decode it.
     */
   def save(id: GameId, snapshot: GameSnapshot): IO[Unit] =
-    Console[IO]
-      .errorln(s"[play][store] ended game ${id.value} produced no game_results row: players=${snapshot.players.keySet}")
-      .whenA(snapshot.ended && PgGameStore.finishedGameOf(snapshot).isEmpty) *>
-      saveTransaction(id, snapshot).transact(xa).timed("save")
+    if snapshot.effectiveVariant != dicechess.play.core.LaboratoryProtocol.Classic || snapshot.lab.nonEmpty ||
+      snapshot.turns.exists(_.labChoice.isDefined)
+    then IO.raiseError(LaboratoryStorageFailure("laboratory snapshot cannot enter the classic store"))
+    else
+      Console[IO]
+        .errorln(
+          s"[play][store] ended game ${id.value} produced no game_results row: players=${snapshot.players.keySet}"
+        )
+        .whenA(snapshot.ended && PgGameStore.finishedGameOf(snapshot).isEmpty) *>
+        saveTransaction(id, snapshot).transact(xa).timed("save")
 
   private def saveTransaction(
       id: GameId,
@@ -325,7 +331,10 @@ final class PgGameStore private (
     val status = if snapshot.ended then "ended" else "active"
     val origin = snapshot.effectiveOrigin.wireName
     val upsert =
-      sql"""INSERT INTO play.games (id, status, snapshot, origin)
+      if snapshot.effectiveVariant != dicechess.play.core.LaboratoryProtocol.Classic || snapshot.lab.nonEmpty ||
+        snapshot.turns.exists(_.labChoice.isDefined)
+      then LaboratoryStorageFailure("laboratory snapshot cannot enter the classic store").raiseError[ConnectionIO, Int]
+      else sql"""INSERT INTO play.games (id, status, snapshot, origin)
             VALUES (${id.value}::uuid, $status, ${snapshot.asJson}, $origin)
             ON CONFLICT (id) DO UPDATE
             SET status = EXCLUDED.status, snapshot = EXCLUDED.snapshot, origin = EXCLUDED.origin,

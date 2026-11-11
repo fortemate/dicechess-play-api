@@ -298,6 +298,79 @@ not UI-only controls. Exporting from the lab is not promotion into the main anal
 The laboratory can be retired after export; arbitrary variant editing and a permanent service
 are not requirements.
 
+### Storage implementation
+
+`PgLaboratoryStore` implements the private `LaboratoryStore` seam over a **dedicated PostgreSQL
+database**. Its independent Flyway location is `classpath:db/laboratory`, with schema and migration
+history in `laboratory`. The classic `db/migration` line is unchanged. Before creating anything,
+the laboratory migrator refuses a database containing user tables or views outside that schema,
+including a classic fixture database or an analytics database. It never converts a classic database
+into a laboratory database. Runtime configuration and wiring belong to
+[issue 293](https://github.com/fortemate/dicechess-play-api/issues/293).
+
+The existing private `GameSnapshot` has optional `variant` and `lab` extensions, and completed
+`TurnRecord` values have an optional `labChoice`. Absent fields decode as classic only in this known
+legacy snapshot shape. Explicit null identities, unsupported revisions, missing laboratory context,
+invalid generated/revealed offers and mismatched public phases are errors. Integration code uses
+the typed `encodeValidated` boundary. Classic snapshots keep their previous field shapes when the
+extensions are absent, and the classic PostgreSQL writer rejects laboratory snapshots.
+
+The private laboratory context captures the protocol and rules/dice provenance, initial position,
+both generated offers, reveal count, accepted choice, frozen effective seed inputs, initial-join
+deadline and observed join history, terminal reveal permission and per-seat command receipts.
+The existing snapshot retains clocks, seat credentials, submitted seeds, draw state, status and
+completed micro-moves. A receipt stores the parsed command, including its original expected version,
+as the semantic retry fingerprint. It is never part of the public history. Live connection presence
+must still be checked by the room; stored join history alone is not presence after recovery.
+
+`commit(gameId, expectedVersion, snapshot)` is the persist-before-broadcast boundary: `None` strictly
+creates, and `Some` fences an update against the stored version. A per-game transaction lock covers
+the snapshot, public transcript, result and receipt list. Existing rows are locked against concurrent
+expiry cleanup. The room broadcasts and acknowledges only
+after `Applied`; an exact retry returns `Unchanged`, and a stale or competing write returns `Conflict`.
+Creation identity/settings, captured provenance and frozen seed inputs are immutable. History and
+receipts are append-only; generated offers, reveal progress and a confirmed choice cannot be rewritten
+within the same macro-turn. This storage seam does not decide move legality or implement room transitions.
+
+The `games`, `results`, `transcripts` and `rematches` projections retain variant id/revision in ordinary
+columns, with foreign-key agreement between them. `results` also preserves technical aborts with a
+null sporting result. `transcripts` is refreshed on every accepted save, including waiting and
+interrupted games. Its schema-1 payload follows the exact export fields above; public reads decode
+and re-encode that shape, excluding unknown private-shaped fields. A terminal save is immutable and
+idempotent. A sporting export is complete only with permitted fairness evidence; aborts stay incomplete.
+
+`createRematch` atomically stores one successor and the inherited variant, protocol and time control.
+The successor starts at `AwaitingPlayers` with new private credentials and seed, empty history/receipts
+and no frozen client inputs. Retries return the existing successor rather than creating another game.
+The caller is responsible for both authenticated consents and the live startup gate.
+
+### Bounded retention and export
+
+The storage default is **30 days from database creation of each game**, configurable between 1 and
+365 days for an experiment. Accepted transitions, reconnects, retries and terminal saves do not move
+that deadline. All records share it: active and incomplete snapshots, aborted and sporting results,
+public transcripts and private command receipts. Expired records are immediately unavailable to
+recovery/export and cannot be revived by a save. `pruneExpired` removes at most 1,000 games per batch,
+with dependent records deleted by foreign keys. The compatibility `GameStore.save` seam creates only
+a fresh version-zero invitation; it cannot recreate a missing in-flight game after pruning. Explicit
+`commit(..., None, ...)` is a trusted strict-insert boundary: creation callers must mint a fresh game id,
+and local/test fixture bootstrap can insert an already-interrupted snapshot. A successor has its own deadline; expiration of its
+source removes the old rematch link, not the successor's transcript.
+
+Export the sanitized transcript through `transcriptFor` before its deadline; it is also available for
+active/incomplete and technically aborted games. There is no automatic export into analytics and no
+indefinite laboratory archive. Scheduling pruning and providing the deployment/export surface belong
+to the isolated runtime tasks. No shared database migration or service deployment is part of this change.
+
+The storage tests use disposable Testcontainers databases: a fresh laboratory database, a V1 classic
+fixture upgraded through its own migrations, refusal to migrate that classic database as laboratory,
+interrupted-stage recovery, atomic rollback, concurrent version fencing, sanitized archive/export,
+terminal retries, rematch inheritance and expiry. Run the focused suites with:
+
+```sh
+sbt 'testOnly dicechess.play.store.LaboratorySnapshotSuite dicechess.play.store.PgLaboratoryStoreSuite'
+```
+
 ## Independent two-dice qualification
 
 `TwoDiceRulesSuite` uses manually specified positions/UCI witnesses through `EngineOps` and the

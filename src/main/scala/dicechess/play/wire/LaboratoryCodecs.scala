@@ -19,7 +19,7 @@ object LaboratoryCodecs:
     */
   final class ValidatedCodec[A] private[LaboratoryCodecs] (
       codec: Codec[A],
-      private[LaboratoryCodecs] val validateValue: A => Either[String, A]
+      private[play] val validateValue: A => Either[String, A]
   ) extends Codec[A]:
     private val decoder = codec.emap(validateValue)
 
@@ -34,7 +34,7 @@ object LaboratoryCodecs:
   def encodeValidated[A](value: A)(using codec: ValidatedCodec[A]): Either[EncodingFailure, Json] =
     codec.encodeValidated(value)
 
-  private def checked[A](codec: Codec[A])(validate: A => Either[String, A]): ValidatedCodec[A] =
+  private[play] def checked[A](codec: Codec[A])(validate: A => Either[String, A]): ValidatedCodec[A] =
     new ValidatedCodec(codec, validate)
 
   // Composite validation precedes encoding, so a bad nested value returns Left without invoking a throwing adapter.

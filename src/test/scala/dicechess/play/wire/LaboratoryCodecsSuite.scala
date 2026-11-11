@@ -2,6 +2,7 @@ package dicechess.play.wire
 
 import dicechess.play.core.*
 import dicechess.play.core.LaboratoryProtocol.*
+import dicechess.play.wire.LaboratoryCodecs.{EncodingFailure, encodeValidated}
 import dicechess.play.wire.LaboratoryCodecs.given
 import io.circe.{Codec, Json}
 import io.circe.parser.{decode, parse}
@@ -55,8 +56,47 @@ class LaboratoryCodecsSuite extends munit.FunSuite:
     assert(
       decode[PublicTurn]("""{"phase":"PlayingSelectedPair","offers":[[1,3],[1,4]],"selectedPairIndex":null}""").isLeft
     )
-    intercept[IllegalArgumentException]:
-      PublicTurn(Phase.AwaitingSecondRoll, List(first, second), None).asJson
+    assertEquals(
+      encodeValidated(PublicTurn(Phase.AwaitingSecondRoll, List(first, second), None)),
+      Left(EncodingFailure("offers and selectedPairIndex do not match the public phase"))
+    )
+
+  test("standalone pair encoding returns typed bounds failures and preserves valid JSON"):
+    List(DicePair(0, 7), DicePair(1, 0), DicePair(7, 1)).foreach: pair =>
+      assertEquals(encodeValidated(pair), Left(EncodingFailure("each die must be in 1..6")))
+    assertEquals(encodeValidated(DicePair(1, 6)), Right(json("[1,6]")))
+    assertEquals(DicePair(1, 6).asJson, json("[1,6]"))
+
+  test("validated encoding rejects nested values before a Circe adapter can throw"):
+    val badTurn      = PublicTurn(Phase.AwaitingSecondRoll, List(first, second), None)
+    val badLab       = PublicState(TwoPairs, ProtocolVersion, provenance, badTurn)
+    val event        = TurnChangedFrame(TurnChanged(2, Seat.White, badLab, EngineInitial, None))
+    val stageFailure = Left(EncodingFailure("offers and selectedPairIndex do not match the public phase"))
+    assertEquals(encodeValidated(badLab), stageFailure)
+    assertEquals(encodeValidated(event), stageFailure)
+    assertEquals(
+      encodeValidated(CommandFrame(Command("choice", 3, Action.ChoosePair(2)))),
+      Left(EncodingFailure("pairIndex must be 0 or 1"))
+    )
+    assertEquals(
+      encodeValidated(
+        badLab.copy(
+          turn = PublicTurn(Phase.AwaitingFirstRoll, Nil, None),
+          provenance = Provenance(RulesVersion.value, "unknown")
+        )
+      ),
+      Left(EncodingFailure("unsupported dice algorithm or missing captured rules version"))
+    )
+    assertEquals(
+      encodeValidated(RejectionFrame(Rejection(-1, None, ErrorCode.InvalidCommand, "invalid", false))),
+      Left(EncodingFailure("invalid rejection version or commandId"))
+    )
+    assertEquals(
+      encodeValidated(ReceiptFrame(Receipt("receipt", -1))),
+      Left(EncodingFailure("invalid receipt version or commandId"))
+    )
+    val valid = CommandFrame(Command("choice", 3, Action.ChoosePair(1)))
+    assertEquals(encodeValidated(valid), Right(valid.asJson))
 
   test("equal offers keep distinct indices and unusable choices remain representable"):
     roundtrip(HistoryChoice(List(first, first), 0))

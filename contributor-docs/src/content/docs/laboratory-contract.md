@@ -57,8 +57,10 @@ commands retain their room authorization and termination/draw policies. They do 
 or bypass readiness. A seed is accepted once before startup freezes seed inputs; reseeding after
 that point is refused/ignored consistently with the existing seed policy.
 
-Theme preference is browser presentation state: Light / Dark / System selects between two
-semantic palettes. It is absent from variant identity, commands, stored rules and exports.
+The [approved design decision](https://github.com/fortemate/dicechess-play/issues/222#accepted-laboratory-appearance-direction-2026-11-11),
+carried into [the client task](https://github.com/fortemate/dicechess-play/issues/223), specifies
+Light / Dark / System browser presentation. At this contract boundary, theme preference is absent
+from variant identity, commands, stored rules and exports.
 This laboratory does not require the broader
 [engine variant architecture](https://github.com/fortemate/dicechess-engine/issues/420).
 
@@ -85,6 +87,13 @@ requests are refused, and responding does not roll dice automatically.
 In `Ended`, a non-null selection still requires two offers. The public type/codec exposes only
 revealed offers; it has no private full-offer or seed field. Invalid stage/cardinality combinations
 are refused on decode and fail closed on encode rather than publishing a second offer early.
+
+Integration code uses `LaboratoryCodecs.encodeValidated(value)`, returning
+`Either[EncodingFailure, Json]`. It validates the complete nested value before invoking any encoder,
+so an invalid standalone pair, nested command or public stage produces a typed failure without
+using exceptions as control flow. The conventional Circe `Encoder` retains a fail-closed invariant
+guard for accidental direct `.asJson` calls with invalid values; it must never substitute partial
+or empty JSON for a rejected value.
 
 At each turn, both offers are fixed by committed seed inputs and stable turn/offer identities,
 independent of the position, elapsed time, commands and reconnects. Issue 291 specifies the

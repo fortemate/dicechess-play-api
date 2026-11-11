@@ -58,6 +58,7 @@ export default defineConfig({
 						{ label: 'Architecture', link: '/architecture/' },
 						{ label: 'Concurrency Doctrine', link: '/concurrency/' },
 						{ label: 'HvH Offers and Rematches', link: '/hvh-offers/' },
+						{ label: 'Two-pair Laboratory Contract', link: '/laboratory-contract/' },
 						{ label: 'Stake Doubling ADR', link: '/stake-doubling/' },
 						{ label: 'Configuration', link: '/configuration/' },
 					],

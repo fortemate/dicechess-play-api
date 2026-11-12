@@ -1,0 +1,368 @@
+{
+  "algorithm": "choice-2x2d6-hmac-sha256-v1",
+  "vectors": [
+    {
+      "name": "ascending-alice-bob-turn-0",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "alice",
+        "black": "bob"
+      },
+      "turnNumber": 0,
+      "offers": [
+        [
+          6,
+          3
+        ],
+        [
+          2,
+          5
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005616c69636500000003626f62000000000000000000",
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005616c69636500000003626f62000000000000000001"
+      ],
+      "firstBlocks": [
+        "95e0683ad8eb3b6814e09375d60d6626c7e29fbb3b59404b2550c17b5080f397",
+        "8bb2965eb2ea45683855579abb4414fdf7a37d97187015dfeacd259e742860e5"
+      ],
+      "classicDice": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "name": "ascending-alice-bob-turn-1",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "alice",
+        "black": "bob"
+      },
+      "turnNumber": 1,
+      "offers": [
+        [
+          6,
+          4
+        ],
+        [
+          4,
+          3
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005616c69636500000003626f62000000000000000100",
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005616c69636500000003626f62000000000000000101"
+      ],
+      "firstBlocks": [
+        "d7c317bede87c6c6917c9012d151892ddf0c145883e63a4ccd1d4d75fabbebfd",
+        "21f2682a6350ae5a7a23fe6f65c3bd82403bc4370556215ba13a4096f2f85100"
+      ],
+      "classicDice": [
+        2,
+        6,
+        6
+      ]
+    },
+    {
+      "name": "length-boundary-ab-c",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "ab",
+        "black": "c"
+      },
+      "turnNumber": 7,
+      "offers": [
+        [
+          1,
+          5
+        ],
+        [
+          6,
+          6
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000261620000000163000000000000000700",
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000261620000000163000000000000000701"
+      ],
+      "firstBlocks": [
+        "9cca57f30703b80269d0ce335b816025c4963e1bd12548b40c83100f0b142819",
+        "29712833b42409de4efa57f4b8c31c342872a46d9be5d81c521b746b4e1ae876"
+      ],
+      "classicDice": [
+        2,
+        1,
+        4
+      ]
+    },
+    {
+      "name": "length-boundary-a-bc",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "a",
+        "black": "bc"
+      },
+      "turnNumber": 7,
+      "offers": [
+        [
+          1,
+          6
+        ],
+        [
+          4,
+          5
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000161000000026263000000000000000700",
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000161000000026263000000000000000701"
+      ],
+      "firstBlocks": [
+        "c0c5351d59a40dafbc59a1abf2051c75a3b0eefdb66d9b6b22f76cfa741643d1",
+        "e7cacf87fbfd2ad2081a525129c92042054081ec04743afc40b2fb5634c65e5f"
+      ],
+      "classicDice": [
+        5,
+        6,
+        3
+      ]
+    },
+    {
+      "name": "unicode-supplementary-nonascii-nul",
+      "serverSeed": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "commit": "72dbb7336c76780023f83da4c355f2eeea85733b13d3477697917790c1229084",
+      "clientSeeds": {
+        "white": "雪🙂\u0000white",
+        "black": "черный\u0000♟"
+      },
+      "turnNumber": 42,
+      "offers": [
+        [
+          6,
+          6
+        ],
+        [
+          5,
+          2
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000de99baaf09f998200776869746500000010d187d0b5d180d0bdd18bd0b900e2999f000000000000002a00",
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000de99baaf09f998200776869746500000010d187d0b5d180d0bdd18bd0b900e2999f000000000000002a01"
+      ],
+      "firstBlocks": [
+        "a7a75f0202072deac10e2d7d696cc3a6c1eba9b02f69633956ef1cc814ee06fc",
+        "a6375c49e0e8a80ddd8b05626489a52602fb08538d7712b32bb815d577573606"
+      ],
+      "classicDice": [
+        1,
+        2,
+        2
+      ]
+    },
+    {
+      "name": "empty-client-seeds",
+      "serverSeed": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "commit": "ca2a4fe727faaecf16ecd130a86e0885c5540c05375340445071c0657555fd42",
+      "clientSeeds": {
+        "white": "",
+        "black": ""
+      },
+      "turnNumber": 9,
+      "offers": [
+        [
+          4,
+          6
+        ],
+        [
+          5,
+          6
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000000000000000000000000000900",
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000000000000000000000000000901"
+      ],
+      "firstBlocks": [
+        "2723a13c6597e2d05d6c6d468f28499e66f83ea1cde9e2bdf43728be9af4162b",
+        "b841767a8a69dd4d35da24a51f6005d8b0530a02078b6de0d1e1a62e41252c08"
+      ],
+      "classicDice": [
+        1,
+        1,
+        6
+      ]
+    },
+    {
+      "name": "swapped-clients",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "bob",
+        "black": "alice"
+      },
+      "turnNumber": 0,
+      "offers": [
+        [
+          1,
+          4
+        ],
+        [
+          6,
+          1
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000003626f6200000005616c696365000000000000000000",
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000003626f6200000005616c696365000000000000000001"
+      ],
+      "firstBlocks": [
+        "ba51504baff8e4a5664199235f30bd90bdf3fd58defe01fa0f912cb4eac8791b",
+        "3b7e9078299b20fb6fe80cfa952692a166f9970bd6da407f80cd7acbed5b5cb4"
+      ],
+      "classicDice": [
+        1,
+        1,
+        2
+      ]
+    },
+    {
+      "name": "different-server-seed",
+      "serverSeed": "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+      "commit": "69c55c9002eb8c7a4e75d0b49629c4cf83d12cfb56670a8cd6e2db1491a996c4",
+      "clientSeeds": {
+        "white": "alice",
+        "black": "bob"
+      },
+      "turnNumber": 0,
+      "offers": [
+        [
+          4,
+          3
+        ],
+        [
+          6,
+          6
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005616c69636500000003626f62000000000000000000",
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005616c69636500000003626f62000000000000000001"
+      ],
+      "firstBlocks": [
+        "51e6a2364549177a4bd2ad450eec855abf1ea7c344e3f88b6e206b26690fe8c5",
+        "a7530599ed3e017bd768f3972debb754f2764ede054c6f2742bdd2b2381f1d69"
+      ],
+      "classicDice": [
+        2,
+        2,
+        4
+      ]
+    },
+    {
+      "name": "maximum-wire-turn",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "max",
+        "black": "turn"
+      },
+      "turnNumber": 9007199254740991,
+      "offers": [
+        [
+          5,
+          3
+        ],
+        [
+          1,
+          5
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d763100000000036d6178000000047475726e001fffffffffffff00",
+        "63686f6963652d32783264362d686d61632d7368613235362d763100000000036d6178000000047475726e001fffffffffffff01"
+      ],
+      "firstBlocks": [
+        "b2bce9ad268cc5a6cff686822a6b92f77a3b570d6d17533c5c5614d5ce9689bb",
+        "663a0f4a26a66e1b4d6c6e0d088775333cd25f6f468d6f24312d9e6d401cf37c"
+      ],
+      "classicDice": [
+        1,
+        6,
+        2
+      ]
+    },
+    {
+      "name": "equal-offer-pairs-witness",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "equal",
+        "black": "pair"
+      },
+      "turnNumber": 32,
+      "offers": [
+        [
+          2,
+          4
+        ],
+        [
+          2,
+          4
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005657175616c0000000470616972000000000000002000",
+        "63686f6963652d32783264362d686d61632d7368613235362d76310000000005657175616c0000000470616972000000000000002001"
+      ],
+      "firstBlocks": [
+        "67ab924720dd57a793f240aa9afc69a94c87e939a2eae424c3cdd0de1a4f6ff5",
+        "0dbd6e366abe845586e90a6f464285cbe9ad2f051219c3f9728f066a6b22d178"
+      ],
+      "classicDice": [
+        3,
+        4,
+        1
+      ]
+    },
+    {
+      "name": "leading-rejected-byte-witness",
+      "serverSeed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "commit": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "clientSeeds": {
+        "white": "reject",
+        "black": "first"
+      },
+      "turnNumber": 15,
+      "offers": [
+        [
+          2,
+          3
+        ],
+        [
+          3,
+          3
+        ]
+      ],
+      "messages": [
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000672656a656374000000056669727374000000000000000f00",
+        "63686f6963652d32783264362d686d61632d7368613235362d7631000000000672656a656374000000056669727374000000000000000f01"
+      ],
+      "firstBlocks": [
+        "fe13b68f01471a72b23380c20eb2226e22c1a5abc97b059b068c5b9a96f7d388",
+        "5c80622433588e2dd9cac19e03e5c90371820b9baf055377da17b29e3d4ff613"
+      ],
+      "classicDice": [
+        2,
+        2,
+        2
+      ]
+    }
+  ]
+}

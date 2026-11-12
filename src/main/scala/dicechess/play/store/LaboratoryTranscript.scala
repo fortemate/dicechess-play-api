@@ -14,6 +14,8 @@ import io.circe.generic.semiauto.deriveCodec
 
 /** Schema-1 public history/export. These types contain no private seat or recovery records. */
 object LaboratoryTranscript:
+  private val InvalidFairnessEvidence = "invalid terminal fairness evidence"
+
   final case class Turn(
       turnNumber: Long,
       activeColor: String,
@@ -54,12 +56,12 @@ object LaboratoryTranscript:
   }
   given ValidatedCodec[Fairness] = LaboratoryCodecs.checked(deriveCodec[Fairness]) { value =>
     for
-      _    <- Either.cond(value.serverSeed.matches("[0-9a-f]{64}"), (), "invalid terminal fairness evidence")
-      dice <- DiceSource.fromHexSeed(value.serverSeed).leftMap(_ => "invalid terminal fairness evidence")
+      _    <- Either.cond(value.serverSeed.matches("[0-9a-f]{64}"), (), InvalidFairnessEvidence)
+      dice <- DiceSource.fromHexSeed(value.serverSeed).leftMap(_ => InvalidFairnessEvidence)
       _    <- Either.cond(
         dice.commit == value.commit && value.clientSeeds.white.nonEmpty && value.clientSeeds.black.nonEmpty,
         (),
-        "invalid terminal fairness evidence"
+        InvalidFairnessEvidence
       )
     yield value
   }

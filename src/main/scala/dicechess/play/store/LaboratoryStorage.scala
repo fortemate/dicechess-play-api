@@ -134,64 +134,79 @@ object LaboratoryStorage:
             (),
             "classic snapshot contains laboratory state"
           )
-        else
-          snapshot.lab.toRight("laboratory snapshot is missing recovery state").flatMap { state =>
-            for
-              _ <- validateState(state)
-              _ <- valid(
-                snapshot.variant.contains(TwoPairs) && validVersion(snapshot.version) && snapshot.ply >= 0 &&
-                  validTimeControl(snapshot.timeControl),
-                (),
-                "invalid laboratory identity, version or settings"
-              )
-              _ <- valid(
-                !snapshot.rated.contains(true) && !snapshot.ratedRequested.contains(true) &&
-                  !snapshot.ladder.contains(true) && snapshot.ratingDomain.forall(_ == RatingDomain.Casual) &&
-                  !snapshot.effectiveOrigin.isShowcase,
-                (),
-                "laboratory games must remain casual and isolated"
-              )
-              _ <- valid(
-                snapshot.players.nonEmpty && snapshot.players.keySet.subsetOf(Seats) &&
-                  snapshot.players.values.forall { case _: Principal.Bot => false; case _ => true } &&
-                  snapshot.seatTokens.keySet.subsetOf(Seats) && snapshot.seatTokens.values.forall(_.nonEmpty),
-                (),
-                "laboratory seats must be human and private"
-              )
-              _ <- valid(
-                snapshot.serverSeed.matches("[0-9a-f]{64}") &&
-                  (!snapshot.started || state.frozenClientSeeds.isDefined),
-                (),
-                "invalid laboratory seed recovery context"
-              )
-              _ <- valid(
-                state.receipts.forall(_.appliedVersion <= snapshot.version) &&
-                  snapshot.turns.forall(_.labChoice.isDefined),
-                (),
-                "incomplete laboratory receipt or turn history"
-              )
-              _ <- valid(
-                snapshot.ended == (state.turn.phase == Phase.Ended) &&
-                  (snapshot.ended || snapshot.started == (state.turn.phase != Phase.AwaitingPlayers)) &&
-                  (!state.fairnessRevealed || snapshot.ended),
-                (),
-                "laboratory status and stage disagree"
-              )
-              position <- EngineOps.parse(snapshot.dfen).left.map(_ => "invalid laboratory position")
-              _        <-
-                if snapshot.ended then Right(())
-                else
-                  val pool =
-                    state.turn.selectedPairIndex.fold(List.empty[Int])(i => state.turn.generatedOffers(i).values)
-                  valid(
-                    snapshot.pending == (state.turn.phase == Phase.PlayingSelectedPair) &&
-                      EngineOps.serialize(EngineOps.withDice(position, pool)) == EngineOps.serialize(position),
-                    (),
-                    "laboratory selected pool and position disagree"
-                  )
-            yield ()
-          }
+        else validateLaboratorySnapshot(snapshot)
     yield snapshot
+
+  private def validateLaboratorySnapshot(snapshot: GameSnapshot): Either[String, Unit] =
+    for
+      state <- snapshot.lab.toRight("laboratory snapshot is missing recovery state")
+      _     <- validateState(state)
+      _     <- validateLaboratoryConfiguration(snapshot)
+      _     <- validateLaboratoryRecovery(snapshot, state)
+      _     <- validateLaboratoryPosition(snapshot, state)
+    yield ()
+
+  private def validateLaboratoryConfiguration(snapshot: GameSnapshot): Either[String, Unit] =
+    for
+      _ <- valid(
+        snapshot.variant.contains(TwoPairs) && validVersion(snapshot.version) && snapshot.ply >= 0 &&
+          validTimeControl(snapshot.timeControl),
+        (),
+        "invalid laboratory identity, version or settings"
+      )
+      _ <- valid(
+        !snapshot.rated.contains(true) && !snapshot.ratedRequested.contains(true) &&
+          !snapshot.ladder.contains(true) && snapshot.ratingDomain.forall(_ == RatingDomain.Casual) &&
+          !snapshot.effectiveOrigin.isShowcase,
+        (),
+        "laboratory games must remain casual and isolated"
+      )
+      _ <- valid(
+        snapshot.players.nonEmpty && snapshot.players.keySet.subsetOf(Seats) &&
+          snapshot.players.values.forall { case _: Principal.Bot => false; case _ => true } &&
+          snapshot.seatTokens.keySet.subsetOf(Seats) && snapshot.seatTokens.values.forall(_.nonEmpty),
+        (),
+        "laboratory seats must be human and private"
+      )
+    yield ()
+
+  private def validateLaboratoryRecovery(snapshot: GameSnapshot, state: State): Either[String, Unit] =
+    for
+      _ <- valid(
+        snapshot.serverSeed.matches("[0-9a-f]{64}") &&
+          (!snapshot.started || state.frozenClientSeeds.isDefined),
+        (),
+        "invalid laboratory seed recovery context"
+      )
+      _ <- valid(
+        state.receipts.forall(_.appliedVersion <= snapshot.version) &&
+          snapshot.turns.forall(_.labChoice.isDefined),
+        (),
+        "incomplete laboratory receipt or turn history"
+      )
+      _ <- valid(
+        snapshot.ended == (state.turn.phase == Phase.Ended) &&
+          (snapshot.ended || snapshot.started == (state.turn.phase != Phase.AwaitingPlayers)) &&
+          (!state.fairnessRevealed || snapshot.ended),
+        (),
+        "laboratory status and stage disagree"
+      )
+    yield ()
+
+  private def validateLaboratoryPosition(snapshot: GameSnapshot, state: State): Either[String, Unit] =
+    for
+      position <- EngineOps.parse(snapshot.dfen).left.map(_ => "invalid laboratory position")
+      _        <-
+        if snapshot.ended then Right(())
+        else
+          val pool = state.turn.selectedPairIndex.fold(List.empty[Int])(i => state.turn.generatedOffers(i).values)
+          valid(
+            snapshot.pending == (state.turn.phase == Phase.PlayingSelectedPair) &&
+              EngineOps.serialize(EngineOps.withDice(position, pool)) == EngineOps.serialize(position),
+            (),
+            "laboratory selected pool and position disagree"
+          )
+    yield ()
 
   /** Immutable identity/settings and append-only history/receipts are fenced inside the store's transaction. */
   def validateUpdate(previous: GameSnapshot, next: GameSnapshot): Either[String, Unit] =

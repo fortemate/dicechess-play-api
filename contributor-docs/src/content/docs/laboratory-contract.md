@@ -20,7 +20,7 @@ Room, storage and dice implementation remain independently owned by
 | Variant | `{"id":"choice-2x2d6","revision":1}` |
 | Protocol version | `1`, negotiated explicitly at creation |
 | Export schema version | `1`, independent of the variant revision |
-| Dice algorithm | `choice-2x2d6-hmac-sha256-v1`; derivation and vectors belong to issue 291 |
+| Dice algorithm | `choice-2x2d6-hmac-sha256-v1`; [exact derivation and published vectors](../laboratory-dice/) |
 | Rules provenance | Resolved `RulesVersion.value`, captured at creation and retained |
 | Historical classic identity | `{"id":"classic-3d6","revision":1}` at the legacy-record boundary |
 
@@ -96,8 +96,8 @@ guard for accidental direct `.asJson` calls with invalid values; it must never s
 or empty JSON for a rejected value.
 
 At each turn, both offers are fixed by committed seed inputs and stable turn/offer identities,
-independent of the position, elapsed time, commands and reconnects. Issue 291 specifies the
-versioned derivation while preserving every classic three-dice verification vector. Persist
+independent of the position, elapsed time, commands and reconnects. The [versioned derivation](../laboratory-dice/)
+preserves the classic three-dice stream and supplies independent verification vectors. Persist
 the complete private generation context before revealing either offer. Do not sort or regenerate
 the transcript on recovery. Pair 2 is public only after an accepted `RollSecond`.
 

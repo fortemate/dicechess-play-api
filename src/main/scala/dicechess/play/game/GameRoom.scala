@@ -479,11 +479,16 @@ final class GameRoom private (
         IO.monotonic.flatMap: now =>
           val both         = Set(Seat.White, Seat.Black).forall(counts.getOrElse(_, 0) > 0)
           val graceElapsed = s.startedAt.exists(start => now - start >= seedGrace)
-          if both && (s.hasAllSeeds || graceElapsed) then
-            IO.fromEither(
-              LaboratoryTurns.open(s, now).leftMap(_ => new IllegalStateException("invalid laboratory dice context"))
-            ).flatMap(publishLaboratory)
+          if both && (s.hasAllSeeds || graceElapsed) then openLaboratoryBeforeDeadline(s, now)
           else IO.pure(s)
+
+  private def openLaboratoryBeforeDeadline(s: Session, now: FiniteDuration): IO[Session] =
+    initialJoin.get.now.flatMap: at =>
+      if !at.isBefore(initialJoin.get.deadline) then endGame(s, GameOver(GameResult.Draw, Termination.Aborted))
+      else
+        IO.fromEither(
+          LaboratoryTurns.open(s, now).leftMap(_ => new IllegalStateException("invalid laboratory dice context"))
+        ).flatMap(publishLaboratory)
 
   def awaitingJoinDeadline: IO[Option[Instant]] =
     stateRef.get.map(s => Option.when(s.awaitingJoins)(initialJoin.get.deadline))

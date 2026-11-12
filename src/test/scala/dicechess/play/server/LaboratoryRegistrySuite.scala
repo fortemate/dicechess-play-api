@@ -10,6 +10,7 @@ import dicechess.play.store.*
 
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
+import scala.concurrent.duration.*
 
 class LaboratoryRegistrySuite extends munit.CatsEffectSuite:
 
@@ -36,9 +37,11 @@ class LaboratoryRegistrySuite extends munit.CatsEffectSuite:
         current.snapshots.get(id) match
           case None if expectedVersion.isEmpty =>
             (current.copy(snapshots = current.snapshots.updated(id, snapshot)), LaboratoryWrite.Applied)
-          case Some(previous) if expectedVersion.contains(previous.version) =>
-            val write = if previous == snapshot then LaboratoryWrite.Unchanged else LaboratoryWrite.Applied
-            (current.copy(snapshots = current.snapshots.updated(id, snapshot)), write)
+          case Some(previous) if expectedVersion.isDefined && previous == snapshot =>
+            (current, LaboratoryWrite.Unchanged)
+          case Some(previous)
+              if expectedVersion.contains(previous.version) && snapshot.version > previous.version && !previous.ended =>
+            (current.copy(snapshots = current.snapshots.updated(id, snapshot)), LaboratoryWrite.Applied)
           case _ => (current, LaboratoryWrite.Conflict)
     override def transcriptFor(id: GameId): IO[Option[LaboratoryTranscriptRecord]] = IO.pure(None)
     override def resultFor(id: GameId): IO[Option[LaboratoryResult]]               = IO.pure(None)
@@ -141,14 +144,43 @@ class LaboratoryRegistrySuite extends munit.CatsEffectSuite:
       made  <- reg.createFriend(alice, alice, control, Some(TwoPairs), Some(ProtocolVersion), requestedRated = false)
       pair  <- IO.fromEither(made.leftMap(message => new RuntimeException(message)))
       (id, room) = pair
-      before  <- store.load(id).map(_.get)
-      claimed <- room.claimSeat(Seat.Black, bob, None, None)
-      after   <- store.load(id).map(_.get)
-      stale   <- store.commit(id, Some(before.version), before.copy(version = before.version + 2))
+      before      <- store.load(id).map(_.get)
+      claimed     <- room.claimSeat(Seat.Black, bob, None, None)
+      after       <- store.load(id).map(_.get)
+      stale       <- store.commit(id, Some(before.version), before.copy(version = before.version + 2))
+      sameVersion <- store.commit(id, Some(after.version), after.copy(clientSeeds = Map(Seat.White -> "changed")))
+      unchanged   <- store.commit(id, Some(before.version), after)
+      preserved   <- store.load(id)
       _ = assert(claimed)
       _ = assertEquals(after.players(Seat.Black), bob)
       _ = assert(after.version > before.version)
       _ = assertEquals(stale, LaboratoryWrite.Conflict)
+      _ = assertEquals(sameVersion, LaboratoryWrite.Conflict)
+      _ = assertEquals(unchanged, LaboratoryWrite.Unchanged)
+      _ = assertEquals(preserved, Some(after))
+      _ <- reg.shutdown
+    yield ()
+
+  test("completed rooms are evicted while their retained snapshot still supports lookup"):
+    for
+      store <- memoryStore
+      reg   <- registry(store)
+      made  <- reg.createFriend(alice, bob, control, Some(TwoPairs), Some(ProtocolVersion), requestedRated = false)
+      pair  <- IO.fromEither(made.leftMap(message => new RuntimeException(message)))
+      (id, original) = pair
+      _        <- original.abort
+      over     <- original.result
+      restored <- {
+        def awaitEviction: IO[GameRoom] = reg
+          .get(id)
+          .flatMap:
+            case Some(room) if room ne original => IO.pure(room)
+            case _                              => IO.cede *> IO.defer(awaitEviction)
+        awaitEviction.timeout(2.seconds)
+      }
+      retained <- store.load(id)
+      _ = assert(retained.exists(_.ended))
+      _ <- restored.result.map(result => assertEquals(result, over))
       _ <- reg.shutdown
     yield ()
 

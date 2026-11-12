@@ -31,7 +31,8 @@ class LaboratoryRoomSuite extends munit.CatsEffectSuite:
       snapshot: GameSnapshot,
       tuning: GameRoom.RoomTuning = baseTuning,
       durability: Durability = Durability.required(_ => IO.unit),
-      customSave: Option[(GameSnapshot, Ref[IO, Vector[GameSnapshot]]) => IO[Unit]] = None
+      customSave: Option[(GameSnapshot, Ref[IO, Vector[GameSnapshot]]) => IO[Unit]] = None,
+      now: IO[java.time.Instant] = IO.realTimeInstant
   ): IO[(GameRoom, Ref[IO, Vector[GameSnapshot]])] =
     for
       saved <- Ref.of[IO, Vector[GameSnapshot]](Vector(snapshot))
@@ -39,7 +40,7 @@ class LaboratoryRoomSuite extends munit.CatsEffectSuite:
         save = next => customSave.fold(saved.update(_ :+ next))(_(next, saved)),
         durability = durability
       )
-      made <- GameRoom.restoreLaboratory(snapshot, tuning, persistence, now = IO.realTimeInstant)
+      made <- GameRoom.restoreLaboratory(snapshot, tuning, persistence, now = now)
       room <- IO.fromEither(made.leftMap(error => RuntimeException(s"laboratory restore failed: $error")))
     yield room -> saved
 
@@ -130,6 +131,32 @@ class LaboratoryRoomSuite extends munit.CatsEffectSuite:
       _ <- room.stopForRestart
     yield ()
 
+  test("a presence write that reaches the join deadline aborts instead of opening the room"):
+    for
+      snapshot <- initial()
+      deadline = java.time.Instant.ofEpochMilli(snapshot.lab.get.joinDeadlineAtEpochMs)
+      clock      <- Ref.of[IO, java.time.Instant](deadline.minusSeconds(10))
+      seedsSaved <- Deferred[IO, Unit]
+      writer = (next: GameSnapshot, saved: Ref[IO, Vector[GameSnapshot]]) =>
+        saved.update(_ :+ next) *>
+          seedsSaved.complete(()).void.whenA(next.clientSeeds.size == 2) *>
+          clock.set(deadline).whenA(next.lab.exists(_.joined == Set(Seat.White, Seat.Black)))
+      (room, saved) <- restore(snapshot, customSave = Some(writer), now = clock.get)
+      over          <- room
+        .connection(Seat.White)
+        .use: _ =>
+          room.submit(Seat.White, GameCommand.SubmitSeed(aliceSeed)) *>
+            room.submit(Seat.Black, GameCommand.SubmitSeed(bobSeed)) *>
+            seedsSaved.get.timeout(2.seconds) *>
+            room.connection(Seat.Black).use(_ => room.result.timeout(2.seconds))
+      images <- saved.get
+      _ = assertEquals(over, GameOver(GameResult.Draw, Termination.Aborted))
+      _ = assert(images.forall(!_.started), "an expired join must never start a sporting game")
+      _ = assert(images.forall(_.lab.exists(_.turn.generatedOffers.isEmpty)))
+      _ = assertEquals(images.last.lab.map(_.turn.phase), Some(Phase.Ended))
+      _ <- room.stopForRestart
+    yield ()
+
   test("all active lab stages recover with offers, commit, seats and history intact; exact retries do not reapply"):
     for
       snapshot   <- initial()
@@ -207,6 +234,7 @@ class LaboratoryRoomSuite extends munit.CatsEffectSuite:
       snapshot   <- initial()
       entered    <- Deferred[IO, Unit]
       subscribed <- Deferred[IO, Unit]
+      observed   <- Deferred[IO, Unit]
       release    <- Deferred[IO, Unit]
       seen       <- Ref.of[IO, Vector[GameEvent]](Vector.empty)
       writer = (next: GameSnapshot, saved: Ref[IO, Vector[GameSnapshot]]) =>
@@ -215,7 +243,12 @@ class LaboratoryRoomSuite extends munit.CatsEffectSuite:
         else saved.update(_ :+ next)
       (room, _)  <- restore(snapshot, customSave = Some(writer))
       subscriber <- room.subscribe
-        .evalMap(event => seen.update(_ :+ event) *> subscribed.complete(()).attempt.void)
+        .evalMap(event =>
+          seen.update(_ :+ event) *> subscribed.complete(()).attempt.void *> (event match
+            case GameEvent.LabTurnChanged(_, _, lab, _, _) if lab.turn.phase == Phase.AwaitingSecondRoll =>
+              observed.complete(()).void
+            case _ => IO.unit)
+        )
         .compile
         .drain
         .start
@@ -240,7 +273,8 @@ class LaboratoryRoomSuite extends munit.CatsEffectSuite:
                       })
                   *> release.complete(()).void *> pending.join.void *>
                   awaitPhase(room, Phase.AwaitingSecondRoll).void
-      _      <- subscriber.cancel
+      _ <- observed.get.timeoutTo(2.seconds, IO.raiseError(RuntimeException("subscriber did not observe the roll")))
+      _ <- subscriber.cancel
       events <- seen.get
       _ = assert(events.exists {
         case GameEvent.LabTurnChanged(_, _, lab, _, _) => lab.turn.phase == Phase.AwaitingSecondRoll

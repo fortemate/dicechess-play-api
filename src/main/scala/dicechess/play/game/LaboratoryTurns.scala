@@ -234,7 +234,7 @@ private[play] object LaboratoryTurns:
       _ <- Either.cond(lab.provenance.rulesVersion == RulesVersion.value, (), "unsupported laboratory rules provenance")
       source <- LaboratoryDiceSource.fromHexSeed(snapshot.serverSeed, lab.provenance.diceAlgorithm)
       _      <-
-        if lab.turn.generatedOffers.isEmpty || snapshot.ended then Right(())
+        if snapshot.ended || lab.turn.phase == Phase.AwaitingPlayers then Right(())
         else
           for
             seeds    <- lab.frozenClientSeeds.toRight("frozen laboratory seeds are required")

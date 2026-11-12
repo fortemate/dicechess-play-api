@@ -1,6 +1,6 @@
 package dicechess.play.server
 
-import cats.effect.{IO, Ref}
+import cats.effect.{FiberIO, IO, Ref}
 import cats.effect.std.{Console, Mutex}
 import cats.syntax.all.*
 import dicechess.play.core.*
@@ -33,7 +33,8 @@ final class LaboratoryRegistry private (
     private val joinWindow: FiniteDuration,
     private val now: IO[Instant],
     private val mutex: Mutex[IO],
-    private val consents: Ref[IO, Map[GameId, Set[Seat]]]
+    private val consents: Ref[IO, Map[GameId, Set[Seat]]],
+    private val observers: Ref[IO, Map[GameId, FiberIO[Unit]]]
 ) extends PlayRegistry:
   import LaboratoryRegistry.{constantTimeEqual, human, validTimeControl}
 
@@ -52,14 +53,15 @@ final class LaboratoryRegistry private (
       .load(id)
       .flatMap:
         case None =>
-          rooms
-            .modify(current => (current.removed(id), current.get(id)))
-            .flatMap(_.traverse_(_.stopForRestart))
-            .as(None)
+          IO.uncancelable: _ =>
+            rooms
+              .modify(current => (current.removed(id), current.get(id)))
+              .flatMap(room => cancelObserver(id) *> room.traverse_(_.stopForRestart))
+              .as(None)
         case Some(snapshot) =>
           rooms.get.flatMap(_.get(id) match
             case Some(room) => IO.pure(Some(room))
-            case None       => restore(id, snapshot).flatMap(room => publish(id, room).as(Some(room))))
+            case None       => restoreAndPublish(id, snapshot).map(Some(_)))
 
   override def claimSeat(id: GameId, seat: Seat, claimer: Principal): IO[Boolean] =
     if !human(claimer) || seat.side.isEmpty then IO.pure(false)
@@ -119,7 +121,7 @@ final class LaboratoryRegistry private (
                   .commit(id, None, snapshot)
                   .flatMap:
                     case LaboratoryWrite.Conflict => IO.pure(Left("laboratory game creation conflicted"))
-                    case _ => restore(id, snapshot).flatMap(room => publish(id, room).as(Right(id -> room)))
+                    case _                        => restoreAndPublish(id, snapshot).map(room => Right(id -> room))
               case Right(_) => IO.pure(Left("laboratory snapshot did not match the requested mode"))
     yield answer
 
@@ -145,7 +147,22 @@ final class LaboratoryRegistry private (
           case LaboratoryWrite.Conflict                            =>
             IO.raiseError(new IllegalStateException("laboratory snapshot write conflicted"))
 
-  private def publish(id: GameId, room: GameRoom): IO[Unit] = rooms.update(_.updated(id, room))
+  // Every caller holds the registry mutex. The consumer and its completion observer must become owned together.
+  private def restoreAndPublish(id: GameId, snapshot: GameSnapshot): IO[GameRoom] = IO.uncancelable: _ =>
+    restore(id, snapshot).flatTap: room =>
+      rooms.update(_.updated(id, room)) *>
+        (room.result *> mutex.lock.surround(evictCompleted(id, room))).start
+          .flatMap(observer => observers.update(_.updated(id, observer)))
+
+  private def evictCompleted(id: GameId, room: GameRoom): IO[Unit] =
+    rooms
+      .modify: current =>
+        if current.get(id).exists(_ eq room) then (current.removed(id), true)
+        else (current, false)
+      .flatMap(removed => observers.update(_.removed(id)).whenA(removed))
+
+  private def cancelObserver(id: GameId): IO[Unit] =
+    observers.modify(current => (current.removed(id), current.get(id))).flatMap(_.traverse_(_.cancel))
 
   /** Load active snapshots and publish each healthy room; corruption logs only its game id. */
   def resume: IO[Int] = mutex.lock.surround:
@@ -154,13 +171,15 @@ final class LaboratoryRegistry private (
           rooms.get.flatMap: current =>
             if current.contains(id) then IO.pure(Some(id))
             else
-              restore(id, snapshot).attempt.flatMap:
-                case Left(_)     => Console[IO].errorln(s"[play][laboratory-resume] game ${id.value} skipped").as(None)
-                case Right(room) => publish(id, room).as(Some(id))
+              restoreAndPublish(id, snapshot).attempt.flatMap:
+                case Left(_)  => Console[IO].errorln(s"[play][laboratory-resume] game ${id.value} skipped").as(None)
+                case Right(_) => IO.pure(Some(id))
       yield restored.flatten.size
 
   def shutdown: IO[Unit] = mutex.lock.surround:
-    rooms.getAndSet(Map.empty).flatMap(_.values.toList.traverse_(_.stopForRestart))
+    IO.uncancelable: _ =>
+      observers.getAndSet(Map.empty).flatMap(_.values.toList.traverse_(_.cancel)) *>
+        rooms.getAndSet(Map.empty).flatMap(_.values.toList.traverse_(_.stopForRestart))
 
   def transcript(id: GameId): IO[Option[LaboratoryTranscriptRecord]] = canonical(id).traverseFilter(store.transcriptFor)
 
@@ -285,7 +304,7 @@ final class LaboratoryRegistry private (
           .load(id)
           .flatMap:
             case None           => IO.raiseError(new IllegalStateException("laboratory room snapshot is unavailable"))
-            case Some(snapshot) => restore(id, snapshot).flatMap(publish(id, _))
+            case Some(snapshot) => restoreAndPublish(id, snapshot).void
 
   private def validInitial(snapshot: GameSnapshot, timeControl: TimeControl): Boolean =
     snapshot.effectiveVariant == TwoPairs && snapshot.timeControl == timeControl &&
@@ -306,11 +325,12 @@ object LaboratoryRegistry:
       now: IO[Instant] = IO.realTimeInstant
   ): IO[LaboratoryRegistry] =
     for
-      _        <- IO.raiseWhen(!store.durable)(new IllegalArgumentException("laboratory storage must be durable"))
-      rooms    <- Ref.of[IO, Map[GameId, GameRoom]](Map.empty)
-      mutex    <- Mutex[IO]
-      consents <- Ref.of[IO, Map[GameId, Set[Seat]]](Map.empty)
-    yield new LaboratoryRegistry(rooms, store, tuning, diceSource, joinWindow, now, mutex, consents)
+      _         <- IO.raiseWhen(!store.durable)(new IllegalArgumentException("laboratory storage must be durable"))
+      rooms     <- Ref.of[IO, Map[GameId, GameRoom]](Map.empty)
+      mutex     <- Mutex[IO]
+      consents  <- Ref.of[IO, Map[GameId, Set[Seat]]](Map.empty)
+      observers <- Ref.of[IO, Map[GameId, FiberIO[Unit]]](Map.empty)
+    yield new LaboratoryRegistry(rooms, store, tuning, diceSource, joinWindow, now, mutex, consents, observers)
 
   private def human(principal: Principal): Boolean = principal match
     case Principal.Guest(_) | Principal.User(_) => true

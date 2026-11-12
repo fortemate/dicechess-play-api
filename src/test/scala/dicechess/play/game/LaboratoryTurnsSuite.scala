@@ -52,6 +52,26 @@ class LaboratoryTurnsSuite extends munit.FunSuite:
   private def command(s: GameRoom.Session, action: Action, id: String): Command =
     Command(id, s.version, action)
 
+  private def snapshotOf(session: GameRoom.Session): GameSnapshot =
+    GameSnapshot(
+      session.version,
+      EngineOps.serialize(session.state),
+      session.players,
+      Map(white -> "white-token", black -> "black-token"),
+      session.dice.reveal,
+      Map(white -> clientSeeds.white, black -> clientSeeds.black),
+      session.started,
+      session.ply,
+      session.pending,
+      session.status,
+      session.timeControl,
+      Map(white -> 60000L, black -> 60000L),
+      session.lastRoll,
+      session.turns,
+      variant = Some(TwoPairs),
+      lab = session.lab
+    )
+
   /** Every accepted fixture action follows the production boundary: admission first, then the pure transition. */
   private def accept(
       s: GameRoom.Session,
@@ -264,24 +284,7 @@ class LaboratoryTurnsSuite extends munit.FunSuite:
 
   test("recovery validation re-derives the committed offers from frozen inputs"):
     val session  = open(fresh())
-    val snapshot = GameSnapshot(
-      session.version,
-      EngineOps.serialize(session.state),
-      session.players,
-      Map(white -> "white-token", black -> "black-token"),
-      session.dice.reveal,
-      Map(white -> clientSeeds.white, black -> clientSeeds.black),
-      session.started,
-      session.ply,
-      session.pending,
-      session.status,
-      session.timeControl,
-      Map(white -> 60000L, black -> 60000L),
-      session.lastRoll,
-      session.turns,
-      variant = Some(TwoPairs),
-      lab = session.lab
-    )
+    val snapshot = snapshotOf(session)
     assertEquals(LaboratoryTurns.validateRecovery(snapshot), Right(()))
     val tampered = snapshot.copy(lab =
       snapshot.lab.map(l =>
@@ -291,3 +294,16 @@ class LaboratoryTurnsSuite extends munit.FunSuite:
       )
     )
     assert(LaboratoryTurns.validateRecovery(tampered).isLeft)
+
+  test("recovery rejects missing offers after opening but allows waiting and ended snapshots"):
+    val opened        = open(fresh())
+    val missingOffers =
+      snapshotOf(opened).copy(lab = opened.lab.map(l => l.copy(turn = l.turn.copy(generatedOffers = Nil))))
+    assert(LaboratoryTurns.validateRecovery(missingOffers).isLeft)
+
+    assertEquals(LaboratoryTurns.validateRecovery(snapshotOf(fresh())), Right(()))
+
+    val ended = LaboratoryTurns.end(opened, GameOver(GameResult.Draw, Termination.Aborted), 1.second).session
+    val endedWithoutOffers =
+      snapshotOf(ended).copy(lab = ended.lab.map(l => l.copy(turn = l.turn.copy(generatedOffers = Nil))))
+    assertEquals(LaboratoryTurns.validateRecovery(endedWithoutOffers), Right(()))

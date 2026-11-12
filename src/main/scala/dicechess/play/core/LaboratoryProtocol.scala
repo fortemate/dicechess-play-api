@@ -1,8 +1,7 @@
 package dicechess.play.core
 
-/** Preparatory laboratory v1 contracts, deliberately not wired into classic routes or rooms. The normative turn, retry,
-  * startup, storage and export mapping is in the contributor documentation's laboratory-contract page. Implementing the
-  * room, storage and dice derivation belongs to separate issues.
+/** Opt-in laboratory v1 contracts. The normative turn, retry, startup, storage and export mapping is in the contributor
+  * documentation's laboratory-contract page. The classic deployment does not mount the laboratory adapter.
   */
 object LaboratoryProtocol:
 

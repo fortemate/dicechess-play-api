@@ -7,8 +7,8 @@ import io.circe.derivation.ConfiguredCodec
 import io.circe.generic.semiauto.deriveCodec
 import io.circe.syntax.*
 
-/** Explicit opt-in laboratory codecs. Importing the classic Codecs alone does not accept laboratory commands. These
-  * types are not routed into GameRoom yet; they pin the additive wire contract ahead of the room implementation.
+/** Explicit opt-in laboratory codecs. Importing the classic Codecs alone does not decode laboratory commands; the
+  * laboratory WebSocket adapter handles their separate envelope and the room enforces the mode boundary.
   */
 object LaboratoryCodecs:
 

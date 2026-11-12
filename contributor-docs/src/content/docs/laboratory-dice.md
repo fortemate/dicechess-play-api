@@ -97,7 +97,9 @@ These are deterministic checks; no frequency test is used as proof of unbiasedne
    `derive_offers(bytes.fromhex(server_seed_hex), white, black, turn_number)` and compare **both** alternatives
    in their original order. Confirm `selectedPairIndex` is 0 or 1 and `dice` equals that pair.
    An empty `moves` list is an explicit pass, not permission to omit the offers or increment twice.
-5. Derive the next turn at `len(turns)` for `currentTurn`. Compare only the 0–2 offers actually
+5. Derive the next turn at `len(turns)` for an in-flight `currentTurn`. A terminal projection may
+   instead retain the just-completed turn's offers and choice; when it exactly matches that last
+   verified history entry, treat it as the same completed turn, not another roll. Compare only the 0–2 offers actually
    revealed in that public projection and its selection, if present. Never require an unrevealed
    alternative to have been published while the game was active.
 6. Report dice verification separately from move legality, clocks, command ordering and whether

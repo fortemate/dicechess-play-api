@@ -1,5 +1,5 @@
-/** Preparatory laboratory v1 wire contract. Not enabled in the classic server/client protocol yet.
- * Adopt with the optional PublicGameState.lab and SnapshotTurn.labChoice fields in issues 292/223/224.
+/** Opt-in laboratory v1 wire contract. The default classic deployment does not mount the lab adapter.
+ * The server publishes optional PublicGameState.lab and SnapshotTurn.labChoice fields; client adoption is in 223/224.
  * The Scala codec suite pins canonical JSON and validates numeric bounds/UCI syntax at runtime.
  */
 export type Die = 1 | 2 | 3 | 4 | 5 | 6;
@@ -58,3 +58,30 @@ export interface ReceiptFrame {
 }
 export type LabProtocolVersion = 1;
 export type LabExportSchemaVersion = 1;
+
+/** Reuse the client's existing structured TimeControl type as the generic argument. */
+export interface CreationRequest<TTimeControl> {
+  white?: string;
+  black?: string;
+  timeControl?: TTimeControl;
+  variant: LabVariant;
+  labProtocolVersion: 1;
+  rated?: false;
+}
+export interface CreationResponse {
+  gameId: string;
+  commit: string;
+  tokens: readonly { seat: 'White' | 'Black'; token: string }[];
+  variant: LabVariant;
+  labProtocolVersion: 1;
+  provenance: Provenance;
+}
+export interface SnapshotExtension { lab?: PublicState }
+export interface HistoryExtension { labChoice?: HistoryChoice }
+/** Private response: the source-seat capability is sent in X-Laboratory-Seat-Token, never in a URL. */
+export interface RematchView {
+  phase: 'awaiting_consent' | 'created';
+  gameId?: string;
+  seat?: 'White' | 'Black';
+  token?: string;
+}

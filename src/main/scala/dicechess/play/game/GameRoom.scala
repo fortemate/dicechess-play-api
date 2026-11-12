@@ -5,9 +5,11 @@ import cats.effect.std.{Console, Queue}
 import cats.syntax.all.*
 import dicechess.engine.domain.{GameState, Move}
 import dicechess.play.core.*
+import dicechess.play.core.LaboratoryProtocol as Lab
 import dicechess.play.dice.DiceSource
 import dicechess.play.store.{
   GameSnapshot,
+  LaboratoryStorage,
   TurnRecord,
   RematchStartup,
   RematchStartupPhase,
@@ -113,6 +115,35 @@ final class GameRoom private (
     */
   def submit(seat: Seat, command: GameCommand): IO[Unit] =
     IO.monotonic.flatMap(receivedAt => inbox.offer(Msg.Command(seat, command, receivedAt, reply = None)))
+
+  /** A private, versioned reply; an identical retry is valid even after the writer has ended. */
+  def submitLaboratory(seat: Seat, command: Lab.Command): IO[Either[Lab.Rejection, Lab.Receipt]] =
+    def current: IO[Either[Lab.Rejection, Lab.Receipt]] = stateRef.get.map(s =>
+      LaboratoryTurns
+        .admit(s, seat, command)
+        .flatMap(
+          _.toRight(LaboratoryTurns.rejection(s, Some(command.commandId), Lab.ErrorCode.GameEnded, "game is over"))
+        )
+    )
+    stateRef.get.flatMap: s =>
+      LaboratoryTurns.admit(s, seat, command) match
+        case Left(error)          => IO.pure(Left(error))
+        case Right(Some(receipt)) => IO.pure(Right(receipt))
+        case Right(None)          =>
+          for
+            reply  <- Deferred[IO, Either[Lab.Rejection, Lab.Receipt]]
+            at     <- IO.monotonic
+            _      <- inbox.offer(Msg.Laboratory(seat, command, at, reply))
+            result <- IO.race(reply.get, done.get).flatMap(_.fold(IO.pure, _ => current))
+          yield result
+
+  def rejectLaboratory(
+      commandId: Option[String],
+      code: Lab.ErrorCode = Lab.ErrorCode.InvalidCommand
+  ): IO[Lab.Rejection] =
+    stateRef.get.map(s => LaboratoryTurns.rejection(s, commandId, code, "invalid laboratory command"))
+
+  def isLaboratory: IO[Boolean] = stateRef.get.map(_.lab.isDefined)
 
   /** Submit the turn (with optional draw offer) and await the writer's verdict: `Applied` with the `TurnPlayed`
     * version, or `Refused` with the same reason the stream's `Rejected` carries — the synchronous feedback surface for
@@ -236,6 +267,8 @@ final class GameRoom private (
   // The companion factories are the only callers; keep the startup effect private to this class and companion.
   private val runConsumer: IO[Unit] =
     supervisedConsume.start.flatMap(fiber => consumerFiber.set(Some(fiber)))
+
+  private def completeRestored(over: GameOver): IO[Unit] = done.complete(over).void
 
   /** Process shutdown: required rooms leave their last committed snapshot for bootstrap recovery. */
   private[play] def stopForRestart: IO[Unit] =
@@ -392,6 +425,16 @@ final class GameRoom private (
       counts: Map[Seat, Int],
       at: Instant
   ): IO[Unit] =
+    if s.lab.isDefined then recordLaboratoryPresence(s, seat, connected, counts)
+    else recordClassicInitialPresence(s, seat, connected, counts, at)
+
+  private def recordClassicInitialPresence(
+      s: Session,
+      seat: Seat,
+      connected: Boolean,
+      counts: Map[Seat, Int],
+      at: Instant
+  ): IO[Unit] =
     val joined = s.rematchStartup.get.joined ++ Option.when(connected)(seat)
     val next   = s.copy(rematchStartup = s.rematchStartup.map(_.copy(joined = joined)))
     if Set(Seat.White, Seat.Black).forall(counts.getOrElse(_, 0) > 0) then
@@ -420,6 +463,28 @@ final class GameRoom private (
       }
     else commit(next).void
 
+  private def recordLaboratoryPresence(s: Session, seat: Seat, connected: Boolean, counts: Map[Seat, Int]): IO[Unit] =
+    IO.monotonic.flatMap: now =>
+      val both = Set(Seat.White, Seat.Black).forall(counts.getOrElse(_, 0) > 0)
+      val next = s.copy(
+        startedAt = if both then s.startedAt.orElse(Some(now)) else None,
+        lab = s.lab.map(l => l.copy(joined = l.joined ++ Option.when(connected)(seat)))
+      )
+      commit(next).flatMap(tryStartLaboratory).flatMap(stateRef.set)
+
+  private def tryStartLaboratory(s: Session): IO[Session] =
+    if !s.awaitingJoins || s.ended then IO.pure(s)
+    else
+      liveRematchPresence.flatMap: counts =>
+        IO.monotonic.flatMap: now =>
+          val both         = Set(Seat.White, Seat.Black).forall(counts.getOrElse(_, 0) > 0)
+          val graceElapsed = s.startedAt.exists(start => now - start >= seedGrace)
+          if both && (s.hasAllSeeds || graceElapsed) then
+            IO.fromEither(
+              LaboratoryTurns.open(s, now).leftMap(_ => new IllegalStateException("invalid laboratory dice context"))
+            ).flatMap(publishLaboratory)
+          else IO.pure(s)
+
   def awaitingJoinDeadline: IO[Option[Instant]] =
     stateRef.get.map(s => Option.when(s.awaitingJoins)(initialJoin.get.deadline))
 
@@ -432,9 +497,11 @@ final class GameRoom private (
           else
             rematchPresence(Some(initialJoin.get.deadline)).flatMap { counts =>
               val connected = Set(Seat.White, Seat.Black).filter(counts.getOrElse(_, 0) > 0)
-              val over      = connected.toList match
-                case seat :: Nil => GameOver(GameResult.Win(seat.side.get), Termination.Timeout)
-                case _           => GameOver(GameResult.Draw, Termination.Aborted)
+              val over      = if s.lab.isDefined then GameOver(GameResult.Draw, Termination.Aborted)
+              else
+                connected.toList match
+                  case seat :: Nil => GameOver(GameResult.Win(seat.side.get), Termination.Timeout)
+                  case _           => GameOver(GameResult.Draw, Termination.Aborted)
               endGame(s, over).flatMap(stateRef.set)
             }
         }
@@ -505,6 +572,10 @@ final class GameRoom private (
   def snapshot: IO[PublicGameState] =
     (stateRef.get, IO.monotonic).mapN((s, now) => s.publicAt(now, maxInlinePaths))
 
+  def resync: IO[GameEvent] = (stateRef.get, IO.monotonic).mapN((s, now) =>
+    GameEvent.Snapshot(s.version, s.publicAt(now, maxInlinePaths), snapshotHistory(s))
+  )
+
   /** The full legal-move tree for the pending roll — never capped, unlike the inline `legalMoves` on the events (see
     * `GET /games/{id}/moves`). Empty when no roll is pending or the roll is a forced pass.
     */
@@ -568,10 +639,12 @@ final class GameRoom private (
       if s.ended then IO.unit
       else
         val over = GameOver(GameResult.Draw, Termination.Aborted)
-        emit(
-          s.copy(pending = false, status = GameStatus.Ended(over)),
-          v => GameEvent.GameEnded(v, over, Some(s.dice.reveal), Some(s.clientSeedsRevealed))
-        ).flatTap(_ => done.complete(over).attempt.void).void
+        if s.lab.isDefined then endGame(s, over).void
+        else
+          emit(
+            s.copy(pending = false, status = GameStatus.Ended(over)),
+            v => GameEvent.GameEnded(v, over, Some(s.dice.reveal), Some(s.clientSeedsRevealed))
+          ).flatTap(_ => done.complete(over).attempt.void).void
 
   private def consume: IO[Unit] =
     // No command within the deadline while a turn is pending => the player to move forfeits. The deadline is the mover's
@@ -590,7 +663,7 @@ final class GameRoom private (
                   // started and rolls as soon as both client seeds are in — which also kicks a game resumed from a
                   // snapshot that had started but not yet rolled. If seeds are still missing, `deadlineFor`/`onTimeout`
                   // force-start once the seed grace elapses (so a game never stalls).
-                  if s.ply > 0L || s.ended || s.awaitingJoins then IO.unit
+                  if s.lab.isDefined || s.ply > 0L || s.ended || s.awaitingJoins then IO.unit
                   else
                     IO.monotonic.flatMap { now =>
                       val started = if s.started then s else s.copy(started = true, startedAt = Some(now))
@@ -608,21 +681,29 @@ final class GameRoom private (
                 inFlightReply.set(reply) *>
                   stateRef.get.flatMap(s => process(s, seat, command, receivedAt, reply)).flatMap(stateRef.set) *>
                   inFlightReply.set(None) *> continue
+              case Msg.Laboratory(seat, command, receivedAt, reply) =>
+                stateRef.get
+                  .flatMap(s => processLaboratory(s, seat, command, receivedAt))
+                  .flatMap(reply.complete)
+                  .void *> continue
               case Msg.ArmDrawOfferMsg(seat, armed, reply) =>
-                stateRef.get.flatMap { s =>
+                expireLaboratoryDecision *> stateRef.get.flatMap { s =>
                   val (sNext, response) = if s.awaitingJoins then
                     (s, DrawOfferArmed(armed = false, reason = Some("waiting for both players")))
                   else s.armDrawOffer(seat, armed)
                   stateRef.set(sNext) *> reportDrawArmRefusal(seat, response) *> reply.complete(response).void
                 } *> continue
               case Msg.Presence(seat, connected, lease, reply) =>
-                handlePresence(seat, connected, lease) *> reply.complete(()).void *> continue
+                expireLaboratoryDecision *> handlePresence(seat, connected, lease) *> reply
+                  .complete(())
+                  .void *> continue
               case Msg.Timeout =>
                 stateRef.get.flatMap(onTimeout).flatMap(stateRef.set) *> continue
               case Msg.Abort =>
                 abortIfActive
               case Msg.ClaimSeat(seat, claimer, displayName, rating, reply) =>
-                stateRef.get.flatMap(s => onClaimSeat(s, seat, claimer, displayName, rating, reply)) *> continue)
+                expireLaboratoryDecision *> stateRef.get
+                  .flatMap(s => onClaimSeat(s, seat, claimer, displayName, rating, reply)) *> continue)
           }
 
   /** Bind `seat` to `claimer` and re-emit, so every board relabels that side (`players` rides on the snapshot). Runs on
@@ -641,7 +722,9 @@ final class GameRoom private (
       rating: Option[Double],
       reply: Deferred[IO, Boolean]
   ): IO[Unit] =
-    if !GameRoom.claimable(s.players, seat, claimer) then reply.complete(false).void
+    if s.ended || (s.lab.isDefined && (s.started || claimer.isInstanceOf[Principal.Bot])) ||
+      !GameRoom.claimable(s.players, seat, claimer)
+    then reply.complete(false).void
     else
       val named = displayName.fold(s.displayNames)(n => s.displayNames.updated(claimer.externalId, n))
       // The claim is the moment the friend seat's identity first exists, so this IS their rating "as of game start" —
@@ -668,6 +751,13 @@ final class GameRoom private (
     */
   private def onTimeout(s: Session): IO[Session] =
     if s.ended then IO.pure(s)
+    else if s.lab.isDefined && s.awaitingJoins then tryStartLaboratory(s)
+    else if s.lab.isDefined then
+      val seat = EngineOps.activeSeat(s.state)
+      endGame(
+        s.copy(remaining = s.remaining.updated(seat, Duration.Zero), turnStartedAt = None),
+        GameOver(GameResult.Win(seat.side.get.opponent), Termination.Timeout)
+      )
     // A started game whose opening roll hasn't happened yet: the seed grace elapsed (force-start; a missing seat
     // falls back to its external id, see `seedFor`), or the game was resumed from a snapshot taken in that window.
     else if s.started && s.ply == 0L then beginTurn(s)
@@ -689,15 +779,20 @@ final class GameRoom private (
   private def deadlineFor(s: Session): IO[FiniteDuration] =
     if s.ended then IO.pure(idleCheck)
     else if s.awaitingJoins then
-      initialJoin.get.now.map(now =>
-        math.max(0L, java.time.Duration.between(now, initialJoin.get.deadline).toNanos).nanos
-      )
+      (initialJoin.get.now, IO.monotonic).mapN: (now, mono) =>
+        val joinLeft = math.max(0L, java.time.Duration.between(now, initialJoin.get.deadline).toNanos).nanos
+        if s.lab.isDefined then s.startedAt.fold(joinLeft)(start => joinLeft.min(floorZero(seedGrace - (mono - start))))
+        else joinLeft
     else if s.awaitingSeeds then
       // Time left in the opening seed grace before we force-start with whatever seeds have arrived.
       IO.monotonic.map(now => floorZero(seedGrace - s.startedAt.fold(Duration.Zero: FiniteDuration)(now - _)))
-    else if !s.pending then IO.pure(idleCheck)
+    else if !s.decisionActive then IO.pure(idleCheck)
     else
       turnBudget(s, EngineOps.activeSeat(s.state)) match
+        case None if s.lab.isDefined =>
+          IO.monotonic.map(now =>
+            floorZero(idleCheck - s.labActivityAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(now - start)))
+          )
         case None         => IO.pure(idleCheck)
         case Some(budget) =>
           IO.monotonic.map: now =>
@@ -736,9 +831,23 @@ final class GameRoom private (
       case Some(Msg.Command(_, _, _, reply))      => answer(reply, TurnVerdict.Refused(GameOverReason)) *> drainRefusing
       case Some(Msg.ArmDrawOfferMsg(_, _, reply)) =>
         reply.complete(DrawOfferArmed(armed = false, reason = Some(GameOverReason))).attempt.void *> drainRefusing
-      case Some(Msg.ClaimSeat(_, _, _, _, reply)) => reply.complete(false).attempt.void *> drainRefusing
-      case Some(_)                                => drainRefusing
-      case None                                   => IO.unit
+      case Some(Msg.ClaimSeat(_, _, _, _, reply))        => reply.complete(false).attempt.void *> drainRefusing
+      case Some(Msg.Laboratory(seat, command, _, reply)) =>
+        stateRef.get
+          .flatMap(s =>
+            reply.complete(
+              LaboratoryTurns
+                .admit(s, seat, command)
+                .flatMap(
+                  _.toRight(
+                    LaboratoryTurns.rejection(s, Some(command.commandId), Lab.ErrorCode.GameEnded, "game is over")
+                  )
+                )
+            )
+          )
+          .void *> drainRefusing
+      case Some(_) => drainRefusing
+      case None    => IO.unit
 
   /** Advance the session, commit it (write the Ref and persist, in the order the room's durability dictates — see
     * [[commit]]), THEN broadcast — so the Ref always reflects the latest published event, and anything a player has
@@ -759,34 +868,45 @@ final class GameRoom private (
     *     that stall: a database hiccup is the server's fault, not the player's.
     */
   private def commit(input: Session): IO[Session] =
-    val s = if input.ended && input.awaitingJoins then
-      input.copy(rematchStartup = input.rematchStartup.map(_.copy(phase = RematchStartupPhase.Aborted)))
-    else input
-    mode match
-      case Durability.BestEffort         => stateRef.set(s) *> persistQuietly(s).as(s)
-      case required: Durability.Required =>
-        persistRequired(required, s).flatMap: stalledFor =>
-          val credited =
-            if stalledFor > Duration.Zero then s.copy(turnStartedAt = s.turnStartedAt.map(_ + stalledFor)) else s
-          stateRef.set(credited).as(credited)
+    (stateRef.get, IO.monotonic).flatMapN: (previous, now) =>
+      val normalized = if input.ended && input.awaitingJoins then
+        input.copy(rematchStartup = input.rematchStartup.map(_.copy(phase = RematchStartupPhase.Aborted)))
+      else input
+      // Quiet seed/presence writes also need a strictly increasing laboratory CAS version.
+      val s = if normalized.lab.isDefined && normalized.version <= previous.version then
+        normalized.copy(version = previous.version + 1)
+      else normalized
+      val image = Option.when(s.lab.isDefined)(snapshotOf(s, Some(now)))
+      mode match
+        case Durability.BestEffort         => stateRef.set(s) *> persistQuietly(s).as(s)
+        case required: Durability.Required =>
+          persistRequired(required, s, image).flatMap: stalledFor =>
+            val credited = if stalledFor > Duration.Zero then
+              s.copy(
+                turnStartedAt = s.turnStartedAt.map(_ + stalledFor),
+                labActivityAt = s.labActivityAt.map(_ + stalledFor)
+              )
+            else s
+            stateRef.set(credited).as(credited)
 
   /** After the fail-closed creation snapshot, persistence is availability-first: a later store failure is logged and
     * the game plays on in memory rather than wedging the writer fiber mid-game.
     */
-  private def persistSession(s: Session): IO[Unit] =
-    initialJoin.fold(persist(snapshotOf(s)))(gate => gate.save(snapshotOf(s), s.rematchStartup.get))
+  private def persistSession(s: Session, image: Option[GameSnapshot] = None): IO[Unit] =
+    val snapshot = image.getOrElse(snapshotOf(s))
+    initialJoin.fold(persist(snapshot))(gate => gate.save(snapshot, s.rematchStartup.get))
 
   private def persistQuietly(s: Session): IO[Unit] =
     persistSession(s).handleErrorWith(e => Console[IO].errorln(s"[play][persist] snapshot write failed: $e"))
 
-  private def confirmUncertainWrite(s: Session): IO[Boolean] = initialJoin match
+  private def confirmUncertainWrite(s: Session, image: Option[GameSnapshot]): IO[Boolean] = initialJoin match
     case None       => IO.pure(false)
     case Some(gate) =>
-      gate.confirms(snapshotOf(s), s.rematchStartup.get).handleErrorWith {
+      gate.confirms(image.getOrElse(snapshotOf(s)), s.rematchStartup.get).handleErrorWith {
         case error: CorruptRematchRecord => IO.raiseError(error)
         case _                           =>
           // The server cannot infer rollback while storage is unavailable. Release transports, then keep reconciling.
-          dropAllSubscribers *> IO.sleep(1.second) *> confirmUncertainWrite(s)
+          dropAllSubscribers *> IO.sleep(1.second) *> confirmUncertainWrite(s, image)
       }
 
   /** The fail-closed write: retry per the policy that applies (terminal for an ending, intermediate otherwise), report
@@ -794,7 +914,11 @@ final class GameRoom private (
     * long the writer was held up. Exhausting a bounded policy raises [[RequiredSaveAbandoned]], which the supervisor
     * turns into a technical abort from the last durable version (`stateRef`, untouched by this method on failure).
     */
-  private def persistRequired(required: Durability.Required, s: Session): IO[FiniteDuration] =
+  private def persistRequired(
+      required: Durability.Required,
+      s: Session,
+      image: Option[GameSnapshot]
+  ): IO[FiniteDuration] =
     val policy = if s.ended then required.terminal else required.intermediate
 
     // Telemetry is observational: a sink that fails must never turn a committed write into a failed commit, nor skip
@@ -805,7 +929,7 @@ final class GameRoom private (
         .handleErrorWith(e => Console[IO].errorln(s"[play][persist][required] telemetry sink failed on $event: $e"))
 
     def attempt(failed: Int, startedAt: FiniteDuration, dropped: Boolean): IO[FiniteDuration] =
-      persistSession(s).attempt.flatMap:
+      persistSession(s, image).attempt.flatMap:
         case Right(()) =>
           if failed == 0 then IO.pure(Duration.Zero)
           else
@@ -823,7 +947,7 @@ final class GameRoom private (
               // Left stalled: the technical abort that follows is itself a required write, still under way.
               stalledRef.set(true) *>
                 report(PersistenceTelemetry.SaveFailed(s.version, attempts, s.ended, None, error)) *>
-                confirmUncertainWrite(s).flatMap {
+                confirmUncertainWrite(s, image).flatMap {
                   case true =>
                     IO.monotonic.flatMap { recoveredAt =>
                       val elapsed = recoveredAt - startedAt
@@ -855,7 +979,7 @@ final class GameRoom private (
   /** The durable image of the session — enough to resume the room after a restart and, once ended, to hand the game to
     * analytics.
     */
-  private def snapshotOf(s: Session): GameSnapshot =
+  private def snapshotOf(s: Session, at: Option[FiniteDuration] = None): GameSnapshot =
     GameSnapshot(
       version = s.version,
       dfen = EngineOps.serialize(s.state),
@@ -874,12 +998,23 @@ final class GameRoom private (
       ratedRequested = s.ratedRequested,
       ratingDomain = s.ratingDomain,
       ratingPolicyVersion = s.ratingPolicyVersion,
-      remainingMs = s.remaining.map((seat, left) => seat -> left.toMillis),
+      remainingMs = if s.lab.isDefined && at.isDefined then
+        liveClocks(s, at.get).fold(
+          Map(
+            EngineOps.activeSeat(s.state) -> floorZero(
+              idleCheck -
+                s.labActivityAt.fold(Duration.Zero: FiniteDuration)(start => floorZero(at.get - start))
+            ).toMillis
+          )
+        )(c => Map(Seat.White -> c.white, Seat.Black -> c.black))
+      else s.remaining.map((seat, left) => seat -> left.toMillis),
       lastRoll = s.lastRoll,
       turns = s.turns,
       createdAtEpochMs = s.createdAtEpochMs,
       pendingDrawOffer = s.pendingDrawOffer,
-      lastDrawOfferer = s.lastDrawOfferer
+      lastDrawOfferer = s.lastDrawOfferer,
+      variant = Option.when(s.lab.isDefined)(Lab.TwoPairs),
+      lab = s.lab
     )
 
   /** Roll for the side to move; publish the roll; auto-pass while there is no legal move. The turn's legal paths are
@@ -1010,10 +1145,48 @@ final class GameRoom private (
     else beginTurnOrPreRoll(s)
 
   private def endGame(s: Session, over: GameOver): IO[Session] =
-    emit(
-      s.copy(pending = false, status = GameStatus.Ended(over), turnStartedAt = None),
-      v => GameEvent.GameEnded(v, over, Some(s.dice.reveal), Some(s.clientSeedsRevealed))
-    ).flatTap(_ => done.complete(over).attempt.void)
+    if s.lab.isDefined then IO.monotonic.flatMap(now => publishLaboratory(LaboratoryTurns.end(s, over, now)))
+    else
+      emit(
+        s.copy(pending = false, status = GameStatus.Ended(over), turnStartedAt = None),
+        v => GameEvent.GameEnded(v, over, Some(s.dice.reveal), Some(s.clientSeedsRevealed))
+      ).flatTap(_ => done.complete(over).attempt.void)
+
+  private def publishLaboratory(group: LaboratoryTurns.Effect): IO[Session] =
+    commit(group.session).flatTap: saved =>
+      group.events.traverse_(broadcast) *> (saved.status match
+        case GameStatus.Ended(over) => done.complete(over).attempt.void
+        case _                      => IO.unit)
+
+  private def processLaboratory(
+      s: Session,
+      seat: Seat,
+      command: Lab.Command,
+      receivedAt: FiniteDuration
+  ): IO[Either[Lab.Rejection, Lab.Receipt]] =
+    LaboratoryTurns.admit(s, seat, command) match
+      case Right(Some(receipt))                  => IO.pure(Right(receipt))
+      case _ if laboratoryExpired(s, receivedAt) =>
+        onTimeout(s).map(next =>
+          Left(LaboratoryTurns.rejection(next, Some(command.commandId), Lab.ErrorCode.GameEnded, "game is over"))
+        )
+      case Left(error) => IO.pure(Left(error))
+      case Right(None) =>
+        LaboratoryTurns(s, seat, command, receivedAt) match
+          case Left(error)  => IO.pure(Left(error))
+          case Right(group) => publishLaboratory(group).as(Right(Lab.Receipt(command.commandId, group.session.version)))
+
+  private def laboratoryExpired(s: Session, at: FiniteDuration): Boolean =
+    if s.lab.isEmpty || !s.decisionActive then false
+    else
+      turnBudget(s, EngineOps.activeSeat(s.state)) match
+        case Some(budget) => s.turnStartedAt.exists(start => at - start >= budget)
+        case None         => s.labActivityAt.exists(start => at - start >= idleCheck)
+
+  private def expireLaboratoryDecision: IO[Unit] =
+    (stateRef.get, IO.monotonic).flatMapN((s, now) =>
+      if laboratoryExpired(s, now) then onTimeout(s).flatMap(stateRef.set) else IO.unit
+    )
 
   private def process(
       s: Session,
@@ -1022,30 +1195,41 @@ final class GameRoom private (
       receivedAt: FiniteDuration,
       reply: Option[Deferred[IO, TurnVerdict]]
   ): IO[Session] =
-    s.status match
-      case GameStatus.Ended(_) => answer(reply, TurnVerdict.Refused(GameOverReason)).as(s)
-      case GameStatus.Active if s.awaitingJoins && !command.isInstanceOf[GameCommand.SubmitSeed] =>
-        answer(reply, TurnVerdict.Refused("waiting for both players")).as(s)
-      case GameStatus.Active =>
-        command match
-          case GameCommand.Resign                     => handleResign(s, seat, reply)
-          case GameCommand.SubmitSeed(seed)           => handleSubmitSeed(s, seat, seed)
-          case GameCommand.ArmDrawOffer(armed)        => handleArmDrawOffer(s, seat, armed)
-          case GameCommand.RespondDraw(accept)        => handleRespondDraw(s, seat, accept, reply)
-          case GameCommand.SubmitTurn(uci, offerDraw) => handleSubmitTurn(s, seat, uci, offerDraw, receivedAt, reply)
+    if laboratoryExpired(s, receivedAt) then
+      onTimeout(s).flatTap(_ => answer(reply, TurnVerdict.Refused(GameOverReason)))
+    else
+      s.status match
+        case GameStatus.Ended(_) => answer(reply, TurnVerdict.Refused(GameOverReason)).as(s)
+        case GameStatus.Active
+            if s.awaitingJoins && !command.isInstanceOf[GameCommand.SubmitSeed] &&
+              !(s.lab.isDefined && command == GameCommand.Resign) =>
+          answer(reply, TurnVerdict.Refused("waiting for both players")).as(s)
+        case GameStatus.Active =>
+          command match
+            case GameCommand.Resign                              => handleResign(s, seat, reply)
+            case GameCommand.SubmitSeed(seed)                    => handleSubmitSeed(s, seat, seed)
+            case GameCommand.ArmDrawOffer(armed)                 => handleArmDrawOffer(s, seat, armed)
+            case GameCommand.RespondDraw(accept)                 => handleRespondDraw(s, seat, accept, reply)
+            case GameCommand.SubmitTurn(_, _) if s.lab.isDefined =>
+              answer(reply, TurnVerdict.Refused("use a versioned LabCommand")).as(s)
+            case GameCommand.SubmitTurn(uci, offerDraw) => handleSubmitTurn(s, seat, uci, offerDraw, receivedAt, reply)
 
   private def handleResign(
       s: Session,
       seat: Seat,
       reply: Option[Deferred[IO, TurnVerdict]]
   ): IO[Session] =
-    seat.side match
-      case Some(loser) =>
-        endGame(s, GameOver(GameResult.Win(loser.opponent), Termination.Resign))
-          .flatTap(s1 => answer(reply, TurnVerdict.Applied(s1.version)))
-      case None =>
-        emit(s, v => GameEvent.Rejected(v, seat, "spectator cannot resign"))
-          .flatTap(_ => answer(reply, TurnVerdict.Refused("spectator cannot resign")))
+    if s.lab.isDefined && s.awaitingJoins && seat.side.isDefined then
+      endGame(s, GameOver(GameResult.Draw, Termination.Aborted))
+        .flatTap(next => answer(reply, TurnVerdict.Applied(next.version)))
+    else
+      seat.side match
+        case Some(loser) =>
+          endGame(s, GameOver(GameResult.Win(loser.opponent), Termination.Resign))
+            .flatTap(s1 => answer(reply, TurnVerdict.Applied(s1.version)))
+        case None =>
+          emit(s, v => GameEvent.Rejected(v, seat, "spectator cannot resign"))
+            .flatTap(_ => answer(reply, TurnVerdict.Refused("spectator cannot resign")))
 
   private def handleSubmitSeed(
       s: Session,
@@ -1056,14 +1240,17 @@ final class GameRoom private (
       case None    => emit(s, v => GameEvent.Rejected(v, seat, "spectator cannot submit a seed"))
       case Some(_) =>
         // Accept exactly one seed per seat, and only before the opening roll — afterwards the dice are locked.
-        if s.ply > 0L || s.clientSeeds.contains(seat) then IO.pure(s)
+        if s.ply > 0L || s.clientSeeds.contains(seat) || s.lab.exists(_.frozenClientSeeds.isDefined) then IO.pure(s)
+        else if s.lab.isDefined && !java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(seed) then
+          emit(s, v => GameEvent.Rejected(v, seat, "seed must be valid Unicode"))
         else if seed.length < MinSeedChars || seed.length > MaxSeedChars then
           emit(s, v => GameEvent.Rejected(v, seat, s"seed must be $MinSeedChars..$MaxSeedChars characters"))
         else
           val seeded = s.copy(clientSeeds = s.clientSeeds.updated(seat, seed))
           // Commit the accepted seed (no event is emitted for it), then — if both seats are in and the game
           // already started — open the gate and roll the opening turn from the durable state.
-          if seeded.started && seeded.hasAllSeeds then commit(seeded).flatMap(beginTurn)
+          if seeded.lab.isDefined then commit(seeded).flatMap(tryStartLaboratory)
+          else if seeded.started && seeded.hasAllSeeds then commit(seeded).flatMap(beginTurn)
           else commit(seeded)
 
   private def handleArmDrawOffer(
@@ -1090,7 +1277,7 @@ final class GameRoom private (
           .flatTap(_ => answer(reply, TurnVerdict.Refused("spectator cannot respond to draw offer")))
       case Some(_) =>
         val active = EngineOps.activeSeat(s.state)
-        if !s.pending || seat != active then
+        if !s.decisionActive || seat != active then
           emit(s, v => GameEvent.Rejected(v, seat, NotYourTurn))
             .flatTap(_ => answer(reply, TurnVerdict.Refused(NotYourTurn)))
         else if !s.pendingDrawOffer.exists(_ != seat) then
@@ -1105,7 +1292,7 @@ final class GameRoom private (
             armedDrawOffer = s.armedDrawOffer.updated(seat, false)
           )
           emit(s1, v => GameEvent.DrawDeclined(v, seat))
-            .flatMap(revealDiceAndBegin)
+            .flatMap(st => if st.lab.isDefined then IO.pure(st) else revealDiceAndBegin(st))
             .flatTap(s2 => answer(reply, TurnVerdict.Applied(s2.version)))
 
   private def handleSubmitTurn(
@@ -1373,7 +1560,7 @@ object GameRoom:
   private[play] object TurnCache:
     val empty: TurnCache = new TurnCache(Map.empty, MoveTree.empty)
 
-  private def turnCache(state: GameState): TurnCache =
+  private[play] def turnCache(state: GameState): TurnCache =
     val turns = EngineOps.legalMovePaths(state).map(path => path.map(EngineOps.toUci) -> path).toMap
     new TurnCache(turns, MoveTree.fromPaths(turns.keys.toList))
 
@@ -1410,6 +1597,12 @@ object GameRoom:
   )
 
   private enum Msg:
+    case Laboratory(
+        seat: Seat,
+        command: Lab.Command,
+        receivedAt: FiniteDuration,
+        reply: Deferred[IO, Either[Lab.Rejection, Lab.Receipt]]
+    )
     case Presence(seat: Seat, connected: Boolean, lease: PresenceLease, reply: Deferred[IO, Unit])
     case Begin
     case Abort
@@ -1498,7 +1691,9 @@ object GameRoom:
       drawReofferTurns: Int = DefaultDrawReofferTurns,
       rematchStartup: Option[RematchStartup] = None,
       rematchJoinDeadline: Option[Instant] = None,
-      resumedActiveRematch: Boolean = false
+      resumedActiveRematch: Boolean = false,
+      lab: Option[LaboratoryStorage.State] = None,
+      labActivityAt: Option[FiniteDuration] = None
   ):
     def ended: Boolean = status match
       case GameStatus.Ended(_) => true
@@ -1559,25 +1754,30 @@ object GameRoom:
     def hasAllSeeds: Boolean = players.keySet.forall(clientSeeds.contains)
 
     /** The game has begun but is still holding the opening roll, waiting for the seats' client seeds. */
-    def awaitingSeeds: Boolean = started && ply == 0L && !ended && !hasAllSeeds
+    def awaitingSeeds: Boolean = lab.isEmpty && started && ply == 0L && !ended && !hasAllSeeds
 
     /** The seed folded in for `seat`: the one it submitted, or — if it never did before the grace elapsed — its
       * external id as a deterministic, already-public fallback (so a missing seed never stalls the game).
       */
     def seedFor(seat: Seat): String = clientSeeds.getOrElse(seat, players.get(seat).fold("")(_.externalId))
 
-    def awaitingJoins: Boolean = rematchStartup.exists(_.phase == RematchStartupPhase.AwaitingJoins)
+    def awaitingJoins: Boolean = lab.fold(rematchStartup.exists(_.phase == RematchStartupPhase.AwaitingJoins))(
+      _.turn.phase == Lab.Phase.AwaitingPlayers
+    )
 
-    def isDrawPending: Boolean = pending && pendingDrawOffer.exists(_ != EngineOps.activeSeat(state))
+    def decisionActive: Boolean = lab.fold(pending)(_ => started && !ended)
+
+    def isDrawPending: Boolean = decisionActive && pendingDrawOffer.exists(_ != EngineOps.activeSeat(state))
 
     def dicePending: Boolean = pending && !isDrawPending
 
     def publicAt(now: FiniteDuration, maxInlinePaths: Int): PublicGameState =
       val (revealed, seeds) = status match
-        case GameStatus.Ended(_) => (Some(dice.reveal), Some(clientSeedsRevealed))
-        case _                   => (None, None)
+        case GameStatus.Ended(_) if lab.forall(_.fairnessRevealed) => (Some(dice.reveal), Some(clientSeedsRevealed))
+        case _                                                     => (None, None)
       val activeSt      = EngineOps.activeSeat(state)
       val publicRematch = rematchStartup
+        .filter(_ => lab.isEmpty)
         .map { startup =>
           PublicRematchStartup(
             startup.phase match
@@ -1617,11 +1817,14 @@ object GameRoom:
           MayOfferDrawBy(white = mayOffer(Seat.White), black = mayOffer(Seat.Black))
         ),
         publicRematch,
-        rulesVersion = Some(RulesVersion.value)
+        rulesVersion = Some(RulesVersion.value),
+        lab = lab.map(_ => LaboratoryTurns.publicState(this))
       )
 
     /** The pair of client seeds actually folded into the dice, for the end-of-game reveal. */
-    def clientSeedsRevealed: ClientSeeds = ClientSeeds(seedFor(Seat.White), seedFor(Seat.Black))
+    def clientSeedsRevealed: ClientSeeds = lab
+      .flatMap(_.frozenClientSeeds)
+      .getOrElse(ClientSeeds(seedFor(Seat.White), seedFor(Seat.Black)))
 
   /** Create a room, or describe why the initial position is invalid — errors as values. */
   def create(
@@ -1689,66 +1892,177 @@ object GameRoom:
       // Display-only metadata: ordinary restart recovery must not reintroduce the initial-join gate.
       resumedActiveRematch: Boolean = false
   ): IO[Either[String, GameRoom]] =
-    EngineOps.parse(snapshot.dfen) match
-      case Left(error)   => IO.pure(Left(s"corrupt snapshot dfen: $error"))
-      case Right(state0) =>
-        IO.uncancelable { _ =>
-          IO.monotonic.flatMap { now =>
-            // The cache is transient; a pending roll's turns re-derive from the persisted DFEN (dice included).
-            val cache =
-              if snapshot.pendingDrawOffer.isDefined then TurnCache.empty
-              else if snapshot.pending then turnCache(state0)
-              else TurnCache.empty
-            val session0 = Session(
-              state0,
-              snapshot.version,
-              snapshot.players,
-              metadata.displayNames,
-              metadata.ratings,
-              dice,
-              snapshot.ply,
-              snapshot.pending,
-              snapshot.status,
-              snapshot.timeControl,
-              // A pre-existing row from before this field existed has no key at all (see GameSnapshot.rated) —
-              // resolve that to unrated, exactly like createdAtEpochMs's own absent-key story.
-              rated = snapshot.rated.getOrElse(false),
-              ladder = snapshot.ladder.getOrElse(false),
-              // One resolution rule for a legacy row, shared with the store's column projection and the V5 backfill.
-              origin = snapshot.effectiveOrigin,
-              // Absent keys stay absent (#146): the store writes `legacy` for them rather than a guessed domain.
-              ratedRequested = snapshot.ratedRequested,
-              ratingDomain = snapshot.ratingDomain,
-              ratingPolicyVersion = snapshot.ratingPolicyVersion,
-              remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
-              // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
-              // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.
-              turnStartedAt = Option.when(snapshot.pending)(now),
-              started = snapshot.started,
-              startedAt = None,
-              clientSeeds = snapshot.clientSeeds,
-              lastRoll = snapshot.lastRoll,
-              turns = snapshot.turns,
-              createdAtEpochMs = snapshot.createdAtEpochMs,
-              turnCache = cache,
-              pendingDrawOffer = snapshot.pendingDrawOffer,
-              lastDrawOfferer = snapshot.lastDrawOfferer,
-              drawReofferTurns = tuning.drawReofferTurns,
-              rematchStartup = initialJoin.map(_.startup),
-              rematchJoinDeadline = initialJoin.map(_.deadline),
-              resumedActiveRematch = resumedActiveRematch
-            )
-            build(
-              session0,
-              snapshot.seatTokens,
-              tuning,
-              persistence,
-              initialJoin
-            )
-              .flatTap(_.runConsumer)
-              .map(Right(_))
+    if (snapshot.lab.isDefined || snapshot.effectiveVariant != Lab.Classic) && initialJoin.isEmpty then
+      IO.pure(Left("laboratory recovery requires the isolated room factory"))
+    else
+      EngineOps.parse(snapshot.dfen) match
+        case Left(error)   => IO.pure(Left(s"corrupt snapshot dfen: $error"))
+        case Right(state0) =>
+          IO.uncancelable { _ =>
+            IO.monotonic.flatMap { now =>
+              // The cache is transient; a pending roll's turns re-derive from the persisted DFEN (dice included).
+              val cache =
+                if snapshot.pendingDrawOffer.isDefined then TurnCache.empty
+                else if snapshot.pending then turnCache(state0)
+                else TurnCache.empty
+              val session0 = Session(
+                state0,
+                snapshot.version,
+                snapshot.players,
+                metadata.displayNames,
+                metadata.ratings,
+                dice,
+                snapshot.ply,
+                snapshot.pending,
+                snapshot.status,
+                snapshot.timeControl,
+                // A pre-existing row from before this field existed has no key at all (see GameSnapshot.rated) —
+                // resolve that to unrated, exactly like createdAtEpochMs's own absent-key story.
+                rated = snapshot.rated.getOrElse(false),
+                ladder = snapshot.ladder.getOrElse(false),
+                // One resolution rule for a legacy row, shared with the store's column projection and the V5 backfill.
+                origin = snapshot.effectiveOrigin,
+                // Absent keys stay absent (#146): the store writes `legacy` for them rather than a guessed domain.
+                ratedRequested = snapshot.ratedRequested,
+                ratingDomain = snapshot.ratingDomain,
+                ratingPolicyVersion = snapshot.ratingPolicyVersion,
+                remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
+                // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
+                // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.
+                turnStartedAt =
+                  Option.when(snapshot.pending || (snapshot.lab.isDefined && snapshot.started && !snapshot.ended))(
+                    snapshot.timeControl match
+                      case TimeControl.PerMove(seconds) if snapshot.lab.isDefined =>
+                        now - floorZero(
+                          seconds.seconds - snapshot.remainingMs
+                            .getOrElse(EngineOps.activeSeat(state0), seconds.seconds.toMillis)
+                            .millis
+                        )
+                      case _ => now
+                  ),
+                started = snapshot.started,
+                startedAt = None,
+                clientSeeds = snapshot.clientSeeds,
+                lastRoll = snapshot.lastRoll,
+                turns = snapshot.turns,
+                createdAtEpochMs = snapshot.createdAtEpochMs,
+                turnCache = cache,
+                pendingDrawOffer = snapshot.pendingDrawOffer,
+                lastDrawOfferer = snapshot.lastDrawOfferer,
+                drawReofferTurns = tuning.drawReofferTurns,
+                rematchStartup = initialJoin.map(_.startup),
+                rematchJoinDeadline = initialJoin.map(_.deadline),
+                resumedActiveRematch = resumedActiveRematch,
+                lab = snapshot.lab,
+                labActivityAt = Option.when(snapshot.lab.isDefined && snapshot.started && !snapshot.ended)(
+                  now - floorZero(
+                    tuning.idleCheck - snapshot.remainingMs
+                      .getOrElse(EngineOps.activeSeat(state0), tuning.idleCheck.toMillis)
+                      .millis
+                  )
+                )
+              )
+              build(
+                session0,
+                snapshot.seatTokens,
+                tuning,
+                persistence,
+                initialJoin
+              )
+                .flatTap(room =>
+                  snapshot.status match
+                    case GameStatus.Ended(over) => room.completeRestored(over)
+                    case _                      => room.runConsumer
+                )
+                .map(Right(_))
+            }
           }
-        }
+
+  /** Fresh laboratory image, saved strictly by the isolated registry before a consumer or response exists. */
+  def laboratorySnapshot(
+      players: Map[Seat, Principal],
+      dice: DiceSource,
+      timeControl: TimeControl,
+      joinDeadlineAt: Instant,
+      initialDfen: String = EngineOps.InitialDfen
+  ): IO[Either[String, GameSnapshot]] =
+    for
+      tokens  <- mintTokens(players.keys)
+      created <- IO.realTime
+      snapshot = GameSnapshot(
+        0L,
+        initialDfen,
+        players,
+        tokens,
+        dice.reveal,
+        Map.empty,
+        started = false,
+        0L,
+        pending = false,
+        GameStatus.Active,
+        timeControl,
+        initialRemaining(timeControl, players.keys).map((seat, left) => seat -> left.toMillis),
+        Nil,
+        Vector.empty,
+        createdAtEpochMs = Some(created.toMillis),
+        rated = Some(false),
+        ladder = Some(false),
+        origin = Some(GameOrigin.Legacy),
+        ratedRequested = Some(false),
+        ratingDomain = Some(RatingDomain.Casual),
+        variant = Some(Lab.TwoPairs),
+        lab = Some(
+          LaboratoryStorage.State(
+            Lab.ProtocolVersion,
+            Lab.Provenance(RulesVersion.value, Lab.DiceAlgorithm),
+            initialDfen,
+            LaboratoryStorage.PendingOffers(Lab.Phase.AwaitingPlayers, Nil, 0, None),
+            None,
+            Vector.empty,
+            joinDeadlineAt.toEpochMilli,
+            Set.empty,
+            fairnessRevealed = false
+          )
+        )
+      )
+    yield LaboratoryTurns.validateRecovery(snapshot).map(_ => snapshot)
+
+  def restoreLaboratory(
+      snapshot: GameSnapshot,
+      tuning: RoomTuning,
+      persistence: RoomPersistence,
+      confirms: GameSnapshot => IO[Boolean] = _ => IO.pure(false),
+      now: IO[Instant] = IO.realTimeInstant
+  ): IO[Either[String, GameRoom]] =
+    val validated = for
+      _ <- LaboratoryTurns.validateRecovery(snapshot)
+      _ <- Either.cond(
+        persistence.durability.isInstanceOf[Durability.Required],
+        (),
+        "laboratory rooms require durable writes"
+      )
+      dice <- DiceSource.fromHexSeed(snapshot.serverSeed).leftMap(_ => "invalid laboratory server seed")
+    yield dice
+    validated.flatTraverse: dice =>
+      val lab   = snapshot.lab.get
+      val phase = if snapshot.ended then RematchStartupPhase.Aborted
+      else if snapshot.started then RematchStartupPhase.Active
+      else RematchStartupPhase.AwaitingJoins
+      restore(
+        snapshot,
+        dice,
+        tuning = tuning,
+        persistence = persistence,
+        initialJoin = Some(
+          InitialJoinGate(
+            Instant.ofEpochMilli(lab.joinDeadlineAtEpochMs),
+            RematchStartup(phase, lab.joined, None),
+            (image, _) => persistence.save(image),
+            now,
+            (image, _) => confirms(image)
+          )
+        )
+      )
 
   private def build(
       session0: Session,
@@ -1864,7 +2178,9 @@ object GameRoom:
   /** The completed-turn history for a joining client's `Snapshot`, mapped from the room's analytics `turns`. */
   private def snapshotHistory(s: Session): List[SnapshotTurn] =
     s.turns.iterator
-      .map(t => SnapshotTurn(if t.activeColor == "w" then Seat.White else Seat.Black, t.dice, t.moves, t.fenAfter))
+      .map(t =>
+        SnapshotTurn(if t.activeColor == "w" then Seat.White else Seat.Black, t.dice, t.moves, t.fenAfter, t.labChoice)
+      )
       .toList
 
   /** Remaining time per side as of `now`, in millis — the mover's in-progress turn already subtracted so a snapshot is
@@ -1874,7 +2190,7 @@ object GameRoom:
     s.timeControl match
       case TimeControl.Unlimited => None
       case timeControl           =>
-        val mover                          = Option.when(s.pending)(EngineOps.activeSeat(s.state))
+        val mover                          = Option.when(s.decisionActive)(EngineOps.activeSeat(s.state))
         def remainingFor(seat: Seat): Long =
           val bank = timeControl match
             case TimeControl.PerMove(spm) => spm.seconds

@@ -50,13 +50,15 @@ class LeaderboardLifetimeCountsSuite extends CatsEffectSuite with TestContainerF
       .transact(db.xa)
       .as(id)
 
-  private def counts(db: PgGameStore): IO[List[(String, String, Long, Long, Long)]] =
+  private def countsSql: ConnectionIO[List[(String, String, Long, Long, Long)]] =
     sql"""SELECT participant_external_id, category, wins, draws, losses
          FROM play.leaderboard_lifetime_counts WHERE wins + draws + losses > 0
          ORDER BY participant_external_id, category"""
       .query[(String, String, Long, Long, Long)]
       .to[List]
-      .transact(db.xa)
+
+  private def counts(db: PgGameStore): IO[List[(String, String, Long, Long, Long)]] =
+    countsSql.transact(db.xa)
 
   /** Independent source-of-truth aggregate, deliberately written as the original two-seat UNION ALL oracle. */
   private def oracle(db: PgGameStore): IO[List[(String, String, Long, Long, Long)]] =
@@ -133,7 +135,7 @@ class LeaderboardLifetimeCountsSuite extends CatsEffectSuite with TestContainerF
 
   test("bulk writes and self-games account for both seats, with statement rollback restoring counters") {
     withStore { db =>
-      val tx: ConnectionIO[Unit] =
+      def tx: ConnectionIO[Unit] =
         sql"""INSERT INTO play.game_results
              (game_id, white_external_id, black_external_id, result, termination, rated, time_control, server_seed,
               rating_outcome, rating_domain)
@@ -146,15 +148,17 @@ class LeaderboardLifetimeCountsSuite extends CatsEffectSuite with TestContainerF
                     (${UUID
             .randomUUID()}, $a, $c, NULL, 'abandoned', false, 'Fischer(300,3)', 'fixture', 'legacy', 'competitive')""".update.run.void *>
           sql"""UPDATE play.game_results SET result=1 WHERE white_external_id=$a AND black_external_id=$b""".update.run.void
+      val rollbackError = new RuntimeException("rollback fixture")
       for
         _      <- tx.transact(db.xa)
         _      <- assertMatchesOracle(db)
         before <- counts(db)
-        failed <- (tx *> new RuntimeException("rollback fixture").raiseError[ConnectionIO, Unit])
+        failed <- (tx *> countsSql.map(current => assertNotEquals(current, before)) *>
+          rollbackError.raiseError[ConnectionIO, Unit])
           .transact(db.xa)
           .attempt
         after <- counts(db)
-        _     <- IO(assert(failed.isLeft))
+        _     <- IO(assertEquals(failed, Left(rollbackError)))
         _     <- IO(assertEquals(after, before))
       yield ()
     }

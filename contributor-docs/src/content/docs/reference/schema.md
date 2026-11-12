@@ -371,6 +371,7 @@ Indexes:
 - `game_results_outcome_category_idx` — `CREATE INDEX game_results_outcome_category_idx ON public.game_results USING btree (rating_outcome, category) WHERE (result IS NOT NULL)`
 - `game_results_pairing_idx` — `CREATE INDEX game_results_pairing_idx ON public.game_results USING btree (pairing_id) WHERE (pairing_id IS NOT NULL)`
 - `game_results_pkey` — `CREATE UNIQUE INDEX game_results_pkey ON public.game_results USING btree (game_id)`
+- `game_results_rated_category_finished_idx` — `CREATE INDEX game_results_rated_category_finished_idx ON public.game_results USING btree (category, finished_at) WHERE (rated = true)`
 - `game_results_rated_finished_idx` — `CREATE INDEX game_results_rated_finished_idx ON public.game_results USING btree (rated, finished_at)`
 - `game_results_rating_queue_idx` — `CREATE INDEX game_results_rating_queue_idx ON public.game_results USING btree (finished_at) WHERE (rated AND (rating_applied_at IS NULL))`
 - `game_results_training_queue_idx` — `CREATE INDEX game_results_training_queue_idx ON public.game_results USING btree (finished_at) WHERE ((rating_domain = 'training'::text) AND (rating_applied_at IS NULL))`

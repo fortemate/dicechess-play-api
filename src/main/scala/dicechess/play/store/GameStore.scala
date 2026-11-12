@@ -717,6 +717,15 @@ trait GameResultsStore:
   def opponentsFor(externalIds: List[String]): IO[List[OpponentAggregateRow]]
 
 object GameResultsStore:
+  /** A report's model input plus diagnostics from the full rated corpus. `categoryCutoff` precedes window filtering;
+    * `excludedRows` counts rows omitted by the database, before the model checks participant/result eligibility.
+    */
+  final case class ReportSource(
+      rows: List[GameResultRow],
+      excludedRows: Int,
+      categoryCutoff: Option[java.time.Instant]
+  )
+
   /** `recentResultsFor`'s default page size — bounds a prolific bot's history to a reasonable page rather than its
     * entire lifetime.
     */

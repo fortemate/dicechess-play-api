@@ -122,7 +122,7 @@ final class GameRoom private (
       LaboratoryTurns
         .admit(s, seat, command)
         .flatMap(
-          _.toRight(LaboratoryTurns.rejection(s, Some(command.commandId), Lab.ErrorCode.GameEnded, "game is over"))
+          _.toRight(LaboratoryTurns.rejection(s, Some(command.commandId), Lab.ErrorCode.GameEnded, GameOverReason))
         )
     )
     stateRef.get.flatMap: s =>
@@ -496,16 +496,17 @@ final class GameRoom private (
           if now.isBefore(initialJoin.get.deadline) then IO.unit
           else
             rematchPresence(Some(initialJoin.get.deadline)).flatMap { counts =>
-              val connected = Set(Seat.White, Seat.Black).filter(counts.getOrElse(_, 0) > 0)
-              val over      = if s.lab.isDefined then GameOver(GameResult.Draw, Termination.Aborted)
-              else
-                connected.toList match
-                  case seat :: Nil => GameOver(GameResult.Win(seat.side.get), Termination.Timeout)
-                  case _           => GameOver(GameResult.Draw, Termination.Aborted)
-              endGame(s, over).flatMap(stateRef.set)
+              endGame(s, initialJoinOutcome(s, counts)).flatMap(stateRef.set)
             }
         }
     }
+
+  private def initialJoinOutcome(s: Session, counts: Map[Seat, Int]): GameOver =
+    if s.lab.isDefined then GameOver(GameResult.Draw, Termination.Aborted)
+    else
+      Set(Seat.White, Seat.Black).filter(counts.getOrElse(_, 0) > 0).toList match
+        case seat :: Nil => GameOver(GameResult.Win(seat.side.get), Termination.Timeout)
+        case _           => GameOver(GameResult.Draw, Termination.Aborted)
 
   /** Start the grace timer for a now-unmanned seat. It forfeits only if the seat is *still* unmanned when the timer
     * elapses — the post-sleep re-check makes a reconnect that races the scheduling safe even if `cancelGrace` missed
@@ -840,7 +841,7 @@ final class GameRoom private (
                 .admit(s, seat, command)
                 .flatMap(
                   _.toRight(
-                    LaboratoryTurns.rejection(s, Some(command.commandId), Lab.ErrorCode.GameEnded, "game is over")
+                    LaboratoryTurns.rejection(s, Some(command.commandId), Lab.ErrorCode.GameEnded, GameOverReason)
                   )
                 )
             )
@@ -1168,7 +1169,7 @@ final class GameRoom private (
       case Right(Some(receipt))                  => IO.pure(Right(receipt))
       case _ if laboratoryExpired(s, receivedAt) =>
         onTimeout(s).map(next =>
-          Left(LaboratoryTurns.rejection(next, Some(command.commandId), Lab.ErrorCode.GameEnded, "game is over"))
+          Left(LaboratoryTurns.rejection(next, Some(command.commandId), Lab.ErrorCode.GameEnded, GameOverReason))
         )
       case Left(error) => IO.pure(Left(error))
       case Right(None) =>
@@ -1177,11 +1178,9 @@ final class GameRoom private (
           case Right(group) => publishLaboratory(group).as(Right(Lab.Receipt(command.commandId, group.session.version)))
 
   private def laboratoryExpired(s: Session, at: FiniteDuration): Boolean =
-    if s.lab.isEmpty || !s.decisionActive then false
-    else
-      turnBudget(s, EngineOps.activeSeat(s.state)) match
-        case Some(budget) => s.turnStartedAt.exists(start => at - start >= budget)
-        case None         => s.labActivityAt.exists(start => at - start >= idleCheck)
+    s.lab.isDefined && s.decisionActive && (turnBudget(s, EngineOps.activeSeat(s.state)) match
+      case Some(budget) => s.turnStartedAt.exists(start => at - start >= budget)
+      case None         => s.labActivityAt.exists(start => at - start >= idleCheck))
 
   private def expireLaboratoryDecision: IO[Unit] =
     (stateRef.get, IO.monotonic).flatMapN((s, now) =>
@@ -1901,10 +1900,7 @@ object GameRoom:
           IO.uncancelable { _ =>
             IO.monotonic.flatMap { now =>
               // The cache is transient; a pending roll's turns re-derive from the persisted DFEN (dice included).
-              val cache =
-                if snapshot.pendingDrawOffer.isDefined then TurnCache.empty
-                else if snapshot.pending then turnCache(state0)
-                else TurnCache.empty
+              val cache    = restoredTurnCache(snapshot, state0)
               val session0 = Session(
                 state0,
                 snapshot.version,
@@ -1929,17 +1925,7 @@ object GameRoom:
                 remaining = snapshot.remainingMs.map((seat, ms) => seat -> FiniteDuration(ms, "milliseconds")),
                 // A pending turn's clock restarts NOW: monotonic time is process-scoped, so the pre-crash start is
                 // meaningless — but leaving it unset would let `debit` charge zero for the whole post-restart turn.
-                turnStartedAt =
-                  Option.when(snapshot.pending || (snapshot.lab.isDefined && snapshot.started && !snapshot.ended))(
-                    snapshot.timeControl match
-                      case TimeControl.PerMove(seconds) if snapshot.lab.isDefined =>
-                        now - floorZero(
-                          seconds.seconds - snapshot.remainingMs
-                            .getOrElse(EngineOps.activeSeat(state0), seconds.seconds.toMillis)
-                            .millis
-                        )
-                      case _ => now
-                  ),
+                turnStartedAt = restoredTurnStart(snapshot, state0, now),
                 started = snapshot.started,
                 startedAt = None,
                 clientSeeds = snapshot.clientSeeds,
@@ -1954,13 +1940,7 @@ object GameRoom:
                 rematchJoinDeadline = initialJoin.map(_.deadline),
                 resumedActiveRematch = resumedActiveRematch,
                 lab = snapshot.lab,
-                labActivityAt = Option.when(snapshot.lab.isDefined && snapshot.started && !snapshot.ended)(
-                  now - floorZero(
-                    tuning.idleCheck - snapshot.remainingMs
-                      .getOrElse(EngineOps.activeSeat(state0), tuning.idleCheck.toMillis)
-                      .millis
-                  )
-                )
+                labActivityAt = restoredLabActivity(snapshot, state0, now, tuning.idleCheck)
               )
               build(
                 session0,
@@ -1969,14 +1949,44 @@ object GameRoom:
                 persistence,
                 initialJoin
               )
-                .flatTap(room =>
-                  snapshot.status match
-                    case GameStatus.Ended(over) => room.completeRestored(over)
-                    case _                      => room.runConsumer
-                )
+                .flatTap(room => startRestoredRoom(room, snapshot.status))
                 .map(Right(_))
             }
           }
+
+  private def restoredTurnCache(snapshot: GameSnapshot, state: GameState): TurnCache =
+    if snapshot.pendingDrawOffer.isDefined || !snapshot.pending then TurnCache.empty else turnCache(state)
+
+  private def hasLabDecision(snapshot: GameSnapshot): Boolean =
+    snapshot.lab.isDefined && snapshot.started && !snapshot.ended
+
+  private def restoredTurnStart(snapshot: GameSnapshot, state: GameState, now: FiniteDuration): Option[FiniteDuration] =
+    Option.when(snapshot.pending || hasLabDecision(snapshot))(
+      snapshot.timeControl match
+        case TimeControl.PerMove(seconds) if snapshot.lab.isDefined =>
+          now - floorZero(
+            seconds.seconds - snapshot.remainingMs
+              .getOrElse(EngineOps.activeSeat(state), seconds.seconds.toMillis)
+              .millis
+          )
+        case _ => now
+    )
+
+  private def restoredLabActivity(
+      snapshot: GameSnapshot,
+      state: GameState,
+      now: FiniteDuration,
+      idleCheck: FiniteDuration
+  ): Option[FiniteDuration] =
+    Option.when(hasLabDecision(snapshot))(
+      now - floorZero(
+        idleCheck - snapshot.remainingMs.getOrElse(EngineOps.activeSeat(state), idleCheck.toMillis).millis
+      )
+    )
+
+  private def startRestoredRoom(room: GameRoom, status: GameStatus): IO[Unit] = status match
+    case GameStatus.Ended(over) => room.completeRestored(over)
+    case _                      => room.runConsumer
 
   /** Fresh laboratory image, saved strictly by the isolated registry before a consumer or response exists. */
   def laboratorySnapshot(

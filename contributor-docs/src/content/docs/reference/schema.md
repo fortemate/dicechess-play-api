@@ -36,6 +36,7 @@ erDiagram
     game_archive
     game_results
     games
+    leaderboard_lifetime_counts
     nickname_history
     outbox
     rating_epoch_control
@@ -69,7 +70,7 @@ erDiagram
     users ||--o{ user_training_ratings : ""
 ```
 
-Only foreign keys appear as edges. Sixteen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bot_strength_snapshots` holds version-pinned engine strength snapshots and benchmark ratings independently of dynamic bot registrations, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `nickname_history` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `rating_epoch_counts` uses public-history participant identities for active epoch baselines; lifecycle triggers remove deleted participants without foreign keys into retained history, `rating_epoch_runs` preserves immutable migration plans and rollback evidence independently of participant lifecycle changes, `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
+Only foreign keys appear as edges. Seventeen tables carry no foreign key on purpose — `admin_actions` is an audit log: it must keep naming an admin who has since deleted their account, on a bot whose row may be long gone, `bot_strength_snapshots` holds version-pinned engine strength snapshots and benchmark ratings independently of dynamic bot registrations, `bots` is the root of the bot identity graph; tokens, incarnation IDs, and webhook revisions are scoped to the bot row directly, `client_reports` holds browser-submitted reports for games that never had a `games` row on this server (kept separate from authoritative game data by design), `game_archive` and `game_results` must outlive the snapshots they describe, `games` holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives, `leaderboard_lifetime_counts` keeps lifetime records by retained result identity, independently of account deletion and bot re-registration; result triggers maintain these counters transactionally, `nickname_history` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `rating_epoch_counts` uses public-history participant identities for active epoch baselines; lifecycle triggers remove deleted participants without foreign keys into retained history, `rating_epoch_runs` preserves immutable migration plans and rollback evidence independently of participant lifecycle changes, `released_nicknames` must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished, `showcase_claims` holds short-lived rate-limiting claims that outlive or precede individual games, `showcase_table` is a singleton table tracking showcase table state without external entity references, `users` is the root of the account graph the other user tables reference, `webhook_admin_authority_generations` tracks global authority heartbeat logs independent of individual bot rows — and `webhook_verification_budgets` tracks rate-limiting verification budgets keyed by actor or IP, independent of persistent entity life cycles.
 
 ## Tables
 
@@ -360,8 +361,12 @@ END)`
 Indexes:
 
 - `game_results_black_finished_idx` — `CREATE INDEX game_results_black_finished_idx ON public.game_results USING btree (black_external_id, finished_at DESC)`
+- `game_results_epoch_computed_idx` — `CREATE INDEX game_results_epoch_computed_idx ON public.game_results USING btree (rating_epoch, category, rating_applied_at DESC) WHERE ((rating_outcome = 'applied'::text) AND (rating_domain <> 'training'::text))`
 - `game_results_epoch_cutoff_idx` — `CREATE INDEX game_results_epoch_cutoff_idx ON public.game_results USING btree (rating_epoch, category, finished_at DESC) WHERE (rating_epoch IS NOT NULL)`
 - `game_results_ladder_idx` — `CREATE INDEX game_results_ladder_idx ON public.game_results USING btree (ladder) WHERE ladder`
+- `game_results_lifetime_computed_idx` — `CREATE INDEX game_results_lifetime_computed_idx ON public.game_results USING btree (category, COALESCE(rating_applied_at, finished_at) DESC) WHERE ((rating_outcome = ANY (ARRAY['applied'::text, 'legacy'::text])) AND (rating_domain <> 'training'::text))`
+- `game_results_lifetime_cutoff_idx` — `CREATE INDEX game_results_lifetime_cutoff_idx ON public.game_results USING btree (category, finished_at DESC) WHERE ((rating_outcome = ANY (ARRAY['applied'::text, 'legacy'::text])) AND (rating_domain <> 'training'::text))`
+- `game_results_live_epoch_cutoff_idx` — `CREATE INDEX game_results_live_epoch_cutoff_idx ON public.game_results USING btree (rating_epoch, category, finished_at DESC) WHERE ((rating_outcome = 'applied'::text) AND (rating_domain <> 'training'::text))`
 - `game_results_origin_finished_idx` — `CREATE INDEX game_results_origin_finished_idx ON public.game_results USING btree (origin, finished_at DESC)`
 - `game_results_outcome_category_idx` — `CREATE INDEX game_results_outcome_category_idx ON public.game_results USING btree (rating_outcome, category) WHERE (result IS NOT NULL)`
 - `game_results_pairing_idx` — `CREATE INDEX game_results_pairing_idx ON public.game_results USING btree (pairing_id) WHERE (pairing_id IS NOT NULL)`
@@ -392,6 +397,26 @@ Indexes:
 - `games_active_idx` — `CREATE INDEX games_active_idx ON public.games USING btree (status) WHERE (status = 'active'::text)`
 - `games_pkey` — `CREATE UNIQUE INDEX games_pkey ON public.games USING btree (id)`
 - `games_showcase_active_idx` — `CREATE INDEX games_showcase_active_idx ON public.games USING btree (id) WHERE ((origin = 'showcase'::text) AND (status = 'active'::text))`
+
+### `leaderboard_lifetime_counts`
+
+| Column | Type | Null | Default | Key |
+| --- | --- | --- | --- | --- |
+| `participant_external_id` | `text` | no | — | PK |
+| `category` | `text` | no | — | PK |
+| `wins` | `bigint` | no | — | — |
+| `draws` | `bigint` | no | — | — |
+| `losses` | `bigint` | no | — | — |
+
+Check constraints:
+
+- `CHECK ((draws >= 0))`
+- `CHECK ((losses >= 0))`
+- `CHECK ((wins >= 0))`
+
+Indexes:
+
+- `leaderboard_lifetime_counts_pkey` — `CREATE UNIQUE INDEX leaderboard_lifetime_counts_pkey ON public.leaderboard_lifetime_counts USING btree (participant_external_id, category)`
 
 ### `nickname_history`
 

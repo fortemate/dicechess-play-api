@@ -43,6 +43,8 @@ const FK_FREE_RATIONALES = {
 	game_archive: 'must outlive the snapshots they describe',
 	game_results: 'must outlive the snapshots they describe',
 	games: 'holds active game state and is unlinked to allow purging ended games without cascading deletes across result archives',
+	leaderboard_lifetime_counts:
+		'keeps lifetime records by retained result identity, independently of account deletion and bot re-registration; result triggers maintain these counters transactionally',
 	nickname_history:
 		'must outlive the account a rename describes just as readily as the one it never touched — a foreign key to `users` would cascade away the audit trail and the hold on exactly the accounts whose history or vacated name matters most, an account that renamed and then vanished',
 	released_nicknames:

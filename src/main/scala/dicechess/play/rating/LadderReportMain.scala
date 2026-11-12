@@ -3,7 +3,7 @@ package dicechess.play.rating
 import cats.effect.{ExitCode, IO, IOApp}
 import dicechess.play.core.RatingCategory
 import dicechess.play.server.{LeaderRow, LeaderboardRoutes}
-import dicechess.play.store.{GameResultRow, LeaderboardEntry, LeaderboardStore, PgGameStore}
+import dicechess.play.store.{GameResultsStore, LeaderboardEntry, LeaderboardStore, PgGameStore}
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
@@ -140,11 +140,9 @@ object LadderReportMain extends IOApp:
   private def doPublishSnapshot(
       store: PgGameStore,
       options: Options,
-      rows: List[GameResultRow],
+      corpusCutoff: Option[Instant],
       effectiveAnchor: AnchorSet
   ): IO[Unit] =
-    val categoryRows = rows.filter(r => RatingCategory.ofStored(r.timeControl).contains(options.category))
-    val corpusCutoff = categoryRows.flatMap(r => Option(r.finishedAt)).maxOption
     for
       appliedPair <- store.latestAppliedCutoff(options.category)
       cutoff = resolveCutoff(corpusCutoff, appliedPair._1)
@@ -168,7 +166,7 @@ object LadderReportMain extends IOApp:
   private[rating] def publishSnapshot(
       store: PgGameStore,
       options: Options,
-      rows: List[GameResultRow],
+      source: GameResultsStore.ReportSource,
       report: StrengthReport
   ): IO[Unit] =
     if !options.saveSnapshot then IO.unit
@@ -178,7 +176,7 @@ object LadderReportMain extends IOApp:
         IO.println(
           s"[ladder-report] snapshot publication refused: category ${options.category.wireName} is uncalibrated or lacks scale anchors (epoch ${effectiveAnchor.epoch})"
         )
-      else doPublishSnapshot(store, options, rows, effectiveAnchor)
+      else doPublishSnapshot(store, options, source.categoryCutoff, effectiveAnchor)
 
   def run(args: List[String]): IO[ExitCode] =
     IO.defer {
@@ -192,12 +190,30 @@ object LadderReportMain extends IOApp:
       case None           => IO.println("[ladder-report] PLAY_DB_URL unset: nothing to report on").as(ExitCode.Error)
       case Some(dbConfig) =>
         PgGameStore.resource(dbConfig).use { store =>
-          store.finishedRatedSince(Instant.EPOCH).flatMap(rows => renderAndPublish(store, options, rows))
+          store
+            .strengthReportSource(options.category, options.config.windowDays)
+            .flatMap {
+              case Left(error) =>
+                IO.println(s"[ladder-report] invalid report source: ${error.message}").as(ExitCode.Error)
+              case Right(source) => renderAndPublish(store, options, source)
+            }
         }
 
-  private def renderAndPublish(store: PgGameStore, options: Options, rows: List[GameResultRow]): IO[ExitCode] =
-    StrengthReport.build(rows, options.category, options.config) match
+  private[rating] def buildReport(
+      source: GameResultsStore.ReportSource,
+      options: Options
+  ): BradleyTerry.FitResult[StrengthReport] =
+    StrengthReport
+      .build(source.rows, options.category, options.config)
+      .map(report => report.copy(excludedRows = Math.addExact(report.excludedRows, source.excludedRows)))
+
+  private def renderAndPublish(
+      store: PgGameStore,
+      options: Options,
+      source: GameResultsStore.ReportSource
+  ): IO[ExitCode] =
+    buildReport(source, options) match
       case Left(error)   => IO.println(s"[ladder-report] strength fit failed: ${error.message}").as(ExitCode.Error)
       case Right(report) =>
-        writeReport(renderReport(report, options), options) *> publishSnapshot(store, options, rows, report)
+        writeReport(renderReport(report, options), options) *> publishSnapshot(store, options, source, report)
           .as(ExitCode.Success)

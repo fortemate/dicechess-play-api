@@ -2745,6 +2745,54 @@ final class PgGameStore private (
       .timed("finishedRatedSince")
       .map(_.map(PgGameStore.toRow))
 
+  /** Push report category/window selection into PostgreSQL. The global rated maximum (including other categories and
+    * undecided games) anchors the window exactly as StrengthReport.build did over the full source. Metadata and rows
+    * share one read-only snapshot; omitted history contributes scalar diagnostics without transferring result payloads.
+    */
+  def strengthReportSource(
+      category: RatingCategory,
+      windowDays: Option[Int]
+  ): IO[Either[GameResultsStore.ReportSourceError, GameResultsStore.ReportSource]] =
+    if windowDays.exists(_ <= 0) then IO.pure(Left(GameResultsStore.ReportSourceError.InvalidWindow))
+    else
+      val tx = for
+        _        <- sql"SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY".update.run
+        metadata <- sql"""SELECT
+            (SELECT COUNT(*) FROM play.game_results WHERE rated = true AND finished_at > ${Instant.EPOCH}),
+            (SELECT MAX(finished_at) FROM play.game_results WHERE rated = true AND finished_at > ${Instant.EPOCH})"""
+          .query[(Long, Option[Instant])]
+          .unique
+        (total, latest) = metadata
+        // The stored category uses bigint while the Scala control parser accepts Int components. Skip any future or
+        // malformed control the model cannot parse, without transferring full result payloads or reimplementing parsing.
+        categoryCutoff <- sql"""SELECT time_control, finished_at FROM play.game_results
+            WHERE rated = true AND finished_at > ${Instant.EPOCH} AND category = ${category.wireName}
+            ORDER BY finished_at DESC"""
+          .query[(String, Instant)]
+          .streamWithChunkSize(1)
+          .find { case (control, _) => RatingCategory.ofStored(control).contains(category) }
+          .map(_._2)
+          .compile
+          .last
+        lower = (for
+          days <- windowDays
+          end  <- latest
+        yield end.minus(java.time.Duration.ofDays(days.toLong))).filter(_.isAfter(Instant.EPOCH))
+        rows <- strengthReportRowsQuery(category, lower)
+          .query[PgGameStore.ResultTuple]
+          .to[List]
+          .map(_.map(PgGameStore.toRow).filter(row => RatingCategory.ofStored(row.timeControl).contains(category)))
+      yield GameResultsStore.ReportSource(rows, Math.toIntExact(total - rows.size.toLong), categoryCutoff)
+      tx.transact(xa).timed("strengthReportSource").map(_.asRight[GameResultsStore.ReportSourceError])
+
+  private[store] def strengthReportRowsQuery(category: RatingCategory, lower: Option[Instant]): Fragment =
+    val window = lower.fold(Fragment.empty)(cutoff => fr" AND finished_at >= $cutoff")
+    sql"""SELECT game_id::text, white_external_id, black_external_id, result, termination, rated, time_control,
+                 server_seed, pairing_id::text, ladder, finished_at, origin, rating_domain
+          FROM play.game_results
+          WHERE rated = true AND finished_at > ${Instant.EPOCH} AND category = ${category.wireName}""" ++
+      window ++ fr" ORDER BY finished_at ASC"
+
   /** One side's `WHERE` clause: the participant match plus whichever optional filters are present, folded from a list
     * rather than built with always-present `col IS NULL OR ...` guards — the latter risks the planner falling back to a
     * full scan of the participant's matching rows on a parameter it can't prove absent at plan time, defeating the

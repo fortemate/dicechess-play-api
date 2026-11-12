@@ -2,7 +2,7 @@ package dicechess.play.rating
 
 import cats.effect.ExitCode
 import dicechess.play.core.{GameId, RatingCategory}
-import dicechess.play.store.GameResultRow
+import dicechess.play.store.{GameResultRow, GameResultsStore}
 
 import java.nio.file.Paths
 import java.time.Instant
@@ -320,6 +320,49 @@ class StrengthReportSuite extends munit.CatsEffectSuite:
     assert(md.contains("### Provisional Bots"))
     assert(md.contains("lack sufficient game/opponent counts, calibration or uncertainty evidence"))
     assert(md.contains("`[Provisional]`"))
+
+  test("database-prefiltered input produces the full-corpus report including bootstrap and exclusion diagnostics"):
+    val recent = pair("source-recent", -1).zipWithIndex.map { (game, index) =>
+      game.copy(finishedAt = at.minusSeconds((index + 1L) * 86400))
+    }
+    val old   = pair("source-old", 0).map(_.copy(finishedAt = at.minusSeconds(40L * 86400)))
+    val split = pair("source-split", 1).zipWithIndex.map { (game, index) =>
+      game.copy(finishedAt = at.minusSeconds((15L - index) * 86400))
+    }
+    val excluded = List(
+      row(v1, v3, Some(1), None).copy(timeControl = "Fischer(600,0)"),
+      row("user:source-fixture", v1, Some(0), None).copy(finishedAt = at.minusSeconds(3L * 86400)),
+      row(v1, v3, None, None).copy(finishedAt = at.minusSeconds(4L * 86400))
+    )
+    val full = recent ++ old ++ split ++ excluded
+    List(None, Some(14)).foreach { days =>
+      val options = parsedOptions(List("iterations=256")).copy(config =
+        StrengthReport.Config(
+          bootstrapIterations = 256,
+          windowDays = days,
+          anchorSet = AnchorSet("source-fixture", 1, "blitz", List(Anchor("oracle/v1", 0.0))),
+          minGamesForAdmission = 1,
+          minOpponentsForAdmission = 1,
+          maxCiWidthElo = Some(10000.0)
+        )
+      )
+      val lower    = days.map(d => at.minus(java.time.Duration.ofDays(d.toLong)))
+      val selected = full.filter(game =>
+        RatingCategory.ofStored(game.timeControl).contains(options.category) &&
+          lower.forall(cutoff => !game.finishedAt.isBefore(cutoff))
+      )
+      val cutoff = full
+        .filter(game => RatingCategory.ofStored(game.timeControl).contains(options.category))
+        .map(_.finishedAt)
+        .maxOption
+      val source   = GameResultsStore.ReportSource(selected, full.size - selected.size, cutoff)
+      val expected = StrengthReport.build(full, options.category, options.config)
+      assert(expected.isRight)
+      val ranking = expected.toOption.get.ranking
+      assert(ranking.nonEmpty)
+      assert(ranking.forall(bot => bot.ciLow.isFinite && bot.ciHigh.isFinite))
+      assertEquals(LadderReportMain.buildReport(source, options), expected)
+    }
 
   test("LadderReportMain helpers: parsePlayerKey, resolveEffectiveAnchor, assembleLeaders, and renderReport"):
     import dicechess.play.store.{LeaderboardEntry, ResultTally}

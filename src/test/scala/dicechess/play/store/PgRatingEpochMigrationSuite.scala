@@ -87,14 +87,15 @@ class PgRatingEpochMigrationSuite extends CatsEffectSuite with TestContainerForA
            'bots',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY team,name,category) FROM play.bot_ratings r),'[]'::jsonb),
            'users',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_ratings r),'[]'::jsonb),
            'training',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY user_id,category) FROM play.user_training_ratings r),'[]'::jsonb),
-           'counts',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.rating_epoch_counts r),'[]'::jsonb))::text"""
+           'counts',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.rating_epoch_counts r),'[]'::jsonb),
+           'lifetime',COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY participant_external_id,category) FROM play.leaderboard_lifetime_counts r),'[]'::jsonb))::text"""
       .query[String]
       .unique
       .transact(xa)
 
   private def assertProjectionCollectionsPopulated(value: String): Unit =
     val json = parse(value).toOption.get
-    List("bots", "users", "training", "counts").foreach { collection =>
+    List("bots", "users", "training", "counts", "lifetime").foreach { collection =>
       assert(json.hcursor.get[List[Json]](collection).toOption.exists(_.nonEmpty), s"$collection projection is empty")
     }
 

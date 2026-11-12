@@ -3264,10 +3264,9 @@ final class PgGameStore private (
 
   // ── LeaderboardStore (#103) ───────────────────────────────────────────────
 
-  /** One query: registered bots joined against their rated, decided W-D-L aggregated from `game_results` (each game
-    * contributes from both seats' perspectives via the UNION ALL). The scan over rated games is acceptable at this
-    * corpus's scale; if the ladder ever grows past that, a materialised tally is the upgrade path — behind this same
-    * trait method.
+  /** Registered bots joined against transactionally maintained lifetime W-D-L before cutover, or the selected epoch's
+    * counters afterwards. Live reads never aggregate result history. Historical cutoffs retain their original bounded
+    * history semantics; published epoch snapshots are immutable.
     *
     * Ordered by the conservative estimate `rating − k·RD` (#169), not the raw rating — see
     * [[dicechess.play.rating.Glicko2.ConservativeOrderingK]] for the k and its justification. The routes' merged
@@ -3288,7 +3287,7 @@ final class PgGameStore private (
   ): IO[List[LeaderboardEntry]] =
     leaderboardSql(category, maxRd, limit, asOfCutoff).transact(xa).timeout(SaveTimeout)
 
-  private def leaderboardSql(
+  private[store] def leaderboardSql(
       category: RatingCategory,
       maxRd: Double,
       limit: Int,
@@ -3332,27 +3331,9 @@ final class PgGameStore private (
               FROM play.bots b
               JOIN play.bot_ratings r
                 ON r.team = b.team AND r.name = b.name AND r.category = ${category.wireName}
-              LEFT JOIN (
-                SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
-                FROM (
-                  SELECT white_external_id AS external_id,
-                         CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
-                         CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
-                         CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
-                  FROM play.game_results
-                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                    AND result IS NOT NULL AND category = ${category.wireName}
-                  UNION ALL
-                  SELECT black_external_id,
-                         CASE WHEN result = -1 THEN 1 ELSE 0 END,
-                         CASE WHEN result = 0  THEN 1 ELSE 0 END,
-                         CASE WHEN result = 1  THEN 1 ELSE 0 END
-                  FROM play.game_results
-                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                    AND result IS NOT NULL AND category = ${category.wireName}
-                ) sides
-                GROUP BY external_id
-              ) t ON t.external_id = 'bot:team:' || b.team || ':' || b.name
+              LEFT JOIN play.leaderboard_lifetime_counts t
+                ON t.participant_external_id = 'bot:team:' || b.team || ':' || b.name
+               AND t.category = r.category
               WHERE r.rd <= $maxRd
               ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
                        r.rd ASC, b.team, b.name
@@ -3448,7 +3429,7 @@ final class PgGameStore private (
   ): IO[List[PlayerLeaderboardEntry]] =
     playerLeaderboardSql(category, maxRd, limit, asOfCutoff).transact(xa).timeout(SaveTimeout)
 
-  private def playerLeaderboardSql(
+  private[store] def playerLeaderboardSql(
       category: RatingCategory,
       maxRd: Double,
       limit: Int,
@@ -3487,27 +3468,9 @@ final class PgGameStore private (
                      COALESCE(t.wins, 0), COALESCE(t.draws, 0), COALESCE(t.losses, 0)
               FROM play.users u
               JOIN play.user_ratings r ON r.user_id = u.id AND r.category = ${category.wireName}
-              LEFT JOIN (
-                SELECT external_id, SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses
-                FROM (
-                  SELECT white_external_id AS external_id,
-                         CASE WHEN result = 1  THEN 1 ELSE 0 END AS win,
-                         CASE WHEN result = 0  THEN 1 ELSE 0 END AS draw,
-                         CASE WHEN result = -1 THEN 1 ELSE 0 END AS loss
-                  FROM play.game_results
-                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                    AND result IS NOT NULL AND category = ${category.wireName}
-                  UNION ALL
-                  SELECT black_external_id,
-                         CASE WHEN result = -1 THEN 1 ELSE 0 END,
-                         CASE WHEN result = 0  THEN 1 ELSE 0 END,
-                         CASE WHEN result = 1  THEN 1 ELSE 0 END
-                  FROM play.game_results
-                  WHERE rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'
-                    AND result IS NOT NULL AND category = ${category.wireName}
-                ) sides
-                GROUP BY external_id
-              ) t ON t.external_id = 'user:' || u.id::text
+              LEFT JOIN play.leaderboard_lifetime_counts t
+                ON t.participant_external_id = 'user:' || u.id::text
+               AND t.category = r.category
               WHERE r.rd <= $maxRd AND u.is_active
               ORDER BY r.rating - ${Glicko2.ConservativeOrderingK} * r.rd DESC,
                        r.rd ASC, u.nickname
@@ -3754,25 +3717,37 @@ final class PgGameStore private (
     activeRatingEpochSql.flatMap {
       case None        => legacyLatestAppliedCutoffSql(category)
       case Some(epoch) =>
-        sql"""SELECT GREATEST(r.cutoff, g.cutoff), GREATEST(r.applied_at, g.computed_at)
-               FROM play.rating_epoch_control c JOIN play.rating_epoch_runs r ON r.run_id = c.active_run_id
-               LEFT JOIN (
-                 SELECT MAX(finished_at) AS cutoff, MAX(rating_applied_at) AS computed_at
-                 FROM play.game_results WHERE rating_epoch = $epoch AND category = ${category.wireName}
-                   AND rating_outcome = 'applied' AND rating_domain <> 'training'
-               ) g ON true WHERE c.singleton"""
+        epochProvenanceQuery(category, epoch)
           .query[(Option[Instant], Option[Instant])]
           .unique
     }
 
   private def legacyLatestAppliedCutoffSql(category: RatingCategory): ConnectionIO[(Option[Instant], Option[Instant])] =
-    sql"""SELECT MAX(finished_at), MAX(COALESCE(rating_applied_at, finished_at))
-          FROM play.game_results
-          WHERE category = ${category.wireName}
-            AND rating_outcome IN ('applied', 'legacy')
-            AND rating_domain <> 'training'"""
+    lifetimeProvenanceQuery(category)
       .query[(Option[Instant], Option[Instant])]
       .unique
+
+  private[store] def epochProvenanceQuery(category: RatingCategory, epoch: Int): Fragment =
+    sql"""SELECT GREATEST(r.cutoff, g.cutoff), GREATEST(r.applied_at, g.computed_at)
+               FROM play.rating_epoch_control c JOIN play.rating_epoch_runs r ON r.run_id = c.active_run_id
+               CROSS JOIN (
+                 SELECT
+                   (SELECT MAX(finished_at) FROM play.game_results
+                    WHERE rating_epoch = $epoch AND category = ${category.wireName}
+                      AND rating_outcome = 'applied' AND rating_domain <> 'training') AS cutoff,
+                   (SELECT MAX(rating_applied_at) FROM play.game_results
+                    WHERE rating_epoch = $epoch AND category = ${category.wireName}
+                      AND rating_outcome = 'applied' AND rating_domain <> 'training') AS computed_at
+               ) g WHERE c.singleton"""
+
+  private[store] def lifetimeProvenanceQuery(category: RatingCategory): Fragment =
+    sql"""SELECT
+          (SELECT MAX(finished_at) FROM play.game_results
+           WHERE category = ${category.wireName}
+             AND rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training'),
+          (SELECT MAX(COALESCE(rating_applied_at, finished_at)) FROM play.game_results
+           WHERE category = ${category.wireName}
+             AND rating_outcome IN ('applied', 'legacy') AND rating_domain <> 'training')"""
 
   override def latestAppliedCutoff(category: RatingCategory): IO[(Option[Instant], Option[Instant])] =
     latestAppliedCutoffSql(category).transact(xa).timeout(SaveTimeout)

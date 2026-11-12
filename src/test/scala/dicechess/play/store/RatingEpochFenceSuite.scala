@@ -160,10 +160,16 @@ class RatingEpochFenceSuite extends CatsEffectSuite with TestContainerForAll:
 
   test("competitive movements atomically count once and public reads use the selected epoch") {
     withStore { db =>
+      val lifetime = sql"""SELECT COALESCE(SUM(wins),0)::bigint FROM play.leaderboard_lifetime_counts
+                           WHERE participant_external_id='bot:team:epoch-test:white' AND category='blitz'"""
+        .query[Long]
+        .unique
+        .transact(db.xa)
       for
-        id <- game(db)
-        _  <- activate(db)
-        _  <- admin(db) {
+        id             <- game(db)
+        beforeLifetime <- lifetime
+        _              <- activate(db)
+        _              <- admin(db) {
           sql"""INSERT INTO play.rating_epoch_counts VALUES
                  ('bot:team:epoch-test:white', 'blitz', 10, 6, 1, 3),
                  ('bot:team:epoch-test:black', 'blitz', 10, 6, 1, 3)""".update.run *>
@@ -171,11 +177,12 @@ class RatingEpochFenceSuite extends CatsEffectSuite with TestContainerForAll:
                    (category, epoch, anchor_set_version, cutoff, is_current, payload)
                    VALUES ('blitz', 99, 'unselected', $cutoff, true, '{"leaders":[]}'::jsonb)""".update.run.void
         }
-        _       <- db.withRatingEpoch(update(db, id))
-        _       <- db.withRatingEpoch(update(db, id))
-        tallies <- db.categoryTalliesFor("bot:team:epoch-test:white")
-        view    <- db.liveLeaderboardView(category, true, false, 110, 200)
-        epoch   <- sql"SELECT rating_epoch FROM play.game_results WHERE game_id = ${id.value}::uuid"
+        _             <- db.withRatingEpoch(update(db, id))
+        _             <- db.withRatingEpoch(update(db, id))
+        afterLifetime <- lifetime
+        tallies       <- db.categoryTalliesFor("bot:team:epoch-test:white")
+        view          <- db.liveLeaderboardView(category, true, false, 110, 200)
+        epoch         <- sql"SELECT rating_epoch FROM play.game_results WHERE game_id = ${id.value}::uuid"
           .query[Option[Int]]
           .unique
           .transact(db.xa)
@@ -185,6 +192,7 @@ class RatingEpochFenceSuite extends CatsEffectSuite with TestContainerForAll:
         assertEquals(view.snapshot.map(_.epoch), Some(42))
         assertEquals(view.dataCutoff, Some(later))
         assertEquals(epoch, Some(42))
+        assertEquals(afterLifetime, beforeLifetime + 1L)
     }
   }
 

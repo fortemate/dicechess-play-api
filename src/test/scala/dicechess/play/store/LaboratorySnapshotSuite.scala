@@ -174,7 +174,7 @@ class LaboratorySnapshotSuite extends munit.FunSuite:
     assertEquals(record.get[List[String]]("moves"), Right(Nil))
     assertEquals(LaboratoryStorage.validateSnapshot(value), Right(value))
 
-  test("aborted export stays incomplete and fairness is withheld until an allowed terminal reveal"):
+  test("terminal fairness may be revealed for an abort while its transcript remains incomplete"):
     val aborted = snapshot(Phase.Ended)
     val hidden  = LaboratoryStorage.transcript(aborted).toOption.get
     assertEquals(hidden.hcursor.get[String]("completeness"), Right("incomplete"))
@@ -186,10 +186,14 @@ class LaboratorySnapshotSuite extends munit.FunSuite:
     val revealed = LaboratoryStorage.transcript(sporting).toOption.get
     assertEquals(revealed.hcursor.get[String]("completeness"), Right("complete"))
     assert(revealed.hcursor.get[io.circe.Json]("fairness").toOption.exists(_ != io.circe.Json.Null))
-    val forbidden   = sporting.copy(status = GameStatus.Ended(GameOver(GameResult.Draw, Termination.Aborted)))
-    val abortReveal = LaboratoryStorage.transcript(forbidden).toOption.get
+    // The approved export contract explicitly permits a revealed abort, but never calls it complete.
+    val revealedAbort = sporting.copy(status = GameStatus.Ended(GameOver(GameResult.Draw, Termination.Aborted)))
+    val abortReveal   = LaboratoryStorage.transcript(revealedAbort).toOption.get
     assertEquals(abortReveal.hcursor.get[String]("completeness"), Right("incomplete"))
     assert(abortReveal.hcursor.get[io.circe.Json]("fairness").toOption.exists(_ != io.circe.Json.Null))
+    assert(LaboratoryTranscript.decode(abortReveal).isRight)
+    val active = snapshot().copy(lab = snapshot().lab.map(_.copy(fairnessRevealed = true)))
+    assert(LaboratoryStorage.transcript(active).isLeft)
 
   test("rated and bot laboratory snapshots fail with typed validation errors"):
     val rated = snapshot().copy(rated = Some(true))

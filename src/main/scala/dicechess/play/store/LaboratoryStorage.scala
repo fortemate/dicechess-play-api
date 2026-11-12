@@ -227,31 +227,51 @@ object LaboratoryStorage:
         (),
         "laboratory history and receipts are append-only"
       )
-      _ <- valid(
-        next.ply >= previous.ply && (next.ply != previous.ply ||
-          ((before.turn.generatedOffers.isEmpty || after.turn.generatedOffers == before.turn.generatedOffers) &&
-            after.turn.revealedOfferCount >= before.turn.revealedOfferCount &&
-            before.turn.selectedPairIndex.forall(i => after.turn.selectedPairIndex.contains(i)))),
-        (),
-        "laboratory offers and confirmed choice cannot be rewritten"
-      )
+      _ <- validateOfferProgress(previous, next, before.turn, after.turn)
       _ <- valid(
         !previous.started || (previous.players == next.players && previous.seatTokens == next.seatTokens),
         (),
         "active laboratory seat ownership cannot be rewritten"
       )
+      _ <- valid(!before.fairnessRevealed || after.fairnessRevealed, (), "terminal reveal cannot be retracted")
+    yield ()
+
+  private def validateOfferProgress(
+      previous: GameSnapshot,
+      next: GameSnapshot,
+      before: PendingOffers,
+      after: PendingOffers
+  ): Either[String, Unit] =
+    val appended         = next.turns.drop(previous.turns.size)
+    val advances         = next.ply == previous.ply + 1 && appended.size == 1
+    val preservesContext =
+      (before.generatedOffers.isEmpty || after.generatedOffers == before.generatedOffers) &&
+        after.revealedOfferCount >= before.revealedOfferCount &&
+        before.selectedPairIndex.forall(i => after.selectedPairIndex.contains(i))
+    for
       _ <- valid(
-        before.turn.selectedPairIndex.forall { index =>
-          val appended = next.turns.drop(previous.turns.size)
-          (next.ply == previous.ply || appended.nonEmpty) && appended.headOption.forall(
-            _.labChoice.contains(HistoryChoice(before.turn.generatedOffers, index))
-          )
-        },
+        next.ply >= previous.ply && (advances || (next.ply == previous.ply && preservesContext)),
+        (),
+        "laboratory offers and confirmed choice cannot be rewritten"
+      )
+      _ <- valid(
+        appended.size <= 1 && appended.forall(record => completedTurnMatches(record, before, after, advances)),
         (),
         "completed laboratory turn must preserve both generated offers and choice"
       )
-      _ <- valid(!before.fairnessRevealed || after.fairnessRevealed, (), "terminal reveal cannot be retracted")
     yield ()
+
+  private def completedTurnMatches(
+      record: TurnRecord,
+      before: PendingOffers,
+      after: PendingOffers,
+      advances: Boolean
+  ): Boolean =
+    record.labChoice.exists { choice =>
+      before.revealedOfferCount == 2 && choice.offers == before.generatedOffers &&
+      before.selectedPairIndex.forall(_ == choice.selectedPairIndex) &&
+      (advances || after.selectedPairIndex.contains(choice.selectedPairIndex))
+    }
 
   given ValidatedCodec[PendingOffers]   = LaboratoryCodecs.checked(deriveCodec[PendingOffers])(validatePending)
   given ValidatedCodec[AcceptedCommand] = LaboratoryCodecs.checked(deriveCodec[AcceptedCommand])(validateReceipt)

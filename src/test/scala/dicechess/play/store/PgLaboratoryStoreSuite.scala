@@ -6,6 +6,7 @@ import com.dimafeng.testcontainers.PostgreSQLContainer
 import com.dimafeng.testcontainers.munit.TestContainerForAll
 import dicechess.play.core.*
 import dicechess.play.core.LaboratoryProtocol.*
+import dicechess.play.game.EngineOps
 import dicechess.play.store.LaboratoryFixtures.snapshot
 import dicechess.play.store.LaboratoryStorage.AcceptedCommand
 import doobie.implicits.*
@@ -140,6 +141,142 @@ class PgLaboratoryStoreSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(retry, LaboratoryWrite.Unchanged)
           assertEquals(stale, LaboratoryWrite.Conflict)
           assertEquals(loaded.flatMap(_.lab).map(_.receipts.size), Some(1))
+      }
+    }
+
+  test("strict creation conflicts with an existing snapshot while versioned exact retries remain idempotent"):
+    withContainers { pg =>
+      PgLaboratoryStore.resource(config(pg)).use { db =>
+        for
+          id <- GameId.random
+          initial = snapshot(Phase.AwaitingPlayers).copy(version = 0)
+          created       <- db.commit(id, None, initial)
+          duplicate     <- db.commit(id, None, initial)
+          changedCreate <- db.commit(id, None, initial.copy(version = 1))
+          exact         <- db.commit(id, Some(0), initial)
+          next = initial.copy(version = 1)
+          updated <- db.commit(id, Some(0), next)
+          retry   <- db.commit(id, Some(0), next)
+          loaded  <- db.load(id)
+        yield
+          assertEquals(created, LaboratoryWrite.Applied)
+          assertEquals(duplicate, LaboratoryWrite.Conflict)
+          assertEquals(changedCreate, LaboratoryWrite.Conflict)
+          assertEquals(exact, LaboratoryWrite.Unchanged)
+          assertEquals(updated, LaboratoryWrite.Applied)
+          assertEquals(retry, LaboratoryWrite.Unchanged)
+          assertEquals(loaded, Some(next))
+      }
+    }
+
+  test("advancing ply cannot replace offers without recording the completed turn"):
+    withContainers { pg =>
+      PgLaboratoryStore.resource(config(pg)).use { db =>
+        for
+          id <- GameId.random
+          old = snapshot(Phase.AwaitingSecondRoll)
+          _      <- seed(db, id, old)
+          before <- db.transcriptFor(id)
+          changed = old.copy(
+            version = 11,
+            ply = old.ply + 1,
+            lab = old.lab.map(s => s.copy(turn = s.turn.copy(generatedOffers = List(DicePair(6, 6), DicePair(1, 1)))))
+          )
+          rejected    <- db.commit(id, Some(10), changed).attempt
+          counterOnly <- db.commit(id, Some(10), old.copy(version = 11, ply = old.ply + 1)).attempt
+          fabricated = changed.copy(turns =
+            Vector(
+              TurnRecord(
+                0,
+                "w",
+                List(2, 5),
+                Nil,
+                old.dfen,
+                labChoice = Some(HistoryChoice(old.lab.get.turn.generatedOffers, 1))
+              )
+            )
+          )
+          unfinished <- db.commit(id, Some(10), fabricated).attempt
+          loaded     <- db.load(id)
+          after      <- db.transcriptFor(id)
+        yield
+          assert(rejected.isLeft)
+          assert(counterOnly.isLeft)
+          assert(unfinished.isLeft, "one revealed offer cannot become a completed choice")
+          assertEquals(loaded, Some(old))
+          assertEquals(after, before)
+      }
+    }
+
+  test("an atomic confirmed pass records both revealed offers before starting a fresh offer context"):
+    withContainers { pg =>
+      PgLaboratoryStore.resource(config(pg)).use { db =>
+        for
+          id <- GameId.random
+          base   = snapshot(Phase.AwaitingPairChoice)
+          offers = List(DicePair(1, 3), DicePair(3, 4))
+          old    = base.copy(lab = base.lab.map(s => s.copy(turn = s.turn.copy(generatedOffers = offers))))
+          _ <- seed(db, id, old)
+          afterPass = EngineOps.serialize(EngineOps.parse(old.dfen).toOption.get.endTurn())
+          completed = TurnRecord(0, "w", List(3, 4), Nil, afterPass, labChoice = Some(HistoryChoice(offers, 1)))
+          nextBase  = snapshot(Phase.AwaitingFirstRoll)
+          next      = nextBase.copy(
+            version = 11,
+            ply = 1,
+            dfen = afterPass,
+            turns = Vector(completed),
+            lab = nextBase.lab.map(s =>
+              s.copy(receipts =
+                Vector(AcceptedCommand(Seat.White, Command("confirmed-pass", 10, Action.ChoosePair(1)), 11))
+              )
+            )
+          )
+          committed  <- db.commit(id, Some(10), next)
+          loaded     <- db.load(id)
+          receipt    <- db.receiptFor(id, Seat.White, "confirmed-pass")
+          transcript <- db.transcriptFor(id)
+        yield
+          assertEquals(committed, LaboratoryWrite.Applied)
+          assertEquals(loaded, Some(next))
+          assertEquals(receipt.map(_.appliedVersion), Some(11L))
+          assertEquals(
+            transcript.get.payload.hcursor.downField("turns").downN(0).get[List[List[Int]]]("offers"),
+            Right(List(List(1, 3), List(3, 4)))
+          )
+          assertEquals(
+            transcript.get.payload.hcursor.downField("currentTurn").get[List[List[Int]]]("offers"),
+            Right(Nil)
+          )
+      }
+    }
+
+  test("active recovery skips bad records while retaining healthy games and strict point-read failures"):
+    withContainers { pg =>
+      PgLaboratoryStore.resource(config(pg)).use { db =>
+        for
+          healthy     <- GameId.random
+          unsupported <- GameId.random
+          mismatch    <- GameId.random
+          value = snapshot()
+          _ <- List(healthy, unsupported, mismatch).traverse_(id => seed(db, id, value))
+          _ <- sql"""UPDATE laboratory.games SET snapshot = jsonb_set(snapshot, '{variant,revision}', '2')
+              WHERE game_id = ${unsupported.value}::uuid""".update.run.transact(db.xa)
+          _ <- sql"UPDATE laboratory.games SET version = 99 WHERE game_id = ${mismatch.value}::uuid".update.run
+            .transact(db.xa)
+          recovered       <- db.loadActive
+          unsupportedRead <- db.load(unsupported).attempt
+          mismatchedRead  <- db.load(mismatch).attempt
+          retained        <- sql"""SELECT count(*) FROM laboratory.games
+              WHERE game_id IN (${unsupported.value}::uuid, ${mismatch.value}::uuid)"""
+            .query[Long]
+            .unique
+            .transact(db.xa)
+        yield
+          assertEquals(recovered.find(_._1 == healthy).map(_._2), Some(value))
+          assert(!recovered.exists(row => Set(unsupported, mismatch)(row._1)))
+          assert(unsupportedRead.isLeft)
+          assert(mismatchedRead.isLeft)
+          assertEquals(retained, 2L, "recovery must not delete or reinterpret rejected records")
       }
     }
 
@@ -305,13 +442,16 @@ class PgLaboratoryStoreSuite extends CatsEffectSuite with TestContainerForAll:
         for
           active  <- GameId.random
           aborted <- GameId.random
+          control <- GameId.random
           old = snapshot()
-          _           <- seed(db, active, old)
-          firstExpiry <- expiry(db, active)
-          _           <- db.commit(active, Some(10), old.copy(version = 11))
-          laterExpiry <- expiry(db, active)
-          _           <- seed(db, aborted, ended(Termination.Aborted))
-          _           <- List(active, aborted).traverse_(id => sql"""UPDATE laboratory.games
+          _             <- seed(db, control, old)
+          controlBefore <- db.transcriptFor(control)
+          _             <- seed(db, active, old)
+          firstExpiry   <- expiry(db, active)
+          _             <- db.commit(active, Some(10), old.copy(version = 11))
+          laterExpiry   <- expiry(db, active)
+          _             <- seed(db, aborted, ended(Termination.Aborted))
+          _             <- List(active, aborted).traverse_(id => sql"""UPDATE laboratory.games
               SET created_at = now() - interval '3 days', expires_at = now() - interval '1 day'
               WHERE game_id = ${id.value}::uuid""".update.run.transact(db.xa))
           hidden            <- db.load(active)
@@ -322,6 +462,8 @@ class PgLaboratoryStoreSuite extends CatsEffectSuite with TestContainerForAll:
           none              <- db.pruneExpired(1)
           remaining         <- sql"""SELECT count(*) FROM laboratory.transcripts
               WHERE game_id IN (${active.value}::uuid, ${aborted.value}::uuid)""".query[Long].unique.transact(db.xa)
+          controlSnapshot <- db.load(control)
+          controlAfter    <- db.transcriptFor(control)
         yield
           assertEquals(firstExpiry, laterExpiry)
           assertEquals(hidden, None)
@@ -329,6 +471,8 @@ class PgLaboratoryStoreSuite extends CatsEffectSuite with TestContainerForAll:
           assertEquals(refused, LaboratoryWrite.Conflict)
           assertEquals((one, two, none), (1, 1, 0))
           assertEquals(remaining, 0L)
+          assertEquals(controlSnapshot, Some(old))
+          assertEquals(controlAfter, controlBefore)
       }
     }
 

@@ -326,11 +326,15 @@ must still be checked by the room; stored join history alone is not presence aft
 `commit(gameId, expectedVersion, snapshot)` is the persist-before-broadcast boundary: `None` strictly
 creates, and `Some` fences an update against the stored version. A per-game transaction lock covers
 the snapshot, public transcript, result and receipt list. Existing rows are locked against concurrent
-expiry cleanup. The room broadcasts and acknowledges only
-after `Applied`; an exact retry returns `Unchanged`, and a stale or competing write returns `Conflict`.
+expiry cleanup. The room broadcasts only after `Applied` and acknowledges it with the new receipt.
+An exact versioned retry returns `Unchanged` and is acknowledged with the original stored receipt.
+A repeated strict creation, stale write or competing write returns `Conflict`.
 Creation identity/settings, captured provenance and frozen seed inputs are immutable. History and
 receipts are append-only; generated offers, reveal progress and a confirmed choice cannot be rewritten
-within the same macro-turn. This storage seam does not decide move legality or implement room transitions.
+within the same macro-turn. A new offer context requires an appended completed turn preserving the
+previously revealed offers and accepted selection; `ply` cannot advance on its own. Recovery logs
+the IDs of corrupt or unsupported active records and resumes the healthy records, while point reads
+remain strict. This storage seam does not decide move legality or implement room transitions.
 
 The `games`, `results`, `transcripts` and `rematches` projections retain variant id/revision in ordinary
 columns, with foreign-key agreement between them. `results` also preserves technical aborts with a

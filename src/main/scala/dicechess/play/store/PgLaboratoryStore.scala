@@ -1,6 +1,7 @@
 package dicechess.play.store
 
 import cats.effect.{IO, Resource}
+import cats.effect.std.Console
 import cats.syntax.all.*
 import dicechess.play.core.*
 import dicechess.play.core.LaboratoryProtocol.*
@@ -59,13 +60,17 @@ final class PgLaboratoryStore private (
           FROM laboratory.games WHERE status = 'active' AND expires_at > clock_timestamp() ORDER BY game_id"""
       .query[(String, Json, Long, String, Int, Int, String, String, Json, Instant, String)]
       .to[List]
-      .flatMap(_.traverse {
-        case (id, json, version, variant, revision, protocol, rules, algorithm, control, expiry, status) =>
-          decodeRow((json, version, variant, revision, protocol, rules, algorithm, control, expiry, status))
-            .map(r => GameId(id) -> r._1)
-            .liftTo[ConnectionIO]
+      .map(_.map { case (id, json, version, variant, revision, protocol, rules, algorithm, control, expiry, status) =>
+        decodeRow((json, version, variant, revision, protocol, rules, algorithm, control, expiry, status))
+          .bimap(_ => GameId(id), r => GameId(id) -> r._1)
       })
-  }
+  }.flatMap(_.traverse {
+    case Left(id) =>
+      Console[IO]
+        .errorln(s"[lab][store] skipping corrupt or unsupported laboratory game ${id.value}")
+        .as(Option.empty[(GameId, GameSnapshot)])
+    case Right(record) => IO.pure(Some(record))
+  }).map(_.flatten)
 
   override def save(id: GameId, snapshot: GameSnapshot): IO[Unit] =
     load(id)
@@ -95,6 +100,7 @@ final class PgLaboratoryStore private (
       previous <- read(id, lock = true)
       now      <- databaseTime
       result   <- previous match
+        case Some(_) if expectedVersion.isEmpty        => LaboratoryWrite.Conflict.pure[ConnectionIO]
         case Some((_, expiry)) if !expiry.isAfter(now) => LaboratoryWrite.Conflict.pure[ConnectionIO]
         case Some((old, _)) if old == snapshot         => LaboratoryWrite.Unchanged.pure[ConnectionIO]
         case Some((old, _)) if expectedVersion != Some(old.version) || snapshot.version <= old.version || old.ended =>

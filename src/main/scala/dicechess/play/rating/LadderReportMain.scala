@@ -192,7 +192,11 @@ object LadderReportMain extends IOApp:
         PgGameStore.resource(dbConfig).use { store =>
           store
             .strengthReportSource(options.category, options.config.windowDays)
-            .flatMap(source => renderAndPublish(store, options, source))
+            .flatMap {
+              case Left(error) =>
+                IO.println(s"[ladder-report] invalid report source: ${error.message}").as(ExitCode.Error)
+              case Right(source) => renderAndPublish(store, options, source)
+            }
         }
 
   private[rating] def buildReport(

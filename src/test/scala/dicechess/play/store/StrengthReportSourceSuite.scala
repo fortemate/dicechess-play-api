@@ -37,6 +37,14 @@ class StrengthReportSourceSuite extends CatsEffectSuite with TestContainerForAll
           VALUES (${f.id}::uuid, 'human:white', 'human:black', $result, 'resign', ${f.rated}, ${f.control},
               'fixture-seed', ${f.at})""".update.run.transact(xa).void
 
+  private def load(
+      db: PgGameStore,
+      category: RatingCategory,
+      windowDays: Option[Int]
+  ): IO[GameResultsStore.ReportSource] =
+    db.strengthReportSource(category, windowDays)
+      .map(_.fold(error => fail(s"unexpected source validation error: ${error.message}"), identity))
+
   private def reset(xa: doobie.Transactor[IO]): IO[Unit] =
     sql"TRUNCATE TABLE play.game_results CASCADE".update.run.transact(xa).void
 
@@ -65,7 +73,7 @@ class StrengthReportSourceSuite extends CatsEffectSuite with TestContainerForAll
           _        <- reset(xa)
           _        <- fixtures.traverse_(f => insert(xa, f, if f.id == fixtures(4).id then None else Some(1)))
           baseline <- db.finishedRatedSince(Instant.EPOCH)
-          source   <- db.strengthReportSource(RatingCategory.Blitz, Some(10))
+          source   <- load(db, RatingCategory.Blitz, Some(10))
         yield
           val expected = baseline.filter(row => row.timeControl == "Fischer(300,3)" && !row.finishedAt.isBefore(lower))
           val expectedCutoff = baseline.filter(_.timeControl == "Fischer(300,3)").map(_.finishedAt).maxOption
@@ -91,13 +99,13 @@ class StrengthReportSourceSuite extends CatsEffectSuite with TestContainerForAll
           _           <- reset(xa)
           _           <- fixtures.traverse_(insert(xa, _))
           baseline    <- db.finishedRatedSince(Instant.EPOCH)
-          full        <- db.strengthReportSource(RatingCategory.Bullet, None)
-          huge        <- db.strengthReportSource(RatingCategory.Bullet, Some(Int.MaxValue))
+          full        <- load(db, RatingCategory.Bullet, None)
+          huge        <- load(db, RatingCategory.Bullet, Some(Int.MaxValue))
           _           <- reset(xa)
-          empty       <- db.strengthReportSource(RatingCategory.Bullet, None)
-          emptyWindow <- db.strengthReportSource(RatingCategory.Bullet, Some(14))
-          zero        <- db.strengthReportSource(RatingCategory.Bullet, Some(0)).attempt
-          negative    <- db.strengthReportSource(RatingCategory.Bullet, Some(-1)).attempt
+          empty       <- load(db, RatingCategory.Bullet, None)
+          emptyWindow <- load(db, RatingCategory.Bullet, Some(14))
+          zero        <- db.strengthReportSource(RatingCategory.Bullet, Some(0))
+          negative    <- db.strengthReportSource(RatingCategory.Bullet, Some(-1))
         yield
           val expected = baseline.filter(_.timeControl == "Fischer(60,1)")
           assertEquals(full.rows.map(_.gameId).toSet, expected.map(_.gameId).toSet)
@@ -108,8 +116,8 @@ class StrengthReportSourceSuite extends CatsEffectSuite with TestContainerForAll
           assertEquals(empty.excludedRows, 0)
           assertEquals(empty.categoryCutoff, None)
           assertEquals(emptyWindow, empty)
-          assert(zero.swap.toOption.exists(_.isInstanceOf[IllegalArgumentException]))
-          assert(negative.swap.toOption.exists(_.isInstanceOf[IllegalArgumentException]))
+          assertEquals(zero, Left(GameResultsStore.ReportSourceError.InvalidWindow))
+          assertEquals(negative, Left(GameResultsStore.ReportSourceError.InvalidWindow))
       }
     }
 
@@ -125,7 +133,7 @@ class StrengthReportSourceSuite extends CatsEffectSuite with TestContainerForAll
         for
           _      <- reset(xa)
           _      <- fixtures.traverse_(insert(xa, _))
-          source <- db.strengthReportSource(RatingCategory.Blitz, Some(10))
+          source <- load(db, RatingCategory.Blitz, Some(10))
         yield
           assertEquals(source.rows, Nil)
           assertEquals(source.excludedRows, 3)
@@ -144,8 +152,8 @@ class StrengthReportSourceSuite extends CatsEffectSuite with TestContainerForAll
         for
           _      <- reset(xa)
           _      <- fixtures.traverse_(insert(xa, _))
-          full   <- db.strengthReportSource(RatingCategory.Rapid, None)
-          window <- db.strengthReportSource(RatingCategory.Rapid, Some(10))
+          full   <- load(db, RatingCategory.Rapid, None)
+          window <- load(db, RatingCategory.Rapid, Some(10))
         yield
           assertEquals(full.rows.map(_.gameId.value).toSet, Set(fixtures.head.id.toString))
           assertEquals(full.excludedRows, 1)

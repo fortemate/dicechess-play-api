@@ -717,6 +717,9 @@ trait GameResultsStore:
   def opponentsFor(externalIds: List[String]): IO[List[OpponentAggregateRow]]
 
 object GameResultsStore:
+  enum ReportSourceError(val message: String):
+    case InvalidWindow extends ReportSourceError("windowDays must be positive")
+
   /** A report's model input plus diagnostics from the full rated corpus. `categoryCutoff` precedes window filtering;
     * `excludedRows` counts rows omitted by the database, before the model checks participant/result eligibility.
     */

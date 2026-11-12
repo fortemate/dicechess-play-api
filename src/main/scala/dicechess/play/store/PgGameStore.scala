@@ -2752,8 +2752,8 @@ final class PgGameStore private (
   def strengthReportSource(
       category: RatingCategory,
       windowDays: Option[Int]
-  ): IO[GameResultsStore.ReportSource] =
-    if windowDays.exists(_ <= 0) then IO.raiseError(new IllegalArgumentException("windowDays must be positive"))
+  ): IO[Either[GameResultsStore.ReportSourceError, GameResultsStore.ReportSource]] =
+    if windowDays.exists(_ <= 0) then IO.pure(Left(GameResultsStore.ReportSourceError.InvalidWindow))
     else
       val tx = for
         _        <- sql"SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY".update.run
@@ -2783,7 +2783,7 @@ final class PgGameStore private (
           .to[List]
           .map(_.map(PgGameStore.toRow).filter(row => RatingCategory.ofStored(row.timeControl).contains(category)))
       yield GameResultsStore.ReportSource(rows, Math.toIntExact(total - rows.size.toLong), categoryCutoff)
-      tx.transact(xa).timed("strengthReportSource")
+      tx.transact(xa).timed("strengthReportSource").map(_.asRight[GameResultsStore.ReportSourceError])
 
   private[store] def strengthReportRowsQuery(category: RatingCategory, lower: Option[Instant]): Fragment =
     val window = lower.fold(Fragment.empty)(cutoff => fr" AND finished_at >= $cutoff")

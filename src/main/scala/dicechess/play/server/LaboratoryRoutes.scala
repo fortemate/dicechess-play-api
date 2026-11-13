@@ -25,7 +25,7 @@ object LaboratoryRoutes:
       wsb: WebSocketBuilder2[IO],
       session: Option[AuthSession] = None
   ): HttpRoutes[IO] =
-    PlayRoutes(registry, wsb, session) <+> HttpRoutes.of[IO] {
+    LaboratoryWebSocket(registry, wsb, session) <+> PlayRoutes(registry, wsb, session) <+> HttpRoutes.of[IO] {
       case GET -> Root / "games" / id / "transcript" =>
         registry
           .transcript(GameId(id))

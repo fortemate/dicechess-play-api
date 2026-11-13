@@ -16,11 +16,12 @@ import io.circe.Json
 import io.circe.parser.parse
 import io.circe.syntax.*
 import org.http4s.Uri
-import org.http4s.client.websocket.{WSConnectionHighLevel, WSFrame, WSRequest}
+import org.http4s.client.websocket.{WSConnection, WSConnectionHighLevel, WSFrame, WSRequest}
 import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.implicits.*
 import org.http4s.jdkhttpclient.JdkWSClient
 import org.http4s.websocket.WebSocketFrame
+import scodec.bits.ByteVector
 
 import scala.concurrent.duration.*
 
@@ -71,7 +72,7 @@ class LaboratoryWebSocketSuite extends munit.CatsEffectSuite:
 
   private val laboratoryGameId = GameId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
-  private def routeServer(room: GameRoom): Resource[IO, Int] =
+  private def routeServer(room: GameRoom, authenticationTimeout: FiniteDuration = 5.seconds): Resource[IO, Int] =
     val registry = new PlayRegistry:
       override def get(id: GameId): IO[Option[GameRoom]] = IO.pure(Option.when(id == laboratoryGameId)(room))
       override val list: IO[List[(GameId, GameRoom)]]    = IO.pure(Nil)
@@ -90,9 +91,44 @@ class LaboratoryWebSocketSuite extends munit.CatsEffectSuite:
       .withHost(host"127.0.0.1")
       .withPort(port"0")
       .withShutdownTimeout(1.second)
-      .withHttpWebSocketApp(wsb => PlayRoutes(registry, wsb).orNotFound)
+      .withHttpWebSocketApp(wsb =>
+        (LaboratoryWebSocket(registry, wsb, authenticationTimeout = authenticationTimeout) <+>
+          PlayRoutes(registry, wsb)).orNotFound
+      )
       .build
       .map(_.address.getPort)
+
+  private def authentication(token: String, guest: String): WSFrame.Text =
+    WSFrame.Text(
+      Json
+        .obj(
+          "LabAuthenticate" -> Json.obj("token" -> token.asJson, "guest" -> guest.asJson)
+        )
+        .noSpaces
+    )
+
+  private def expectPolicyClose(conn: WSConnection[IO]): IO[Unit] =
+    conn.receiveStream
+      .dropWhile {
+        case _: WSFrame.Ping | _: WSFrame.Pong => true
+        case _                                 => false
+      }
+      .take(1)
+      .compile
+      .lastOrError
+      .timeout(2.seconds)
+      .flatMap {
+        case close: WSFrame.Close => IO(assertEquals(close.statusCode, 1008))
+        case frame                => IO(fail(s"expected close 1008 before data, received $frame"))
+      }
+
+  private def awaitSeatConnection(room: GameRoom, seat: Seat, expected: Boolean, remaining: Int = 100): IO[Unit] =
+    room
+      .seatConnected(seat)
+      .flatMap: connected =>
+        if connected == expected then IO.unit
+        else if remaining <= 0 then IO.raiseError(new RuntimeException(s"seat $seat did not reach presence=$expected"))
+        else IO.sleep(10.millis) *> awaitSeatConnection(room, seat, expected, remaining - 1)
 
   private def readJson(conn: WSConnectionHighLevel[IO]): IO[Json] =
     conn.receiveStream
@@ -169,6 +205,170 @@ class LaboratoryWebSocketSuite extends munit.CatsEffectSuite:
         if rejected then IO.pure(List(json))
         else awaitPrivateRejection(conn, commandId, remaining - 1).map(json :: _)
 
+  test("only a valid first authentication frame attaches a seat and it is acknowledged before the feed"):
+    laboratory.use: (room, writes) =>
+      routeServer(room).use: port =>
+        JdkWSClient
+          .simple[IO]
+          .use: ws =>
+            val uri = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
+            for
+              initial <- room.snapshot
+              _       <- writes.get.map(value => assertEquals(value.size, 1))
+              _       <- ws
+                .connectHighLevel(WSRequest(uri))
+                .use: white =>
+                  for
+                    _       <- awaitSeatConnection(room, Seat.White, expected = false)
+                    pending <- room.snapshot
+                    _ = assertEquals(pending.version, initial.version)
+                    _ <- writes.get.map(value => assertEquals(value.size, 1))
+                    _ <- white.send(authentication(room.joinTokens(Seat.White), "11111111-1111-1111-1111-111111111111"))
+                    ack <- readJson(white)
+                    _ = assertEquals(
+                      ack.hcursor.downField("LabAuthenticated").get[String]("seat").toOption,
+                      Some("White")
+                    )
+                    _ <- awaitPublicVersion(white, initial.version)
+                    _ <- awaitSeatConnection(room, Seat.White, expected = true)
+                  yield ()
+              after <- room.snapshot
+              _ = assertEquals(after.dfen, initial.dfen)
+              _ = assertEquals(after.lab.map(_.turn.phase), Some(Lab.Phase.AwaitingPlayers))
+            yield ()
+
+  test("invalid, premature, and non-text first frames close with policy code and never attach presence"):
+    laboratory.use: (room, writes) =>
+      laboratory.use: (otherRoom, _) =>
+        routeServer(room).use: port =>
+          JdkWSClient
+            .simple[IO]
+            .use: ws =>
+              val uri = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
+              val invalidFrames: List[WSFrame] = List(
+                authentication("wrong-token", "11111111-1111-1111-1111-111111111111"),
+                authentication(otherRoom.joinTokens(Seat.White), "11111111-1111-1111-1111-111111111111"),
+                authentication(room.joinTokens(Seat.White), "invalid-guest"),
+                WSFrame.Text("{\"LabAuthenticate\":{\"token\":\"x\"}}"),
+                WSFrame.Text("{\"LabAuthenticate\":{\"token\":\"x\",\"guest\":\"x\",\"seat\":\"White\"}}"),
+                WSFrame.Text("{"),
+                WSFrame.Text("x" * 1100),
+                WSFrame.Text("\"" + "\u20ac" * 400 + "\""),
+                WSFrame.Binary(ByteVector.encodeAscii("not text").toOption.get),
+                WSFrame.Text("{\"LabAuthenticate\":", last = false),
+                WSFrame.Text((GameCommand.SubmitSeed("must-not-become-a-seed"): GameCommand).asJson.noSpaces)
+              )
+              for
+                initial <- room.snapshot
+                _       <- invalidFrames.traverse_(frame =>
+                  ws.connect(WSRequest(uri))
+                    .use: conn =>
+                      conn.send(frame) *> expectPolicyClose(conn) *>
+                        room.seatConnected(Seat.White).map(connected => assert(!connected))
+                )
+                after     <- room.snapshot
+                persisted <- writes.get
+                _ = assertEquals(after.version, initial.version)
+                _ = assertEquals(persisted.size, 1)
+              yield ()
+
+  test("an idle deadline survives control pings and times out an unauthenticated connection"):
+    laboratory.use: (room, _) =>
+      routeServer(room, 250.millis).use: port =>
+        JdkWSClient
+          .simple[IO]
+          .use: ws =>
+            val uri = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
+            ws.connect(WSRequest(uri))
+              .use: conn =>
+                conn.send(WSFrame.Ping(ByteVector.empty)) *> expectPolicyClose(conn) *>
+                  room.seatConnected(Seat.White).map(connected => assert(!connected))
+
+  test("seat URLs reject legacy capability queries while the public spectator URL still works"):
+    laboratory.use: (room, _) =>
+      routeServer(room).use: port =>
+        JdkWSClient
+          .simple[IO]
+          .use: ws =>
+            val base   = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
+            val legacy = base +? ("token" -> room.joinTokens(Seat.White))
+            val guest  = base +? ("guest" -> "11111111-1111-1111-1111-111111111111")
+            val mixed  = base.withQueryParam("mode", "spectator").withQueryParam("token", room.joinTokens(Seat.White))
+            for
+              legacyResult <- ws.connectHighLevel(WSRequest(legacy)).use(_ => IO.unit).attempt
+              guestResult  <- ws.connectHighLevel(WSRequest(guest)).use(_ => IO.unit).attempt
+              mixedResult  <- ws.connectHighLevel(WSRequest(mixed)).use(_ => IO.unit).attempt
+              _ = assert(legacyResult.isLeft, "a legacy seat token in the URL must be rejected")
+              _ = assert(guestResult.isLeft, "a guest id in the URL must be rejected")
+              _ = assert(mixedResult.isLeft, "spectator mode cannot be combined with a seat token")
+              _ <- ws
+                .connectHighLevel(WSRequest(base +? ("mode" -> "spectator")))
+                .use: viewer =>
+                  readJson(viewer).void
+              _ <- room.seatConnected(Seat.White).map(connected => assert(!connected))
+            yield ()
+
+  test("a second authentication frame cannot switch the authenticated seat"):
+    laboratory.use: (room, _) =>
+      routeServer(room).use: port =>
+        JdkWSClient
+          .simple[IO]
+          .use: ws =>
+            val uri = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
+            val authenticatedWhite = for
+              _ <- room.submit(Seat.White, GameCommand.SubmitSeed("white-auth-seat-seed-0123456789"))
+              _ <- room.submit(Seat.Black, GameCommand.SubmitSeed("black-auth-seat-seed-0123456789"))
+              _ <- ws
+                .connectHighLevel(WSRequest(uri))
+                .use: conn =>
+                  for
+                    _ <- conn.send(authentication(room.joinTokens(Seat.White), "11111111-1111-1111-1111-111111111111"))
+                    ack <- readJson(conn)
+                    _ = assertEquals(
+                      ack.hcursor.downField("LabAuthenticated").get[String]("seat").toOption,
+                      Some("White")
+                    )
+                    readyState <- ready(room)
+                    _ <- conn.send(authentication(room.joinTokens(Seat.Black), "22222222-2222-2222-2222-222222222222"))
+                    command = Lab.Command("auth-seat-barrier", readyState.version, Lab.Action.RollFirst)
+                    _        <- conn.send(WSFrame.Text(Lab.CommandFrame(command).asJson.noSpaces))
+                    advanced <- awaitRoomVersion(room, readyState.version)
+                    frames   <- awaitReceiptAndSnapshot(conn, command.commandId, advanced.version)
+                    _ = assert(
+                      frames.exists(
+                        _.hcursor
+                          .downField("LabCommandApplied")
+                          .get[String]("commandId")
+                          .toOption
+                          .contains(command.commandId)
+                      ),
+                      "the authenticated White seat should still be able to act after a duplicate auth frame"
+                    )
+                    _ <- awaitSeatConnection(room, Seat.White, expected = true)
+                  yield ()
+            yield ()
+            room.connection(Seat.Black).use(_ => authenticatedWhite)
+
+  test("disconnecting before authentication leaves the room untouched"):
+    laboratory.use: (room, writes) =>
+      routeServer(room).use: port =>
+        JdkWSClient
+          .simple[IO]
+          .use: ws =>
+            val uri = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
+            for
+              before <- room.snapshot
+              _      <- ws
+                .connectHighLevel(WSRequest(uri))
+                .use: _ =>
+                  IO.unit
+              after     <- room.snapshot
+              persisted <- writes.get
+              _         <- awaitSeatConnection(room, Seat.White, expected = false)
+              _ = assertEquals(after.version, before.version)
+              _ = assertEquals(persisted.size, 1)
+            yield ()
+
   test("the routed laboratory command receipt reaches only its token-authorized WebSocket"):
     laboratory.use: (room, _) =>
       routeServer(room).use: port =>
@@ -176,9 +376,9 @@ class LaboratoryWebSocketSuite extends munit.CatsEffectSuite:
           .simple[IO]
           .use: ws =>
             val base      = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
-            val whiteUri  = base +? ("token" -> room.joinTokens(Seat.White))
-            val blackUri  = base +? ("token" -> room.joinTokens(Seat.Black))
-            val viewerUri = base +? ("mode"  -> "spectator")
+            val whiteUri  = base
+            val blackUri  = base
+            val viewerUri = base +? ("mode" -> "spectator")
             ws.connectHighLevel(WSRequest(whiteUri))
               .use: white =>
                 ws.connectHighLevel(WSRequest(blackUri))
@@ -186,7 +386,22 @@ class LaboratoryWebSocketSuite extends munit.CatsEffectSuite:
                     ws.connectHighLevel(WSRequest(viewerUri))
                       .use: viewer =>
                         for
-                          // The greeting and public feed are merged; readiness is fenced by version below.
+                          _ <- white.send(
+                            authentication(room.joinTokens(Seat.White), "11111111-1111-1111-1111-111111111111")
+                          )
+                          _ <- black.send(
+                            authentication(room.joinTokens(Seat.Black), "22222222-2222-2222-2222-222222222222")
+                          )
+                          whiteAuth <- readJson(white)
+                          blackAuth <- readJson(black)
+                          _ = assertEquals(
+                            whiteAuth.hcursor.downField("LabAuthenticated").get[String]("seat").toOption,
+                            Some("White")
+                          )
+                          _ = assertEquals(
+                            blackAuth.hcursor.downField("LabAuthenticated").get[String]("seat").toOption,
+                            Some("Black")
+                          )
                           _ <- white.send(
                             WSFrame.Text(
                               (GameCommand.SubmitSeed("white-route-seed-0123456789"): GameCommand).asJson.noSpaces

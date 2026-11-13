@@ -285,7 +285,7 @@ object PlayRoutes:
     * The log line names the game and seat but never the identity: this runs on an unauthenticated-looking upgrade and a
     * failure is not a reason to write who was trying to sit down.
     */
-  private def claimSeatQuietly(
+  private[server] def claimSeatQuietly(
       registry: PlayRegistry,
       session: Option[AuthSession],
       req: Request[IO],
@@ -321,7 +321,7 @@ object PlayRoutes:
           WebSocketFrame.Close(ByteVector.fromShort(1000.toShort))
         )
 
-  private def armedFrame(response: DrawOfferArmed): WebSocketFrame =
+  private[server] def armedFrame(response: DrawOfferArmed): WebSocketFrame =
     WebSocketFrame.Text(DrawOfferArmedFrame(response).asJson.noSpaces)
 
   private[server] def fromClient(

@@ -1,7 +1,9 @@
 package dicechess.play.store
 
 import dicechess.play.core.*
+import dicechess.play.core.LaboratoryProtocol.Phase
 import dicechess.play.game.EngineOps
+import dicechess.play.wire.LaboratoryCodecs
 
 /** The archive payload builder: field round-trip, the same do-not-archive rules as `PlaysiteIngest`, and the
   * fairness-block fallback for a seat that never submitted a client seed.
@@ -103,6 +105,33 @@ class GameArchiveSuite extends munit.FunSuite:
     val malformed = snapshot(ended(GameResult.Win(Side.White), Termination.KingCaptured))
       .copy(players = Map(Seat.White -> Principal.Guest("w-uuid"))) // Black seat missing
     assertEquals(GameArchive.payload(malformed), None)
+
+  test("the archive classifier distinguishes malformed classic games from valid classic and laboratory endings"):
+    val classic     = snapshot(ended(GameResult.Draw, Termination.Draw))
+    val classicJson = LaboratoryCodecs.encodeValidated(classic).getOrElse(fail("classic fixture must validate"))
+    assert(PgGameStore.archivableEntry(classicJson).isRight, "a valid classic sporting game remains archivable")
+
+    val malformed     = classic.copy(players = Map(Seat.White -> Principal.Guest("w-uuid")))
+    val malformedJson =
+      LaboratoryCodecs.encodeValidated(malformed).getOrElse(fail("malformed classic fixture must encode"))
+    val malformedResult = PgGameStore.archivableEntry(malformedJson)
+    assert(malformedResult.isLeft)
+    assert(malformedResult.swap.toOption.exists(_.contains("missing a player seat")))
+    assert(malformedResult.swap.toOption.exists(_.contains("investigate")))
+
+    val aborted     = LaboratoryFixtures.snapshot(Phase.Ended)
+    val abortedJson = LaboratoryCodecs.encodeValidated(aborted).getOrElse(fail("aborted lab fixture must validate"))
+    assertEquals(
+      PgGameStore.archivableEntry(abortedJson),
+      Left("non-classic — expected, only classic games are archived")
+    )
+
+    val sporting     = aborted.copy(status = GameStatus.Ended(GameOver(GameResult.Draw, Termination.Draw)))
+    val sportingJson = LaboratoryCodecs.encodeValidated(sporting).getOrElse(fail("sporting lab fixture must validate"))
+    assertEquals(
+      PgGameStore.archivableEntry(sportingJson),
+      Left("non-classic — expected, only classic games are archived")
+    )
 
   test("a snapshot with no rated key archives as rated=false"):
     val json = GameArchive.payload(snapshot(ended(GameResult.Win(Side.Black), Termination.Resign), rated = None))

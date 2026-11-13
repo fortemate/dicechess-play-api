@@ -4309,19 +4309,21 @@ object PgGameStore:
           )
         }
 
-  /** A stored snapshot's archive entry, or `Left(reason)` naming WHY there isn't one (#199). The three causes are not
-    * equivalent to whoever is watching a backfill run: an aborted game is a correct, permanent skip, whereas a snapshot
-    * that will not decode or is missing a seat is a data problem worth looking at. Collapsing them into one message —
-    * and swallowing circe's decode error — would leave an operator scanning tens of thousands of rows with no way to
-    * tell the two apart, which is exactly why `loadActive` logs its own decode failures in full.
+  /** A stored snapshot's archive entry, or `Left(reason)` naming WHY there isn't one (#199). The causes are not
+    * equivalent to whoever is watching a backfill run: a non-classic or aborted game is an expected skip, whereas a
+    * snapshot that will not decode or is missing a seat is a data problem worth looking at. Collapsing them into one
+    * message — and swallowing circe's decode error — would leave an operator scanning tens of thousands of rows with no
+    * way to tell the two apart, which is exactly why `loadActive` logs its own decode failures in full.
     */
-  private def archivableEntry(json: Json): Either[String, GameArchive.Entry] =
+  private[store] def archivableEntry(json: Json): Either[String, GameArchive.Entry] =
     json.as[GameSnapshot] match
       case Left(error)     => Left(s"snapshot does not decode — investigate ($error)")
       case Right(snapshot) =>
         GameArchive.entry(snapshot) match
-          case Some(entry) => Right(entry)
-          case None        =>
+          case Some(entry)                 => Right(entry)
+          case None if !snapshot.isClassic =>
+            Left("non-classic — expected, only classic games are archived")
+          case None =>
             snapshot.status match
               case GameStatus.Ended(GameOver(_, Termination.Aborted)) =>
                 Left("aborted — expected, aborted games outside the showcase are never archived")

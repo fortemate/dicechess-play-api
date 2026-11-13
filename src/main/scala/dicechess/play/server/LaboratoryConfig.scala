@@ -126,8 +126,7 @@ object LaboratoryConfig:
     )
 
   private def validDatabaseUrl(url: String): Boolean =
-    if !url.startsWith("jdbc:postgresql://") then false
-    else
+    url.startsWith("jdbc:postgresql://") &&
       Try(URI.create(url.stripPrefix("jdbc:"))).toOption.exists: uri =>
         val keys = Option(uri.getRawQuery).toList
           .flatMap(_.split('&'))

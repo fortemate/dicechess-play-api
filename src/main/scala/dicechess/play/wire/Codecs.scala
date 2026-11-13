@@ -3,7 +3,7 @@ package dicechess.play.wire
 import dicechess.play.core.*
 import io.circe.derivation.{Configuration, ConfiguredCodec}
 import io.circe.generic.semiauto.deriveCodec
-import io.circe.{Codec, Decoder, Encoder, Json, KeyDecoder}
+import io.circe.{Codec, Decoder, DecodingFailure, Encoder, Json, KeyDecoder}
 import io.circe.syntax.*
 
 import java.time.Instant
@@ -101,19 +101,57 @@ object Codecs:
       Json.obj(fields*)
     }
   )
-  given Codec[PublicPlayer]                                  = deriveCodec
-  given Codec[Players]                                       = deriveCodec
+  given Codec[PublicPlayer] = deriveCodec
+  given Codec[Players]      = deriveCodec
+
+  // Resolve validated laboratory codecs only when a public lab field is actually encoded or decoded. LaboratoryCodecs
+  // imports the classic codecs for Seat/Clocks, so resolving these codecs while either object initializes would form
+  // an eager initialization cycle.
+  private def validatedLabState: LaboratoryCodecs.ValidatedCodec[LaboratoryProtocol.PublicState] =
+    import LaboratoryCodecs.given
+    summon[LaboratoryCodecs.ValidatedCodec[LaboratoryProtocol.PublicState]]
+  private def validatedLabChoice: LaboratoryCodecs.ValidatedCodec[LaboratoryProtocol.HistoryChoice] =
+    import LaboratoryCodecs.given
+    summon[LaboratoryCodecs.ValidatedCodec[LaboratoryProtocol.HistoryChoice]]
+
+  given Codec[LaboratoryProtocol.PublicState] = Codec.from(
+    Decoder.instance(cursor => validatedLabState(cursor)),
+    Encoder.instance(value => validatedLabState(value))
+  )
+  given Codec[LaboratoryProtocol.HistoryChoice] = Codec.from(
+    Decoder.instance(cursor => validatedLabChoice(cursor)),
+    Encoder.instance(value => validatedLabChoice(value))
+  )
+
   private val publicGameStateDerived: Codec[PublicGameState] = deriveCodec
   given Codec[PublicGameState]                               = Codec.from(
-    publicGameStateDerived,
+    Decoder.instance { cursor =>
+      cursor.downField("lab").focus match
+        case Some(Json.Null) => Left(DecodingFailure("lab must be omitted or a laboratory state", cursor.history))
+        case _               => publicGameStateDerived(cursor)
+    },
     Encoder.instance(state =>
       publicGameStateDerived(state).mapObject(fields =>
-        if state.rematchStartup.isDefined then fields else fields.remove("rematchStartup")
+        val withoutRematch = if state.rematchStartup.isDefined then fields else fields.remove("rematchStartup")
+        if state.lab.isDefined then withoutRematch else withoutRematch.remove("lab")
       )
     )
   )
-  given Codec[GameMoves]           = deriveCodec
-  given Codec[SnapshotTurn]        = deriveCodec
+  given Codec[GameMoves]                               = deriveCodec
+  private val snapshotTurnDerived: Codec[SnapshotTurn] = deriveCodec
+  given Codec[SnapshotTurn]                            = Codec.from(
+    Decoder.instance { cursor =>
+      cursor.downField("labChoice").focus match
+        case Some(Json.Null) =>
+          Left(DecodingFailure("labChoice must be omitted or a laboratory history choice", cursor.history))
+        case _ => snapshotTurnDerived(cursor)
+    },
+    Encoder.instance(turn =>
+      snapshotTurnDerived(turn).mapObject(fields =>
+        if turn.labChoice.isDefined then fields else fields.remove("labChoice")
+      )
+    )
+  )
   given Codec[DrawOfferArmed]      = deriveCodec
   given Codec[DrawOfferArmedFrame] = deriveCodec
   // ConfiguredCodec, not deriveCodec: `SubmitTurn.offerDraw` (#327) is a defaulted non-Option field.

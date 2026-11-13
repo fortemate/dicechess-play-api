@@ -3,15 +3,16 @@ title: Two-pair laboratory contract
 description: Revision-1 identity, two-roll protocol, readiness, retry, persistence and rules-consumer fixtures for the isolated human laboratory.
 ---
 
-This is the normative preparatory contract for
+This is the normative revision-1 contract introduced by
 [play-api issue 289](https://github.com/fortemate/dicechess-play-api/issues/289), under
 [the laboratory Epic](https://github.com/fortemate/dicechess-play/issues/221).
-`LaboratoryProtocol` and `LaboratoryCodecs` pin its values and JSON examples. They do **not**
-enable a route, start laboratory rooms, change classic frames, implement the RNG or migrate a database.
-Room, storage and dice implementation remain independently owned by
+`LaboratoryProtocol` and `LaboratoryCodecs` pin its values and JSON examples. Room, storage and
+dice implementations are owned by
 [292](https://github.com/fortemate/dicechess-play-api/issues/292),
 [290](https://github.com/fortemate/dicechess-play-api/issues/290) and
 [291](https://github.com/fortemate/dicechess-play-api/issues/291).
+The [room adapter](../laboratory-rooms/) is explicit opt-in code; runtime configuration and route
+assembly belong to [293](https://github.com/fortemate/dicechess-play-api/issues/293).
 
 ## Identity and compatibility
 
@@ -36,7 +37,7 @@ New laboratory creation and state require explicit revision-1 identity. The main
 continues accepting legacy classic creation with no variant; the lab deployment requires an
 explicit supported lab variant. Neither deployment silently falls through to the other mode.
 
-The future additive `POST /games` request retains existing anonymous UUID fields `white` and
+The additive `POST /games` request retains existing anonymous UUID fields `white` and
 `black` and the structured `timeControl`, adding `variant` and `labProtocolVersion: 1`.
 Both seats initially belong to the creator until the opponent redeems their distinct seat token,
 as in the current friend-by-link flow. The response echoes the agreed variant, protocol and
@@ -49,9 +50,9 @@ issuing an invitation. An absent/mismatched echo is an incompatible server, not 
 This matters during staged rollout: the current classic creation decoder can ignore unknown JSON
 fields, so sending a new selector to an old server is not proof that it created a lab game.
 
-Classic creation and `GameCommand`/`GameEvent` codecs remain unchanged in this preparatory change.
+Classic creation responses and existing command/event JSON retain their existing shapes.
 Laboratory turn commands use a distinct `LabCommand` envelope. Classic endpoints reject that
-envelope; a future lab room must refuse classic `SubmitTurn` as a bypass of the version guard.
+envelope; a laboratory room refuses classic `SubmitTurn` as a bypass of the version guard.
 Existing seat-authenticated `SubmitSeed`, `Resign`, `ArmDrawOffer` and `RespondDraw` lifecycle
 commands retain their room authorization and termination/draw policies. They do not roll dice
 or bypass readiness. A seed is accepted once before startup freezes seed inputs; reseeding after
@@ -214,7 +215,7 @@ Do not echo private seeds, other-seat receipts or arbitrary submitted bodies in 
 
 ## Events, snapshots, legal moves and TypeScript
 
-The future `PublicGameState` gains an optional `lab: PublicState` extension; missing `lab` means
+`PublicGameState` has an optional `lab: PublicState` extension; missing `lab` means
 classic only for that legacy state shape. Snapshot outer version and state version stay consistent.
 `lab` is mandatory for a known laboratory game. New committed lab stages use `LabTurnChanged`;
 this carries complete lab context, DFEN and clock readings, not just a pair index patch.
@@ -249,14 +250,14 @@ Use existing `TurnPlayed`, terminal events and commitment reveal for completed t
 followed by the new current-stage projection. Do not expose `DiceRolled` for the first offer as
 if it were already a selected, playable classic pool.
 
-Each future `SnapshotTurn` gets an optional `labChoice` extension:
+Each `SnapshotTurn` has an optional `labChoice` extension:
 `{"offers":[[1,3],[1,4]],"selectedPairIndex":1}`. Its existing `dice` is the chosen pair; an empty
 `moves` list denotes a confirmed pass. Classic rows omit `labChoice`. Laboratory rows require it
 and preserve both alternatives. Resync/replay rebuilds from the whole snapshot and completed
 history; a client does not reapply an acknowledged choice as a new action.
 
 [The TypeScript declarations](/dicechess-play-api/contracts/laboratory-v1.d.ts) pin the corresponding new shapes.
-They are a preparatory contract asset, not a replacement for the existing client wire module.
+They are an adoption contract asset, not a replacement for the existing client wire module.
 Issues 223/224 adopt these additive declarations and the snapshot/history fields together with
 the room implementation, keeping existing classic types/frames intact. Review literal JSON,
 enum spelling, nullability, tuple lengths and zero-based indices against the Scala codec suite;

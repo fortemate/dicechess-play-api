@@ -29,7 +29,7 @@ final class GameRegistry private (
     resumeHooks: CopyOnWriteArrayList[List[(GameId, List[Principal], GameOrigin)] => IO[Unit]],
     /** The eligibility rule set every game this registry creates is classified under (#146). */
     val ratingPolicy: RatingPolicy
-):
+) extends PlayRegistry:
 
   private var rematchService: Option[RematchService] = None
   def rematches: Option[RematchService]              = rematchService
@@ -167,6 +167,20 @@ final class GameRegistry private (
           .map(_.left.map(_.message))
       case None =>
         createRoomInternal(white, black, timeControl, origin, requestedRated, ladder)
+
+  /** Shared friend-creation entry point. Classic rooms reject laboratory opt-ins rather than silently downgrading them.
+    */
+  override def createFriend(
+      white: Principal,
+      black: Principal,
+      timeControl: TimeControl,
+      variant: Option[LaboratoryProtocol.VariantIdentity],
+      protocolVersion: Option[Int],
+      @scala.annotation.unused requestedRated: Boolean
+  ): IO[Either[String, (GameId, GameRoom)]] =
+    if variant.isDefined || protocolVersion.isDefined then
+      IO.pure(Left("laboratory games are unavailable on this registry"))
+    else create(white, black, timeControl, requestedRated = false)
 
   private[server] def createRoomInternal(
       white: Principal,

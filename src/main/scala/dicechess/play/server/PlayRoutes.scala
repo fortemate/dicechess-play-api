@@ -4,10 +4,13 @@ import cats.effect.IO
 import cats.effect.std.Console
 import cats.syntax.all.*
 import dicechess.play.core.*
+import dicechess.play.core.LaboratoryProtocol as Lab
 import dicechess.play.game.GameRoom
 import dicechess.play.wire.Codecs.given
 import fs2.{Pipe, Stream}
-import io.circe.Codec
+import io.circe.{Codec, Decoder, DecodingFailure, Encoder}
+import io.circe.generic.semiauto.deriveCodec
+import dicechess.play.wire.LaboratoryCodecs.given
 import io.circe.parser.decode
 import io.circe.syntax.*
 import org.http4s.circe.CirceEntityCodec.given
@@ -26,14 +29,51 @@ import scala.concurrent.duration.*
 final case class CreateGame(
     white: Option[String] = None,
     black: Option[String] = None,
-    timeControl: Option[TimeControl] = None
-) derives Codec.AsObject
+    timeControl: Option[TimeControl] = None,
+    variant: Option[Lab.VariantIdentity] = None,
+    labProtocolVersion: Option[Int] = None,
+    rated: Option[Boolean] = None
+)
+object CreateGame:
+  private val codec: Codec[CreateGame] = deriveCodec
+  given Codec[CreateGame]              = Codec.from(
+    Decoder.instance(c =>
+      if List("variant", "labProtocolVersion").exists(key => c.downField(key).focus.exists(_.isNull)) then
+        Left(DecodingFailure("explicit mode fields cannot be null", c.history))
+      else codec(c)
+    ),
+    Encoder.instance(value =>
+      codec(value).mapObject { fields =>
+        val withVariant  = if value.variant.isEmpty then fields.remove("variant") else fields
+        val withProtocol =
+          if value.labProtocolVersion.isEmpty then withVariant.remove("labProtocolVersion") else withVariant
+        if value.rated.isEmpty then withProtocol.remove("rated") else withProtocol
+      }
+    )
+  )
 final case class SeatToken(seat: Seat, token: String) derives Codec.AsObject
 
 /** The created game plus a per-seat join token: the creator distributes each token to the player who should hold that
   * seat, and the WebSocket upgrade authorizes the seat from the token (never a trusted `?seat=` param).
   */
-final case class CreatedGame(gameId: String, commit: String, tokens: List[SeatToken]) derives Codec.AsObject
+final case class CreatedGame(
+    gameId: String,
+    commit: String,
+    tokens: List[SeatToken],
+    variant: Option[Lab.VariantIdentity] = None,
+    labProtocolVersion: Option[Int] = None,
+    provenance: Option[Lab.Provenance] = None
+)
+object CreatedGame:
+  private val codec: Codec[CreatedGame] = deriveCodec
+  given Codec[CreatedGame]              = Codec.from(
+    codec,
+    Encoder.instance(value =>
+      codec(value).mapObject { obj =>
+        if value.variant.isEmpty then obj.remove("variant").remove("labProtocolVersion").remove("provenance") else obj
+      }
+    )
+  )
 
 /** One live game in the public listing — who plays, how far along it is, and the position itself (`dfen`, so a lobby
   * can render live mini-boards without a per-game round trip). The legal-move tree is deliberately not carried here.
@@ -72,7 +112,7 @@ object PlayRoutes:
   private object GuestParam extends OptionalQueryParamDecoderMatcher[String]("guest")
 
   def apply(
-      registry: GameRegistry,
+      registry: PlayRegistry,
       wsb: WebSocketBuilder2[IO],
       session: Option[AuthSession] = None,
       keepAlive: FiniteDuration = DefaultKeepAlive
@@ -112,12 +152,30 @@ object PlayRoutes:
                       // both sides. Adding a `rated` flag would therefore stamp `rated = true` on a row the batch then
                       // skips as self-play — a lie in the column #279 exists to keep honest. Making these ratable
                       // needs identity-on-seat-claim first, which is a feature, not a flag.
-                      .create(white, black, body.timeControl.getOrElse(TimeControl.Default), requestedRated = false)
+                      .createFriend(
+                        white,
+                        black,
+                        body.timeControl.getOrElse(TimeControl.Default),
+                        body.variant,
+                        body.labProtocolVersion,
+                        body.rated.getOrElse(false)
+                      )
                       .flatMap:
                         case Left(error)       => BadRequest(error)
                         case Right((id, room)) =>
                           val tokens = room.joinTokens.toList.map((seat, token) => SeatToken(seat, token))
-                          room.diceCommit.flatMap(c => Created(CreatedGame(id.value, c, tokens)))
+                          (room.diceCommit, room.snapshot).flatMapN((c, snapshot) =>
+                            Created(
+                              CreatedGame(
+                                id.value,
+                                c,
+                                tokens,
+                                snapshot.lab.map(_.variant),
+                                snapshot.lab.map(_.protocolVersion),
+                                snapshot.lab.map(_.provenance)
+                              )
+                            )
+                          )
               }
 
       // Public like the per-game snapshot: everything here is already public information. Feeds the Watch page, the
@@ -228,7 +286,7 @@ object PlayRoutes:
     * failure is not a reason to write who was trying to sit down.
     */
   private def claimSeatQuietly(
-      registry: GameRegistry,
+      registry: PlayRegistry,
       session: Option[AuthSession],
       req: Request[IO],
       id: GameId,
@@ -251,13 +309,17 @@ object PlayRoutes:
       keepAlive: FiniteDuration,
       privates: Stream[IO, WebSocketFrame] = Stream.empty
   ): Stream[IO, WebSocketFrame] =
-    val events     = room.subscribe.map(event => WebSocketFrame.Text(event.asJson.noSpaces))
-    val keepAlives = Stream.awakeEvery[IO](keepAlive).as(WebSocketFrame.Ping())
-    // `privates` is seat-private and merged, not interleaved with the broadcast in any defined order: a client reads
-    // each channel's own order, which is all the standing-flag status needs.
-    events.mergeHaltL(keepAlives).mergeHaltL(privates) ++ Stream.emit(
-      WebSocketFrame.Close(ByteVector.fromShort(1000.toShort))
-    )
+    Stream
+      .eval(room.isLaboratory)
+      .flatMap: laboratory =>
+        val events = room.subscribe.map(event => WebSocketFrame.Text(event.asJson.noSpaces))
+        // A terminal broadcast can race its private receipt. Also allow a rejoining lab client to retry the command
+        // after the terminal greeting. Keep this window bounded; classic transports retain their immediate close.
+        val feed       = if laboratory then events ++ Stream.sleep[IO](2.seconds).drain else events
+        val keepAlives = Stream.awakeEvery[IO](keepAlive).as(WebSocketFrame.Ping())
+        feed.mergeHaltL(keepAlives).mergeHaltL(privates) ++ Stream.emit(
+          WebSocketFrame.Close(ByteVector.fromShort(1000.toShort))
+        )
 
   private def armedFrame(response: DrawOfferArmed): WebSocketFrame =
     WebSocketFrame.Text(DrawOfferArmedFrame(response).asJson.noSpaces)
@@ -270,25 +332,68 @@ object PlayRoutes:
     in =>
       val commands = in.evalMap {
         case WebSocketFrame.Text(txt, _) =>
-          decode[GameCommand](txt) match
-            case Right(GameCommand.ArmDrawOffer(armed)) =>
-              // Unlike every other command here, arming needs a private answer, so it awaits the room rather than
-              // being posted fire-and-forget. Two consequences are deliberate. A spectator is refused AT THIS EDGE:
-              // the room would refuse it too, but a frame anyone can send must never reach the single-writer fiber.
-              // And the await is sequential, which keeps a burst of toggles answered in the order they were sent;
-              // it can only stall behind a writer that is already stalled, in which case this seat's next move would
-              // not have been processed either.
-              privateQueue match
-                case None                         => IO.unit
-                case Some(q) if seat.side.isEmpty =>
-                  q.offer(armedFrame(DrawOfferArmed(armed = false, reason = Some(GameRoom.SpectatorCannotArmReason))))
-                case Some(q) =>
-                  room.armDrawOffer(seat, armed).flatMap(response => q.offer(armedFrame(response)))
-            case Right(cmd) if seat.side.isDefined =>
-              room.submit(seat, cmd)
-            case _ => IO.unit
+          decode[Lab.CommandFrame](txt) match
+            case Right(frame) =>
+              room.submitLaboratory(seat, frame.LabCommand).flatMap { result =>
+                val json =
+                  result.fold(error => Lab.RejectionFrame(error).asJson, receipt => Lab.ReceiptFrame(receipt).asJson)
+                privateQueue.traverse_(_.offer(WebSocketFrame.Text(json.noSpaces))) *>
+                  room.resync
+                    .flatMap(event => privateQueue.traverse_(_.offer(WebSocketFrame.Text(event.asJson.noSpaces))))
+              }
+            case Left(_) if io.circe.parser.parse(txt).toOption.exists(_.hcursor.downField("LabCommand").succeeded) =>
+              val cursor       = io.circe.parser.parse(txt).toOption.get.hcursor.downField("LabCommand")
+              val id           = cursor.get[String]("commandId").toOption
+              val invalidIndex = cursor
+                .downField("action")
+                .downField("ChoosePair")
+                .get[Int]("pairIndex")
+                .toOption
+                .exists(i => i < 0 || i > 1)
+              room
+                .rejectLaboratory(
+                  id,
+                  if invalidIndex then Lab.ErrorCode.InvalidPairIndex else Lab.ErrorCode.InvalidCommand
+                )
+                .flatMap(error =>
+                  privateQueue.traverse_(_.offer(WebSocketFrame.Text(Lab.RejectionFrame(error).asJson.noSpaces)))
+                )
+            case Left(_) => fromClassicClient(room, seat, txt, privateQueue)
         case _ => IO.unit
       }
-      // Hold the seat's presence for the life of the socket. When it drops, the room starts the reconnect grace
-      // timer (a no-op for spectators) — so a refresh or a brief blip no longer resigns the game outright.
       Stream.resource(room.connection(seat)) >> commands
+
+  private def fromClassicClient(
+      room: GameRoom,
+      seat: Seat,
+      txt: String,
+      privateQueue: Option[cats.effect.std.Queue[IO, WebSocketFrame]]
+  ): IO[Unit] =
+    decode[GameCommand](txt) match
+      case Right(_: GameCommand.SubmitTurn) =>
+        room.isLaboratory.flatMap {
+          case true =>
+            room
+              .rejectLaboratory(None)
+              .flatMap(error =>
+                privateQueue.traverse_(_.offer(WebSocketFrame.Text(Lab.RejectionFrame(error).asJson.noSpaces)))
+              )
+          case false if seat.side.isDefined => decode[GameCommand](txt).toOption.traverse_(room.submit(seat, _))
+          case _                            => IO.unit
+        }
+      case Right(GameCommand.ArmDrawOffer(armed)) =>
+        // Unlike every other command here, arming needs a private answer, so it awaits the room rather than
+        // being posted fire-and-forget. Two consequences are deliberate. A spectator is refused AT THIS EDGE:
+        // the room would refuse it too, but a frame anyone can send must never reach the single-writer fiber.
+        // And the await is sequential, which keeps a burst of toggles answered in the order they were sent;
+        // it can only stall behind a writer that is already stalled, in which case this seat's next move would
+        // not have been processed either.
+        privateQueue match
+          case None                         => IO.unit
+          case Some(q) if seat.side.isEmpty =>
+            q.offer(armedFrame(DrawOfferArmed(armed = false, reason = Some(GameRoom.SpectatorCannotArmReason))))
+          case Some(q) =>
+            room.armDrawOffer(seat, armed).flatMap(response => q.offer(armedFrame(response)))
+      case Right(cmd) if seat.side.isDefined =>
+        room.submit(seat, cmd)
+      case _ => IO.unit

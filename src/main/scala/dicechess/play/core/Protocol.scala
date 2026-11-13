@@ -235,7 +235,9 @@ final case class PublicGameState(
     rematchStartup: Option[PublicRematchStartup] = None,
     // The server's current rules dependency, not a persisted property of the game. Older servers omit it; a client
     // must treat absence or a mismatch with its bundled rules as a reason to fetch GET /games/{id}/moves.
-    rulesVersion: Option[String] = None
+    rulesVersion: Option[String] = None,
+    // Public turn context for laboratory games. Classic state encodings omit this extension when it is absent.
+    lab: Option[LaboratoryProtocol.PublicState] = None
 )
 
 /** The full legal-move tree for a game's pending roll, served by `GET /games/{id}/moves` — never capped, unlike the
@@ -248,7 +250,13 @@ final case class GameMoves(version: Long, dfen: String, dicePending: Boolean, le
   * than at connect time. `dice` is the roll; `moves` are the UCI micro-moves played (empty for a forced pass);
   * `fenAfter` is the resulting position (also the next turn's starting position — the client chains from the opening).
   */
-final case class SnapshotTurn(seat: Seat, dice: List[Int], moves: List[String], fenAfter: String)
+final case class SnapshotTurn(
+    seat: Seat,
+    dice: List[Int],
+    moves: List[String],
+    fenAfter: String,
+    labChoice: Option[LaboratoryProtocol.HistoryChoice] = None
+)
 
 /** Transport-neutral commands a player submits. NOT WebSocket/HTTP frames — the website WS edge and the Bot API are
   * codecs over this vocabulary.
@@ -295,6 +303,8 @@ enum GameEvent:
       legalMoves: Option[MoveTree]
   )
   case TurnPlayed(v: Long, seat: Seat, moves: List[String], fenAfter: String)
+  // Complete public laboratory stage context; never carries private seeds or command receipts.
+  case LabTurnChanged(v: Long, seat: Seat, lab: LaboratoryProtocol.PublicState, dfen: String, clocks: Option[Clocks])
   case DrawOffered(v: Long, by: Seat)
   case DrawDeclined(v: Long, by: Seat)
   // `seed` is the revealed server seed encoded as hex. Hex-decode it, then SHA-256 the raw bytes to reproduce the

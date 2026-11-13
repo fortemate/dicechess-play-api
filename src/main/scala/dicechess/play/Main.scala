@@ -126,7 +126,13 @@ object Main extends IOApp.Simple:
             }
     }
 
-  def run: IO[Unit] = appResources.use(serve)
+  def run: IO[Unit] =
+    IO.fromEither(server.RuntimeMode.fromEnv(sys.env).leftMap(new IllegalArgumentException(_)))
+      .flatMap:
+        case server.RuntimeMode.Classic    => appResources.use(serve)
+        case server.RuntimeMode.Laboratory =>
+          IO.fromEither(server.LaboratoryConfig.fromEnv(sys.env).leftMap(new IllegalArgumentException(_)))
+            .flatMap(LaboratoryRuntime.run)
 
   private[play] def maxInlineTurnPathsFrom(raw: Option[String]): Int =
     raw.flatMap(_.toIntOption).filter(_ >= 0).getOrElse(GameRoom.DefaultMaxInlineTurnPaths)

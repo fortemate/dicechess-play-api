@@ -33,6 +33,7 @@ object PlaysiteIngest:
     */
   def payload(id: GameId, snapshot: GameSnapshot): Option[Json] =
     snapshot.status match
+      case _ if !snapshot.isClassic                           => None
       case GameStatus.Active                                  => None
       case GameStatus.Ended(GameOver(_, Termination.Aborted)) => None
       case GameStatus.Ended(GameOver(result, termination))    =>

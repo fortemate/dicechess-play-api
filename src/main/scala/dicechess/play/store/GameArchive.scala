@@ -46,6 +46,7 @@ object GameArchive:
   def entry(snapshot: GameSnapshot, retainTechnicalAbort: Boolean = false): Option[Entry] =
     val origin = snapshot.effectiveOrigin
     snapshot.status match
+      case _ if !snapshot.isClassic                                                                          => None
       case GameStatus.Active                                                                                 => None
       case GameStatus.Ended(GameOver(_, Termination.Aborted)) if !origin.isShowcase && !retainTechnicalAbort => None
       case GameStatus.Ended(GameOver(result, termination))                                                   =>

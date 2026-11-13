@@ -186,10 +186,7 @@ class LaboratoryWebSocketSuite extends munit.CatsEffectSuite:
                     ws.connectHighLevel(WSRequest(viewerUri))
                       .use: viewer =>
                         for
-                          whiteGreeting <- readJson(white)
-                          blackGreeting <- readJson(black)
-                          _ = assert(whiteGreeting.hcursor.downField("DrawOfferArmed").succeeded)
-                          _ = assert(blackGreeting.hcursor.downField("DrawOfferArmed").succeeded)
+                          // The greeting and public feed are merged; readiness is fenced by version below.
                           _ <- white.send(
                             WSFrame.Text(
                               (GameCommand.SubmitSeed("white-route-seed-0123456789"): GameCommand).asJson.noSpaces

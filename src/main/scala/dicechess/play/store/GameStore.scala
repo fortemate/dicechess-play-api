@@ -97,6 +97,10 @@ final case class GameSnapshot(
   /** Absence is resolved only by this known legacy storage shape, never by a new laboratory creation request. */
   def effectiveVariant: LaboratoryProtocol.VariantIdentity = variant.getOrElse(LaboratoryProtocol.Classic)
 
+  /** Ordinary projections may never reinterpret experimental dice or turn history as classic data. */
+  def isClassic: Boolean = effectiveVariant == LaboratoryProtocol.Classic && lab.isEmpty &&
+    turns.forall(_.labChoice.isEmpty)
+
   def ended: Boolean = status match
     case GameStatus.Ended(_) => true
     case GameStatus.Active   => false

@@ -1,0 +1,63 @@
+name: dicechess-laboratory
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: laboratory
+      POSTGRES_USER: ${LAB_DB_USER:?set LAB_DB_USER in the operator environment}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD:?generate and set LAB_DB_PASSWORD in the operator environment}
+    volumes:
+      - laboratory-db:/var/lib/postgresql
+    networks:
+      - laboratory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d laboratory"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PLAY_RUNTIME_MODE: laboratory
+      LAB_DB_URL: jdbc:postgresql://db:5432/laboratory
+      LAB_DB_USER: ${LAB_DB_USER:?set LAB_DB_USER in the operator environment}
+      LAB_DB_PASSWORD: ${LAB_DB_PASSWORD:?generate and set LAB_DB_PASSWORD in the operator environment}
+      LAB_FRONTEND_ORIGIN: ${LAB_FRONTEND_ORIGIN:?set the exact laboratory frontend origin}
+      LAB_BIND_HOST: 0.0.0.0
+      LAB_PORT: "8081"
+      LAB_DB_POOL_SIZE: ${LAB_DB_POOL_SIZE:-2}
+      LAB_RETENTION_DAYS: ${LAB_RETENTION_DAYS:-30}
+      LAB_JOIN_WINDOW_SECONDS: ${LAB_JOIN_WINDOW_SECONDS:-300}
+      LAB_PRUNE_INTERVAL_SECONDS: ${LAB_PRUNE_INTERVAL_SECONDS:-3600}
+      LAB_PRUNE_BATCH_SIZE: ${LAB_PRUNE_BATCH_SIZE:-100}
+      LAB_ADMISSION_OPEN: ${LAB_ADMISSION_OPEN:-true}
+    init: true
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8081/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - laboratory
+    restart: unless-stopped
+
+networks:
+  laboratory:
+    name: dicechess-laboratory-network
+    driver: bridge
+
+volumes:
+  laboratory-db:
+    name: dicechess-laboratory-db

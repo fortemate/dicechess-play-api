@@ -34,7 +34,8 @@ final class LaboratoryRegistry private (
     private val now: IO[Instant],
     private val mutex: Mutex[IO],
     private val consents: Ref[IO, Map[GameId, Set[Seat]]],
-    private val observers: Ref[IO, Map[GameId, FiberIO[Unit]]]
+    private val observers: Ref[IO, Map[GameId, FiberIO[Unit]]],
+    private val admissionOpen: Boolean
 ) extends PlayRegistry:
   import LaboratoryRegistry.{constantTimeEqual, human, validTimeControl}
 
@@ -82,7 +83,8 @@ final class LaboratoryRegistry private (
       requestedRated: Boolean
   ): IO[Either[String, (GameId, GameRoom)]] =
     val modeError =
-      if variant != Some(TwoPairs) || protocolVersion != Some(ProtocolVersion) then
+      if !admissionOpen then Some("laboratory room admission is closed")
+      else if variant != Some(TwoPairs) || protocolVersion != Some(ProtocolVersion) then
         Some("unsupported laboratory variant or protocol")
       else if requestedRated then Some("laboratory games cannot be rated")
       else if !human(white) || !human(black) then Some("laboratory games are human-only")
@@ -181,6 +183,11 @@ final class LaboratoryRegistry private (
       observers.getAndSet(Map.empty).flatMap(_.values.toList.traverse_(_.cancel)) *>
         rooms.getAndSet(Map.empty).flatMap(_.values.toList.traverse_(_.stopForRestart))
 
+  /** Expired live rooms lose their writer before their recovery rows are removed. TTL also applies to unfinished games.
+    */
+  def pruneExpired(limit: Int): IO[Int] = mutex.lock.surround:
+    rooms.get.flatMap(_.keys.toList.traverse_(refresh)) *> store.pruneExpired(limit)
+
   def transcript(id: GameId): IO[Option[LaboratoryTranscriptRecord]] = canonical(id).traverseFilter(store.transcriptFor)
 
   /** Two authenticated final players must consent before the durable store creates one swapped-color successor. */
@@ -230,9 +237,10 @@ final class LaboratoryRegistry private (
     store
       .successorOf(sourceId)
       .flatMap:
-        case Some(successor)  => ensurePublished(successor) *> rematchView(seat, successor).map(Right(_))
-        case None if !consent => IO.pure(Right(LaboratoryRematchView("awaiting_consent", None, None, None)))
-        case None             =>
+        case Some(successor)        => ensurePublished(successor) *> rematchView(seat, successor).map(Right(_))
+        case None if !admissionOpen => IO.pure(Left("laboratory room admission is closed"))
+        case None if !consent       => IO.pure(Right(LaboratoryRematchView("awaiting_consent", None, None, None)))
+        case None                   =>
           consents
             .modify { current =>
               val agreed = current.getOrElse(sourceId, Set.empty) + seat
@@ -322,7 +330,8 @@ object LaboratoryRegistry:
       tuning: GameRoom.RoomTuning = GameRoom.RoomTuning.Default,
       diceSource: () => IO[DiceSource] = () => DiceSource.newCommitReveal(),
       joinWindow: FiniteDuration = 5.minutes,
-      now: IO[Instant] = IO.realTimeInstant
+      now: IO[Instant] = IO.realTimeInstant,
+      admissionOpen: Boolean = true
   ): IO[LaboratoryRegistry] =
     for
       _         <- IO.raiseWhen(!store.durable)(new IllegalArgumentException("laboratory storage must be durable"))
@@ -330,7 +339,18 @@ object LaboratoryRegistry:
       mutex     <- Mutex[IO]
       consents  <- Ref.of[IO, Map[GameId, Set[Seat]]](Map.empty)
       observers <- Ref.of[IO, Map[GameId, FiberIO[Unit]]](Map.empty)
-    yield new LaboratoryRegistry(rooms, store, tuning, diceSource, joinWindow, now, mutex, consents, observers)
+    yield new LaboratoryRegistry(
+      rooms,
+      store,
+      tuning,
+      diceSource,
+      joinWindow,
+      now,
+      mutex,
+      consents,
+      observers,
+      admissionOpen
+    )
 
   private def human(principal: Principal): Boolean = principal match
     case Principal.Guest(_) | Principal.User(_) => true

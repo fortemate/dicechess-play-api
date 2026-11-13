@@ -122,7 +122,12 @@ object LaboratoryWebSocket:
                           authorized.room
                             .drawOfferArmedStatus(authorized.seat)
                             .flatMap(status => privateQueue.offer(PlayRoutes.armedFrame(status)))
-                      ) >> tail.through(PlayRoutes.fromClient(authorized.room, authorized.seat, Some(privateQueue)))
+                      ) >> tail
+                        .filter {
+                          case WebSocketFrame.Text(_, false) => false
+                          case _                             => true
+                        }
+                        .through(PlayRoutes.fromClient(authorized.room, authorized.seat, Some(privateQueue)))
         authenticated.pull.echo
       case None => Pull.eval(decision.complete(Left(Refused)).void)
     in => first(in).stream

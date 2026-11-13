@@ -349,6 +349,49 @@ class LaboratoryWebSocketSuite extends munit.CatsEffectSuite:
             yield ()
             room.connection(Seat.Black).use(_ => authenticatedWhite)
 
+  test("a complete command in a non-final text frame cannot change the authenticated room"):
+    laboratory.use: (room, writes) =>
+      routeServer(room).use: port =>
+        JdkWSClient
+          .simple[IO]
+          .use: ws =>
+            val uri = Uri.unsafeFromString(s"ws://127.0.0.1:$port") / "games" / laboratoryGameId.value / "ws"
+            room
+              .connection(Seat.Black)
+              .use: _ =>
+                ws.connectHighLevel(WSRequest(uri))
+                  .use: conn =>
+                    for
+                      _ <- room.submit(Seat.White, GameCommand.SubmitSeed("white-fragment-seed-0123456789"))
+                      _ <- room.submit(Seat.Black, GameCommand.SubmitSeed("black-fragment-seed-0123456789"))
+                      _ <- conn.send(
+                        authentication(room.joinTokens(Seat.White), "11111111-1111-1111-1111-111111111111")
+                      )
+                      ack <- readJson(conn)
+                      _ = assertEquals(
+                        ack.hcursor.downField("LabAuthenticated").get[String]("seat").toOption,
+                        Some("White")
+                      )
+                      before       <- ready(room)
+                      beforeWrites <- writes.get
+                      fragmented = Lab.Command("non-final-command", before.version, Lab.Action.RollFirst)
+                      _ <- conn.send(WSFrame.Text(Lab.CommandFrame(fragmented).asJson.noSpaces, last = false))
+                      // Finish the message with a continuation, then use an invalid-stage command as a processing barrier.
+                      _ <- conn.send(WSFrame.Text("", last = true))
+                      barrier = Lab.Command("after-fragment-barrier", before.version, Lab.Action.RollSecond)
+                      _           <- conn.send(WSFrame.Text(Lab.CommandFrame(barrier).asJson.noSpaces))
+                      frames      <- awaitPrivateRejection(conn, barrier.commandId)
+                      after       <- room.snapshot
+                      afterWrites <- writes.get
+                      rejection = frames.last.hcursor.downField("LabRejected")
+                      _         = assertEquals(rejection.get[String]("code").toOption, Some("WrongStage"))
+                      _         = assertEquals(after.version, before.version)
+                      _         = assertEquals(after.dfen, before.dfen)
+                      _         = assertEquals(after.lab, before.lab)
+                      _         = assertEquals(afterWrites.size, beforeWrites.size)
+                      _         = assert(!frames.exists(_.hcursor.downField("LabCommandApplied").succeeded))
+                    yield ()
+
   test("disconnecting before authentication leaves the room untouched"):
     laboratory.use: (room, writes) =>
       routeServer(room).use: port =>

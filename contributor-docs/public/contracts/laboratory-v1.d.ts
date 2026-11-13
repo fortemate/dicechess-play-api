@@ -59,6 +59,15 @@ export interface ReceiptFrame {
 export type LabProtocolVersion = 1;
 export type LabExportSchemaVersion = 1;
 
+/** First complete text message on a query-free /games/{id}/ws laboratory seat socket. */
+export interface AuthenticationFrame {
+  LabAuthenticate: { token: string; guest: string };
+}
+/** Private acknowledgement, emitted before any room state. The client verifies its expected seat. */
+export interface AuthenticatedFrame {
+  LabAuthenticated: { seat: 'White' | 'Black' };
+}
+
 /** Reuse the client's existing structured TimeControl type as the generic argument. */
 export interface CreationRequest<TTimeControl> {
   white?: string;

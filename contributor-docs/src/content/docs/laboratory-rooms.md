@@ -20,7 +20,7 @@ refuses explicit laboratory selectors. Ordinary classic requests and responses o
 
 The creation response adds `variant`, `labProtocolVersion` and `provenance` to `gameId`, `commit`
 and the creator's per-seat tokens. Verify all echoed values before distributing the opponent link.
-The same token handshake authenticates each WebSocket seat; command bodies do not name a seat.
+The first-message handshake below authenticates each WebSocket seat; command bodies do not name a seat.
 Laboratory rooms are absent from the ordinary `GET /games` listing. This registry has no rating,
 training, showcase, analytics delivery or ordinary registry-hook integration.
 
@@ -28,6 +28,28 @@ Both authenticated seat connections must be live before seed grace can finish. S
 `Begin` cannot start the game. A disconnect during readiness closes that readiness window until
 both reconnect, within the durable join deadline. Expiry or cancellation while waiting produces
 a retained technical abort, with no clock charge and no sporting win for the connected player.
+
+## WebSocket authentication
+
+Connect to `wss://<laboratory-api>/games/{id}/ws` with no query parameters or fragment. The first
+complete text message must be `{"LabAuthenticate":{"token":"<seat-capability>","guest":"<guest-uuid>"}}`.
+The server validates the capability for that room and replies privately with
+`{"LabAuthenticated":{"seat":"White"}}` (or `Black`) before sending any room state.
+The client verifies the expected seat, then sends its stable `SubmitSeed` contribution and queued commands.
+Every reconnect repeats authentication; a successful HTTP upgrade alone does not establish seat ownership.
+
+Until authentication succeeds there is no room subscription, presence or command processing.
+The first authentication message is limited to 1024 UTF-8 bytes and must arrive within five seconds;
+malformed, fragmented, binary, invalid-guest and invalid-token attempts close with WebSocket code `1008`.
+Ping/pong control frames cannot extend this deadline. Failure messages never echo a credential.
+Changing the seat requires a new authenticated connection; a later authentication message cannot rebind it.
+
+Seat socket query parameters, including the former `token`/`guest` parameters, are rejected with HTTP 400.
+The explicit `?mode=spectator` path remains public and has no seat permissions. Classic deployment
+authentication is unchanged. Deploy this laboratory adapter before enabling the updated laboratory client;
+the client has no URL-token fallback and waits for acknowledgement when talking to an older adapter.
+Invitation links retain capabilities in their page fragments. Production transport requires HTTPS/WSS;
+application and proxy diagnostics must not record WebSocket message bodies containing authentication.
 
 ## Atomic commands and public state
 

@@ -136,6 +136,28 @@ class RatingEvaluationSuite extends munit.FunSuite:
     assertEqualsDouble(logLoss(0.0, 1.0), -math.log(1e-6), 1e-9, "saturated forecasts are clipped")
     assertEquals(metrics(Nil).games, 0L)
 
+  test("empty forecast metrics and every calibration bin remain finite zeros"):
+    val empty = metrics(Nil)
+    assertEquals(empty.games, 0L)
+    List(empty.logLoss, empty.brier, empty.accuracy, empty.ece).foreach(value => assertEquals(value, 0.0))
+    assertEquals(empty.bins.size, 10)
+    assert(empty.bins.forall(bin => bin.games == 0 && bin.meanForecast == 0.0 && bin.meanScore == 0.0))
+    assertEquals(empty.bins.head, Bin(0.0, 0.1, 0, 0.0, 0.0))
+    assertEquals(empty.bins.last, Bin(0.9, 1.0, 0, 0.0, 0.0))
+
+  test("calibration bin edges are lower-inclusive and a saturated forecast stays in the final bin"):
+    val belowEdge = Math.nextDown(0.1)
+    val result    = metrics(List(0.0 -> 0.0, belowEdge -> 0.0, 0.1 -> 1.0, 0.9 -> 0.5, 1.0 -> 1.0))
+    assertEquals(result.games, 5L)
+    assertEquals(result.bins.map(_.games), List(2L, 1L) ++ List.fill(7)(0L) ++ List(2L))
+    assertEqualsDouble(result.bins.head.meanForecast, belowEdge / 2, 1e-15)
+    assertEquals(result.bins.head.meanScore, 0.0)
+    assertEquals(result.bins(1), Bin(0.1, 0.2, 1, 0.1, 1.0))
+    assertEqualsDouble(result.bins.last.meanForecast, 0.95, 1e-15)
+    assertEquals(result.bins.last.meanScore, 0.75)
+    assertEqualsDouble(result.accuracy, 0.8, 1e-12)
+    assertEqualsDouble(result.ece, (2.0 / 5) * (belowEdge / 2) + 0.9 / 5 + (2.0 / 5) * 0.2, 1e-12)
+
   test("the day-block bootstrap centres on the mean difference and its interval covers it"):
     val rows     = (0 until 4).flatMap(day => (0 until 20).map(m => row(day, A, B, Some(1), minute = m))).toList
     val prepared = prepare(rows, windows, Set.empty)

@@ -301,14 +301,7 @@ object AnchoredStrength:
 
       var b = 0
       while b < config.bootstrapIterations do
-        // Draw groups with replacement
-        val sampleGroups = new Array[Seq[Game]](groupCount)
-        var i            = 0
-        while i < groupCount do
-          sampleGroups(i) = groupArray(rng.nextInt(groupCount))
-          i += 1
-
-        val sampleGames              = sampleGroups.flatten.toSeq
+        val sampleGames              = resampleGames(groupArray, rng)
         val (sampleRatings, offsets) = fitComponents(sampleGames, config)
           .getOrElse((Map.empty[String, Double], Map.empty[String, Double]))
         // A lost anchor/bridge cannot be replaced with the base offset or a smoothing-created comparison.
@@ -316,10 +309,6 @@ object AnchoredStrength:
           if offsets.contains(player) && elo.isFinite then playerReplicates(player)(b) = elo
         }
         b += 1
-
-      def percentile(sorted: Array[Double], p: Double): Double =
-        if sorted.isEmpty then 0.0
-        else sorted(math.min(sorted.length - 1, math.max(0, math.round(p * (sorted.length - 1)).toInt)))
 
       val lowsMap  = mutable.Map.empty[String, Double]
       val highsMap = mutable.Map.empty[String, Double]
@@ -333,6 +322,20 @@ object AnchoredStrength:
       }
 
       (lowsMap.toMap, highsMap.toMap, playerReplicates.toMap)
+
+  /** Draw complete observation groups with replacement, preserving their internal game order. */
+  private def resampleGames(groupArray: Array[Seq[Game]], rng: Random): Seq[Game] =
+    val groupCount   = groupArray.length
+    val sampleGroups = new Array[Seq[Game]](groupCount)
+    var i            = 0
+    while i < groupCount do
+      sampleGroups(i) = groupArray(rng.nextInt(groupCount))
+      i += 1
+    sampleGroups.flatten.toSeq
+
+  private def percentile(sorted: Array[Double], p: Double): Double =
+    if sorted.isEmpty then 0.0
+    else sorted(math.min(sorted.length - 1, math.max(0, math.round(p * (sorted.length - 1)).toInt)))
 
   /** Missing/conditional bootstrap evidence never grants admission. The width policy is operator supplied; absent
     * policy means provisional. All requested replicates must be on the calibrated comparison graph.

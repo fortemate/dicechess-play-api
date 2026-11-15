@@ -269,17 +269,8 @@ object RatingEvaluation:
       binP(bin) += p
       binS(bin) += score
     }
-    val bins = (0 until Bins).toList.map { b =>
-      val count = binN(b)
-      Bin(
-        lo = b.toDouble / Bins,
-        hi = (b + 1).toDouble / Bins,
-        games = count,
-        meanForecast = if count == 0 then 0.0 else binP(b) / count,
-        meanScore = if count == 0 then 0.0 else binS(b) / count
-      )
-    }
-    val ece = if n == 0 then 0.0 else bins.map(b => b.games.toDouble / n * math.abs(b.meanForecast - b.meanScore)).sum
+    val bins = calibrationBins(binN, binP, binS)
+    val ece  = if n == 0 then 0.0 else bins.map(b => b.games.toDouble / n * math.abs(b.meanForecast - b.meanScore)).sum
     Metrics(
       games = n,
       logLoss = if n == 0 then 0.0 else ll / n,
@@ -288,6 +279,18 @@ object RatingEvaluation:
       ece = ece,
       bins = bins
     )
+
+  private def calibrationBins(counts: Array[Long], forecasts: Array[Double], scores: Array[Double]): List[Bin] =
+    (0 until Bins).toList.map { b =>
+      val count = counts(b)
+      Bin(
+        lo = b.toDouble / Bins,
+        hi = (b + 1).toDouble / Bins,
+        games = count,
+        meanForecast = if count == 0 then 0.0 else forecasts(b) / count,
+        meanScore = if count == 0 then 0.0 else scores(b) / count
+      )
+    }
 
   /** Mean log-loss difference challenger − baseline with a day-block bootstrap interval: days are resampled with
     * replacement as units, because a day's games share the pool state and are not independent draws.

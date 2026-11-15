@@ -16,7 +16,15 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
 
   private def greedy = BotRegistry.getAlgorithm("greedy").get
   private def dice   = DiceSource.commitReveal("server-seed-fixture".getBytes("UTF-8"))
-  private def seats  =
+  // Clock tests need an actual idle turn: random client seeds can otherwise give Black forced passes.
+  private def pawnDice: DiceSource =
+    val source = dice
+    new DiceSource:
+      def commit: String                                                       = source.commit
+      def reveal: String                                                       = source.reveal
+      def roll(ply: Long, clientSeedW: String, clientSeedB: String): List[Int] = List(1, 1, 1)
+
+  private def seats =
     Map[Seat, Principal](Seat.White -> Principal.Guest("white"), Seat.Black -> Principal.Guest("black"))
 
   /** Proves the chess clock — not the 120s anti-abandonment `idleCheck` — is what ends a timed game: with nobody ever
@@ -228,7 +236,7 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
       // SuddenDeath(1): human only has 1s total bank!
       .create(
         botVsHuman,
-        dice,
+        pawnDice,
         config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(1)),
         tuning = GameRoom.RoomTuning(seedGrace = 50.millis)
       )
@@ -265,7 +273,7 @@ class GameRoomClockSuite extends munit.CatsEffectSuite:
     GameRoom
       .create(
         botVsBot,
-        dice,
+        pawnDice,
         config = GameRoom.GameConfig(timeControl = TimeControl.SuddenDeath(1)),
         tuning = GameRoom.RoomTuning(seedGrace = 50.millis)
       )

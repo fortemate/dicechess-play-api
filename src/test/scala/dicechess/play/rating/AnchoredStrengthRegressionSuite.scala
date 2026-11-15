@@ -112,6 +112,36 @@ class AnchoredStrengthRegressionSuite extends munit.FunSuite:
     // Symmetric color exposure still changes likelihood curvature and hence the interval.
     assert(math.abs(row(result, "candidate").ciHigh - row(symmetric, "candidate").ciHigh) > 0.01)
 
+  test("one multi-game bootstrap unit stays intact at the minimum evidence boundary"):
+    val groups = Seq(
+      Seq(
+        ("candidate", "ref/a", 1.0),
+        ("ref/a", "candidate", 0.0),
+        ("candidate", "ref/a", 0.0),
+        ("ref/a", "candidate", 0.5)
+      )
+    )
+    val cfg = config.copy(
+      minGamesForAdmission = 1,
+      minOpponentsForAdmission = 1,
+      bootstrapIterations = 40,
+      maxCiWidthElo = Some(10000.0)
+    )
+    val result    = fitted(AnchoredStrength.evaluate(groups, cfg))
+    val candidate = row(result, "candidate")
+    // One resampling unit has 2 wins, 1 draw and 1 loss for the candidate. Every replicate is identical.
+    val expected = 400.0 * math.log10(2.75 / 1.75)
+    assertEquals(result.admitted.map(_.player), List("candidate", "ref/a"))
+    assertEquals(candidate.validBootstrapSamples, 40)
+    assertEquals(candidate.status, AdmissionStatus.Admitted)
+    assertEqualsDouble(candidate.elo, expected, 1e-6)
+    assertEqualsDouble(candidate.ciLow, candidate.elo, 1e-8)
+    assertEqualsDouble(candidate.ciHigh, candidate.elo, 1e-8)
+    assertEquals(candidate.losVsNext, Some(1.0))
+    assertEqualsDouble(row(result, "ref/a").ciLow, 0.0, 1e-8)
+    assertEqualsDouble(row(result, "ref/a").ciHigh, 0.0, 1e-8)
+    assertEquals(result, fitted(AnchoredStrength.evaluate(groups, cfg)))
+
   test("counts and connectivity cannot admit a wide interval, but additional evidence can"):
     val groups = (0 until 30).map(i =>
       Seq(

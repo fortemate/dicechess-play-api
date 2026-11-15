@@ -92,12 +92,9 @@ class PlayerRoutesSuite extends munit.CatsEffectSuite:
       white: String,
       black: String,
       result: Option[Int],
-      rated: Boolean = false,
-      termination: String = "resign",
-      timeControl: String = "Fischer(300,3)",
       finishedAt: Instant = at
   ): GameResultRow =
-    GameResultRow(GameId(id), white, black, result, termination, rated, timeControl, "ab12", None, false, finishedAt)
+    GameResultRow(GameId(id), white, black, result, "resign", false, "Fischer(300,3)", "ab12", None, false, finishedAt)
 
   private def get(path: String)(service: HttpApp[IO]) =
     service.run(Request[IO](Method.GET, Uri.unsafeFromString(path)))
@@ -111,7 +108,7 @@ class PlayerRoutesSuite extends munit.CatsEffectSuite:
       row("g-1", guestExt, bob.externalId, result = Some(1), finishedAt = at.plusSeconds(3)), // guest wins as White
       row("g-2", bob.externalId, guestExt, result = Some(1), finishedAt = at.plusSeconds(2)), // guest loses as Black
       row("g-3", "guest:other-uuid", guestExt, result = Some(-1), finishedAt = at.plusSeconds(1)), // wins vs a HUMAN
-      row("g-4", guestExt, bob.externalId, result = Some(0), termination = "draw_agreement", finishedAt = at)
+      row("g-4", guestExt, bob.externalId, result = Some(0), finishedAt = at).copy(termination = "draw_agreement")
     )
     val service  = app(recent = Map(guestExt -> games))
     val expected = parse(

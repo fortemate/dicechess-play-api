@@ -159,39 +159,50 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     def guestsOf(userId: String): IO[List[String]]                           = IO.raiseError(AssertionError("unused"))
     def deleteUser(userId: String): IO[Boolean]                              = IO.raiseError(AssertionError("unused"))
 
-  private def app(
-      bots: Map[(String, String), BotRating] = Map.empty,
+  final private case class BoardFixture(
       entries: List[LeaderboardEntry] = Nil,
+      players: List[PlayerLeaderboardEntry] = Nil,
+      // Category-specific entries supplement the default category rather than replacing it.
+      entriesByCategory: Map[RatingCategory, List[LeaderboardEntry]] = Map.empty,
+      playersByCategory: Map[RatingCategory, List[PlayerLeaderboardEntry]] = Map.empty
+  )
+
+  final private case class ProfileFixture(
       totals: Map[String, Int] = Map.empty,
       recent: Map[String, List[GameResultRow]] = Map.empty,
       opponents: Map[String, List[OpponentAggregateRow]] = Map.empty,
-      players: List[PlayerLeaderboardEntry] = Nil,
       accounts: List[UserAccount] = Nil,
-      // `entries`/`players` above are the DEFAULT category's board; these two add the other scales, so a test can
-      // assert that `?category=` actually selects one (#280).
-      entriesByCategory: Map[RatingCategory, List[LeaderboardEntry]] = Map.empty,
-      playersByCategory: Map[RatingCategory, List[PlayerLeaderboardEntry]] = Map.empty,
       ratings: Map[RatedIdentity, Map[RatingCategory, Glicko]] = Map.empty,
       categoryTallies: Map[String, Map[RatingCategory, ResultTally]] = Map.empty,
+      training: Map[String, Map[RatingCategory, TrainingState]] = Map.empty
+  )
+
+  final private case class SnapshotFixture(
       snapshots: Map[RatingCategory, RatingSnapshot] = Map.empty,
       snapshotHistory: List[RatingSnapshot] = Nil,
-      liveCutoffs: Map[RatingCategory, (Option[Instant], Option[Instant])] = Map.empty,
-      training: Map[String, Map[RatingCategory, TrainingState]] = Map.empty
+      liveCutoffs: Map[RatingCategory, (Option[Instant], Option[Instant])] = Map.empty
+  )
+
+  private def app(
+      bots: Map[(String, String), BotRating] = Map.empty,
+      board: BoardFixture = BoardFixture(),
+      profiles: ProfileFixture = ProfileFixture(),
+      snapshots: SnapshotFixture = SnapshotFixture()
   ): HttpApp[IO] =
     LeaderboardRoutes(
       stubBots(bots),
       stubBoard(
-        Map(RatingCategory.Default -> entries) ++ entriesByCategory,
-        Map(RatingCategory.Default -> players) ++ playersByCategory,
-        totals,
-        categoryTallies,
-        snapshots,
-        snapshotHistory,
-        liveCutoffs
+        Map(RatingCategory.Default -> board.entries) ++ board.entriesByCategory,
+        Map(RatingCategory.Default -> board.players) ++ board.playersByCategory,
+        profiles.totals,
+        profiles.categoryTallies,
+        snapshots.snapshots,
+        snapshots.snapshotHistory,
+        snapshots.liveCutoffs
       ),
-      stubResults(recent, opponents),
-      stubRatings(ratings, training),
-      users = Some(stubUsers(accounts))
+      stubResults(profiles.recent, profiles.opponents),
+      stubRatings(profiles.ratings, profiles.training),
+      users = Some(stubUsers(profiles.accounts))
     ).orNotFound
 
   private val at = Instant.parse("2026-07-16T12:00:00Z")
@@ -212,7 +223,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       LeaderboardEntry("acme", "bob", 1480.0, 100.0, onLadder = false, ResultTally(10, 2, 30)),
       LeaderboardEntry("acme", "fresh", 1500.0, 350.0, onLadder = true, ResultTally.Empty) // provisional: filtered
     )
-    val service  = app(entries = entries)
+    val service  = app(board = BoardFixture(entries = entries))
     val expected = parse(
       // `kind` is the one field #249 added. Everything else is byte-identical, and `/leaderboard` with no `?kind=`
       // still answers bots only — the SPA's existing call must keep working.
@@ -235,10 +246,13 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       LeaderboardEntry("acme", "streaker", 1580.0, 105.0, onLadder = true, ResultTally(12, 0, 3)),
       LeaderboardEntry("acme", "steady", 1560.0, 45.0, onLadder = true, ResultTally(30, 5, 20))
     )
-    app(entries = entries).run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Leaderboard]).map { board =>
-      assertEquals(board.leaders.map(_.name), List("steady", "streaker"))
-      assertEquals(board.leaders.map(_.rank), List(1, 2))
-    }
+    app(board = BoardFixture(entries = entries))
+      .run(Request[IO](Method.GET, uri"/leaderboard"))
+      .flatMap(_.as[Leaderboard])
+      .map { board =>
+        assertEquals(board.leaders.map(_.name), List("steady", "streaker"))
+        assertEquals(board.leaders.map(_.rank), List(1, 2))
+      }
 
   test("GET /bots/{team}/{name} returns the profile with POV results and an anonymised human opponent"):
     val aliceId = alice.externalId
@@ -254,22 +268,24 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     )
     val service = app(
       bots = Map(("acme", "alice") -> BotRating(onLadder = true, None)),
-      // Two scales, one of them provisional: the profile must report each on its own terms rather than collapsing
-      // them (#280). Blitz is the default, so it is also what the scalar fields above describe.
-      ratings = Map(
-        RatedIdentity.Bot("acme", "alice") -> Map(
-          RatingCategory.Blitz -> Glicko(1650.0, 95.0, 0.058),
-          RatingCategory.Rapid -> Glicko(1512.0, 180.0, 0.06)
-        )
-      ),
-      categoryTallies = Map(
-        aliceId -> Map(RatingCategory.Blitz -> ResultTally(20, 3, 7), RatingCategory.Rapid -> ResultTally(1, 0, 2))
-      ),
-      // Deliberately not games.size (4) or the tally's 30 — a distinct number pins that this is its OWN read, not
-      // one derived from either.
-      totals = Map(aliceId -> 34),
-      recent = Map(aliceId -> games),
-      opponents = Map(aliceId -> opponents)
+      profiles = ProfileFixture(
+        // Two scales, one of them provisional: the profile must report each on its own terms rather than collapsing
+        // them (#280). Blitz is the default, so it is also what the scalar fields above describe.
+        ratings = Map(
+          RatedIdentity.Bot("acme", "alice") -> Map(
+            RatingCategory.Blitz -> Glicko(1650.0, 95.0, 0.058),
+            RatingCategory.Rapid -> Glicko(1512.0, 180.0, 0.06)
+          )
+        ),
+        categoryTallies = Map(
+          aliceId -> Map(RatingCategory.Blitz -> ResultTally(20, 3, 7), RatingCategory.Rapid -> ResultTally(1, 0, 2))
+        ),
+        // Deliberately not games.size (4) or the tally's 30 — a distinct number pins that this is its OWN read, not
+        // one derived from either.
+        totals = Map(aliceId -> 34),
+        recent = Map(aliceId -> games),
+        opponents = Map(aliceId -> opponents)
+      )
     )
     val expected = parse(
       s"""{"team":"acme","name":"alice","rating":1650.0,"rd":95.0,"provisional":false,"onLadder":true,
@@ -307,8 +323,12 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   test("a provisional bot is absent from the board but visible — flagged — on its own profile"):
     val service = app(
       bots = Map(("acme", "newbie") -> BotRating(onLadder = true, None)),
-      entries = List(LeaderboardEntry("acme", "newbie", 1500.0, 350.0, onLadder = true, ResultTally.Empty)),
-      ratings = Map(RatedIdentity.Bot("acme", "newbie") -> Map(RatingCategory.Blitz -> Glicko.Initial))
+      board = BoardFixture(
+        entries = List(LeaderboardEntry("acme", "newbie", 1500.0, 350.0, onLadder = true, ResultTally.Empty))
+      ),
+      profiles = ProfileFixture(
+        ratings = Map(RatedIdentity.Bot("acme", "newbie") -> Map(RatingCategory.Blitz -> Glicko.Initial))
+      )
     )
     for
       board   <- service.run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Json])
@@ -320,7 +340,12 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   test("?category= selects the scale, defaults to the ladder's, and rejects a name that is not one (#280)"):
     val blitz   = List(LeaderboardEntry("acme", "blitzer", 1700.0, 60.0, onLadder = true, ResultTally(10, 0, 2)))
     val rapid   = List(LeaderboardEntry("acme", "slowpoke", 1650.0, 70.0, onLadder = true, ResultTally(4, 1, 1)))
-    val service = app(entries = blitz, entriesByCategory = Map(RatingCategory.Rapid -> rapid))
+    val service = app(
+      board = BoardFixture(
+        entries = blitz,
+        entriesByCategory = Map(RatingCategory.Rapid -> rapid)
+      )
+    )
     for
       byDefault <- service.run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Leaderboard])
       explicit  <- service.run(Request[IO](Method.GET, uri"/leaderboard?category=blitz")).flatMap(_.as[Leaderboard])
@@ -339,10 +364,12 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
 
   test("?category= also selects which scale the human half of a merged board comes from (#280)"):
     val service = app(
-      entries = Nil,
-      players = List(PlayerLeaderboardEntry("BlitzOnly", 1600.0, 90.0, ResultTally(9, 1, 5))),
-      playersByCategory =
-        Map(RatingCategory.Bullet -> List(PlayerLeaderboardEntry("BulletOnly", 1580.0, 95.0, ResultTally(3, 0, 1))))
+      board = BoardFixture(
+        entries = Nil,
+        players = List(PlayerLeaderboardEntry("BlitzOnly", 1600.0, 90.0, ResultTally(9, 1, 5))),
+        playersByCategory =
+          Map(RatingCategory.Bullet -> List(PlayerLeaderboardEntry("BulletOnly", 1580.0, 95.0, ResultTally(3, 0, 1))))
+      )
     )
     for
       blitz  <- service.run(Request[IO](Method.GET, uri"/leaderboard?kind=all")).flatMap(_.as[Leaderboard])
@@ -356,9 +383,11 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   test("a profile reports a category it has never played by ABSENCE, not by a 1500 nobody measured (#280)"):
     val service = app(
       bots = Map(("acme", "onespeed") -> BotRating(onLadder = true, None)),
-      ratings = Map(RatedIdentity.Bot("acme", "onespeed") -> Map(RatingCategory.Blitz -> Glicko(1700.0, 60.0, 0.05))),
-      categoryTallies =
-        Map(Principal.Bot("acme", "onespeed").externalId -> Map(RatingCategory.Blitz -> ResultTally(8, 0, 2)))
+      profiles = ProfileFixture(
+        ratings = Map(RatedIdentity.Bot("acme", "onespeed") -> Map(RatingCategory.Blitz -> Glicko(1700.0, 60.0, 0.05))),
+        categoryTallies =
+          Map(Principal.Bot("acme", "onespeed").externalId -> Map(RatingCategory.Blitz -> ResultTally(8, 0, 2)))
+      )
     )
     service.run(Request[IO](Method.GET, uri"/bots/acme/onespeed")).flatMap(_.as[BotProfile]).map { profile =>
       assertEquals(profile.ratings.map(_.category), List("blitz"), "only the scale it has actually been rated on")
@@ -392,7 +421,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       LeaderboardEntry("acme", "alice", 1720.5, 85.2, onLadder = true, ResultTally(30, 2, 10)),
       LeaderboardEntry("acme", "bob", 1480.0, 100.0, onLadder = false, ResultTally(10, 2, 30))
     )
-    val service = app(entries = botEntries, players = playerEntries)
+    val service = app(board = BoardFixture(entries = botEntries, players = playerEntries))
     for
       players <- service.run(Request[IO](Method.GET, uri"/leaderboard?kind=players")).flatMap(_.as[Leaderboard])
       all     <- service.run(Request[IO](Method.GET, uri"/leaderboard?kind=all")).flatMap(_.as[Leaderboard])
@@ -411,12 +440,15 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     val account = UserAccount("0197f0a0-0000-7000-8000-000000000249", "SwiftRook7", at, Some(at), isActive = true)
     val me      = Principal.User(account.id).externalId
     val service = app(
-      totals = Map(me -> 19), // deliberately distinct from the rated tally's 15, same reasoning as the bot profile
-      recent = Map(me -> List(row("g-p1", me, alice.externalId, result = Some(1)))),
-      opponents = Map(me -> List(OpponentAggregateRow(Some(alice.externalId), 3, 2, 0, 1, at))),
-      accounts = List(account),
-      ratings = Map(RatedIdentity.User(account.id) -> Map(RatingCategory.Blitz -> Glicko(1600.0, 90.0, 0.06))),
-      categoryTallies = Map(me -> Map(RatingCategory.Blitz -> ResultTally(9, 1, 5)))
+      profiles = ProfileFixture(
+        // deliberately distinct from the rated tally's 15, same reasoning as the bot profile
+        totals = Map(me -> 19),
+        recent = Map(me -> List(row("g-p1", me, alice.externalId, result = Some(1)))),
+        opponents = Map(me -> List(OpponentAggregateRow(Some(alice.externalId), 3, 2, 0, 1, at))),
+        accounts = List(account),
+        ratings = Map(RatedIdentity.User(account.id) -> Map(RatingCategory.Blitz -> Glicko(1600.0, 90.0, 0.06))),
+        categoryTallies = Map(me -> Map(RatingCategory.Blitz -> ResultTally(9, 1, 5)))
+      )
     )
     for
       resp    <- service.run(Request[IO](Method.GET, uri"/players/by-nickname/swiftrook7"))
@@ -444,7 +476,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
 
   test("a deactivated account is indistinguishable from a missing one"):
     val blocked = UserAccount("0197f0a0-0000-7000-8000-00000000024b", "GoneNick", at, Some(at), isActive = false)
-    app(accounts = List(blocked))
+    app(profiles = ProfileFixture(accounts = List(blocked)))
       .run(Request[IO](Method.GET, uri"/players/by-nickname/GoneNick"))
       .map(resp => assertEquals(resp.status, Status.NotFound, "the API must not confirm a blocked nickname exists"))
 
@@ -455,7 +487,7 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     val botEs =
       (1 to n).toList.map(i => LeaderboardEntry("x", s"b$i", 2000.0 - i, 50.0, onLadder = true, ResultTally.Empty))
     val playerEs = (1 to n).toList.map(i => PlayerLeaderboardEntry(s"p$i", 2000.5 - i, 50.0, ResultTally.Empty))
-    val service  = app(entries = botEs, players = playerEs)
+    val service  = app(board = BoardFixture(entries = botEs, players = playerEs))
     service.run(Request[IO](Method.GET, uri"/leaderboard?kind=all")).flatMap(_.as[Leaderboard]).map { board =>
       assertEquals(
         board.leaders.length,
@@ -527,9 +559,13 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     val liveComputed = at.plusSeconds(7200)
     val service      = app(
       bots = Map(("aws", "hunter-v30") -> BotRating(onLadder = true, None)),
-      entries = List(LeaderboardEntry("aws", "hunter-v30", 2905.89, 50.0, onLadder = true, ResultTally(90, 5, 5))),
-      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
-      liveCutoffs = Map(RatingCategory.Blitz -> (Some(liveCutoff), Some(liveComputed)))
+      board = BoardFixture(
+        entries = List(LeaderboardEntry("aws", "hunter-v30", 2905.89, 50.0, onLadder = true, ResultTally(90, 5, 5)))
+      ),
+      snapshots = SnapshotFixture(
+        snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
+        liveCutoffs = Map(RatingCategory.Blitz -> (Some(liveCutoff), Some(liveComputed)))
+      )
     )
     service.run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Leaderboard]).map { board =>
       assertEquals(board.category, "blitz")
@@ -574,10 +610,12 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       )
     )
     val service = app(
-      accounts = List(account),
-      ratings = Map(RatedIdentity.User(account.id) -> Map(RatingCategory.Blitz -> Glicko(1600.0, 90.0, 0.06))),
-      categoryTallies = Map(me -> Map(RatingCategory.Blitz -> ResultTally(9, 1, 5))),
-      training = trainingMap
+      profiles = ProfileFixture(
+        accounts = List(account),
+        ratings = Map(RatedIdentity.User(account.id) -> Map(RatingCategory.Blitz -> Glicko(1600.0, 90.0, 0.06))),
+        categoryTallies = Map(me -> Map(RatingCategory.Blitz -> ResultTally(9, 1, 5))),
+        training = trainingMap
+      )
     )
     service
       .run(Request[IO](Method.GET, uri"/players/by-nickname/SwiftRook7"))
@@ -605,8 +643,13 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
   test("GET /bots/{team}/{name} serves competitive ratings without leaking internal anchored strength report (#150)"):
     val service = app(
       bots = Map(("aws", "hunter-v30") -> BotRating(onLadder = true, None)),
-      ratings = Map(RatedIdentity.Bot("aws", "hunter-v30") -> Map(RatingCategory.Blitz -> Glicko(1650.0, 95.0, 0.058))),
-      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot)
+      profiles = ProfileFixture(
+        ratings =
+          Map(RatedIdentity.Bot("aws", "hunter-v30") -> Map(RatingCategory.Blitz -> Glicko(1650.0, 95.0, 0.058)))
+      ),
+      snapshots = SnapshotFixture(
+        snapshots = Map(RatingCategory.Blitz -> sampleSnapshot)
+      )
     )
     for
       resp    <- service.run(Request[IO](Method.GET, uri"/bots/aws/hunter-v30"))
@@ -623,8 +666,10 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
       isCurrent = false
     )
     val service = app(
-      snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
-      snapshotHistory = List(historicalSnapshot)
+      snapshots = SnapshotFixture(
+        snapshots = Map(RatingCategory.Blitz -> sampleSnapshot),
+        snapshotHistory = List(historicalSnapshot)
+      )
     )
     val histCutoff = historicalSnapshot.cutoff.toString
     val histUri    = org.http4s.Uri.unsafeFromString(s"/leaderboard/snapshots/blitz/1/$histCutoff")

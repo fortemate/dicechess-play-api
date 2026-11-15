@@ -102,6 +102,12 @@ class RematchRoutesSuite extends munit.CatsEffectSuite with TestContainerForAll:
 
   private def public(app: HttpApp[IO], id: String) = app.run(request(Method.GET, s"/games/$id/continuation"))
 
+  private def browserHeaders(origin: Option[String] = Some(Origin), csrf: Boolean = true): List[Header.Raw] =
+    List(
+      origin.map(value => Header.Raw(ci"Origin", value)),
+      Option.when(csrf)(Header.Raw(ci"X-DiceChess-CSRF", "1"))
+    ).flatten
+
   private def post(
       app: HttpApp[IO],
       id: GameId,
@@ -109,14 +115,8 @@ class RematchRoutesSuite extends munit.CatsEffectSuite with TestContainerForAll:
       action: String,
       requestId: UUID = UUID.randomUUID(),
       cookie: Option[String] = None,
-      origin: Option[String] = Some(Origin),
-      csrf: Boolean = true
+      headers: List[Header.Raw] = browserHeaders()
   ): IO[Response[IO]] =
-    val headers =
-      List(
-        origin.map(value => Header.Raw(ci"Origin", value)),
-        Option.when(csrf)(Header.Raw(ci"X-DiceChess-CSRF", "1"))
-      ).flatten
     app.run(
       request(
         Method.POST,
@@ -275,15 +275,29 @@ class RematchRoutesSuite extends munit.CatsEffectSuite with TestContainerForAll:
             seed(db, Principal.User(user.id), Principal.Guest(GuestBlack)).flatMap { (id, _, _) =>
               app(db, registry, Some(AuthSession(db, Secret))).use { routes =>
                 for
-                  missing <- post(routes, id, Some(BlackToken), "propose", cookie = Some(cookie), origin = None)
-                  noCsrf  <- post(routes, id, Some(BlackToken), "propose", cookie = Some(cookie), csrf = false)
+                  missing <- post(
+                    routes,
+                    id,
+                    Some(BlackToken),
+                    "propose",
+                    cookie = Some(cookie),
+                    headers = browserHeaders(origin = None)
+                  )
+                  noCsrf <- post(
+                    routes,
+                    id,
+                    Some(BlackToken),
+                    "propose",
+                    cookie = Some(cookie),
+                    headers = browserHeaders(csrf = false)
+                  )
                   hostile <- post(
                     routes,
                     id,
                     Some(BlackToken),
                     "propose",
                     cookie = Some(cookie),
-                    origin = Some("https://evil.example")
+                    headers = browserHeaders(origin = Some("https://evil.example"))
                   )
                   other  <- get(routes, id, Some(BlackToken), Some(otherCookie))
                   absent <- get(routes, id)

@@ -174,6 +174,71 @@ class RematchRoutesSuite extends munit.CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  test("empty, oversized and duplicate seat tokens cannot authorize a participant"):
+    withContainers { pg =>
+      resources(pg).use { (db, registry) =>
+        seed(db, Principal.Guest(GuestWhite), Principal.Guest(GuestBlack)).flatMap { (id, _, _) =>
+          app(db, registry).use { routes =>
+            val path = s"/games/${id.value}/rematch"
+            for
+              empty     <- get(routes, id, Some(""))
+              oversized <- get(routes, id, Some("x" * 513))
+              duplicate <- routes.run(
+                request(
+                  Method.GET,
+                  path,
+                  headers = List(
+                    Header.Raw(ci"X-Rematch-Seat-Token", WhiteToken),
+                    Header.Raw(ci"X-Rematch-Seat-Token", WhiteToken)
+                  )
+                )
+              )
+              wrong <- get(routes, id, Some("wrong-token"))
+              valid <- get(routes, id, Some(BlackToken))
+              state <- json(valid)
+            yield
+              List(empty, oversized, duplicate).foreach { response =>
+                assertEquals(response.status, Status.Unauthorized)
+                noStore(response)
+              }
+              assertEquals(wrong.status, Status.Forbidden)
+              assertEquals(valid.status, Status.Ok)
+              assertEquals(state.hcursor.get[List[String]]("allowedActions").toOption, Some(List("propose")))
+              noStore(wrong)
+              noStore(valid)
+          }
+        }
+      }
+    }
+
+  test("private reads without a rematch session distinguish missing games only after authentication"):
+    withContainers { pg =>
+      resources(pg).use { (db, registry) =>
+        for
+          active  <- GameId.random
+          missing <- GameId.random
+          _ <- db.save(active, snapshot(Principal.Guest(GuestWhite), Principal.Guest(GuestBlack), GameStatus.Active))
+          _ <- app(db, registry).use { routes =>
+            for
+              activeAnonymous  <- get(routes, active)
+              missingAnonymous <- get(routes, missing)
+              activeWithToken  <- get(routes, active, Some(WhiteToken))
+              missingWithToken <- get(routes, missing, Some(WhiteToken))
+              activeBody       <- json(activeWithToken)
+              missingBody      <- json(missingWithToken)
+            yield
+              assertEquals(activeAnonymous.status, Status.Unauthorized)
+              assertEquals(missingAnonymous.status, Status.Unauthorized)
+              assertEquals(activeWithToken.status, Status.Forbidden)
+              assertEquals(missingWithToken.status, Status.NotFound)
+              assertEquals(activeBody.hcursor.downField("error").get[String]("code").toOption, Some("not_participant"))
+              assertEquals(missingBody.hcursor.downField("error").get[String]("code").toOption, Some("game_not_found"))
+              List(activeAnonymous, missingAnonymous, activeWithToken, missingWithToken).foreach(noStore)
+          }
+        yield ()
+      }
+    }
+
   test("account seats require a matching active session; a valid account exposes its final seat"):
     withContainers { pg =>
       resources(pg).use { (db, registry) =>

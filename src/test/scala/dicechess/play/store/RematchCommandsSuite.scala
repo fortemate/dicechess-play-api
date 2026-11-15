@@ -202,6 +202,32 @@ class RematchCommandsSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  test("a rejected command receipt keeps its original error after the action becomes valid"):
+    withContainers { pg =>
+      (store(pg), rawXa(pg)).tupled.use { (db, xa) =>
+        for
+          id <- source(db)
+          request = UUID.randomUUID()
+          rejected  <- db.rematchCommands.command(id, Seat.White, request, RematchAction.Accept)
+          offered   <- command(db, id, Seat.Black, RematchAction.Propose)
+          replay    <- db.rematchCommands.command(id, Seat.White, request, RematchAction.Accept)
+          conflict  <- db.rematchCommands.command(id, Seat.White, request, RematchAction.Propose)
+          unchanged <- db.rematches.session(id)
+          accepted  <- command(db, id, Seat.White, RematchAction.Accept)
+          receipts  <- receiptCount(id, xa)
+        yield
+          assertEquals(rejected.error, Some("invalid_transition"))
+          assertEquals(replay.error, rejected.error)
+          assertEquals(session(replay), session(offered))
+          assertEquals(conflict.error, Some("request_id_conflict"))
+          assertEquals(session(conflict), session(offered))
+          assertEquals(unchanged, Some(session(offered)))
+          assertEquals(accepted.error, None)
+          assertEquals(session(accepted).phase, RematchPhase.Starting)
+          assertEquals(receipts, 3L)
+      }
+    }
+
   test("replay of a valid command returns current closed state after restart; a fresh request cannot reopen it"):
     withContainers { pg =>
       store(pg).use { db =>

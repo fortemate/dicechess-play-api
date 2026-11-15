@@ -26,22 +26,25 @@ final class RematchLimiter private (
         val fresh  = prune(current, now)
         val scoped = (if mutation then "write:" else "read:") + key
         val limit  = if mutation then config.writesPerMinute else config.readsPerMinute
-        fresh.entries.get(scoped) match
-          case Some(window) if now < window.expiresAt =>
-            if window.count < limit then
-              (fresh.copy(entries = fresh.entries.updated(scoped, window.copy(count = window.count + 1))), true)
-            else (fresh, false)
-          case Some(window) =>
-            val rolled = fresh.remove(scoped, window.expiresAt).add(scoped, Window(now, 1))
-            (rolled, true)
-          case None if fresh.entries.size < config.maxKeys =>
-            (fresh.add(scoped, Window(now, 1)), true)
-          case None =>
-            // If any tracked window were expired, the ordered prune above would have removed at least one and freed
-            // a slot. Reaching this branch therefore means every capacity-holding window is still live.
-            (fresh, false)
+        consume(fresh, scoped, limit, now)
       }
     }
+
+  private def consume(fresh: State, scoped: String, limit: Int, now: FiniteDuration): (State, Boolean) =
+    fresh.entries.get(scoped) match
+      case Some(window) if now < window.expiresAt =>
+        if window.count < limit then
+          (fresh.copy(entries = fresh.entries.updated(scoped, window.copy(count = window.count + 1))), true)
+        else (fresh, false)
+      case Some(window) =>
+        val rolled = fresh.remove(scoped, window.expiresAt).add(scoped, Window(now, 1))
+        (rolled, true)
+      case None if fresh.entries.size < config.maxKeys =>
+        (fresh.add(scoped, Window(now, 1)), true)
+      case None =>
+        // If any tracked window were expired, the ordered prune above would have removed at least one and freed
+        // a slot. Reaching this branch therefore means every capacity-holding window is still live.
+        (fresh, false)
 
 object RematchLimiter:
   private val WindowDuration  = 1.minute

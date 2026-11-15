@@ -85,18 +85,25 @@ object RematchRoutes:
                 case None    => problem("game_not_found")
                 case Some(_) => problem("not_participant")
               }
-            case Some(s) =>
-              val seat = account match
-                case Some(user) => s.source.players.collectFirst { case (seat, owner) if owner == user => seat }
-                case None       => token.flatMap(s.source.guestSeat)
-              seat match
-                case None             => IO.pure(problem("not_participant"))
-                case Some(authorized) =>
-                  limiter
-                    .attempt("actor:" + s.source.players(authorized).externalId, req.method == Method.POST)
-                    .flatMap(allowed => if allowed then f(authorized) else IO.pure(throttled))
+            case Some(s) => authorizedParticipant(req, s, account, token)(f)
           }
       }
+
+    private def authorizedParticipant(
+        req: Request[IO],
+        s: RematchSession,
+        account: Option[Principal.User],
+        token: Option[String]
+    )(f: Seat => IO[Response[IO]]): IO[Response[IO]] =
+      val seat = account match
+        case Some(user) => s.source.players.collectFirst { case (seat, owner) if owner == user => seat }
+        case None       => token.flatMap(s.source.guestSeat)
+      seat match
+        case None             => IO.pure(problem("not_participant"))
+        case Some(authorized) =>
+          limiter
+            .attempt("actor:" + s.source.players(authorized).externalId, req.method == Method.POST)
+            .flatMap(allowed => if allowed then f(authorized) else IO.pure(throttled))
 
     private def publicResponse(db: PgGameStore, service: RematchCoordinator, id: GameId): IO[Response[IO]] =
       def project(state: RematchRead): IO[Response[IO]] = state.session match

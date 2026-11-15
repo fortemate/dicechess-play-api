@@ -189,32 +189,8 @@ object StrengthReport:
       category: RatingCategory,
       config: Config = Config()
   ): BradleyTerry.FitResult[StrengthReport] =
-    // If windowDays is specified, filter rows to trailing window from the latest game
-    val (activeRows, windowExcluded) = config.windowDays match
-      case Some(days) =>
-        val latest = rows.flatMap(r => Option(r.finishedAt)).maxOption
-        latest match
-          case Some(maxTime) =>
-            val cutoff = maxTime.minus(java.time.Duration.ofDays(days.toLong))
-            rows.partition(r => Option(r.finishedAt).exists(!_.isBefore(cutoff)))
-          case None => (rows, Nil)
-      case None => (rows, Nil)
-
-    val (usable, excluded) = activeRows.partitionMap { row =>
-      (
-        Principal.fromBotExternalId(row.whiteExternalId),
-        Principal.fromBotExternalId(row.blackExternalId),
-        row.result
-      ) match
-        case (Some(white), Some(black), Some(result))
-            if white != black && RatingCategory.ofStored(row.timeControl).contains(category) =>
-          val whiteScore = result match
-            case 1  => 1.0
-            case -1 => 0.0
-            case _  => 0.5
-          Left(row.pairingId -> BotGame(white, black, whiteScore))
-        case _ => Right(())
-    }
+    val (activeRows, windowExcluded) = rowsInWindow(rows, config.windowDays)
+    val (usable, excluded)           = activeRows.partitionMap(observation(_, category))
 
     // CRN groups: a pairing id shared by exactly two usable games of the same unordered matchup is a complete pair
     // (ONE pentanomial observation); everything else degrades to per-game trinomial singles.
@@ -229,11 +205,8 @@ object StrengthReport:
     }
     val singleGames = unpaired.map(_._2) ++ brokenGroups.flatten
 
-    def key(a: Principal.Bot, b: Principal.Bot): (Principal.Bot, Principal.Bot) =
-      if a.externalId <= b.externalId then (a, b) else (b, a)
-
     val pentaByPair = completePairs
-      .groupBy(games => key(games.head.white, games.head.black))
+      .groupBy(games => matchupKey(games.head.white, games.head.black))
       .map { case ((perspective, opponent), pairs) =>
         val bins = pairs.groupBy { games =>
           val score = games.map(g => if g.white == perspective then g.whiteScore else 1.0 - g.whiteScore).sum
@@ -244,7 +217,7 @@ object StrengthReport:
       }
 
     val triByPair = singleGames
-      .groupBy(game => key(game.white, game.black))
+      .groupBy(game => matchupKey(game.white, game.black))
       .map { case ((perspective, opponent), games) =>
         val scores = games.map(g => if g.white == perspective then g.whiteScore else 1.0 - g.whiteScore)
         (perspective, opponent) -> Sprt.Trinomial(
@@ -291,6 +264,42 @@ object StrengthReport:
       anchored = result
     )
 
+  // If windowDays is specified, filter rows to trailing window from the latest game.
+  private def rowsInWindow(
+      rows: List[GameResultRow],
+      windowDays: Option[Int]
+  ): (List[GameResultRow], List[GameResultRow]) =
+    windowDays match
+      case Some(days) =>
+        val latest = rows.flatMap(r => Option(r.finishedAt)).maxOption
+        latest match
+          case Some(maxTime) =>
+            val cutoff = maxTime.minus(java.time.Duration.ofDays(days.toLong))
+            rows.partition(r => Option(r.finishedAt).exists(!_.isBefore(cutoff)))
+          case None => (rows, Nil)
+      case None => (rows, Nil)
+
+  private def observation(
+      row: GameResultRow,
+      category: RatingCategory
+  ): Either[(Option[String], BotGame), Unit] =
+    (
+      Principal.fromBotExternalId(row.whiteExternalId),
+      Principal.fromBotExternalId(row.blackExternalId),
+      row.result
+    ) match
+      case (Some(white), Some(black), Some(result))
+          if white != black && RatingCategory.ofStored(row.timeControl).contains(category) =>
+        val whiteScore = result match
+          case 1  => 1.0
+          case -1 => 0.0
+          case _  => 0.5
+        Left(row.pairingId -> BotGame(white, black, whiteScore))
+      case _ => Right(())
+
+  private def matchupKey(a: Principal.Bot, b: Principal.Bot): (Principal.Bot, Principal.Bot) =
+    if a.externalId <= b.externalId then (a, b) else (b, a)
+
   private def toBtGame(game: BotGame): BradleyTerry.Game =
     (display(game.white), display(game.black), game.whiteScore)
 
@@ -333,30 +342,7 @@ object StrengthReport:
         s"minimum games/opponents: ${report.anchored.minGamesForAdmission}/${report.anchored.minOpponentsForAdmission}",
       ""
     )
-    val pairLines = report.pairwise.map { p =>
-      val verdict = p.result.verdict match
-        case Sprt.Verdict.AcceptH1 => s"ACCEPT H1 — ${p.perspective} is stronger"
-        case Sprt.Verdict.AcceptH0 => s"ACCEPT H0 — ${p.perspective} is not stronger"
-        case Sprt.Verdict.Continue => "CONTINUE — need more games"
-      val pen = p.pairs
-      line(
-        "%-18s vs %-18s pairs[%d,%d,%d,%d,%d] singles(w/d/l %d/%d/%d)  LLR %+.2f in [%.2f, %.2f]  %s",
-        p.perspective,
-        p.opponent,
-        pen.n0,
-        pen.n1,
-        pen.n2,
-        pen.n3,
-        pen.n4,
-        p.singles.wins,
-        p.singles.draws,
-        p.singles.losses,
-        p.result.llr,
-        p.result.lower,
-        p.result.upper,
-        verdict
-      )
-    }
+    val pairLines = report.pairwise.map(textPairwiseLine)
 
     val poolHeader = if report.anchored.admitted.nonEmpty then
       val calib = if report.anchored.isCalibrated then "" else " (uncalibrated scale)"
@@ -373,7 +359,45 @@ object StrengthReport:
       line("%2d. %-18s%-15s %+7.1f  [%+7.1f, %+7.1f]%s", i + 1, r.player, badge, r.elo, r.ciLow, r.ciHigh, los)
     }
 
-    val provisionalLines = if report.anchored.provisional.nonEmpty then
+    val provisionalLines = textProvisionalSection(report)
+
+    val disconnectedLines = if report.anchored.disconnected.nonEmpty then
+      List("", "--- Disconnected bots (no path to anchor set) ---") ++
+        report.anchored.disconnected.map { r =>
+          line(" ?  %-18s (%d games, %d opponents)", r.player, r.games, r.opponents)
+        }
+    else Nil
+
+    (header ++ List("--- Pairwise SPRT (pentanomial on CRN pairs) ---") ++ pairLines ++
+      poolHeader ++ rankLines ++ provisionalLines ++ disconnectedLines)
+      .mkString("\n")
+
+  private def textPairwiseLine(p: Pairwise): String =
+    val verdict = p.result.verdict match
+      case Sprt.Verdict.AcceptH1 => s"ACCEPT H1 — ${p.perspective} is stronger"
+      case Sprt.Verdict.AcceptH0 => s"ACCEPT H0 — ${p.perspective} is not stronger"
+      case Sprt.Verdict.Continue => "CONTINUE — need more games"
+    val pen = p.pairs
+    line(
+      "%-18s vs %-18s pairs[%d,%d,%d,%d,%d] singles(w/d/l %d/%d/%d)  LLR %+.2f in [%.2f, %.2f]  %s",
+      p.perspective,
+      p.opponent,
+      pen.n0,
+      pen.n1,
+      pen.n2,
+      pen.n3,
+      pen.n4,
+      p.singles.wins,
+      p.singles.draws,
+      p.singles.losses,
+      p.result.llr,
+      p.result.lower,
+      p.result.upper,
+      verdict
+    )
+
+  private def textProvisionalSection(report: StrengthReport): List[String] =
+    if report.anchored.provisional.nonEmpty then
       List(
         "",
         s"--- Provisional bots (insufficient counts, calibration or uncertainty evidence) ---"
@@ -391,17 +415,6 @@ object StrengthReport:
           )
         }
     else Nil
-
-    val disconnectedLines = if report.anchored.disconnected.nonEmpty then
-      List("", "--- Disconnected bots (no path to anchor set) ---") ++
-        report.anchored.disconnected.map { r =>
-          line(" ?  %-18s (%d games, %d opponents)", r.player, r.games, r.opponents)
-        }
-    else Nil
-
-    (header ++ List("--- Pairwise SPRT (pentanomial on CRN pairs) ---") ++ pairLines ++
-      poolHeader ++ rankLines ++ provisionalLines ++ disconnectedLines)
-      .mkString("\n")
 
   /** Owner-facing Markdown rendering formatted for the internal knowledge base (Quartz / GitHub Flavored Markdown). */
   def renderMarkdown(report: StrengthReport, config: Config, generatedAt: Instant = Instant.now()): String =

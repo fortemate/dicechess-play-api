@@ -72,6 +72,28 @@ class AnchoredStrengthSuite extends munit.FunSuite:
     assertEquals(connectivity.statuses("island/1"), AdmissionStatus.Disconnected)
     assertEquals(connectivity.statuses("island/2"), AdmissionStatus.Disconnected)
 
+  test("without an observed anchor all components remain connected to the relative scale"):
+    val games   = Seq(("fixture/a", "fixture/b"), ("island/a", "island/b"), ("solo", "solo"))
+    val players = Set("fixture/a", "fixture/b", "island/a", "island/b", "solo")
+    List(Set.empty[String], Set("absent-anchor")).foreach { anchors =>
+      val result = GraphConnectivity.analyze(games, anchors, minGames = 1, minOpponents = 1)
+      assert(!result.hasAnchors)
+      assertEquals(result.anchorConnectedPlayers, players)
+      assertEquals(result.disconnectedPlayers, Set.empty[String])
+      assertEquals(
+        result.components.toSet,
+        Set(Set("fixture/a", "fixture/b"), Set("island/a", "island/b"), Set("solo"))
+      )
+      assertEquals(result.statuses("solo"), AdmissionStatus.Provisional(0, 0))
+      assertEquals(result.gameCounts("solo"), 0)
+      assertEquals(result.opponentCounts("solo"), 0)
+      assert((players - "solo").forall(result.isAdmitted))
+    }
+    val anchored = GraphConnectivity.analyze(games, Set("fixture/a"), minGames = 1, minOpponents = 1)
+    assert(anchored.hasAnchors)
+    assertEquals(anchored.anchorConnectedPlayers, Set("fixture/a", "fixture/b"))
+    assertEquals(anchored.disconnectedPlayers, players -- Set("fixture/a", "fixture/b"))
+
   test("Admission criteria: requires >= 30 games and >= 2 opponents"):
     // bot/under-games: 20 games against 2 opponents -> Provisional
     val underGames = (1 to 10).flatMap(_ => Seq(("bot/under-games", anchorGreedy), ("bot/under-games", anchorAggr)))

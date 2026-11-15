@@ -128,7 +128,7 @@ object GraphConnectivity:
     val connected    = mutable.Set.empty[String]
     val disconnected = mutable.Set.empty[String]
     components.foreach { comp =>
-      val isConnected = if hasAnchors then comp.exists(anchors.contains) else true
+      val isConnected = !hasAnchors || comp.exists(anchors.contains)
       if isConnected then connected ++= comp
       else disconnected ++= comp
     }

@@ -138,6 +138,121 @@ class StrengthReportSuite extends munit.CatsEffectSuite:
     assertEquals(report.singles, 0, "the Rapid game must not become a Blitz single")
     assertEquals(report.excludedRows, 1, "and it must be counted as excluded, not silently dropped")
 
+  test("trailing windows use the latest timestamp across all rows and include the exact cutoff"):
+    val cfg          = StrengthReport.Config(windowDays = Some(1), bootstrapIterations = 0)
+    val complete     = pair("window-complete", -1)
+    val retainedHalf = row(v3, v1, Some(0), Some("window-split")).copy(finishedAt = at.plusSeconds(1))
+    val excluded     = List(
+      row("guest:window-fixture", v1, Some(1), None).copy(finishedAt = at.plusSeconds(86400)),
+      row(v1, v3, Some(1), Some("window-split")).copy(finishedAt = at.minusNanos(1)),
+      row(v1, v3, Some(-1), None).copy(finishedAt = null),
+      row(v1, v3, Some(1), None).copy(timeControl = "Fischer(600,10)", finishedAt = at.plusSeconds(5))
+    )
+    val report   = buildReport(complete ++ List(retainedHalf) ++ excluded, RatingCategory.Default, cfg)
+    val selected = buildReport(complete :+ retainedHalf, RatingCategory.Default, cfg.copy(windowDays = None))
+    assertEquals(report.completePairs, 1, "both games at the exact cutoff remain a complete pair")
+    assertEquals(report.singles, 1, "a pair split by the cutoff degrades to one single")
+    assertEquals(report.excludedRows, 4, "old, untimed, non-bot and other-category rows are counted once")
+    assertEquals(report.pairwise, selected.pairwise)
+    assertEquals(report.ranking.map(r => r.player -> r.elo), selected.ranking.map(r => r.player -> r.elo))
+
+  test("a requested trailing window preserves untimed input when no latest timestamp exists"):
+    val cfg     = StrengthReport.Config(windowDays = Some(1), bootstrapIterations = 0)
+    val untimed = pair("untimed", 0).map(_.copy(finishedAt = null))
+    val report  = buildReport(untimed, RatingCategory.Default, cfg)
+    val empty   = buildReport(Nil, RatingCategory.Default, cfg)
+    assertEquals(report.completePairs, 1)
+    assertEquals(report.singles, 0)
+    assertEquals(report.excludedRows, 0)
+    assertEquals(empty.completePairs, 0)
+    assertEquals(empty.singles, 0)
+    assertEquals(empty.excludedRows, 0)
+    assertEquals(empty.pairwise, Nil)
+    assertEquals(empty.ranking, Nil)
+
+  test("plain-text rendering preserves complete synthetic sections, verdicts, badges and spacing"):
+    import GraphConnectivity.AdmissionStatus
+    val cfg  = StrengthReport.Config(bootstrapIterations = 0)
+    val base = buildReport(Nil, RatingCategory.Default, cfg)
+    // A manually specified synthetic report tests formatting independently of statistical fitting.
+    def bot(name: String): AnchoredStrength.RankedBot =
+      AnchoredStrength.RankedBot(
+        s"fixture/$name",
+        10.0,
+        0.0,
+        20.0,
+        None,
+        AdmissionStatus.Admitted,
+        false,
+        30,
+        2,
+        10
+      )
+    val admitted = List(
+      bot("anchor").copy(isAnchor = true, losVsNext = Some(0.75)),
+      bot("challenger").copy(elo = -10.0, ciLow = -20.0, ciHigh = 0.0)
+    )
+    val provisional = List(
+      bot("new").copy(
+        ciLow = Double.NaN,
+        ciHigh = Double.NaN,
+        isAnchor = true,
+        status = AdmissionStatus.Provisional(1, 1),
+        games = 1,
+        opponents = 1,
+        validBootstrapSamples = 0
+      )
+    )
+    val disconnected = List(bot("island").copy(status = AdmissionStatus.Disconnected, games = 5, opponents = 1))
+    val anchored     = base.anchored.copy(
+      epoch = 2,
+      anchorSetVersion = "fixture-anchors",
+      admitted = admitted,
+      provisional = provisional,
+      disconnected = disconnected,
+      appliedOffset = Some(0.0),
+      modelVersion = "fixture-model",
+      whiteAdvantageElo = 0.0,
+      maxCiWidthElo = Some(50.0),
+      bootstrapIterations = 10,
+      seed = 7L,
+      minGamesForAdmission = 2,
+      minOpponentsForAdmission = 1
+    )
+    val pairwise = List(Sprt.Verdict.AcceptH1, Sprt.Verdict.AcceptH0, Sprt.Verdict.Continue).map { verdict =>
+      StrengthReport.Pairwise(
+        "fixture/a",
+        "fixture/b",
+        Sprt.Pentanomial.Empty,
+        Sprt.Trinomial(1, 2, 3),
+        Sprt.Result(1.25, -2.0, 2.0, verdict, 6)
+      )
+    }
+    val report   = base.copy(pairwise = pairwise, ranking = anchored.allConnected, singles = 18, anchored = anchored)
+    val expected =
+      """=== Dice Chess ladder — strength report (blitz) ===
+      |observations: 0 CRN pairs + 18 singles (excluded rows: 0, other categories included)
+      |SPRT hypotheses: H0 "stronger by <= 0 elo" vs H1 ">= 20 elo", alpha=beta=0.05
+      |model: fixture-model; white advantage: 0.0; max CI width: 50.0; bootstrap iterations: 10; seed: 7; minimum games/opponents: 2/1
+      |
+      |--- Pairwise SPRT (pentanomial on CRN pairs) ---
+      |fixture/a          vs fixture/b          pairs[0,0,0,0,0] singles(w/d/l 3/2/1)  LLR +1.25 in [-2.00, 2.00]  ACCEPT H1 — fixture/a is stronger
+      |fixture/a          vs fixture/b          pairs[0,0,0,0,0] singles(w/d/l 3/2/1)  LLR +1.25 in [-2.00, 2.00]  ACCEPT H0 — fixture/a is not stronger
+      |fixture/a          vs fixture/b          pairs[0,0,0,0,0] singles(w/d/l 3/2/1)  LLR +1.25 in [-2.00, 2.00]  CONTINUE — need more games
+      |
+      |--- Pool ranking (Bradley-Terry, anchor set fixture-anchors, epoch 2) ---
+      | 1. fixture/anchor     [Anchor]         +10.0  [   +0.0,   +20.0]  LOS vs next 75.0%
+      | 2. fixture/challenger                  -10.0  [  -20.0,    +0.0]
+      |
+      |--- Provisional bots (insufficient counts, calibration or uncertainty evidence) ---
+      | -  fixture/new        [Provisional] [Anchor]   +10.0  unavailable  (1 games, 1 opponents; 0 valid bootstrap samples)
+      |
+      |--- Disconnected bots (no path to anchor set) ---
+      | ?  fixture/island     (5 games, 1 opponents)""".stripMargin
+    assertNoDiff(StrengthReport.render(report, cfg), expected)
+    val uncalibrated = report.copy(anchored = anchored.copy(appliedOffset = None))
+    assert(StrengthReport.render(uncalibrated, cfg).contains("epoch 2 (uncalibrated scale)"))
+
   test("render mentions the counts and each matchup once"):
     val report   = buildReport(pair("p1", -1) :+ row(v3, v1, Some(1), None), RatingCategory.Default)
     val rendered = StrengthReport.render(report, StrengthReport.Config())

@@ -145,6 +145,38 @@ class RematchStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  test("missing, stale and invalid advance requests preserve source progress"):
+    withContainers { pg =>
+      store(pg).use { db =>
+        for
+          id       <- GameId.random
+          missing  <- db.rematches.advance(id, 0, RematchChange.Offer(Seat.White))
+          _        <- db.save(id, fixture)
+          before   <- db.rematches.session(id).map(_.get)
+          rejected <- List(
+            db.rematches.advance(id, -1, RematchChange.Offer(Seat.White)),
+            db.rematches.advance(id, before.version, RematchChange.Offer(Seat.Spectator)),
+            db.rematches.advance(id, before.version, RematchChange.Accept(Seat.Black)),
+            db.rematches.advance(id, before.version, RematchChange.Close(RematchCloseReason.Expired)),
+            db.rematches.advance(id, before.version, RematchChange.Close(RematchCloseReason.Cancelled)),
+            db.rematches.advance(id, before.version, RematchChange.Close(RematchCloseReason.Declined))
+          ).sequence
+          unchanged <- db.rematches.session(id)
+          closed    <- db.rematches
+            .advance(id, before.version, RematchChange.Close(RematchCloseReason.TechnicalFailure))
+            .map(applied)
+          terminal <- db.rematches.advance(id, closed.version, RematchChange.Offer(Seat.White))
+        yield
+          assertEquals(missing, RematchWrite.Missing)
+          assertEquals(rejected, List.fill(6)(RematchWrite.Conflict(before)))
+          assertEquals(unchanged, Some(before))
+          assertEquals(closed.phase, RematchPhase.Closed)
+          assertEquals(closed.closedReason, Some(RematchCloseReason.TechnicalFailure))
+          assertEquals(closed.version, before.version + 1)
+          assertEquals(terminal, RematchWrite.Conflict(closed))
+      }
+    }
+
   test("offers and acceptance use version fences; self-accept and late retries cannot extend a deadline"):
     withContainers { pg =>
       (store(pg), rawXa(pg)).tupled.use { (db, xa) =>

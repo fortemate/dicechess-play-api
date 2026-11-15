@@ -54,32 +54,40 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
         case None => RematchCommandResult(RematchRead(None, now), Some("game_not_found")).pure[ConnectionIO]
         case Some(s) if !s.source.players.contains(seat) =>
           RematchCommandResult(RematchRead(Some(s), now), Some("not_participant")).pure[ConnectionIO]
-        case Some(s) =>
-          for
-            // Opportunistic per-source cleanup bounds recognition; permanent source/link records are never deleted.
-            _ <- sql"""DELETE FROM play.rematch_commands WHERE source_game_id = ${sourceId.value}::uuid
-                       AND recorded_at < ${now.minusSeconds(86400)}""".update.run
-            receipt <- sql"""SELECT action, error_code FROM play.rematch_commands
-                       WHERE source_game_id = ${sourceId.value}::uuid AND seat = ${seat.toString}
-                       AND request_id = $requestId""".query[(String, Option[String])].option
-            outcome <- receipt match
-              case Some((prior, error)) =>
-                RematchCommandResult(
-                  RematchRead(Some(s), now),
-                  if prior == action.wire then error else Some("request_id_conflict")
-                ).pure[ConnectionIO]
-              case None =>
-                val transition = RematchCommands.transition(s, seat, action, now)
-                val next       = transition.toOption.filter(_ != s).map(_.copy(version = s.version + 1)).getOrElse(s)
-                val error      = transition.left.toOption.map(_.wire)
-                for
-                  _ <- writeProgress(next).whenA(next != s)
-                  _ <-
-                    sql"""INSERT INTO play.rematch_commands (source_game_id, seat, request_id, action, error_code, recorded_at)
-                        VALUES (${sourceId.value}::uuid, ${seat.toString}, $requestId, ${action.wire}, $error, $now)""".update.run
-                yield RematchCommandResult(RematchRead(Some(next), now), error)
-          yield outcome
+        case Some(s) => applyCommand(s, seat, requestId, action, now)
     yield result).transact(xa).timeout(Timeout)
+
+  private def applyCommand(
+      s: RematchSession,
+      seat: Seat,
+      requestId: UUID,
+      action: RematchAction,
+      now: Instant
+  ): ConnectionIO[RematchCommandResult] =
+    for
+      // Opportunistic per-source cleanup bounds recognition; permanent source/link records are never deleted.
+      _ <- sql"""DELETE FROM play.rematch_commands WHERE source_game_id = ${s.sourceId.value}::uuid
+                       AND recorded_at < ${now.minusSeconds(86400)}""".update.run
+      receipt <- sql"""SELECT action, error_code FROM play.rematch_commands
+                       WHERE source_game_id = ${s.sourceId.value}::uuid AND seat = ${seat.toString}
+                       AND request_id = $requestId""".query[(String, Option[String])].option
+      outcome <- receipt match
+        case Some((prior, error)) =>
+          RematchCommandResult(
+            RematchRead(Some(s), now),
+            if prior == action.wire then error else Some("request_id_conflict")
+          ).pure[ConnectionIO]
+        case None =>
+          val transition = RematchCommands.transition(s, seat, action, now)
+          val next       = transition.toOption.filter(_ != s).map(_.copy(version = s.version + 1)).getOrElse(s)
+          val error      = transition.left.toOption.map(_.wire)
+          for
+            _ <- writeProgress(next).whenA(next != s)
+            _ <-
+              sql"""INSERT INTO play.rematch_commands (source_game_id, seat, request_id, action, error_code, recorded_at)
+                        VALUES (${s.sourceId.value}::uuid, ${seat.toString}, $requestId, ${action.wire}, $error, $now)""".update.run
+          yield RematchCommandResult(RematchRead(Some(next), now), error)
+    yield outcome
 
   def session(sourceId: GameId): IO[Option[RematchSession]] =
     readSession(sourceId, lock = false).transact(xa).timeout(Timeout)
@@ -117,28 +125,7 @@ final private[store] class PgRematchStore(xa: Transactor[IO]) extends RematchSto
               s.phase == RematchPhase.Matched =>
           RematchWrite.Conflict(s).pure[ConnectionIO]
         case Some(s) =>
-          val next =
-            if (s.phase == RematchPhase.Available || s.phase == RematchPhase.Offered) && !now.isBefore(s.deadlineAt)
-            then Some(s.copy(phase = RematchPhase.Closed, closedReason = Some(RematchCloseReason.Expired)))
-            else
-              change match
-                case RematchChange.Offer(by) if s.phase == RematchPhase.Available && by.side.isDefined =>
-                  Some(
-                    s.copy(
-                      phase = RematchPhase.Offered,
-                      consents = Set(by),
-                      offeredBy = Some(by),
-                      deadlineAt = now.plusSeconds(RematchResponseWindowSeconds)
-                    )
-                  )
-                case RematchChange.Accept(by)
-                    if s.phase == RematchPhase.Offered &&
-                      s.offeredBy.flatMap(_.opponent).contains(by) =>
-                  Some(s.copy(phase = RematchPhase.Starting, consents = Seats))
-                case RematchChange.Close(reason) if canClose(s.phase, reason) =>
-                  Some(s.copy(phase = RematchPhase.Closed, closedReason = Some(reason)))
-                case _ => None
-          next match
+          nextProgress(s, change, now) match
             case None    => RematchWrite.Conflict(s).pure[ConnectionIO]
             case Some(n) =>
               val updated = n.copy(version = s.version + 1)
@@ -384,6 +371,28 @@ private[store] object PgRematchStore:
         RematchStartup(RematchStartupPhase.AwaitingJoins, Set.empty, None)
       )
     )
+
+  private def nextProgress(s: RematchSession, change: RematchChange, now: Instant): Option[RematchSession] =
+    if (s.phase == RematchPhase.Available || s.phase == RematchPhase.Offered) && !now.isBefore(s.deadlineAt)
+    then Some(s.copy(phase = RematchPhase.Closed, closedReason = Some(RematchCloseReason.Expired)))
+    else
+      change match
+        case RematchChange.Offer(by) if s.phase == RematchPhase.Available && by.side.isDefined =>
+          Some(
+            s.copy(
+              phase = RematchPhase.Offered,
+              consents = Set(by),
+              offeredBy = Some(by),
+              deadlineAt = now.plusSeconds(RematchResponseWindowSeconds)
+            )
+          )
+        case RematchChange.Accept(by)
+            if s.phase == RematchPhase.Offered &&
+              s.offeredBy.flatMap(_.opponent).contains(by) =>
+          Some(s.copy(phase = RematchPhase.Starting, consents = Seats))
+        case RematchChange.Close(reason) if canClose(s.phase, reason) =>
+          Some(s.copy(phase = RematchPhase.Closed, closedReason = Some(reason)))
+        case _ => None
 
   private def canClose(phase: RematchPhase, reason: RematchCloseReason): Boolean =
     reason match

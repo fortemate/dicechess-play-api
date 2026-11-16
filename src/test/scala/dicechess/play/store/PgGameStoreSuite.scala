@@ -459,6 +459,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       }
     }
 
+  private case class WebhookCandidate(url: String, secret: String, capabilities: List[WebhookCapability])
+
   /** One activated registration on a fresh bot, so a test can start from the state the interesting operations act on
     * instead of re-staging the whole machine each time. Returns the owner actor and the slot after activation.
     */
@@ -468,9 +470,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
       team: String,
       name: String,
       userId: UUID,
-      url: String,
-      secret: String,
-      capabilities: List[WebhookCapability],
+      candidate: WebhookCandidate,
       now: Instant
   ): IO[(WebhookActor, ManagedWebhookSlot)] =
     val owner   = s"user:$userId"
@@ -493,9 +493,9 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
         NewWebhookSetup(
           setupId,
           WebhookSetupKind.Create,
-          Some(url),
-          secret,
-          capabilities,
+          Some(candidate.url),
+          candidate.secret,
+          candidate.capabilities,
           now,
           now.plusSeconds(900)
         ),
@@ -526,10 +526,8 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             "webhook-caps",
             "staged",
             userId,
-            "https://caps.example/webhook",
-            "c" * 64,
             // Deliberately starts EMPTY, so the first update below cannot pass by writing what is already stored.
-            Nil,
+            WebhookCandidate("https://caps.example/webhook", "c" * 64, Nil),
             now
           )
           (actor, active) = fixture
@@ -606,9 +604,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             "webhook-fail",
             "staged",
             userId,
-            "https://live.example/webhook",
-            "d" * 64,
-            List(WebhookCapability.Draws),
+            WebhookCandidate("https://live.example/webhook", "d" * 64, List(WebhookCapability.Draws)),
             now
           )
           (actor, active) = fixture
@@ -696,9 +692,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             "webhook-delete",
             "staged",
             userId,
-            "https://doomed.example/webhook",
-            "f" * 64,
-            List(WebhookCapability.Draws),
+            WebhookCandidate("https://doomed.example/webhook", "f" * 64, List(WebhookCapability.Draws)),
             now
           )
           (actor, active) = fixture
@@ -810,9 +804,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             "webhook-kinds",
             "staged",
             userId,
-            "https://first.example/webhook",
-            "1" * 64,
-            List(WebhookCapability.Draws),
+            WebhookCandidate("https://first.example/webhook", "1" * 64, List(WebhookCapability.Draws)),
             now
           )
           (_, active) = fixture
@@ -879,9 +871,7 @@ class PgGameStoreSuite extends CatsEffectSuite with TestContainerForAll:
             "webhook-cas",
             "staged",
             userId,
-            "https://cas.example/webhook",
-            "5" * 64,
-            Nil,
+            WebhookCandidate("https://cas.example/webhook", "5" * 64, Nil),
             now
           )
           (actor, active) = fixture

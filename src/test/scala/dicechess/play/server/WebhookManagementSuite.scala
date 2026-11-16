@@ -150,14 +150,7 @@ class WebhookManagementSuite extends CatsEffectSuite:
         ),
       acquire: WebhookManagementResult[WebhookActivationLease] = WebhookManagementResult.Applied(ActivationLease),
       complete: WebhookManagementResult[StoredSlot] = WebhookManagementResult.Applied(ActivatedSlot),
-      failActivation: WebhookManagementResult[WebhookActivationFailure] = WebhookManagementResult.Applied(
-        WebhookActivationFailure(CurrentSlot, attemptsExhausted = false)
-      ),
-      cancel: WebhookManagementResult[StoredSlot] = WebhookManagementResult.Applied(CurrentSlot),
-      updateCapabilities: WebhookManagementResult[StoredSlot] = WebhookManagementResult.Applied(CurrentSlot),
-      delete: WebhookManagementResult[WebhookDeletion] = WebhookManagementResult.Applied(
-        WebhookDeletion(CurrentSlot, changed = true)
-      ),
+      mutations: MutationAnswers = MutationAnswers(),
       budget: (WebhookBudgetKind, Instant) => WebhookBudgetDecision = (_, _) => WebhookBudgetDecision.Allowed(99)
   ): StoreAnswers =
     StoreAnswers(
@@ -165,12 +158,23 @@ class WebhookManagementSuite extends CatsEffectSuite:
       create,
       acquire,
       complete,
-      failActivation,
-      cancel,
-      updateCapabilities,
-      delete,
+      mutations.failActivation,
+      mutations.cancel,
+      mutations.updateCapabilities,
+      mutations.delete,
       budget
     )
+
+  final private case class MutationAnswers(
+      failActivation: WebhookManagementResult[WebhookActivationFailure] = WebhookManagementResult.Applied(
+        WebhookActivationFailure(CurrentSlot, attemptsExhausted = false)
+      ),
+      cancel: WebhookManagementResult[StoredSlot] = WebhookManagementResult.Applied(CurrentSlot),
+      updateCapabilities: WebhookManagementResult[StoredSlot] = WebhookManagementResult.Applied(CurrentSlot),
+      delete: WebhookManagementResult[WebhookDeletion] = WebhookManagementResult.Applied(
+        WebhookDeletion(CurrentSlot, changed = true)
+      )
+  )
 
   final private class StubStore(
       answers: StoreAnswers,
@@ -585,7 +589,7 @@ class WebhookManagementSuite extends CatsEffectSuite:
       )
       for
         f <- fixture(
-          answers = defaultAnswers(failActivation = failed),
+          answers = defaultAnswers(mutations = MutationAnswers(failActivation = failed)),
           postAnswer = (_, _, _, _) => Left(WebhookVerificationFailure.TimedOut)
         )
         result <- activate(f.management)
@@ -668,7 +672,9 @@ class WebhookManagementSuite extends CatsEffectSuite:
 
   test("a stale CAS result carries the exact current redacted slot"):
     for
-      f      <- fixture(answers = defaultAnswers(cancel = WebhookManagementResult.Stale(CurrentSlot)))
+      f <- fixture(
+        answers = defaultAnswers(mutations = MutationAnswers(cancel = WebhookManagementResult.Stale(CurrentSlot)))
+      )
       result <- f.management.cancelSetup(
         Bot,
         Owner,
@@ -834,7 +840,7 @@ class WebhookManagementSuite extends CatsEffectSuite:
 
     cases.traverse_ { case (storedResult, status, code) =>
       for
-        f      <- fixture(answers = defaultAnswers(cancel = storedResult))
+        f      <- fixture(answers = defaultAnswers(mutations = MutationAnswers(cancel = storedResult)))
         result <- f.management.cancelSetup(
           Bot,
           Owner,
@@ -851,7 +857,9 @@ class WebhookManagementSuite extends CatsEffectSuite:
       ManagedWebhookActor.Admin("admin-1") -> "admin_required"
     ).traverse_ { case (actor, code) =>
       for
-        f      <- fixture(answers = defaultAnswers(cancel = WebhookManagementResult.AuthorityChanged))
+        f <- fixture(
+          answers = defaultAnswers(mutations = MutationAnswers(cancel = WebhookManagementResult.AuthorityChanged))
+        )
         result <- f.management.cancelSetup(
           Bot,
           actor,

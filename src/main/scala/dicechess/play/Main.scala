@@ -202,6 +202,40 @@ object Main extends IOApp.Simple:
       seatGuard = SeatGuard(admissionGuard)
     yield (admissionGuard, seatGuard, resumed)
 
+  private def showcaseResourceFor(
+      showcaseConfig: ShowcaseConfig,
+      registry: GameRegistry,
+      admissionGuard: AdmissionGuard,
+      pgStore: Option[PgGameStore],
+      botStore: BotStore,
+      webhookService: Option[Webhooks]
+  ): Resource[IO, Option[ShowcaseTable]] =
+    if !showcaseConfig.enabled then Resource.pure(None)
+    else
+      // Test-harness override only. A non-positive value would turn the coordinator's `IO.sleep *> tick`
+      // loop into a busy spin, so anything but a positive integer falls back to the shipped cadence.
+      val tickInterval = sys.env
+        .get("SHOWCASE_TICK_SECONDS")
+        .flatMap(_.toIntOption)
+        .filter(_ > 0)
+        .map(_.seconds)
+        .getOrElse(ShowcaseTable.DefaultTickInterval)
+      ShowcaseTable
+        .create(
+          showcaseConfig,
+          registry,
+          admissionGuard,
+          pgStore.map(pg => pg: ShowcaseStore),
+          botReady = showcaseReadiness(showcaseConfig, botStore, webhookService),
+          timings = ShowcaseTable.Timings(tickInterval = tickInterval)
+        )
+        .evalTap(table =>
+          table.reconcile.flatMap(phase =>
+            IO.println(s"[play][showcase] table reconciled at boot: ${ShowcaseTable.describe(phase)}")
+          )
+        )
+        .map(Some(_))
+
   private def serve(
       resources: (GameStore, BotStore, Option[PgGameStore], Client[IO], WebhookTransport, IO[Unit])
   ): IO[Unit] =
@@ -390,9 +424,8 @@ object Main extends IOApp.Simple:
                 webhookStore,
                 httpClient,
                 webhookConfig,
-                stats = stats,
-                transport = Some(webhookTransport),
-                featuredBot = showcaseConfig.featuredBot
+                monitoring = Webhooks.Monitoring(stats, showcaseConfig.featuredBot),
+                transport = Some(webhookTransport)
               )
             }
             .map(Some(_))
@@ -474,32 +507,8 @@ object Main extends IOApp.Simple:
         // The singleton showcase table (ADR-005, #46). Created only when enabled; reconciled from durable state BEFORE
         // the port opens, so no visitor can ever see `open` ahead of the boot-time check. Without PostgreSQL the table
         // exists but is permanently unavailable and says so (`warnInertShowcase` above is loud about why).
-        val showcaseResource: Resource[IO, Option[ShowcaseTable]] =
-          if !showcaseConfig.enabled then Resource.pure(None)
-          else
-            // Test-harness override only. A non-positive value would turn the coordinator's `IO.sleep *> tick`
-            // loop into a busy spin, so anything but a positive integer falls back to the shipped cadence.
-            val tickInterval = sys.env
-              .get("SHOWCASE_TICK_SECONDS")
-              .flatMap(_.toIntOption)
-              .filter(_ > 0)
-              .map(_.seconds)
-              .getOrElse(ShowcaseTable.DefaultTickInterval)
-            ShowcaseTable
-              .create(
-                showcaseConfig,
-                registry,
-                admissionGuard,
-                pgStore.map(pg => pg: ShowcaseStore),
-                botReady = showcaseReadiness(showcaseConfig, botStore, webhookService),
-                timings = ShowcaseTable.Timings(tickInterval = tickInterval)
-              )
-              .evalTap(table =>
-                table.reconcile.flatMap(phase =>
-                  IO.println(s"[play][showcase] table reconciled at boot: ${ShowcaseTable.describe(phase)}")
-                )
-              )
-              .map(Some(_))
+        val showcaseResource =
+          showcaseResourceFor(showcaseConfig, registry, admissionGuard, pgStore, botStore, webhookService)
 
         showcaseResource.use { showcase =>
           val showcaseRoutes = showcase.fold(org.http4s.HttpRoutes.empty[IO])(table =>

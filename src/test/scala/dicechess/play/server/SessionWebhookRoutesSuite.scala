@@ -193,25 +193,30 @@ class SessionWebhookRoutesSuite extends munit.CatsEffectSuite:
         .addCookie(RequestCookie(AuthSession.SessionCookieName, token))
     )
 
+  final private case class MutationOptions(
+      origin: Option[String] = Some(AllowedOrigin),
+      csrf: Option[String] = Some("1"),
+      ifMatch: Option[String] = Some(s"\"$Revision\""),
+      jsonContentType: Boolean = true
+  )
+
   private def mutation(
       method: Method,
       path: String,
       cookie: String,
       body: Option[String],
-      origin: Option[String] = Some(AllowedOrigin),
-      csrf: Option[String] = Some("1"),
-      ifMatch: Option[String] = Some(s"\"$Revision\""),
-      jsonContentType: Boolean = true
+      options: MutationOptions = MutationOptions()
   ): Request[IO] =
     val base     = request(method, path, Some(cookie))
     val withBody = body.fold(base): raw =>
       val encoded = base.withEntity(raw)(using org.http4s.EntityEncoder.stringEncoder[IO])
-      if jsonContentType then encoded.withContentType(org.http4s.headers.`Content-Type`(MediaType.application.json))
+      if options.jsonContentType then
+        encoded.withContentType(org.http4s.headers.`Content-Type`(MediaType.application.json))
       else encoded
     List(
-      origin.map(Header.Raw(ci"Origin", _)),
-      csrf.map(Header.Raw(ci"X-DiceChess-CSRF", _)),
-      ifMatch.map(Header.Raw(ci"If-Match", _))
+      options.origin.map(Header.Raw(ci"Origin", _)),
+      options.csrf.map(Header.Raw(ci"X-DiceChess-CSRF", _)),
+      options.ifMatch.map(Header.Raw(ci"If-Match", _))
     ).flatten.foldLeft(withBody)(_.putHeaders(_))
 
   private def header(response: Response[IO], name: CIString): Option[String] =
@@ -288,21 +293,59 @@ class SessionWebhookRoutesSuite extends munit.CatsEffectSuite:
         Header.Raw(ci"Content-Type", "application/json")
       )
       val cases = List(
-        (mutation(Method.POST, path, f.ownerCookie, body, origin = None), Status.Forbidden, "csrf_origin_rejected"),
         (
-          mutation(Method.POST, path, f.ownerCookie, body, origin = Some("https://evil.example")),
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(origin = None)
+          ),
+          Status.Forbidden,
+          "csrf_origin_rejected"
+        ),
+        (
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(origin = Some("https://evil.example"))
+          ),
           Status.Forbidden,
           "csrf_origin_rejected"
         ),
         (duplicateOrigin, Status.Forbidden, "csrf_origin_rejected"),
-        (mutation(Method.POST, path, f.ownerCookie, body, csrf = None), Status.Forbidden, "csrf_origin_rejected"),
         (
-          mutation(Method.POST, path, f.ownerCookie, body, csrf = Some("true")),
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(csrf = None)
+          ),
           Status.Forbidden,
           "csrf_origin_rejected"
         ),
         (
-          mutation(Method.POST, path, f.ownerCookie, body, csrf = Some("1, 1")),
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(csrf = Some("true"))
+          ),
+          Status.Forbidden,
+          "csrf_origin_rejected"
+        ),
+        (
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(csrf = Some("1, 1"))
+          ),
           Status.Forbidden,
           "csrf_origin_rejected"
         ),
@@ -312,29 +355,63 @@ class SessionWebhookRoutesSuite extends munit.CatsEffectSuite:
             "/me/bots/acme/unknown/webhook/setups",
             f.ownerCookie,
             body,
-            origin = None
+            options = MutationOptions(origin = None)
           ),
           Status.Forbidden,
           "csrf_origin_rejected"
         ),
         (
-          mutation(Method.POST, path, f.ownerCookie, body, ifMatch = None),
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(ifMatch = None)
+          ),
           Status.PreconditionRequired,
           "webhook_revision_required"
         ),
-        (mutation(Method.POST, path, f.ownerCookie, body, ifMatch = Some("*")), Status.BadRequest, "malformed_request"),
         (
-          mutation(Method.POST, path, f.ownerCookie, body, ifMatch = Some(s"W/\"$Revision\"")),
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(ifMatch = Some("*"))
+          ),
           Status.BadRequest,
           "malformed_request"
         ),
         (
-          mutation(Method.POST, path, f.ownerCookie, body, ifMatch = Some(s"\"$Revision\", \"whrev_other\"")),
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(ifMatch = Some(s"W/\"$Revision\""))
+          ),
           Status.BadRequest,
           "malformed_request"
         ),
         (
-          mutation(Method.POST, path, f.ownerCookie, body, jsonContentType = false),
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(ifMatch = Some(s"\"$Revision\", \"whrev_other\""))
+          ),
+          Status.BadRequest,
+          "malformed_request"
+        ),
+        (
+          mutation(
+            Method.POST,
+            path,
+            f.ownerCookie,
+            body,
+            options = MutationOptions(jsonContentType = false)
+          ),
           Status.UnsupportedMediaType,
           "malformed_request"
         ),
@@ -358,7 +435,7 @@ class SessionWebhookRoutesSuite extends munit.CatsEffectSuite:
           "/me/bots/acme/alice/webhook/setups",
           f.ownerCookie,
           Some("""{"kind":"create","url":"https://bot.example/webhook","capabilities":[]}"""),
-          origin = Some("null")
+          options = MutationOptions(origin = Some("null"))
         )
       )
       responseCode <- code(response)

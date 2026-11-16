@@ -95,14 +95,10 @@ object RatingReplayFixture:
     val base                            = rounds.result()
     val special: Map[Int, Vector[Spec]] = Map(
       20 -> Vector(Spec(Alpha, Alpha)), // rated self-play (pre-numeric era)
-      30 -> Vector(Spec(Guest, Alpha, rated = false), Spec(Alpha, Guest, rated = false)), // guest casual
-      70 -> (0 until 6).toVector.map(k =>
-        Spec(if k % 2 == 0 then Ghost else Beta, if k % 2 == 0 then Beta else Ghost)
-      ), // deleted bot, numeric era
+      30  -> Vector(Spec(Guest, Alpha, rated = false), Spec(Alpha, Guest, rated = false)), // guest casual
+      70  -> alternatingGames(Ghost, Beta, 6),                                             // deleted bot, numeric era
       90  -> Vector(Spec(Alpha, Beta, result = Some(0), termination = "draw_agreement")),
-      100 -> (0 until 10).toVector.map(k =>
-        Spec(if k % 2 == 0 then Human else Alpha, if k % 2 == 0 then Alpha else Human)
-      ),
+      100 -> alternatingGames(Human, Alpha, 10),
       110 -> Vector(
         Spec(Human, Beta, ownerRelation = Some("white_owns_black")),
         Spec(Beta, Human, ownerRelation = Some("black_owns_white")),
@@ -113,13 +109,9 @@ object RatingReplayFixture:
       // rules would apply: `replay_applied_recorded_skipped`. Against delta, so no later game of either seat on this
       // scale is disturbed.
       121 -> Vector(Spec(Human, Delta, recordedSkipped = true), Spec(Delta, Human, recordedSkipped = true)),
-      130 -> (0 until 12).toVector.map(k =>
-        Spec(if k % 2 == 0 then Alpha else Gamma, if k % 2 == 0 then Gamma else Alpha, timeControl = "Fischer(600,10)")
-      ),
+      130 -> alternatingGames(Alpha, Gamma, 12, "Fischer(600,10)"),
       140 -> Vector(Spec(Beta, Gamma, rated = false, result = Some(0), termination = "aborted")),
-      200 -> (0 until 4).toVector.map(k =>
-        Spec(if k % 2 == 0 then Human else Gamma, if k % 2 == 0 then Gamma else Human, timeControl = "Fischer(600,10)")
-      )
+      200 -> alternatingGames(Human, Gamma, 4, "Fischer(600,10)")
     )
     val out = Vector.newBuilder[Spec]
     base.zipWithIndex.foreach { case (spec, idx) =>
@@ -130,12 +122,100 @@ object RatingReplayFixture:
     out += Spec(Gamma, Alpha, pending = true)
     out.result()
 
+  private def alternatingGames(
+      first: String,
+      second: String,
+      count: Int,
+      timeControl: String = "Fischer(300,3)"
+  ): Vector[Spec] =
+    Vector.tabulate(count): k =>
+      val (white, black) = if k % 2 == 0 then (first, second) else (second, first)
+      Spec(white, black, timeControl = timeControl)
+
+  private def ratingEligible(spec: Spec, applied: Boolean, category: Option[RatingCategory]): Boolean =
+    applied && !spec.recordedSkipped && spec.white != spec.black && spec.ownerRelation.isEmpty &&
+      category.isDefined && kindOf(spec.white) != "guest" && kindOf(spec.black) != "guest"
+
+  private def updateRatings(
+      state: scala.collection.mutable.Map[(String, RatingCategory), Glicko],
+      spec: Spec,
+      category: RatingCategory,
+      result: Int
+  ): (Double, Double, Double, Double) =
+    val scores = RatingBatch.scores(result).get
+    val w0     = state.getOrElse((spec.white, category), Glicko.Initial)
+    val b0     = state.getOrElse((spec.black, category), Glicko.Initial)
+    val w1     = Glicko2.update(w0, List(Glicko2.Result(b0, scores._1)))
+    val b1     = Glicko2.update(b0, List(Glicko2.Result(w0, scores._2)))
+    state.update((spec.white, category), w1)
+    state.update((spec.black, category), b1)
+    (w0.rating, w1.rating, b0.rating, b1.rating)
+
   private def sample(rnd: Random, white: String, black: String): Int =
     val pWhite = 1.0 / (1.0 + math.pow(10.0, (strength(black) - strength(white)) / 400.0))
     if rnd.nextDouble() < pWhite then 1 else -1
 
   private def kindOf(id: String): String =
     if id.startsWith("bot:") then "bot" else if id.startsWith("human:") then "human" else "guest"
+
+  private def gameFor(
+      spec: Spec,
+      idx: Int,
+      rnd: Random,
+      state: scala.collection.mutable.Map[(String, RatingCategory), Glicko],
+      appliedSeq: Long
+  ): (Game, Long) =
+    val finishedAt     = start.plusSeconds(idx.toLong * 3600L) // one game an hour: ~19 days, so inactivity is reachable
+    val aborted        = spec.termination == "aborted"
+    val result         = Option.unless(aborted)(spec.result.getOrElse(sample(rnd, spec.white, spec.black)))
+    val rated          = spec.rated && !aborted
+    val category       = RatingCategory.ofStored(spec.timeControl)
+    val applied        = rated && !spec.pending
+    val appliedAt      = Option.when(applied)(finishedAt.plusSeconds(40L))
+    val nextAppliedSeq = if applied then appliedSeq + 1 else appliedSeq
+    // The batch of the day: both seats resolvable (ghost still registered then), own-bot and self-play skipped.
+    val eligible         = ratingEligible(spec, applied, category)
+    val numeric          = eligible && idx >= RecordedFrom
+    val (wb, wa, bb, ba) =
+      if eligible then updateRatings(state, spec, category.get, result.get)
+      else (0.0, 0.0, 0.0, 0.0)
+    val corrupt = if idx == CorruptedIndex then 5.0 else 0.0
+    val shift   = if LevelShiftedRows.contains(idx) then LevelShift else 0.0
+    val game    = Game(
+      gameId = f"00000000-0000-4000-8000-${idx + 1}%012d",
+      finishedAt = finishedAt,
+      ratingAppliedAt = appliedAt,
+      seqFinished = idx.toLong + 1,
+      seqApplied = Option.when(applied)(nextAppliedSeq),
+      category = category.map(_.wireName),
+      timeControl = spec.timeControl,
+      result = result,
+      termination = spec.termination,
+      rated = rated,
+      origin = if idx < 50 then "legacy" else "ladder",
+      ladder = idx >= 50 && kindOf(spec.white) == "bot" && kindOf(spec.black) == "bot",
+      pairingId = None,
+      applied = applied,
+      numericRecorded = numeric,
+      white = Seat(
+        spec.white,
+        kindOf(spec.white),
+        spec.white != Ghost,
+        Option.when(numeric)(wb + shift),
+        Option.when(numeric)(wa + corrupt + shift)
+      ),
+      black = Seat(
+        spec.black,
+        kindOf(spec.black),
+        spec.black != Ghost,
+        Option.when(numeric)(bb + shift),
+        Option.when(numeric)(ba + shift)
+      ),
+      ownerRelation = spec.ownerRelation,
+      hasArchive = idx >= 10,
+      archiveSportingEligible = Option.when(idx >= 10)(!aborted)
+    )
+    (game, nextAppliedSeq)
 
   /** The corpus rows and the participant snapshot, both deterministic for `seed`. */
   def generate(seed: Long = 20260911L): (Vector[Game], Vector[Participant]) =
@@ -145,66 +225,9 @@ object RatingReplayFixture:
     val games      = Vector.newBuilder[Game]
     var appliedSeq = 0L
     plan.zipWithIndex.foreach { case (spec, idx) =>
-      val finishedAt = start.plusSeconds(idx.toLong * 3600L) // one game an hour: ~19 days, so inactivity is reachable
-      val aborted    = spec.termination == "aborted"
-      val result     = if aborted then None else Some(spec.result.getOrElse(sample(rnd, spec.white, spec.black)))
-      val rated      = spec.rated && !aborted
-      val category   = RatingCategory.ofStored(spec.timeControl)
-      val applied    = rated && !spec.pending
-      val appliedAt  = Option.when(applied)(finishedAt.plusSeconds(40L))
-      if applied then appliedSeq += 1
-      // The batch of the day: both seats resolvable (ghost still registered then), own-bot and self-play skipped.
-      val eligible = applied && !spec.recordedSkipped && spec.white != spec.black && spec.ownerRelation.isEmpty &&
-        category.isDefined && kindOf(spec.white) != "guest" && kindOf(spec.black) != "guest"
-      val numeric          = eligible && idx >= RecordedFrom
-      val (wb, wa, bb, ba) =
-        if eligible then
-          val cat    = category.get
-          val scores = RatingBatch.scores(result.get).get
-          val w0     = state.getOrElse((spec.white, cat), Glicko.Initial)
-          val b0     = state.getOrElse((spec.black, cat), Glicko.Initial)
-          val w1     = Glicko2.update(w0, List(Glicko2.Result(b0, scores._1)))
-          val b1     = Glicko2.update(b0, List(Glicko2.Result(w0, scores._2)))
-          state.update((spec.white, cat), w1)
-          state.update((spec.black, cat), b1)
-          (w0.rating, w1.rating, b0.rating, b1.rating)
-        else (0.0, 0.0, 0.0, 0.0)
-      val corrupt = if idx == CorruptedIndex then 5.0 else 0.0
-      val shift   = if LevelShiftedRows.contains(idx) then LevelShift else 0.0
-      games += Game(
-        gameId = f"00000000-0000-4000-8000-${idx + 1}%012d",
-        finishedAt = finishedAt,
-        ratingAppliedAt = appliedAt,
-        seqFinished = idx.toLong + 1,
-        seqApplied = Option.when(applied)(appliedSeq),
-        category = category.map(_.wireName),
-        timeControl = spec.timeControl,
-        result = result,
-        termination = spec.termination,
-        rated = rated,
-        origin = if idx < 50 then "legacy" else "ladder",
-        ladder = idx >= 50 && kindOf(spec.white) == "bot" && kindOf(spec.black) == "bot",
-        pairingId = None,
-        applied = applied,
-        numericRecorded = numeric,
-        white = Seat(
-          spec.white,
-          kindOf(spec.white),
-          spec.white != Ghost,
-          Option.when(numeric)(wb + shift),
-          Option.when(numeric)(wa + corrupt + shift)
-        ),
-        black = Seat(
-          spec.black,
-          kindOf(spec.black),
-          spec.black != Ghost,
-          Option.when(numeric)(bb + shift),
-          Option.when(numeric)(ba + shift)
-        ),
-        ownerRelation = spec.ownerRelation,
-        hasArchive = idx >= 10,
-        archiveSportingEligible = Option.when(idx >= 10)(!aborted)
-      )
+      val (game, nextAppliedSeq) = gameFor(spec, idx, rnd, state, appliedSeq)
+      games += game
+      appliedSeq = nextAppliedSeq
     }
     val participants = Vector(Alpha, Beta, Gamma, Delta).map { id =>
       Participant(

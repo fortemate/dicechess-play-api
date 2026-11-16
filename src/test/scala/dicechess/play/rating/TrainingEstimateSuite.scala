@@ -76,6 +76,30 @@ class TrainingEstimateSuite extends FunSuite:
       s"Black win (${updateAsBlack.rating}) must yield higher rating than White win (${updateAsWhite.rating})"
     )
 
+  test("configured zero White advantage gives the same update for either side"):
+    val now         = Instant.parse("2026-09-16T12:00:00Z")
+    val botRef      = Glicko(1500.0, 50.0, 0.06)
+    val noAdvantage = TrainingEstimate.Config(whiteAdvantage = 0.0)
+
+    val asWhite = TrainingEstimate.update(
+      TrainingState.Initial,
+      botRef,
+      humanIsWhite = true,
+      score = 1.0,
+      gameTime = now,
+      config = noAdvantage
+    )
+    val asBlack = TrainingEstimate.update(
+      TrainingState.Initial,
+      botRef,
+      humanIsWhite = false,
+      score = 1.0,
+      gameTime = now,
+      config = noAdvantage
+    )
+
+    assertEquals(asWhite, asBlack)
+
   test("inactivity inflation widens RD for returning players and caps at initial deviation"):
     val t0        = Instant.parse("2026-08-01T12:00:00Z")
     val converged = TrainingState(
@@ -116,6 +140,81 @@ class TrainingEstimateSuite extends FunSuite:
     // 1500 days later: capped at 350.0
     val capped = Glicko2.inflateIdleDeviation(80.0, 1500.0, idleEloPerSqrtDay = 10.0)
     assertEquals(capped, 350.0)
+
+  test("configured zero idle inflation gives the same Glicko update at either elapsed time"):
+    val t0        = Instant.parse("2026-08-01T12:00:00Z")
+    val converged = TrainingState(
+      rating = 1600.0,
+      deviation = 80.0,
+      volatility = 0.06,
+      games = 20,
+      wins = 12,
+      draws = 4,
+      losses = 4,
+      updatedAt = Some(t0)
+    )
+    val botRef       = Glicko(1500.0, 50.0, 0.06)
+    val noIdleEffect = TrainingEstimate.Config(idleEloPerSqrtDay = 0.0)
+    val sameDay      = TrainingEstimate.update(
+      converged,
+      botRef,
+      humanIsWhite = true,
+      score = 0.5,
+      gameTime = t0,
+      config = noIdleEffect
+    )
+    val later = TrainingEstimate.update(
+      converged,
+      botRef,
+      humanIsWhite = true,
+      score = 0.5,
+      gameTime = t0.plus(20, ChronoUnit.DAYS),
+      config = noIdleEffect
+    )
+
+    assertEquals(sameDay.glicko, later.glicko)
+    assertEquals(
+      (sameDay.games, sameDay.wins, sameDay.draws, sameDay.losses),
+      (later.games, later.wins, later.draws, later.losses)
+    )
+    assertEquals(sameDay.updatedAt, Some(t0))
+    assertEquals(later.updatedAt, Some(t0.plus(20, ChronoUnit.DAYS)))
+
+  test("custom tau changes the finite volatility update for a volatile player"):
+    val now            = Instant.parse("2026-09-16T12:00:00Z")
+    val volatilePlayer = TrainingState(
+      rating = 1500.0,
+      deviation = 50.0,
+      volatility = 0.2,
+      games = 20,
+      wins = 10,
+      draws = 0,
+      losses = 10
+    )
+    val unexpectedWin = Glicko(1900.0, 50.0, 0.06)
+
+    val defaultUpdate = TrainingEstimate.update(
+      volatilePlayer,
+      unexpectedWin,
+      humanIsWhite = true,
+      score = 1.0,
+      gameTime = now
+    )
+    val customTauUpdate = TrainingEstimate.update(
+      volatilePlayer,
+      unexpectedWin,
+      humanIsWhite = true,
+      score = 1.0,
+      gameTime = now,
+      config = TrainingEstimate.Config(tau = 0.8)
+    )
+
+    assert(defaultUpdate.volatility.isFinite)
+    assert(customTauUpdate.volatility.isFinite)
+    assert(
+      math.abs(defaultUpdate.volatility - customTauUpdate.volatility) > 1e-8,
+      s"custom tau must change the volatility update: ${defaultUpdate.volatility} vs ${customTauUpdate.volatility}"
+    )
 
   test("provisional status respects both game count and RD threshold"):
     // Under 10 games with settled RD is still provisional

@@ -459,17 +459,7 @@ final class PgGameStore private (
       allowed = !prior.exists(_.version > snapshot.version) && joined.subsetOf(next.joined) && next.joined.subsetOf(
         Set(Seat.White, Seat.Black)
       ) &&
-        (phase match
-          case "awaiting_joins" =>
-            next.phase match
-              case RematchStartupPhase.AwaitingJoins => !snapshot.started && !snapshot.ended && next.activatedAt.isEmpty
-              case RematchStartupPhase.Active        =>
-                snapshot.started && !snapshot.ended && next.joined.size == 2 &&
-                now.isBefore(deadline) && next.activatedAt.isDefined
-              case RematchStartupPhase.Aborted => snapshot.ended && next.activatedAt.isEmpty
-          case "active"  => next.phase == RematchStartupPhase.Active && snapshot.started && !prior.exists(_.ended)
-          case "aborted" => next.phase == RematchStartupPhase.Aborted && snapshot.ended && !prior.exists(_.ended)
-          case _         => false)
+        rematchPhaseAllows(phase, prior, snapshot, next, now, deadline)
       activated =
         if phase == "active" then priorActivated
         else Option.when(next.phase == RematchStartupPhase.Active)(now)
@@ -487,6 +477,26 @@ final class PgGameStore private (
                 WHERE game_id = ${id.value}::uuid""".update.run *>
             saveTransaction(id, snapshot, retainTechnicalAbort = true)
     yield ()).transact(xa).timeout(SaveTimeout)
+
+  private def rematchPhaseAllows(
+      phase: String,
+      prior: Option[GameSnapshot],
+      snapshot: GameSnapshot,
+      next: RematchStartup,
+      now: Instant,
+      deadline: Instant
+  ): Boolean =
+    phase match
+      case "awaiting_joins" =>
+        next.phase match
+          case RematchStartupPhase.AwaitingJoins => !snapshot.started && !snapshot.ended && next.activatedAt.isEmpty
+          case RematchStartupPhase.Active        =>
+            snapshot.started && !snapshot.ended && next.joined.size == 2 &&
+            now.isBefore(deadline) && next.activatedAt.isDefined
+          case RematchStartupPhase.Aborted => snapshot.ended && next.activatedAt.isEmpty
+      case "active"  => next.phase == RematchStartupPhase.Active && snapshot.started && !prior.exists(_.ended)
+      case "aborted" => next.phase == RematchStartupPhase.Aborted && snapshot.ended && !prior.exists(_.ended)
+      case _         => false
 
   // ── OutboxStore ─────────────────────────────────────────────────────────────
 
@@ -750,42 +760,51 @@ final class PgGameStore private (
               case Some(bot) if bot.ownerExternalId.contains(ownerExternalId) =>
                 OwnerClaim.Claimed.pure[ConnectionIO]
               case Some(bot) =>
-                val nextRevision = UUID.randomUUID()
-                for
-                  registrationId <- activeRegistrationId(bot)
-                  pending        <- pendingWebhookSetup(bot)
-                  _              <- pending.traverse_ { setup =>
-                    terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
-                      auditWebhookTx(
-                        actor,
-                        bot,
-                        WebhookSetupInvalidateAction,
-                        context,
-                        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
-                        Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "ownership_change".asJson)
-                      )
-                  }
-                  _ <- sql"""UPDATE play.bots
-                             SET owner_external_id = $ownerExternalId,
-                                 ownership_generation = ownership_generation + 1,
-                                 webhook_revision = $nextRevision
-                             WHERE team = $team AND name = $name AND owner_external_id IS NULL""".update.run
-                  _ <- auditWebhookTx(
-                    actor,
-                    bot,
-                    "webhook.authority.owner_claim",
-                    context,
-                    WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
-                    Json.obj(
-                      "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
-                      "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson
-                    )
-                  )
-                yield OwnerClaim.Claimed
+                claimUnownedWebhookBot(bot, ownerExternalId, actor, now, context)
           yield result
     yield result)
       .transact(xa)
       .timeout(SaveTimeout)
+
+  private def claimUnownedWebhookBot(
+      bot: WebhookBotControl,
+      ownerExternalId: String,
+      actor: WebhookActor,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[OwnerClaim] =
+    val nextRevision = UUID.randomUUID()
+    for
+      registrationId <- activeRegistrationId(bot)
+      pending        <- pendingWebhookSetup(bot)
+      _              <- pending.traverse_ { setup =>
+        terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
+          auditWebhookTx(
+            actor,
+            bot,
+            WebhookSetupInvalidateAction,
+            context,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+            Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "ownership_change".asJson)
+          )
+      }
+      _ <- sql"""UPDATE play.bots
+                 SET owner_external_id = $ownerExternalId,
+                     ownership_generation = ownership_generation + 1,
+                     webhook_revision = $nextRevision
+                 WHERE team = ${bot.team} AND name = ${bot.name} AND owner_external_id IS NULL""".update.run
+      _ <- auditWebhookTx(
+        actor,
+        bot,
+        "webhook.authority.owner_claim",
+        context,
+        WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+        Json.obj(
+          "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
+          "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson
+        )
+      )
+    yield OwnerClaim.Claimed
 
   def releaseOwner(team: String, name: String, ownerExternalId: String): IO[Boolean] =
     val actor   = WebhookActor(WebhookActorKind.Owner, ownerExternalId)
@@ -4161,59 +4180,73 @@ final class PgGameStore private (
       name: String,
       context: WebhookRequestContext
   ): ConnectionIO[Unit] =
-    val actor = WebhookActor(WebhookActorKind.System, s"account-deletion:$ownerExternalId")
     for
       _      <- webhookFence(team, name)
       locked <- lockWebhookBot(team, name)
       now    <- databaseClock
       _      <- locked.traverse_ { rawBot =>
         expirePendingWebhookSetup(rawBot, now, context).flatMap { bot =>
-          pendingWebhookSetup(bot).flatMap { pending =>
-            val releasesOwnership = bot.ownerExternalId.contains(ownerExternalId)
-            val revokedSetup      =
-              pending.filter(setup => releasesOwnership || sameUserAuthority(setup.actorId, ownerExternalId))
-            if !releasesOwnership && revokedSetup.isEmpty then ().pure[ConnectionIO]
-            else
-              val nextRevision = UUID.randomUUID()
-              for
-                registrationId <- activeRegistrationId(bot)
-                _              <- revokedSetup.traverse_ { setup =>
-                  terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
-                    auditWebhookTx(
-                      actor,
-                      bot,
-                      WebhookSetupInvalidateAction,
-                      context,
-                      WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
-                      Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "account_deletion".asJson)
-                    )
-                }
-                _ <-
-                  if releasesOwnership then
-                    sql"""UPDATE play.bots
-                           SET owner_external_id = NULL,
-                               ownership_generation = ownership_generation + 1,
-                               webhook_revision = $nextRevision
-                           WHERE team = $team AND name = $name AND owner_external_id = $ownerExternalId""".update.run.void
-                  else sql"""UPDATE play.bots SET webhook_revision = $nextRevision
-                           WHERE team = $team AND name = $name""".update.run.void
-                _ <- auditWebhookTx(
-                  actor,
-                  bot,
-                  "webhook.authority.owner_release",
-                  context,
-                  WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
-                  Json.obj(
-                    "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
-                    "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson,
-                    "reason"                    -> "account_deletion".asJson
-                  )
-                ).whenA(releasesOwnership)
-              yield ()
-          }
+          revokeDeletedUserAuthority(ownerExternalId, bot, now, context)
         }
       }
     yield ()
+
+  private def revokeDeletedUserAuthority(
+      ownerExternalId: String,
+      bot: WebhookBotControl,
+      now: Instant,
+      context: WebhookRequestContext
+  ): ConnectionIO[Unit] =
+    val actor = WebhookActor(WebhookActorKind.System, s"account-deletion:$ownerExternalId")
+    pendingWebhookSetup(bot).flatMap { pending =>
+      val releasesOwnership = bot.ownerExternalId.contains(ownerExternalId)
+      val revokedSetup      =
+        pending.filter(setup => releasesOwnership || sameUserAuthority(setup.actorId, ownerExternalId))
+      if !releasesOwnership && revokedSetup.isEmpty then ().pure[ConnectionIO]
+      else
+        val nextRevision = UUID.randomUUID()
+        for
+          registrationId <- activeRegistrationId(bot)
+          _              <- revokedSetup.traverse_ { setup =>
+            terminateWebhookSetup(setup.setupId, WebhookSetupTerminalStatus.Invalidated, now) *>
+              auditWebhookTx(
+                actor,
+                bot,
+                WebhookSetupInvalidateAction,
+                context,
+                WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+                Json.obj("setupId" -> setup.setupId.toString.asJson, "reason" -> "account_deletion".asJson)
+              )
+          }
+          _ <- releaseDeletedUserOwnership(bot, ownerExternalId, nextRevision, releasesOwnership)
+          _ <- auditWebhookTx(
+            actor,
+            bot,
+            "webhook.authority.owner_release",
+            context,
+            WebhookAuditTransition(bot.revision, nextRevision, registrationId, registrationId),
+            Json.obj(
+              "ownershipGenerationBefore" -> bot.ownershipGeneration.asJson,
+              "ownershipGenerationAfter"  -> (bot.ownershipGeneration + 1L).asJson,
+              "reason"                    -> "account_deletion".asJson
+            )
+          ).whenA(releasesOwnership)
+        yield ()
+    }
+
+  private def releaseDeletedUserOwnership(
+      bot: WebhookBotControl,
+      ownerExternalId: String,
+      nextRevision: UUID,
+      releasesOwnership: Boolean
+  ): ConnectionIO[Unit] =
+    if releasesOwnership then sql"""UPDATE play.bots
+             SET owner_external_id = NULL,
+                 ownership_generation = ownership_generation + 1,
+                 webhook_revision = $nextRevision
+             WHERE team = ${bot.team} AND name = ${bot.name} AND owner_external_id = $ownerExternalId""".update.run.void
+    else sql"""UPDATE play.bots SET webhook_revision = $nextRevision
+             WHERE team = ${bot.team} AND name = ${bot.name}""".update.run.void
 
   def deleteUser(userId: String): IO[Boolean] =
     val ownerExternalId = s"user:$userId"

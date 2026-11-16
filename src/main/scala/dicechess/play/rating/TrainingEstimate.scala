@@ -87,6 +87,13 @@ object TrainingEstimate:
   /** Fixed reference RD assigned to immutable benchmark scale anchors. */
   val AnchorDeviation: Double = 50.0
 
+  /** Parameters governing the rating update, independent of the individual game. */
+  final case class Config(
+      tau: Double = DefaultTau,
+      whiteAdvantage: Double = WhiteAdvantage,
+      idleEloPerSqrtDay: Double = Glicko2.DefaultIdleEloPerSqrtDay
+  )
+
   /** Resolves a category-matching reference Glicko state for `botKey` ("team/name"). Priority:
     *   1. If anchorSet matches `category` and contains `botKey`, uses fixed anchor target (1500 + targetElo, RD =
     *      50.0), tagged with the anchor set's version and epoch.
@@ -118,9 +125,7 @@ object TrainingEstimate:
       humanIsWhite: Boolean,
       score: Double,
       gameTime: Instant,
-      tau: Double = DefaultTau,
-      whiteAdvantage: Double = WhiteAdvantage,
-      idleEloPerSqrtDay: Double = Glicko2.DefaultIdleEloPerSqrtDay
+      config: Config = Config()
   ): TrainingState =
     // 1. Idle RD inflation for returning player
     val idleDays = current.updatedAt match
@@ -128,14 +133,14 @@ object TrainingEstimate:
         val millis = math.max(0L, java.time.Duration.between(lastUpdated, gameTime).toMillis)
         millis.toDouble / (86400.0 * 1000.0)
       case None => 0.0
-    val inflatedDeviation = Glicko2.inflateIdleDeviation(current.deviation, idleDays, idleEloPerSqrtDay)
+    val inflatedDeviation = Glicko2.inflateIdleDeviation(current.deviation, idleDays, config.idleEloPerSqrtDay)
     val preGameHuman      = current.glicko.copy(deviation = inflatedDeviation)
 
     // 2. White advantage adjustment on opponent reference
-    val adjustedOpponent = Glicko2.withWhiteAdvantage(botReference, playerIsWhite = humanIsWhite, whiteAdvantage)
+    val adjustedOpponent = Glicko2.withWhiteAdvantage(botReference, playerIsWhite = humanIsWhite, config.whiteAdvantage)
 
     // 3. Glicko-2 update
-    val postGameGlicko = Glicko2.update(preGameHuman, List(Glicko2.Result(adjustedOpponent, score)), tau)
+    val postGameGlicko = Glicko2.update(preGameHuman, List(Glicko2.Result(adjustedOpponent, score)), config.tau)
 
     // 4. Update counters
     val isWin  = score > 0.75

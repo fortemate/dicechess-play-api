@@ -266,51 +266,72 @@ final class Webhooks private (
           state.drawOffer.exists(_.pending) && state.activeSeat == seat
         val isOurTurn = state.status == GameStatus.Active && state.dicePending && state.activeSeat == seat
 
-        if isOurPreRoll then
-          if !hook.capabilities.contains(WebhookCapability.Draws) then
-            // Preserve legacy bot behavior: bots that did not opt in cannot answer a
-            // draw decision, so decline before revealing dice and continue with yourTurn.
-            store
-              .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(
-                room.enqueueDrawResponse(seat, accept = false)
-              )
-              .flatMap:
-                case Some(await) => await.void
-                case None        => IO.cede *> deliver(id, room, seat, bot, lastVersion)
-          else
-          // Keep the decision independent of the roll: capable bots decide before
-          // receiving dice in a drawDecision payload.
-          {
-            val body    = WebhookEnvelope("drawDecision", id.value, seat, state).asJson.noSpaces
-            val budget  = state.clocks.map(c => (if seat == Seat.White then c.white else c.black).millis)
-            val timeout = budget.fold(config.timeout)(_.min(config.timeout)).max(1.millisecond)
-            for
-              started <- IO.monotonic
-              attempt <- postDetailed(hook.url, hook.secret, body, timeout)
-              elapsed <- IO.monotonic.map(_ - started)
-              plan = retryPlan(attempt, budget, elapsed, retries)
-              outcome <- classifyDrawDecision(id, seat, room, bot, hook, attempt, plan)
-              _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
-              _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
-              _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan)
-            yield ()
-          }
-        else if isOurTurn then {
-          val body    = WebhookEnvelope("yourTurn", id.value, seat, state).asJson.noSpaces
-          val budget  = state.clocks.map(c => (if seat == Seat.White then c.white else c.black).millis)
-          val timeout = budget.fold(config.timeout)(_.min(config.timeout)).max(1.millisecond)
-          for
-            started <- IO.monotonic
-            attempt <- postDetailed(hook.url, hook.secret, body, timeout)
-            elapsed <- IO.monotonic.map(_ - started)
-            plan = retryPlan(attempt, budget, elapsed, retries)
-            outcome <- classifyTurn(id, seat, room, bot, hook, attempt, plan)
-            _       <- lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
-            _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
-            _       <- deliverAgain(id, room, seat, bot, lastVersion, outcome, plan)
-          yield ()
-        } else IO.unit
+        val progress = DeliveryProgress(lastVersion, retries)
+        if isOurPreRoll then deliverDrawDecision(id, room, seat, bot, hook, state, progress)
+        else if isOurTurn then deliverTurn(id, room, seat, bot, hook, state, progress)
+        else IO.unit
     }
+
+  private case class DeliveryProgress(lastVersion: Ref[IO, Long], retries: Int)
+
+  private def deliverDrawDecision(
+      id: GameId,
+      room: GameRoom,
+      seat: Seat,
+      bot: Principal.Bot,
+      hook: BotWebhook,
+      state: PublicGameState,
+      progress: DeliveryProgress
+  ): IO[Unit] =
+    if !hook.capabilities.contains(WebhookCapability.Draws) then
+      // Preserve legacy bot behavior: bots that did not opt in cannot answer a
+      // draw decision, so decline before revealing dice and continue with yourTurn.
+      store
+        .enqueueIfCurrent(hook.team, hook.name, hook.registrationId)(
+          room.enqueueDrawResponse(seat, accept = false)
+        )
+        .flatMap:
+          case Some(await) => await.void
+          case None        => IO.cede *> deliver(id, room, seat, bot, progress.lastVersion)
+    else
+      // Keep the decision independent of the roll: capable bots decide before
+      // receiving dice in a drawDecision payload.
+      val body    = WebhookEnvelope("drawDecision", id.value, seat, state).asJson.noSpaces
+      val budget  = state.clocks.map(c => (if seat == Seat.White then c.white else c.black).millis)
+      val timeout = budget.fold(config.timeout)(_.min(config.timeout)).max(1.millisecond)
+      for
+        started <- IO.monotonic
+        attempt <- postDetailed(hook.url, hook.secret, body, timeout)
+        elapsed <- IO.monotonic.map(_ - started)
+        plan = retryPlan(attempt, budget, elapsed, progress.retries)
+        outcome <- classifyDrawDecision(id, seat, room, bot, hook, attempt, plan)
+        _       <- progress.lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
+        _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
+        _       <- deliverAgain(id, room, seat, bot, progress.lastVersion, outcome, plan)
+      yield ()
+
+  private def deliverTurn(
+      id: GameId,
+      room: GameRoom,
+      seat: Seat,
+      bot: Principal.Bot,
+      hook: BotWebhook,
+      state: PublicGameState,
+      progress: DeliveryProgress
+  ): IO[Unit] =
+    val body    = WebhookEnvelope("yourTurn", id.value, seat, state).asJson.noSpaces
+    val budget  = state.clocks.map(c => (if seat == Seat.White then c.white else c.black).millis)
+    val timeout = budget.fold(config.timeout)(_.min(config.timeout)).max(1.millisecond)
+    for
+      started <- IO.monotonic
+      attempt <- postDetailed(hook.url, hook.secret, body, timeout)
+      elapsed <- IO.monotonic.map(_ - started)
+      plan = retryPlan(attempt, budget, elapsed, progress.retries)
+      outcome <- classifyTurn(id, seat, room, bot, hook, attempt, plan)
+      _       <- progress.lastVersion.set(state.version).unlessA(outcome == DeliveryOutcome.StaleRegistration)
+      _       <- recordDelivery(bot, hook.registrationId, outcome, elapsed)
+      _       <- deliverAgain(id, room, seat, bot, progress.lastVersion, outcome, plan)
+    yield ()
 
   /** Is this failure worth another attempt, and after how long? Only the transport-level ones are: a 5xx from whatever
     * sits in front of the bot, our own timeout, a connection that never completed. In all three the bot said nothing,
@@ -816,12 +837,19 @@ object Webhooks:
     */
   def configFromEnv: Option[Config] = Config.fromValues(sys.env.get("WEBHOOK_TIMEOUT_SECONDS"))
 
+  /** Delivery telemetry and the optional featured bot whose failures also raise a showcase alert. */
+  final case class Monitoring(
+      stats: WebhookStatsStore = WebhookStatsStore.noop,
+      featuredBot: Option[Principal.Bot] = None
+  )
+
   /** A `Resource` because the service OWNS its per-game runner fibers (a `Supervisor`): releasing it cancels every
     * in-flight runner, so webhook delivery can never outlive the server that started it.
     *
-    * `stats` defaults to [[WebhookStatsStore.noop]] — every existing caller (tests, and any deployment that hasn't
-    * wired persistence) gets a `Webhooks` that classifies deliveries and drains the queue exactly as if telemetry were
-    * on, only the writes themselves go nowhere. `Main` is the one caller that passes the real, Postgres-backed store.
+    * `monitoring.stats` defaults to [[WebhookStatsStore.noop]] — every existing caller (tests, and any deployment that
+    * hasn't wired persistence) gets a `Webhooks` that classifies deliveries and drains the queue exactly as if
+    * telemetry were on, only the writes themselves go nowhere. `Main` is the one caller that passes the real,
+    * Postgres-backed store.
     */
   def create(
       registry: GameRegistry,
@@ -829,11 +857,24 @@ object Webhooks:
       client: Client[IO],
       config: Config,
       checkUrl: String => IO[Either[String, Uri]] = WebhookSecurity.checkPublicHttps,
-      stats: WebhookStatsStore = WebhookStatsStore.noop,
-      transport: Option[WebhookTransport] = None,
-      featuredBot: Option[Principal.Bot] = None
+      monitoring: Monitoring = Monitoring(),
+      transport: Option[WebhookTransport] = None
   ): Resource[IO, Webhooks] =
     Supervisor[IO](await = false).evalMap { runners =>
       (Ref.of[IO, Set[(GameId, Seat)]](Set.empty), Queue.bounded[IO, DeliveryEvent](DeliveryEventQueueCapacity))
-        .mapN(new Webhooks(registry, store, client, checkUrl, transport, config, _, runners, stats, _, featuredBot))
+        .mapN(
+          new Webhooks(
+            registry,
+            store,
+            client,
+            checkUrl,
+            transport,
+            config,
+            _,
+            runners,
+            monitoring.stats,
+            _,
+            monitoring.featuredBot
+          )
+        )
     }

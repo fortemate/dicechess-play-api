@@ -119,64 +119,7 @@ object PlayRoutes:
   ): HttpRoutes[IO] =
     HttpRoutes.of[IO]:
       case req @ POST -> Root / "games" =>
-        // attemptAs (not as): a malformed body is the client's fault, so answer 400, not 500.
-        req
-          .attemptAs[CreateGame]
-          .value
-          .flatMap:
-            case Left(failure) => BadRequest(failure.message)
-            case Right(body)   =>
-              AuthSession.principalFor(session, req).flatMap { signedIn =>
-                val seats: Either[String, (Principal, Principal)] = signedIn match
-                  // Session wins (#235): the creator owns both seats until the share link is used, exactly as the
-                  // anonymous flow already seats one guest id on both sides.
-                  case Some(user) => Right((user, user))
-                  case None       =>
-                    def required(field: String, value: Option[String]) =
-                      value
-                        .toRight(s"$field: required when not signed in")
-                        .flatMap(id => Principal.guest(id).left.map(err => s"$field: $err"))
-                    for
-                      white <- required("white", body.white)
-                      black <- required("black", body.black)
-                    yield (white, black)
-                seats match
-                  case Left(err)             => BadRequest(err)
-                  case Right((white, black)) =>
-                    registry
-                      // Friend-by-link games are ALWAYS casual, and #282 decided this deliberately rather than
-                      // leaving the default to speak for itself. Both seats belong to the same principal here (the
-                      // creator, or — from the SPA's anonymous path — one guest id passed twice), because a friend is
-                      // authorized by POSSESSING a seat token, never by being named. So the second player's identity
-                      // is not known at creation and is never recorded at all: `game_results` stores the creator on
-                      // both sides. Adding a `rated` flag would therefore stamp `rated = true` on a row the batch then
-                      // skips as self-play — a lie in the column #279 exists to keep honest. Making these ratable
-                      // needs identity-on-seat-claim first, which is a feature, not a flag.
-                      .createFriend(
-                        white,
-                        black,
-                        body.timeControl.getOrElse(TimeControl.Default),
-                        body.variant,
-                        body.labProtocolVersion,
-                        body.rated.getOrElse(false)
-                      )
-                      .flatMap:
-                        case Left(error)       => BadRequest(error)
-                        case Right((id, room)) =>
-                          val tokens = room.joinTokens.toList.map((seat, token) => SeatToken(seat, token))
-                          (room.diceCommit, room.snapshot).flatMapN((c, snapshot) =>
-                            Created(
-                              CreatedGame(
-                                id.value,
-                                c,
-                                tokens,
-                                snapshot.lab.map(_.variant),
-                                snapshot.lab.map(_.protocolVersion),
-                                snapshot.lab.map(_.provenance)
-                              )
-                            )
-                          )
-              }
+        createGame(registry, session, req)
 
       // Public like the per-game snapshot: everything here is already public information. Feeds the Watch page, the
       // lobby's "top game" preview, and the live-games counter; sorted by version (most action first) and capped —
@@ -220,46 +163,126 @@ object PlayRoutes:
           .flatMap:
             case None       => NotFound()
             case Some(room) =>
-              cats.effect.std.Queue.unbounded[IO, WebSocketFrame].flatMap { privateQueue =>
-                // The seat-private channel, alongside the room's broadcast: it carries the standing draw-offer status,
-                // which belongs to one seat and must never reach the other or a spectator. Seeding it with the seat's
-                // current status BEFORE the socket opens is what makes the channel's order meaningful — the greeting
-                // can never be overtaken by the answer to a command sent the instant the socket came up, so the last
-                // `DrawOfferArmed` a client received is always its true state.
-                def open(seat: Seat): IO[Response[IO]] =
-                  room
-                    .drawOfferArmedStatus(seat)
-                    .flatMap(status => privateQueue.offer(armedFrame(status)))
-                    .whenA(seat.side.isDefined) *>
-                    wsb.build(
-                      clientFrames(room, keepAlive, Stream.fromQueueUnterminated(privateQueue)),
-                      fromClient(room, seat, Some(privateQueue))
-                    )
+              openSocket(registry, wsb, session, keepAlive, req, room, SocketJoin(GameId(id), token, guest, mode))
 
-                if mode.contains("spectator") then open(Seat.Spectator)
-                else
-                  token match
-                    case Some(t) =>
-                      room.seatFor(t) match
-                        case None       => Forbidden()
-                        case Some(seat) =>
-                          // #285: redeeming a join token is the only moment the second player of a friend-by-link game is
-                          // ever identifiable, so bind the seat to them before the socket opens. `claimSeat` is a no-op for
-                          // every game that already has two distinct players, so this costs one seating read otherwise.
-                          // The session wins over `guest` (the #235 idiom); a game whose seats already differ ignores both.
-                          claimSeatQuietly(registry, session, req, GameId(id), seat, guest) *> open(seat)
-                    case None =>
-                      AuthSession.principalFor(session, req).flatMap {
-                        case None       => open(Seat.Spectator)
-                        case Some(user) =>
-                          room.seating.flatMap { seats =>
-                            val owned = seats.collect { case (seat, p) if p == user => seat }.toList
-                            open(owned match
-                              case only :: Nil => only
-                              case _           => Seat.Spectator)
-                          }
-                      }
-              }
+  private case class SocketJoin(id: GameId, token: Option[String], guest: Option[String], mode: Option[String])
+
+  private def openSocket(
+      registry: PlayRegistry,
+      wsb: WebSocketBuilder2[IO],
+      session: Option[AuthSession],
+      keepAlive: FiniteDuration,
+      req: Request[IO],
+      room: GameRoom,
+      join: SocketJoin
+  ): IO[Response[IO]] =
+    cats.effect.std.Queue.unbounded[IO, WebSocketFrame].flatMap { privateQueue =>
+      // The seat-private channel, alongside the room's broadcast: it carries the standing draw-offer status,
+      // which belongs to one seat and must never reach the other or a spectator. Seeding it with the seat's
+      // current status BEFORE the socket opens is what makes the channel's order meaningful — the greeting
+      // can never be overtaken by the answer to a command sent the instant the socket came up, so the last
+      // `DrawOfferArmed` a client received is always its true state.
+      def open(seat: Seat): IO[Response[IO]] =
+        room
+          .drawOfferArmedStatus(seat)
+          .flatMap(status => privateQueue.offer(armedFrame(status)))
+          .whenA(seat.side.isDefined) *>
+          wsb.build(
+            clientFrames(room, keepAlive, Stream.fromQueueUnterminated(privateQueue)),
+            fromClient(room, seat, Some(privateQueue))
+          )
+
+      if join.mode.contains("spectator") then open(Seat.Spectator)
+      else
+        join.token match
+          case Some(t) =>
+            room.seatFor(t) match
+              case None       => Forbidden()
+              case Some(seat) =>
+                // #285: redeeming a join token is the only moment the second player of a friend-by-link game is
+                // ever identifiable, so bind the seat to them before the socket opens. `claimSeat` is a no-op for
+                // every game that already has two distinct players, so this costs one seating read otherwise.
+                // The session wins over `guest` (the #235 idiom); a game whose seats already differ ignores both.
+                claimSeatQuietly(registry, session, req, join.id, seat, join.guest) *> open(seat)
+          case None =>
+            sessionSeat(room, session, req).flatMap(open)
+    }
+
+  private def sessionSeat(room: GameRoom, session: Option[AuthSession], req: Request[IO]): IO[Seat] =
+    AuthSession.principalFor(session, req).flatMap {
+      case None       => IO.pure(Seat.Spectator)
+      case Some(user) =>
+        room.seating.map { seats =>
+          val owned = seats.collect { case (seat, p) if p == user => seat }.toList
+          owned match
+            case only :: Nil => only
+            case _           => Seat.Spectator
+        }
+    }
+
+  private def createGame(
+      registry: PlayRegistry,
+      session: Option[AuthSession],
+      req: Request[IO]
+  ): IO[Response[IO]] =
+    // attemptAs (not as): a malformed body is the client's fault, so answer 400, not 500.
+    req
+      .attemptAs[CreateGame]
+      .value
+      .flatMap:
+        case Left(failure) => BadRequest(failure.message)
+        case Right(body)   =>
+          AuthSession.principalFor(session, req).flatMap { signedIn =>
+            val seats: Either[String, (Principal, Principal)] = signedIn match
+              // Session wins (#235): the creator owns both seats until the share link is used, exactly as the
+              // anonymous flow already seats one guest id on both sides.
+              case Some(user) => Right((user, user))
+              case None       =>
+                def required(field: String, value: Option[String]) =
+                  value
+                    .toRight(s"$field: required when not signed in")
+                    .flatMap(id => Principal.guest(id).left.map(err => s"$field: $err"))
+                for
+                  white <- required("white", body.white)
+                  black <- required("black", body.black)
+                yield (white, black)
+            seats match
+              case Left(err)             => BadRequest(err)
+              case Right((white, black)) =>
+                registry
+                  // Friend-by-link games are ALWAYS casual, and #282 decided this deliberately rather than
+                  // leaving the default to speak for itself. Both seats belong to the same principal here (the
+                  // creator, or — from the SPA's anonymous path — one guest id passed twice), because a friend is
+                  // authorized by POSSESSING a seat token, never by being named. So the second player's identity
+                  // is not known at creation and is never recorded at all: `game_results` stores the creator on
+                  // both sides. Adding a `rated` flag would therefore stamp `rated = true` on a row the batch then
+                  // skips as self-play — a lie in the column #279 exists to keep honest. Making these ratable
+                  // needs identity-on-seat-claim first, which is a feature, not a flag.
+                  .createFriend(
+                    white,
+                    black,
+                    body.timeControl.getOrElse(TimeControl.Default),
+                    body.variant,
+                    body.labProtocolVersion,
+                    body.rated.getOrElse(false)
+                  )
+                  .flatMap:
+                    case Left(error)       => BadRequest(error)
+                    case Right((id, room)) =>
+                      val tokens = room.joinTokens.toList.map((seat, token) => SeatToken(seat, token))
+                      (room.diceCommit, room.snapshot).flatMapN((c, snapshot) =>
+                        Created(
+                          CreatedGame(
+                            id.value,
+                            c,
+                            tokens,
+                            snapshot.lab.map(_.variant),
+                            snapshot.lab.map(_.protocolVersion),
+                            snapshot.lab.map(_.provenance)
+                          )
+                        )
+                      )
+          }
 
   /** Who is redeeming a join token, for the seat-claim in #285: the account session if there is one, otherwise the
     * `guest` query param — the same "session wins, the anonymous id is only a fallback" order #235 established for the

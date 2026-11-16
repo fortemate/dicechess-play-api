@@ -328,7 +328,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
           Client.fromHttpApp(fencedEndpoint(registry, generations)),
           config,
           allowAll,
-          stats
+          Webhooks.Monitoring(stats = stats)
         )
         .use { webhooks =>
           webhooks.statsLoop.background.use { _ =>
@@ -820,14 +820,23 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       // Black is driven, White is not (#176's gotcha): the opening roll misses a pawn/knight ~30% of the time, and
       // with an idle Black and no clock (Unlimited) that would deadlock the room before White ever sees a turn.
       driver = BotConnection(opponent, Seat.Black, BotRegistry.getAlgorithm("greedy").get)
-      recorded <- Webhooks.create(registry, store, dead, config, allowAll, statsStore).use { webhooks =>
-        (driver.run(room).background, webhooks.statsLoop.background).tupled.use { _ =>
-          webhooks.attachSweep *>
-            calls.get
-              .iterateUntil(_.nonEmpty)
-              .timeoutTo(15.seconds, IO.raiseError(new RuntimeException("delivery telemetry never arrived")))
+      recorded <- Webhooks
+        .create(
+          registry,
+          store,
+          dead,
+          config,
+          allowAll,
+          Webhooks.Monitoring(stats = statsStore)
+        )
+        .use { webhooks =>
+          (driver.run(room).background, webhooks.statsLoop.background).tupled.use { _ =>
+            webhooks.attachSweep *>
+              calls.get
+                .iterateUntil(_.nonEmpty)
+                .timeoutTo(15.seconds, IO.raiseError(new RuntimeException("delivery telemetry never arrived")))
+          }
         }
-      }
     yield
       assert(recorded.forall { case (t, n, _, _) => t == "hooks" && n == "silent-stats" })
       assert(
@@ -854,13 +863,13 @@ class WebhooksSuite extends munit.CatsEffectSuite:
 
   test("a successful delivery is recorded as Applied telemetry"):
     for
-      registry         <- GameRegistry.create(store = GameStore.noop)
-      store            <- WebhookStore.inMemory
-      secrets          <- Ref.of[IO, List[String]](Nil)
-      delivered        <- Ref.of[IO, Int](0)
-      badSig           <- Ref.of[IO, Int](0)
-      calls_statsStore <- capturingStats
-      (calls, statsStore)       = calls_statsStore
+      registry           <- GameRegistry.create(store = GameStore.noop)
+      store              <- WebhookStore.inMemory
+      secrets            <- Ref.of[IO, List[String]](Nil)
+      delivered          <- Ref.of[IO, Int](0)
+      badSig             <- Ref.of[IO, Int](0)
+      callsAndStatsStore <- capturingStats
+      (calls, statsStore)       = callsAndStatsStore
       webhookBot: Principal.Bot = Principal.Bot("hooks", "applied-stats")
       opponent: Principal.Bot   = Principal.Bot("acme", "driven-stats")
       resources                 = Webhooks.create(
@@ -869,7 +878,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         Client.fromHttpApp(botEndpoint(secrets, registry, delivered, badSig)),
         config,
         allowAll,
-        statsStore
+        Webhooks.Monitoring(stats = statsStore)
       )
       recorded <- resources.use { webhooks =>
         for
@@ -981,7 +990,14 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       attempts <- Ref.of[IO, Int](0)
       endpoint = flakyEndpoint(registry, attempts, failFirst = 1, IO.pure(Response[IO](Status.BadGateway)))
       recorded <- Webhooks
-        .create(registry, store, Client.fromHttpApp(endpoint), retryConfig, allowAll, statsStore)
+        .create(
+          registry,
+          store,
+          Client.fromHttpApp(endpoint),
+          retryConfig,
+          allowAll,
+          Webhooks.Monitoring(stats = statsStore)
+        )
         .use(webhooks => awaitDelivery(driver, room, webhooks, calls, _.exists(_._3 == DeliveryOutcome.Applied)))
       _ <- settle(room)
     yield assertEquals(
@@ -1006,7 +1022,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
           Client.fromHttpApp(endpoint),
           retryConfig.copy(timeout = 200.millis),
           allowAll,
-          statsStore
+          Webhooks.Monitoring(stats = statsStore)
         )
         .use(webhooks => awaitDelivery(driver, room, webhooks, calls, _.exists(_._3 == DeliveryOutcome.Applied)))
       _ <- settle(room)
@@ -1028,7 +1044,14 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       attempts <- Ref.of[IO, Int](0)
       endpoint = flakyEndpoint(registry, attempts, failFirst = Int.MaxValue, answer)
       _ <- Webhooks
-        .create(registry, store, Client.fromHttpApp(endpoint), retryConfig, allowAll, statsStore)
+        .create(
+          registry,
+          store,
+          Client.fromHttpApp(endpoint),
+          retryConfig,
+          allowAll,
+          Webhooks.Monitoring(stats = statsStore)
+        )
         .use { webhooks =>
           awaitDelivery(driver, room, webhooks, calls, _.exists(_._3 == expected)) *>
             IO.sleep(20 * retryConfig.retryBackoff.head)
@@ -1067,7 +1090,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       (registry, store, room, _, calls, statsStore) = fixture
       forfeitConfig                                 = retryConfig.copy(retryBackoff = List(200.millis))
       observed <- Webhooks
-        .create(registry, store, dead, forfeitConfig, allowAll, statsStore)
+        .create(registry, store, dead, forfeitConfig, allowAll, Webhooks.Monitoring(stats = statsStore))
         .use { webhooks =>
           webhooks.statsLoop.background.use { _ =>
             for
@@ -1192,7 +1215,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       _        <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
       _        <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
       observed <- Webhooks
-        .create(registry, store, down, retryConfig, allowAll, statsStore)
+        .create(registry, store, down, retryConfig, allowAll, Webhooks.Monitoring(stats = statsStore))
         .use { webhooks =>
           webhooks.statsLoop.background.use { _ =>
             for
@@ -1283,7 +1306,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
           Client.fromHttpApp(flakyDrawBot(registry, seen, failures)),
           retryConfig,
           allowAll,
-          statsStore
+          Webhooks.Monitoring(stats = statsStore)
         )
         .use { webhooks =>
           (whitePlays(room).background, webhooks.statsLoop.background).tupled.use { _ =>
@@ -1430,7 +1453,14 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       (_, room) = made.toOption.get
       _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
       _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
-      resources = Webhooks.create(registry, store, Client.fromHttpApp(resigningBot), config, allowAll, statsStore)
+      resources = Webhooks.create(
+        registry,
+        store,
+        Client.fromHttpApp(resigningBot),
+        config,
+        allowAll,
+        Webhooks.Monitoring(stats = statsStore)
+      )
       recorded <- resources.use { webhooks =>
         webhooks.statsLoop.background.use { _ =>
           webhooks.attachSweep *>
@@ -1507,7 +1537,7 @@ class WebhooksSuite extends munit.CatsEffectSuite:
         Client.fromHttpApp(resigningDrawBot(registry)),
         config,
         allowAll,
-        statsStore
+        Webhooks.Monitoring(stats = statsStore)
       )
       res <- resources.use { webhooks =>
         webhooks.statsLoop.background.use { _ =>
@@ -1549,7 +1579,14 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       (_, room) = made.toOption.get
       _ <- room.submit(Seat.White, GameCommand.SubmitSeed(seed))
       _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
-      resources = Webhooks.create(registry, store, Client.fromHttpApp(slowBot), config, allowAll, statsStore)
+      resources = Webhooks.create(
+        registry,
+        store,
+        Client.fromHttpApp(slowBot),
+        config,
+        allowAll,
+        Webhooks.Monitoring(stats = statsStore)
+      )
       _ <- resources.use { webhooks =>
         webhooks.statsLoop.background.use { _ =>
           webhooks.attachSweep *>
@@ -1591,17 +1628,26 @@ class WebhooksSuite extends munit.CatsEffectSuite:
       _ <- room.submit(Seat.Black, GameCommand.SubmitSeed(seed))
       driver = BotConnection(opponent, Seat.Black, BotRegistry.getAlgorithm("greedy").get)
       (_, err) <- captureStderr {
-        Webhooks.create(registry, store, dead, config, allowAll, featuredBot = Some(silent)).use { webhooks =>
-          driver
-            .run(room)
-            .background
-            .use { _ =>
-              webhooks.attachSweep *>
-                room.result.timeoutTo(
-                  20.seconds,
-                  IO.raiseError(new RuntimeException("the room hung instead of flagging the dead webhook"))
-                )
-            }
-        }
+        Webhooks
+          .create(
+            registry,
+            store,
+            dead,
+            config,
+            allowAll,
+            Webhooks.Monitoring(featuredBot = Some(silent))
+          )
+          .use { webhooks =>
+            driver
+              .run(room)
+              .background
+              .use { _ =>
+                webhooks.attachSweep *>
+                  room.result.timeoutTo(
+                    20.seconds,
+                    IO.raiseError(new RuntimeException("the room hung instead of flagging the dead webhook"))
+                  )
+              }
+          }
       }
     yield assert(err.contains("[play][showcase] featured bot delivery failed"), s"expected alert in stderr, got: $err")

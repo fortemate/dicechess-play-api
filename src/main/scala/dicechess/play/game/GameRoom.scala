@@ -652,6 +652,24 @@ final class GameRoom private (
             v => GameEvent.GameEnded(v, over, Some(s.dice.reveal), Some(s.clientSeedsRevealed))
           ).flatTap(_ => done.complete(over).attempt.void).void
 
+  private def onBegin: IO[Unit] =
+    stateRef.get.flatMap { s =>
+      // Idempotent: a Begin never re-rolls (ply > 0) or revives an ended game. Otherwise it marks the game
+      // started and rolls as soon as both client seeds are in — which also kicks a game resumed from a
+      // snapshot that had started but not yet rolled. If seeds are still missing, `deadlineFor`/`onTimeout`
+      // force-start once the seed grace elapses (so a game never stalls).
+      if s.lab.isDefined || s.ply > 0L || s.ended || s.awaitingJoins then IO.unit
+      else
+        IO.monotonic.flatMap { now =>
+          val started = if s.started then s else s.copy(started = true, startedAt = Some(now))
+          // Commit `started` (and any seeds already in) before the opening roll, so a roll failure aborts
+          // from current state rather than from stale state (dropping seeds / re-starting) — and, in the
+          // required mode, so `stateRef` keeps holding only committed state for the abort to start from.
+          commit(started).flatMap: committed =>
+            if committed.hasAllSeeds then beginTurn(committed).flatMap(stateRef.set) else IO.unit
+        }
+    }
+
   private def consume: IO[Unit] =
     // No command within the deadline while a turn is pending => the player to move forfeits. The deadline is the mover's
     // remaining clock for a timed game, or the fixed anti-abandonment `idleCheck` for an unlimited one. The timeout is
@@ -664,22 +682,7 @@ final class GameRoom private (
           .flatMap { message =>
             expireInitialJoin *> (message match
               case Msg.Begin =>
-                stateRef.get.flatMap { s =>
-                  // Idempotent: a Begin never re-rolls (ply > 0) or revives an ended game. Otherwise it marks the game
-                  // started and rolls as soon as both client seeds are in — which also kicks a game resumed from a
-                  // snapshot that had started but not yet rolled. If seeds are still missing, `deadlineFor`/`onTimeout`
-                  // force-start once the seed grace elapses (so a game never stalls).
-                  if s.lab.isDefined || s.ply > 0L || s.ended || s.awaitingJoins then IO.unit
-                  else
-                    IO.monotonic.flatMap { now =>
-                      val started = if s.started then s else s.copy(started = true, startedAt = Some(now))
-                      // Commit `started` (and any seeds already in) before the opening roll, so a roll failure aborts
-                      // from current state rather than from stale state (dropping seeds / re-starting) — and, in the
-                      // required mode, so `stateRef` keeps holding only committed state for the abort to start from.
-                      commit(started).flatMap: committed =>
-                        if committed.hasAllSeeds then beginTurn(committed).flatMap(stateRef.set) else IO.unit
-                    }
-                } *> continue
+                onBegin *> continue
               case Msg.Command(seat, command, receivedAt, reply) =>
                 // The reply is parked while the command runs so a writer failure mid-command (a required write that
                 // exhausted its retries, an engine invariant) can still settle it AFTER the technical abort commits —

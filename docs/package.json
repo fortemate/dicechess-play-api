@@ -12,15 +12,15 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.42.10",
-    "astro": "^7.4.7",
+    "@astrojs/starlight": "^0.43.1",
+    "astro": "^7.4.12",
     "astro-mermaid": "^2.2.0",
     "mermaid": "^11.17.2",
     "sharp": "^0.35.5",
-    "starlight-openapi": "^0.27.0"
+    "starlight-openapi": "^0.27.1"
   },
   "devDependencies": {
     "ajv": "^8.17.1",
-    "wrangler": "^4.158.0"
+    "wrangler": "^4.162.0"
   }
 }

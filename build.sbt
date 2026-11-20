@@ -4,7 +4,7 @@ ThisBuild / organizationHomepage := Some(uri("https://fortemate.com"))
 ThisBuild / homepage             := Some(uri("https://fortemate.com"))
 ThisBuild / startYear            := Some(2026)
 ThisBuild / version              := "0.1.0-SNAPSHOT"
-ThisBuild / scalaVersion         := "3.10.0"
+ThisBuild / scalaVersion         := "3.10.1"
 
 ThisBuild / description := "Authoritative real-time server for Dice Chess (human-vs-human + Bot API + Glicko-2 rating ladder)."
 ThisBuild / licenses := List(License("AGPL-3.0-only", uri("https://www.gnu.org/licenses/agpl-3.0.txt")))
@@ -31,13 +31,13 @@ ThisBuild / resolvers := Seq(
   Resolver.mavenCentral
 )
 
-val DiceChessRulesVersion     = "0.18.2"
-val DiceChessEngineVersion    = "0.18.2"
+val DiceChessRulesVersion     = "0.18.4"
+val DiceChessEngineVersion    = "0.18.4"
 val CatsEffectVersion         = "3.7.1"
 val Fs2Version                = "3.14.0"
 val Http4sVersion             = "0.23.37"
 val CirceVersion              = "0.14.10"
-val LogbackVersion            = "1.6.6"
+val LogbackVersion            = "1.6.7"
 val Http4sJdkClientVersion    = "0.10.0"
 val MunitVersion              = "1.3.6"
 val MunitCatsEffectVersion    = "2.2.1"

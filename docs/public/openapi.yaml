@@ -549,11 +549,50 @@ paths:
     get:
       tags: [Discovery]
       summary: List live games (public)
-      description: Every live game on the node, with both seats' public faces. Sorted by version desc, capped at 50.
+      description: >
+        The live games on the node, with both seats' public faces, one page at a time. Without
+        parameters: every live game, sorted by version desc (ties by gameId), the first 50. The
+        parameters order by rating, filter, search and page; filters combine with AND. Unknown
+        parameters are ignored.
       security: []
+      parameters:
+        - name: order
+          in: query
+          schema: { type: string, enum: [activity, rating], default: activity }
+          description: >
+            activity — the game further along first (version desc, then gameId asc). rating — the
+            highest sum of both seats' ratings first, where a seat without a rating adds nothing;
+            equal sums are ordered by the number of rated seats (two before one), then version
+            desc, then gameId asc. Both orders are total.
+        - name: players
+          in: query
+          schema: { type: string, enum: [all, human, bots], default: all }
+          description: >
+            human — at least one seat is a human. bots — both seats are bots. A game whose
+            players are null matches neither.
+        - name: category
+          in: query
+          schema: { type: string, enum: [bullet, blitz, rapid] }
+          description: >
+            Only games whose time control counts on this rating scale. Absent — any speed,
+            including controls that count on no scale (Unlimited, PerMove).
+        - name: q
+          in: query
+          schema: { type: string }
+          description: >
+            Only games where either seat's name contains this text, ignoring case and surrounding
+            spaces. Empty or blank — no search. An anonymous seat has no name and is never found.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 50, default: 50 }
+          description: Page size. 0 answers the total alone.
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: How many games of the ordered, filtered listing to skip. Past the end the page is empty.
       responses:
         '200':
-          description: Live games with a total count.
+          description: One page of live games with the count of all games the filters keep.
           content:
             application/json:
               schema:
@@ -562,8 +601,14 @@ paths:
                   games:
                     type: array
                     items: { $ref: '#/components/schemas/PublicGame' }
-                  total: { type: integer }
+                  total:
+                    type: integer
+                    description: >
+                      Games matching players, category and q — every live game when none is
+                      given. Independent of order, limit and offset.
                 required: [games, total]
+        '400':
+          description: A parameter carries a value outside its domain; the plain-text body names the parameter.
   /games/{id}:
     get:
       tags: [Discovery]

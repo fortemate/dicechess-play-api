@@ -145,6 +145,74 @@ class PlayRoutesSuite extends munit.CatsEffectSuite:
           .timeoutTo(10.seconds, IO.raiseError(RuntimeException("the finished game never left the listing")))
       yield ()
 
+  test("GET /games without parameters keeps its shape: `games` and `total`, the same fields per game"):
+    (server, JdkHttpClient.simple[IO]).tupled.use: (port, http) =>
+      val games = Uri.unsafeFromString(s"http://127.0.0.1:$port") / "games"
+      for
+        first  <- http.expect[CreatedGame](POST(CreateGame(Some(WhiteId), Some(BlackId)), games))
+        second <- http.expect[CreatedGame](POST(CreateGame(Some(WhiteId), Some(BlackId)), games))
+        body   <- http.expect[Json](games)
+        typed  <- http.expect[LiveGames](games)
+        // Naming every default explicitly is the same request.
+        spelled <- http.expect[Json](
+          games +? ("order" -> "activity") +? ("players" -> "all") +? ("limit" -> "50") +? ("offset" -> "0")
+        )
+      yield
+        assertEquals(body.asObject.map(_.keys.toList), Some(List("games", "total")))
+        assertEquals(
+          body.hcursor.downField("games").downArray.focus.flatMap(_.asObject).map(_.keys.toList),
+          Some(List("gameId", "players", "timeControl", "activeSeat", "dicePending", "clocks", "version", "dfen"))
+        )
+        assertEquals(typed.total, 2)
+        assertEquals(typed.games.map(_.gameId).toSet, Set(first.gameId, second.gameId))
+        // Most action first, as before; two fresh games tie, and the tie no longer depends on the registry's order.
+        assertEquals(typed.games, typed.games.sortBy(g => (-g.version, g.gameId)))
+        assertEquals(spelled, body)
+
+  test("GET /games orders, filters, searches and pages on request, and refuses a value it does not know"):
+    (server, JdkHttpClient.simple[IO]).tupled.use: (port, http) =>
+      val games                            = Uri.unsafeFromString(s"http://127.0.0.1:$port") / "games"
+      def create(timeControl: TimeControl) =
+        http.expect[CreatedGame](POST(CreateGame(Some(WhiteId), Some(BlackId), Some(timeControl)), games))
+      def listing(params: (String, String)*)         = http.expect[LiveGames](games.withQueryParams(params.toMap))
+      def refused(param: (String, String)): IO[Unit] =
+        http
+          .run(GET(games.withQueryParams(Map(param))))
+          .use(response => response.as[String].map(response.status -> _))
+          .map: (status, message) =>
+            assertEquals(status, Status.BadRequest)
+            assert(message.contains(s"${param._1}: '${param._2}' must be"), message)
+      for
+        blitz    <- create(TimeControl.Fischer(300, 3))
+        rapid    <- create(TimeControl.Fischer(600, 10))
+        all      <- listing("order" -> "rating")
+        humans   <- listing("players" -> "human")
+        bots     <- listing("players" -> "bots")
+        onRapid  <- listing("category" -> "rapid")
+        onBullet <- listing("category" -> "bullet")
+        named    <- listing("q" -> "anyone")
+        first    <- listing("order" -> "rating", "limit" -> "1")
+        second   <- listing("order" -> "rating", "limit" -> "1", "offset" -> "1")
+        past     <- listing("limit" -> "1", "offset" -> "2")
+        count    <- listing("limit" -> "0")
+        _ <- List("order" -> "elo", "players" -> "humans", "category" -> "classical", "limit" -> "51", "offset" -> "-1")
+          .traverse_(refused)
+      yield
+        val both = Set(blitz.gameId, rapid.gameId)
+        assertEquals(all.games.map(_.gameId).toSet, both)
+        // Two games of guests: nobody is rated, so the rating order falls through to activity, then the game id.
+        assertEquals(all.games, all.games.sortBy(g => (-g.version, g.gameId)))
+        assertEquals(humans.total, 2)
+        assertEquals(bots, LiveGames(Nil, 0))
+        assertEquals(onRapid.games.map(_.gameId), List(rapid.gameId))
+        assertEquals(onRapid.total, 1)
+        assertEquals(onBullet, LiveGames(Nil, 0))
+        assertEquals(named, LiveGames(Nil, 0)) // guests carry no name to find
+        assertEquals(first.games ++ second.games, all.games)
+        assertEquals(List(first.total, second.total, past.total, count.total), List(2, 2, 2, 2))
+        assertEquals(past.games, Nil)
+        assertEquals(count.games, Nil)
+
   test("GET /games/{id}/moves serves the full legal-move tree for the pending roll"):
     val resources =
       for

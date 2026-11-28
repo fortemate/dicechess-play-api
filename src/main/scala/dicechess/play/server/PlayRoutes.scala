@@ -89,7 +89,9 @@ final case class LiveGame(
     dfen: String
 ) derives Codec.AsObject
 
-/** The public games listing: up to the cap of live games (most action first) plus the uncapped total. */
+/** The public games listing: one page of live games plus `total`, the number of games the request's filters keep (every
+  * live game when it names none). See [[LiveGamesListing]] for the order, the filters and the paging.
+  */
 final case class LiveGames(games: List[LiveGame], total: Int) derives Codec.AsObject
 
 object PlayRoutes:
@@ -98,9 +100,6 @@ object PlayRoutes:
     * connection alive between game events.
     */
   val DefaultKeepAlive: FiniteDuration = 25.seconds
-
-  /** Cap on the public games listing: bounds the payload of an unauthenticated, poll-heavy endpoint. */
-  private val MaxListedGames = 50
 
   private object TokenParam extends OptionalQueryParamDecoderMatcher[String]("token")
   private object ModeParam  extends OptionalQueryParamDecoderMatcher[String]("mode")
@@ -122,20 +121,30 @@ object PlayRoutes:
         createGame(registry, session, req)
 
       // Public like the per-game snapshot: everything here is already public information. Feeds the Watch page, the
-      // lobby's "top game" preview, and the live-games counter; sorted by version (most action first) and capped —
-      // nobody scrolls past MaxListedGames boards, and `total` still carries the real count.
-      case GET -> Root / "games" =>
-        registry.list
-          .flatMap(_.traverse { (id, room) =>
-            room.snapshot.map { s =>
-              Option.when(s.status == GameStatus.Active):
-                LiveGame(id.value, s.players, s.timeControl, s.activeSeat, s.dicePending, s.clocks, s.version, s.dfen)
-            }
-          })
-          .flatMap { entries =>
-            val live = entries.flatten.sortBy(-_.version)
-            Ok(LiveGames(live.take(MaxListedGames), live.size))
-          }
+      // Arena overview and its list of all live games, and the live-games counter. Without parameters: sorted by
+      // version (most action first) and capped at one page, with `total` carrying the real count. The parameters
+      // (#332) order by rating, filter, search and page; see LiveGamesListing.
+      case req @ GET -> Root / "games" =>
+        LiveGamesListing.parse(req.uri.query.params) match
+          case Left(error)  => BadRequest(error)
+          case Right(query) =>
+            registry.list
+              .flatMap(_.traverse { (id, room) =>
+                room.snapshot.map { s =>
+                  Option.when(s.status == GameStatus.Active):
+                    LiveGame(
+                      id.value,
+                      s.players,
+                      s.timeControl,
+                      s.activeSeat,
+                      s.dicePending,
+                      s.clocks,
+                      s.version,
+                      s.dfen
+                    )
+                }
+              })
+              .flatMap(entries => Ok(LiveGamesListing.page(entries.flatten, query)))
 
       case GET -> Root / "games" / id =>
         registry

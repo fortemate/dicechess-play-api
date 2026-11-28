@@ -2317,13 +2317,16 @@ components:
         wins: { type: integer }
         draws: { type: integer }
         losses: { type: integer }
+        ratings:
+          type: array
+          items: { $ref: '#/components/schemas/CategoryRating' }
         opponents:
           type: array
           items: { $ref: '#/components/schemas/OpponentRecord' }
         recent:
           type: array
           items: { $ref: '#/components/schemas/RecentGame' }
-      required: [team, name, rating, rd, provisional, onLadder, games, wins, draws, losses, opponents, recent]
+      required: [team, name, rating, rd, provisional, onLadder, games, wins, draws, losses, ratings, opponents, recent]
     OpponentRecord:
       type: object
       description: >

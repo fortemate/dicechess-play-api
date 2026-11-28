@@ -429,6 +429,8 @@ One registered bot's public card: rating summary, its aggregate record against e
 
 `ratings` carries one entry per scale the bot has **actually been rated on**, each with its own `provisional` flag and its own record — a bot can be settled at blitz and still finding its level at bullet, and one flag for both would be a lie about one of them. A speed it has never played is simply absent, not reported as `1500 ± 350`. The top-level `rating`/`rd`/`provisional`/`games`/`wins`/`draws`/`losses` describe **blitz**, the same default `GET /leaderboard` answers on.
 
+Each `ratings` entry may also carry **`rank`**: the bot's 1-based row on that speed's board — the same number as `rank` in `GET /leaderboard?category=…` (the bots board), computed by the board's own ordering, ties included. The field is **optional**: it is omitted (never `null`) when the bot has no row on that board — while it is still provisional, or beyond the size limit of the board response. A client that ignores `rank` is unaffected.
+
 `opponents` is one row per other registered bot (head-to-head) plus one collapsed row for every human/guest opponent combined — that collapsed row (`team`/`botName` both `null`) is the bot's **record vs humans**. Unlike the top-level `wins`/`draws`/`losses` (rated, decided games only — the ladder record), `opponents` counts every game, rated and casual alike: a guest game is always casual, so a rated-only tally would always read zero against humans. A bucket with no games simply has no row.
 
 ```json
@@ -437,7 +439,7 @@ One registered bot's public card: rating summary, its aggregate record against e
   "rating": 1650.0, "rd": 95.0, "provisional": false, "onLadder": true,
   "games": 30, "wins": 20, "draws": 3, "losses": 7, "totalGames": 34,
   "ratings": [
-    { "category": "blitz", "rating": 1650.0, "rd": 95.0, "provisional": false, "games": 30, "wins": 20, "draws": 3, "losses": 7 },
+    { "category": "blitz", "rating": 1650.0, "rd": 95.0, "provisional": false, "games": 30, "wins": 20, "draws": 3, "losses": 7, "rank": 4 },
     { "category": "rapid", "rating": 1512.0, "rd": 180.0, "provisional": true, "games": 3, "wins": 1, "draws": 0, "losses": 2 }
   ],
   "opponents": [
@@ -452,7 +454,9 @@ One registered bot's public card: rating summary, its aggregate record against e
 
 `GET /players/by-nickname/{nick}`
 
-One registered human player's public card: their nickname, account status, competitive per-category ratings, up to 20 recent games, and versioned training estimates against calibrated bots:
+One registered human player's public card: their nickname, account status, competitive per-category ratings, up to 20 recent games, and versioned training estimates against calibrated bots.
+
+As on the bot profile, each `ratings` entry may carry an optional **`rank`** — here the player's 1-based row on that speed's players board, `GET /leaderboard?kind=players&category=…`. It is omitted when the player has no row there, and a client that ignores it is unaffected. `training` entries never carry it: there is no training board.
 
 ```json
 {
@@ -467,7 +471,8 @@ One registered human player's public card: their nickname, account status, compe
       "games": 42,
       "wins": 25,
       "draws": 5,
-      "losses": 12
+      "losses": 12,
+      "rank": 7
     }
   ],
   "training": [

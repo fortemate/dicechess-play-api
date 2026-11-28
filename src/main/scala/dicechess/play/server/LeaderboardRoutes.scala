@@ -111,6 +111,11 @@ final case class RecentGame(
   * A profile carries one of these per category it has ACTUALLY been rated in. A speed the participant has never played
   * is absent rather than present at 1500 ± 350: the tables are sparse (V21) precisely so that absence can mean "not
   * measured" instead of "measured as average".
+  *
+  * `rank` (#333) is the participant's 1-based row on this category's public board — the same number `GET /leaderboard`
+  * reports for it, on the board of its own population (`kind=bots` for a bot, `kind=players` for an account). It is
+  * absent, never `null`, whenever the participant has no row there: still provisional, deactivated, or beyond the
+  * board's size guard. It is also absent wherever this type is served without a board read (`/auth/me`).
   */
 final case class CategoryRating(
     category: String,
@@ -120,8 +125,16 @@ final case class CategoryRating(
     games: Int,
     wins: Int,
     draws: Int,
-    losses: Int
-) derives Codec.AsObject
+    losses: Int,
+    rank: Option[Int] = None
+)
+
+object CategoryRating:
+  given Codec.AsObject[CategoryRating] =
+    val base = deriveCodec[CategoryRating]
+    // Absent rather than `null`: the field is optional on the wire, and a response without a board row must stay
+    // byte-identical to what it was before the field existed.
+    Codec.AsObject.from(base, base.mapJsonObject(_.filter((key, value) => !(key == "rank" && value.isNull))))
 
 /** A bot's public profile: the rating summary, its recent games, and its aggregate record against every opponent it has
   * played (#182) — one row per other bot (head-to-head) plus one collapsed row for every human/guest opponent combined
@@ -223,13 +236,16 @@ object LeaderboardRoutes:
   /** Which populations a board response covers. */
   final private[server] case class Populations(bots: Boolean, players: Boolean)
 
+  private val BotsOnly    = Populations(bots = true, players = false)
+  private val PlayersOnly = Populations(bots = false, players = true)
+
   /** `?kind=` → populations. Default `bots` keeps the existing response for the existing caller; an unrecognised value
     * is a 400 rather than a silent fallback, so a typo cannot look like an empty board.
     */
   private[server] def parseKind(kind: Option[String]): Either[String, Populations] =
     kind match
-      case None | Some("bots") => Right(Populations(bots = true, players = false))
-      case Some("players")     => Right(Populations(bots = false, players = true))
+      case None | Some("bots") => Right(BotsOnly)
+      case Some("players")     => Right(PlayersOnly)
       case Some("all")         => Right(Populations(bots = true, players = true))
       case Some(other)         => Left(s"kind: '$other' must be 'bots', 'players', or 'all'")
 
@@ -294,6 +310,45 @@ object LeaderboardRoutes:
       ciHigh = snapshotEpoch.as((high * 10).round / 10.0)
     )
 
+  /** THE board's ordering rule, in one place: merge both populations, order by the conservative estimate (then the
+    * smaller deviation, then the name), cut to `limit`, and number the rows from 1. `GET /leaderboard` serves exactly
+    * this list, and a profile's `rank` (#333) is a lookup in it — so the two cannot disagree, ties included.
+    */
+  private[server] def rankedRows(view: LeaderboardStore.LiveLeaderboardView, limit: Int): List[LeaderRow] =
+    val epoch = view.snapshot.map(_.epoch)
+    (view.bots.map(botRow(_, epoch)) ++ view.players.map(playerRow(_, epoch)))
+      .sortBy(row => (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name))
+      .take(limit)
+      .zipWithIndex
+      .map((row, index) => row.copy(rank = index + 1))
+
+  /** One participant's row number on each of `categories`' boards (#333), read through the same store call and the same
+    * [[rankedRows]] as `GET /leaderboard` for its population. A category whose board has no row for the participant is
+    * absent from the map.
+    *
+    * One board read per category the participant is rated in — at most `RatingCategory.values.size`. Deliberately not
+    * pre-filtered on the profile's own deviation: whether a participant is on the board is the board query's decision,
+    * and second-guessing it here would be a second copy of that rule.
+    */
+  private def boardRanks(
+      board: LeaderboardStore,
+      categories: Iterable[RatingCategory],
+      population: Populations
+  )(isParticipant: LeaderRow => Boolean): IO[Map[RatingCategory, Int]] =
+    val limit = LeaderboardStore.MaxBoardSize
+    categories.toList
+      .traverse: category =>
+        board
+          .liveLeaderboardView(
+            category,
+            population.bots,
+            population.players,
+            Glicko2.ProvisionalDeviationThreshold,
+            limit
+          )
+          .map(view => rankedRows(view, limit).find(isParticipant).map(row => category -> row.rank))
+      .map(_.flatten.toMap)
+
   /** Recent games shown on a profile — a glance at current form, not a full history. */
   val RecentGamesShown: Int = 20
 
@@ -316,7 +371,8 @@ object LeaderboardRoutes:
     */
   private[server] def categoryRatings(
       ratings: Map[RatingCategory, Glicko],
-      tallies: Map[RatingCategory, ResultTally]
+      tallies: Map[RatingCategory, ResultTally],
+      ranks: Map[RatingCategory, Int] = Map.empty
   ): List[CategoryRating] =
     RatingCategory.values.toList.flatMap: category =>
       ratings.get(category).map { glicko =>
@@ -329,7 +385,8 @@ object LeaderboardRoutes:
           games = tally.games,
           wins = tally.wins,
           draws = tally.draws,
-          losses = tally.losses
+          losses = tally.losses,
+          rank = ranks.get(category)
         )
       }
 
@@ -350,22 +407,13 @@ object LeaderboardRoutes:
             board
               .liveLeaderboardView(onCategory, wantedFor.bots, wantedFor.players, maxRd, limit)
               .flatMap: view =>
-                val epochOpt          = view.snapshot.map(_.epoch)
                 val effectiveCutoff   = view.dataCutoff.orElse(view.snapshot.map(_.cutoff))
                 val effectiveComputed = view.computedAt.orElse(view.snapshot.map(_.computedAt))
-                val merged            =
-                  (view.bots.map(b => LeaderboardRoutes.botRow(b, epochOpt)) ++ view.players
-                    .map(p => LeaderboardRoutes.playerRow(p, epochOpt)))
-                    .sortBy(row =>
-                      (-row.orderingValue.getOrElse(Glicko2.conservativeRating(row.rating, row.rd)), row.rd, row.name)
-                    )
-                    .take(limit)
-                val ranked = merged.zipWithIndex.map((row, index) => row.copy(rank = index + 1))
                 Ok(
                   Leaderboard(
                     category = onCategory.wireName,
-                    leaders = ranked,
-                    epoch = epochOpt,
+                    leaders = LeaderboardRoutes.rankedRows(view, limit),
+                    epoch = view.snapshot.map(_.epoch),
                     anchorSetVersion = view.snapshot.map(_.anchorSetVersion),
                     cutoff = effectiveCutoff,
                     computedAt = effectiveComputed
@@ -458,24 +506,28 @@ object LeaderboardRoutes:
                 // the two-sided participant predicate, so each one costs a full scan.
                 val default = byCategory.getOrElse(RatingCategory.Default, Glicko.Initial)
                 val tally   = talliesByCategory.getOrElse(RatingCategory.Default, ResultTally.Empty)
-                Ok(
-                  BotProfile(
-                    team = team,
-                    name = name,
-                    rating = default.rating,
-                    rd = default.deviation,
-                    provisional = default.deviation > Glicko2.ProvisionalDeviationThreshold,
-                    onLadder = bot.onLadder,
-                    games = tally.games,
-                    wins = tally.wins,
-                    draws = tally.draws,
-                    losses = tally.losses,
-                    totalGames = totalGames,
-                    ratings = LeaderboardRoutes.categoryRatings(byCategory, talliesByCategory),
-                    opponents = opponents.map(playerOpponent),
-                    recent = recent.map(recentGame(externalId, _))
+                // A bot's place is its row on the bots board — what `GET /leaderboard` answers by default (#333).
+                val onBotsBoard = LeaderboardRoutes.boardRanks(board, byCategory.keys, BotsOnly): row =>
+                  row.kind == "bot" && row.team.contains(team) && row.name == name
+                onBotsBoard.flatMap: ranks =>
+                  Ok(
+                    BotProfile(
+                      team = team,
+                      name = name,
+                      rating = default.rating,
+                      rd = default.deviation,
+                      provisional = default.deviation > Glicko2.ProvisionalDeviationThreshold,
+                      onLadder = bot.onLadder,
+                      games = tally.games,
+                      wins = tally.wins,
+                      draws = tally.draws,
+                      losses = tally.losses,
+                      totalGames = totalGames,
+                      ratings = LeaderboardRoutes.categoryRatings(byCategory, talliesByCategory, ranks),
+                      opponents = opponents.map(playerOpponent),
+                      recent = recent.map(recentGame(externalId, _))
+                    )
                   )
-                )
 
   /** The account profile's own reads, scoped to the account's `user:` id ONLY — never its claimed guest ids (see
     * [[PlayerProfile]] for why that scoping is the privacy promise, not an oversight).
@@ -523,23 +575,28 @@ object LeaderboardRoutes:
               draws = state.draws,
               losses = state.losses
             )
-      Ok(
-        PlayerProfile(
-          nickname = account.nickname,
-          rating = default.rating,
-          rd = default.deviation,
-          provisional = default.deviation > Glicko2.ProvisionalDeviationThreshold,
-          games = tally.games,
-          wins = tally.wins,
-          draws = tally.draws,
-          losses = tally.losses,
-          totalGames = totalGames,
-          ratings = LeaderboardRoutes.categoryRatings(byCategory, talliesByCategory),
-          training = trainingRatings,
-          opponents = opponents.map(playerOpponent),
-          recent = recent.map(recentGame(externalId, _))
+      // An account's place is its row on the players board, `GET /leaderboard?kind=players` (#333). The nickname is
+      // the board's own key for a person — unique, and the stored spelling on both sides of this comparison.
+      val onPlayersBoard = LeaderboardRoutes.boardRanks(board, byCategory.keys, PlayersOnly): row =>
+        row.kind == "player" && row.name == account.nickname
+      onPlayersBoard.flatMap: ranks =>
+        Ok(
+          PlayerProfile(
+            nickname = account.nickname,
+            rating = default.rating,
+            rd = default.deviation,
+            provisional = default.deviation > Glicko2.ProvisionalDeviationThreshold,
+            games = tally.games,
+            wins = tally.wins,
+            draws = tally.draws,
+            losses = tally.losses,
+            totalGames = totalGames,
+            ratings = LeaderboardRoutes.categoryRatings(byCategory, talliesByCategory, ranks),
+            training = trainingRatings,
+            opponents = opponents.map(playerOpponent),
+            recent = recent.map(recentGame(externalId, _))
+          )
         )
-      )
 
   /** Reframe a stored white-POV row from the profiled bot's point of view. */
   private def recentGame(profiledExternalId: String, row: GameResultRow): RecentGame =

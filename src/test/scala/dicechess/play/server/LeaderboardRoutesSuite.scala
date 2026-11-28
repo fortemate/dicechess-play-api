@@ -1,6 +1,7 @@
 package dicechess.play.server
 
 import cats.effect.IO
+import cats.syntax.all.*
 import dicechess.play.core.{GameId, Principal, RatingCategory}
 import dicechess.play.rating.{Glicko, Glicko2, RatingSnapshot, RatingSnapshotSummary, TrainingState}
 import dicechess.play.store.*
@@ -479,6 +480,134 @@ class LeaderboardRoutesSuite extends munit.CatsEffectSuite:
     app(profiles = ProfileFixture(accounts = List(blocked)))
       .run(Request[IO](Method.GET, uri"/players/by-nickname/GoneNick"))
       .map(resp => assertEquals(resp.status, Status.NotFound, "the API must not confirm a blocked nickname exists"))
+
+  // ── A participant's place on the board, on its profile (#333) ────────────────
+
+  /** `category -> rank` as the profile reports it, read off the raw JSON so that an ABSENT key and a `null` cannot be
+    * confused: a category with no board row must not carry the key at all.
+    */
+  private def profileRanks(profile: Json): Map[String, Option[Int]] =
+    profile.hcursor
+      .downField("ratings")
+      .values
+      .getOrElse(Nil)
+      .map: rating =>
+        assert(!rating.hcursor.downField("rank").focus.exists(_.isNull), s"rank must be absent, never null: $rating")
+        rating.hcursor.get[String]("category").toOption.get -> rating.hcursor.get[Int]("rank").toOption
+      .toMap
+
+  private def boardRankOf(board: Leaderboard, kind: String, name: String): Option[Int] =
+    board.leaders.find(row => row.kind == kind && row.name == name).map(_.rank)
+
+  test("a bot profile reports its row on each speed's board, and nothing for a speed it is not on yet (#333)"):
+    val service = app(
+      bots = Map(("acme", "alice") -> BotRating(onLadder = true, None)),
+      board = BoardFixture(
+        entries = List(
+          LeaderboardEntry("acme", "bob", 1700.0, 60.0, onLadder = true, ResultTally(20, 0, 5)),
+          LeaderboardEntry("acme", "alice", 1650.0, 95.0, onLadder = true, ResultTally(20, 3, 7))
+        ),
+        entriesByCategory = Map(
+          // Alice leads Bullet, and has played Rapid without settling: the store's own filter keeps her off that board.
+          RatingCategory.Bullet -> List(
+            LeaderboardEntry("acme", "alice", 1810.0, 70.0, onLadder = true, ResultTally(9, 0, 1)),
+            LeaderboardEntry("acme", "bob", 1500.0, 80.0, onLadder = true, ResultTally(1, 0, 9))
+          ),
+          RatingCategory.Rapid -> List(
+            LeaderboardEntry("acme", "bob", 1600.0, 75.0, onLadder = true, ResultTally(5, 0, 5)),
+            LeaderboardEntry("acme", "alice", 1512.0, 180.0, onLadder = true, ResultTally(1, 0, 2))
+          )
+        )
+      ),
+      profiles = ProfileFixture(
+        ratings = Map(
+          RatedIdentity.Bot("acme", "alice") -> Map(
+            RatingCategory.Bullet -> Glicko(1810.0, 70.0, 0.06),
+            RatingCategory.Blitz  -> Glicko(1650.0, 95.0, 0.058),
+            RatingCategory.Rapid  -> Glicko(1512.0, 180.0, 0.06)
+          )
+        )
+      )
+    )
+    for
+      profile <- service.run(Request[IO](Method.GET, uri"/bots/acme/alice")).flatMap(_.as[Json])
+      blitz   <- service.run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Leaderboard])
+      bullet  <- service.run(Request[IO](Method.GET, uri"/leaderboard?category=bullet")).flatMap(_.as[Leaderboard])
+      rapid   <- service.run(Request[IO](Method.GET, uri"/leaderboard?category=rapid")).flatMap(_.as[Leaderboard])
+    yield
+      val ranks = profileRanks(profile)
+      assertEquals(ranks, Map("bullet" -> Some(1), "blitz" -> Some(2), "rapid" -> None))
+      // The contract is not "some plausible number" but "the same number the board shows", speed by speed.
+      assertEquals(ranks("blitz"), boardRankOf(blitz, "bot", "alice"))
+      assertEquals(ranks("bullet"), boardRankOf(bullet, "bot", "alice"))
+      assertEquals(ranks("rapid"), boardRankOf(rapid, "bot", "alice"), "off the board on both surfaces alike")
+
+  test("equal ordering values still give every profile exactly its own board row (#333)"):
+    // Three bots on ONE conservative estimate (1500): 1700 − 2·100, 1600 − 2·50, and a second 1600/50. The board
+    // separates them by deviation and then by name; a profile that ranked by its own rule would hand two of them the
+    // same place, or a place the board gives to someone else.
+    val tied = List(
+      LeaderboardEntry("acme", "wide", 1700.0, 100.0, onLadder = true, ResultTally(8, 0, 2)),
+      LeaderboardEntry("acme", "zed", 1600.0, 50.0, onLadder = true, ResultTally(6, 0, 4)),
+      LeaderboardEntry("acme", "amy", 1600.0, 50.0, onLadder = true, ResultTally(6, 0, 4))
+    )
+    val service = app(
+      bots = tied.map(entry => (entry.team, entry.name) -> BotRating(onLadder = true, None)).toMap,
+      board = BoardFixture(entries = tied),
+      profiles = ProfileFixture(
+        ratings = tied
+          .map(entry =>
+            RatedIdentity.Bot(entry.team, entry.name) -> Map(
+              RatingCategory.Blitz -> Glicko(entry.rating, entry.rd, 0.06)
+            )
+          )
+          .toMap
+      )
+    )
+    for
+      board    <- service.run(Request[IO](Method.GET, uri"/leaderboard")).flatMap(_.as[Leaderboard])
+      profiles <- tied.traverse: entry =>
+        service
+          .run(Request[IO](Method.GET, uri"/bots/acme" / entry.name))
+          .flatMap(_.as[Json])
+          .map(profile => entry.name -> profileRanks(profile)("blitz"))
+    yield
+      assertEquals(board.leaders.map(_.name), List("amy", "zed", "wide"), "smaller deviation, then name")
+      assertEquals(profiles.toMap, Map("amy" -> Some(1), "zed" -> Some(2), "wide" -> Some(3)))
+      profiles.foreach((name, rank) => assertEquals(rank, boardRankOf(board, "bot", name), name))
+
+  test("a player profile reports its row on the players board, not on the bots or the merged one (#333)"):
+    val settled = UserAccount("0197f0a0-0000-7000-8000-000000000333", "SwiftRook7", at, Some(at), isActive = true)
+    val fresh   = UserAccount("0197f0a0-0000-7000-8000-000000000334", "Provisional1", at, Some(at), isActive = true)
+    val service = app(
+      board = BoardFixture(
+        // Two bots sit above every account on the shared scale: on the merged board SwiftRook7 is fourth.
+        entries = List(
+          LeaderboardEntry("acme", "alice", 1900.0, 50.0, onLadder = true, ResultTally(30, 2, 10)),
+          LeaderboardEntry("acme", "bob", 1850.0, 50.0, onLadder = true, ResultTally(10, 2, 30))
+        ),
+        players = PlayerLeaderboardEntry("KeenKnight2", 1700.0, 60.0, ResultTally(12, 0, 3)) :: playerEntries
+      ),
+      profiles = ProfileFixture(
+        accounts = List(settled, fresh),
+        ratings = Map(
+          RatedIdentity.User(settled.id) -> Map(RatingCategory.Blitz -> Glicko(1600.0, 90.0, 0.06)),
+          RatedIdentity.User(fresh.id)   -> Map(RatingCategory.Blitz -> Glicko(1900.0, 300.0, 0.06))
+        )
+      )
+    )
+    for
+      // Lower-cased on purpose: the place must survive the case-insensitive lookup the route already allows.
+      ranked   <- service.run(Request[IO](Method.GET, uri"/players/by-nickname/swiftrook7")).flatMap(_.as[Json])
+      unranked <- service.run(Request[IO](Method.GET, uri"/players/by-nickname/Provisional1")).flatMap(_.as[Json])
+      players  <- service.run(Request[IO](Method.GET, uri"/leaderboard?kind=players")).flatMap(_.as[Leaderboard])
+      all      <- service.run(Request[IO](Method.GET, uri"/leaderboard?kind=all")).flatMap(_.as[Leaderboard])
+    yield
+      assertEquals(profileRanks(ranked), Map("blitz" -> Some(2)))
+      assertEquals(profileRanks(ranked)("blitz"), boardRankOf(players, "player", "SwiftRook7"))
+      assertEquals(boardRankOf(all, "player", "SwiftRook7"), Some(4), "the merged board is a different list")
+      assertEquals(profileRanks(unranked), Map("blitz" -> None), "a provisional account has a rating and no place")
+      assertEquals(boardRankOf(players, "player", "Provisional1"), None)
 
   test("?kind=all re-limits the merged board to MaxBoardSize, returning the true top N across populations (#289)"):
     // Produce MaxBoardSize + 1 entries per population: the merged board must be MaxBoardSize, not 2*(MaxBoardSize+1).

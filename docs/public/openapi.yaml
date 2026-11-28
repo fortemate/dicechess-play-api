@@ -2294,6 +2294,14 @@ components:
         wins: { type: integer }
         draws: { type: integer }
         losses: { type: integer }
+        rank:
+          type: integer
+          minimum: 1
+          description: >-
+            Optional. The participant's 1-based row on this category's leaderboard, equal to `rank` in
+            `GET /leaderboard?category=…` for its own population (`kind=bots` for a bot profile,
+            `kind=players` for a player profile). Omitted, never `null`, when the participant has no row on
+            that board. A client that ignores the field is unaffected.
       required: [category, rating, rd, provisional, games, wins, draws, losses]
     TrainingCategoryRating:
       type: object
@@ -2354,13 +2362,16 @@ components:
         wins: { type: integer }
         draws: { type: integer }
         losses: { type: integer }
+        ratings:
+          type: array
+          items: { $ref: '#/components/schemas/CategoryRating' }
         opponents:
           type: array
           items: { $ref: '#/components/schemas/OpponentRecord' }
         recent:
           type: array
           items: { $ref: '#/components/schemas/RecentGame' }
-      required: [team, name, rating, rd, provisional, onLadder, games, wins, draws, losses, opponents, recent]
+      required: [team, name, rating, rd, provisional, onLadder, games, wins, draws, losses, ratings, opponents, recent]
     OpponentRecord:
       type: object
       description: >

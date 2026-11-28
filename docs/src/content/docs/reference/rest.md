@@ -231,7 +231,27 @@ Every live game you are seated in — the polling counterpart of `GameStart` and
 
 ### List live games
 
-`GET /games` — **public.** Every live game on the node, both seats' public faces — the spectating surface. Sorted by `version` descending, capped at 50; `total` carries the real count. No legal-move tree (fetch the per-game endpoint).
+`GET /games` — **public.** The live games on the node, both seats' public faces — the spectating surface. Without parameters: sorted by `version` descending (the game further along first), the first 50; `total` carries the real count. No legal-move tree (fetch the per-game endpoint).
+
+Optional query parameters order, filter, search and page the listing. Filters combine with AND, and parameters the listing does not know are ignored.
+
+| Parameter | Values | Default | Meaning |
+|---|---|---|---|
+| `order` | `activity`, `rating` | `activity` | `activity`: `version` descending. `rating`: the highest sum of both seats' `rating` first. |
+| `players` | `all`, `human`, `bots` | `all` | `human`: at least one seat is a human. `bots`: both seats are bots. |
+| `category` | `bullet`, `blitz`, `rapid` | any speed | Only games whose time control counts on that [rating scale](../../rating/). |
+| `q` | text | no search | Only games where either seat's `name` contains the text, ignoring case and surrounding spaces. |
+| `limit` | `0`–`50` | `50` | Page size. `0` answers `total` alone. |
+| `offset` | `0` and up | `0` | How many games of the ordered, filtered listing to skip. |
+
+- **Rating order.** A seat without a `rating` adds nothing to the sum, so it counts lowest. Equal sums are ordered by the number of rated seats (two before one), then `version` descending, then `gameId` ascending. Both orders end on `gameId`, so each is total: the same games in the same state always come in the same order.
+- **Filters.** A game whose `players` is `null` matches neither `human` nor `bots`. A time control that counts on no scale (`Unlimited`, `PerMove`) matches no `category`. An anonymous seat has no `name`, so `q` never finds it; `players=human` is the way to those games.
+- **Paging.** `total` counts the games that `players`, `category` and `q` keep — every live game when none is given — and does not depend on `order`, `limit` or `offset`. Walk the listing with `offset=0, 50, 100, …` until `offset >= total`; an `offset` past the end answers an empty `games`. The listing is live: games start, advance and end between two requests, so a walk over several pages may repeat or miss a game. Treat `gameId` as the key and re-read from the first page to refresh.
+- **Errors.** `400` with a plain-text message naming the parameter when a value is outside the table above (for example `limit=51` or `players=humans`).
+
+```
+GET /games?order=rating&players=human&category=blitz&q=alpha&limit=25&offset=25
+```
 
 ```json
 {

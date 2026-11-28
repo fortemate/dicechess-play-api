@@ -1072,7 +1072,7 @@ object LeaderboardStore:
   /** Payload guard for the public leaderboard endpoint: the SQL query is bounded to this many rows, so the response
     * never grows without limit as the platform scales (#289). Sized to match Lichess's own top-list and to be an order
     * of magnitude above anything this platform will have soon — it is NOT a display cap; the SPA decides what to show.
-    * Compare [[PlayRoutes]]'s `MaxListedGames = 50`, which guards a different public listing.
+    * Compare `LiveGamesListing.MaxPageSize`, which guards a different public listing.
     */
   val MaxBoardSize: Int = 200
 

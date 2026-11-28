@@ -114,7 +114,7 @@ object LiveGamesListing:
 
   /** Whether the filters of `query` keep `game`. A game whose players are unknown has neither a human nor two bots. */
   private[server] def matches(game: LiveGame, query: Query): Boolean =
-    val players   = seats(game)
+    val players  = seats(game)
     val whoPlays = query.participants match
       case Participants.All   => true
       case Participants.Human => players.exists(_.kind == PlayerKind.Human)

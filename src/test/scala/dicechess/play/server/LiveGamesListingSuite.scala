@@ -184,7 +184,14 @@ class LiveGamesListingSuite extends munit.FunSuite:
 
   test("every parameter parses, and the explicit defaults equal the absent ones"):
     assertEquals(
-      parsed("order" -> "rating", "players" -> "bots", "category" -> "rapid", "q" -> " Bob ", "limit" -> "25", "offset" -> "75"),
+      parsed(
+        "order"    -> "rating",
+        "players"  -> "bots",
+        "category" -> "rapid",
+        "q"        -> " Bob ",
+        "limit"    -> "25",
+        "offset"   -> "75"
+      ),
       Query(Order.Rating, Participants.Bots, Some(RatingCategory.Rapid), Some("bob"), 25, 75)
     )
     assertEquals(parsed("order" -> "activity", "players" -> "all", "limit" -> "50", "offset" -> "0"), Query())
